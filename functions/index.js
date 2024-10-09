@@ -1,22 +1,3 @@
-/*
- * MIT License
- * Copyright (c) 2024 Harvey
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- * The above copyright notice and this permission notice shall be included in all
- * copies or substantial portions of the Software.
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
- */
 require('dotenv').config();
 const { onRequest } = require("firebase-functions/v2/https");
 const express = require("express");
@@ -32,19 +13,19 @@ const { scrapeActiveStock } = require("./services/scrapeActiveStock");
 const { scrapeGainers } = require("./services/scrapeGainers");
 const { scrapeLosers } = require("./services/scrapeLosers");
 const { scrapeNews } = require("./services/scrapeNews");
+const updateCurrentPrices = require('./services/updateCurrentPrices');
 
 const app = express();
-const port = 3000;
+const port = 3100;
 
 corsOptions = {
-  origin: [process.env.ORIGIN, "http://localhost:3000", "https://gfinance-api-doc.web.app", "https://gfinance-api-doc.firebaseapp.com"],
+  origin: ["https://stocks-analyzer-system.web.app", "https://stocks-analyzer-system.firebaseapp.com", "http://localhost:3000", "http://localhost:3001", "http://stocks-analyzer-system.web.app"],
   optionsSuccessStatus: 200
 };
 
 app.use(cors(corsOptions));
 
 const demoApiKey = "demo";
-//limits demo key to 10 requests a minute
 const demoApiLimiter = rateLimit({
   windowMs: 60000,
   max: 10,
@@ -190,3 +171,4 @@ app.listen(port, () => {
 });
 
 exports.app = onRequest(app);
+exports.updateCurrentPrices = updateCurrentPrices.updateCurrentPrices;

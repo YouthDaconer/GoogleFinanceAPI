@@ -10,7 +10,8 @@ info:
     name: "MIT"
     url: "https://opensource.org/licenses/MIT"
 servers:
-  - url: "https://app-coujq7nbwq-uc.a.run.app"
+  - url: "https://app-sgrxuanvjq-uc.a.run.app"
+  - url: "http://localhost:3100"
 
 paths:
   /indices:
