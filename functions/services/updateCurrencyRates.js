@@ -29,30 +29,23 @@ exports.updateCurrencyRates = functions.pubsub
 
         try {
           const currencyData = await scrapeSimpleCurrencie('USD', code);
-          
+
           if (currencyData && currencyData.current) {
             const newRate = parseFloat(currencyData.current);
-            
-            // Actualizar solo si la tasa ha cambiado significativamente (más del 0.1%)
-            if (Math.abs(newRate - lastRate) / lastRate > 0.001) {
-              const updatedData = {
-                code: code,
-                name: name,
-                symbol: symbol,
-                exchangeRate: newRate,
-                lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
-                change: currencyData.change,
-                percentChange: currencyData.percentChange
-              };
+            const updatedData = {
+              code: code,
+              name: name,
+              symbol: symbol,
+              exchangeRate: newRate,
+              lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
+              change: currencyData.change,
+              percentChange: currencyData.percentChange
+            };
 
-              batch.update(doc.ref, updatedData);
-              cache.set(cacheKey, updatedData);
-              updatesCount++;
-              console.log(`Actualizada tasa de cambio para USD:${code}`);
-            } else {
-              console.log(`No se requiere actualización para USD:${code}`);
-              cache.set(cacheKey, doc.data());
-            }
+            batch.update(doc.ref, updatedData);
+            cache.set(cacheKey, updatedData);
+            updatesCount++;
+            console.log(`Actualizada tasa de cambio para USD:${code}`);
           } else {
             console.warn(`No se pudo obtener la tasa de cambio para USD:${code}`);
           }

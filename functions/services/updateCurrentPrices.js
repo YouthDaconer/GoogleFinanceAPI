@@ -29,30 +29,23 @@ exports.updateCurrentPrices = functions.pubsub
 
         try {
           const quoteData = await scrapeSimpleQuote(symbol, market);
-          
+
           if (quoteData && quoteData.current) {
             const newPrice = parseFloat(quoteData.current);
-            
-            // Actualizar solo si el precio ha cambiado significativamente (más del 0.1%)
-            if (Math.abs(newPrice - lastPrice) / lastPrice > 0.001) {
-              const updatedData = {
-                symbol: symbol,
-                market: market,
-                price: newPrice,
-                lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
-                name: quoteData.name || doc.data().name,
-                change: quoteData.change,
-                percentChange: quoteData.percentChange
-              };
+            const updatedData = {
+              symbol: symbol,
+              market: market,
+              price: newPrice,
+              lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
+              name: quoteData.name || doc.data().name,
+              change: quoteData.change,
+              percentChange: quoteData.percentChange
+            };
 
-              batch.update(doc.ref, updatedData);
-              cache.set(cacheKey, updatedData);
-              updatesCount++;
-              console.log(`Actualizado precio para ${symbol}:${market}`);
-            } else {
-              console.log(`No se requiere actualización para ${symbol}:${market}`);
-              cache.set(cacheKey, doc.data());
-            }
+            batch.update(doc.ref, updatedData);
+            cache.set(cacheKey, updatedData);
+            updatesCount++;
+            console.log(`Actualizado precio para ${symbol}:${market}`);
           } else {
             console.warn(`No se pudo obtener el precio para ${symbol}:${market}`);
           }
