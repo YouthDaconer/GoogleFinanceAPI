@@ -1,12 +1,9 @@
 const functions = require('firebase-functions');
-const admin = require('firebase-admin');
+const admin = require('./firebaseAdmin');
 const { scrapeSimpleQuote } = require('./scrapeQuote');
 const NodeCache = require('node-cache');
 
-admin.initializeApp();
-
-// Inicializar caché con un tiempo de vida de 25 minutos
-const cache = new NodeCache({ stdTTL: 1500 });
+const cache = new NodeCache({ stdTTL: 2100 });
 
 exports.updateCurrentPrices = functions.pubsub
   .schedule('every 30 minutes')

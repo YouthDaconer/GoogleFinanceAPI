@@ -10,10 +10,12 @@ const scrapeIndicesByCountry = require("./services/scrapeIndicesByCountry");
 const cors = require('cors');
 const {scrapeFullQuote, scrapeSimpleQuote,} = require("./services/scrapeQuote");
 const { scrapeActiveStock } = require("./services/scrapeActiveStock");
+const { scrapeSimpleCurrencie } = require("./services/scrapeCurrencies");
 const { scrapeGainers } = require("./services/scrapeGainers");
 const { scrapeLosers } = require("./services/scrapeLosers");
 const { scrapeNews } = require("./services/scrapeNews");
 const updateCurrentPrices = require('./services/updateCurrentPrices');
+const updateCurrencyRates = require('./services/updateCurrencyRates');
 
 const app = express();
 const port = 3100;
@@ -110,6 +112,25 @@ app.get("/quote", async (req, res) => {
   }
 });
 
+app.get("/currencie", async (req, res) => {
+  const { origin, target } = req.query;
+  try {
+    if (!origin || !target) {
+      res.status(400).json({
+        error: "Please provide both origin and target query parameters",
+      });
+      return;
+    }
+    const currencie = await scrapeSimpleCurrencie(origin, target);
+    res.status(200).json(currencie);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({
+      error: "An error occurred while searching for the currencie: " + error.message,
+    });
+  }
+});
+
 app.get("/active", async (req, res) => {
   try {
     const activeStocks = await scrapeActiveStock();
@@ -172,3 +193,4 @@ app.listen(port, () => {
 
 exports.app = onRequest(app);
 exports.updateCurrentPrices = updateCurrentPrices.updateCurrentPrices;
+exports.updateCurrencyRates = updateCurrencyRates.updateCurrencyRates;
