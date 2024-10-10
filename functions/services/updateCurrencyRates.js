@@ -5,6 +5,11 @@ const NodeCache = require('node-cache');
 
 const cache = new NodeCache({ stdTTL: 2100 });
 
+function normalizeAndParseFloat(value) {
+  const normalizedValue = value.replace(/[,$\s]/g, '');
+  return parseFloat(normalizedValue);
+}
+
 exports.updateCurrencyRates = functions.pubsub
   .schedule('every 30 minutes')
   .onRun(async (context) => {
@@ -31,21 +36,23 @@ exports.updateCurrencyRates = functions.pubsub
           const currencyData = await scrapeSimpleCurrencie('USD', code);
 
           if (currencyData && currencyData.current) {
-            const newRate = parseFloat(currencyData.current);
-            const updatedData = {
-              code: code,
-              name: name,
-              symbol: symbol,
-              exchangeRate: newRate,
-              lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
-              change: currencyData.change,
-              percentChange: currencyData.percentChange
-            };
+            const newRate = normalizeAndParseFloat(currencyData.current);
+            if (!isNaN(newRate)) {
+              const updatedData = {
+                code: code,
+                name: name,
+                symbol: symbol,
+                exchangeRate: newRate,
+                lastUpdated: admin.firestore.FieldValue.serverTimestamp()
+              };
 
-            batch.update(doc.ref, updatedData);
-            cache.set(cacheKey, updatedData);
-            updatesCount++;
-            console.log(`Actualizada tasa de cambio para USD:${code}`);
+              batch.update(doc.ref, updatedData);
+              cache.set(cacheKey, updatedData);
+              updatesCount++;
+              console.log(`Actualizada tasa de cambio para USD:${code}`);
+            } else {
+              console.warn(`Valor inválido para USD:${code}: ${currencyData.current}`);
+            }
           } else {
             console.warn(`No se pudo obtener la tasa de cambio para USD:${code}`);
           }
