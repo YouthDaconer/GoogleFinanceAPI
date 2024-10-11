@@ -3,16 +3,31 @@ const admin = require('./firebaseAdmin');
 const { scrapeSimpleCurrencie } = require('./scrapeCurrencies');
 const NodeCache = require('node-cache');
 
-const cache = new NodeCache({ stdTTL: 2100 });
+const cache = new NodeCache({ stdTTL: 900 });
+
+// Horarios estáticos para NYSE (en UTC)
+const NYSE_OPEN_HOUR = 13.5;  // 9:30 AM EST
+const NYSE_CLOSE_HOUR = 20;   // 4:00 PM EST
 
 function normalizeAndParseFloat(value) {
   const normalizedValue = value.replace(/[,$\s]/g, '');
   return parseFloat(normalizedValue);
 }
 
+function isNYSEMarketOpen() {
+  const now = new Date();
+  const utcHour = now.getUTCHours() + now.getUTCMinutes() / 60;
+  return utcHour >= NYSE_OPEN_HOUR && utcHour < NYSE_CLOSE_HOUR;
+}
+
 exports.updateCurrencyRates = functions.pubsub
-  .schedule('every 30 minutes')
+  .schedule('every 10 minutes')
   .onRun(async (context) => {
+    if (!isNYSEMarketOpen()) {
+      console.log('El mercado NYSE está cerrado. No se actualizarán las tasas de cambio.');
+      return null;
+    }
+
     const db = admin.firestore();
     const currenciesRef = db.collection('currencies');
 
@@ -76,6 +91,10 @@ exports.updateCurrencyRates = functions.pubsub
 
 // Función HTTP para pruebas locales (opcional)
 /*exports.httpUpdateCurrencyRates = functions.https.onRequest(async (req, res) => {
-  await exports.updateCurrencyRates.run();
-  res.send('Actualización de tasas de cambio completada');
+  if (isNYSEMarketOpen()) {
+    await exports.updateCurrencyRates.run();
+    res.send('Actualización de tasas de cambio completada');
+  } else {
+    res.send('El mercado NYSE está cerrado. No se actualizaron las tasas de cambio.');
+  }
 });*/
