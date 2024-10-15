@@ -3,7 +3,7 @@ const admin = require('./firebaseAdmin');
 const { scrapeSimpleCurrencie } = require('./scrapeCurrencies');
 const NodeCache = require('node-cache');
 
-const cache = new NodeCache({ stdTTL: 900 });
+const cache = new NodeCache({ stdTTL: 420 });
 
 // Horarios estáticos para NYSE (en UTC)
 const NYSE_OPEN_HOUR = 13.5;  // 9:30 AM EST
@@ -21,7 +21,7 @@ function isNYSEMarketOpen() {
 }
 
 exports.updateCurrencyRates = functions.pubsub
-  .schedule('every 10 minutes')
+  .schedule('every 5 minutes')
   .onRun(async (context) => {
     if (!isNYSEMarketOpen()) {
       console.log('El mercado NYSE está cerrado. No se actualizarán las tasas de cambio.');
