@@ -21,7 +21,7 @@ function isNYSEMarketOpen() {
 }
 
 exports.updateCurrencyRates = functions.pubsub
-  .schedule('every 5 minutes')
+  .schedule('*/5 * * * 1-5')
   .onRun(async (context) => {
     if (!isNYSEMarketOpen()) {
       console.log('El mercado NYSE está cerrado. No se actualizarán las tasas de cambio.');

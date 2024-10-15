@@ -2,11 +2,49 @@ const functions = require('firebase-functions');
 const admin = require('firebase-admin');
 const { scrapeSimpleQuote } = require('./scrapeQuote');
 const NodeCache = require('node-cache');
+
 const priceCache = new NodeCache({ stdTTL: 420 });
 const marketHoursCache = new NodeCache({ stdTTL: 86400 });
 
+async function getMarketHours() {
+  const cachedMarketHours = marketHoursCache.get('marketHours');
+  if (cachedMarketHours) {
+    return cachedMarketHours;
+  }
+
+  const db = admin.firestore();
+  const marketsSnapshot = await db.collection('markets').get();
+  const marketHours = {};
+  marketsSnapshot.forEach(doc => {
+    const data = doc.data();
+    marketHours[data.code] = { open: data.open, close: data.close };
+  });
+
+  marketHoursCache.set('marketHours', marketHours);
+  return marketHours;
+}
+
+function isWeekday(date) {
+  const day = date.getUTCDay();
+  return day >= 1 && day <= 5; // 1 (Lunes) a 5 (Viernes)
+}
+
+async function isAnyMarketOpen() {
+  const now = new Date();
+  if (!isWeekday(now)) return false;
+
+  const utcHour = now.getUTCHours() + now.getUTCMinutes() / 60;
+  const marketHours = await getMarketHours();
+
+  return Object.values(marketHours).some(hours =>
+    utcHour >= hours.open && utcHour < hours.close
+  );
+}
+
 async function isMarketOpen(market) {
   const now = new Date();
+  if (!isWeekday(now)) return { isOpen: false, isClosing: false };
+
   const utcHour = now.getUTCHours() + now.getUTCMinutes() / 60;
 
   const marketHours = await getMarketHours();
@@ -17,12 +55,17 @@ async function isMarketOpen(market) {
   }
 
   const isOpen = utcHour >= hours.open && utcHour < hours.close;
-  const isClosing = utcHour >= hours.close - 0.1 && utcHour < hours.close; // 6 minutos antes del cierre
+  const isClosing = utcHour >= hours.close - 0.0833 && utcHour < hours.close; // 5 minutos antes del cierre
 
   return { isOpen, isClosing };
 }
 
 async function updateCurrentPrices() {
+  if (!(await isAnyMarketOpen())) {
+    console.log('Ningún mercado está abierto. No se realizarán actualizaciones.');
+    return;
+  }
+
   const db = admin.firestore();
   const currentPricesRef = db.collection('currentPrices');
 
@@ -90,11 +133,51 @@ async function updateCurrentPrices() {
   }
 }
 
-// Función para ejecutar actualizaciones más frecuentes cerca del cierre
+function convertDecimalToTime(decimal) {
+  const hours = Math.floor(decimal);
+  const minutes = Math.round((decimal - hours) * 60);
+  return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}`;
+}
+
+async function getMarketOpenCloseTimes() {
+  const marketHours = await getMarketHours();
+  const times = new Set();
+  Object.values(marketHours).forEach(hours => {
+    times.add(typeof hours.open === 'number' ? hours.open : parseFloat(hours.open));
+    times.add(typeof hours.close === 'number' ? hours.close : parseFloat(hours.close));
+  });
+  return Array.from(times).sort((a, b) => a - b);
+}
+
+async function scheduleMarketUpdates() {
+  const times = await getMarketOpenCloseTimes();
+
+  times.forEach(time => {
+    const timeString = convertDecimalToTime(time);
+    const [hours, minutes] = timeString.split(':').map(Number);
+    const cronExpression = `${minutes} ${hours} * * 1-5`;
+
+    exports[`updatePricesAt_${hours}_${minutes}`] = functions.pubsub
+      .schedule(cronExpression)
+      .timeZone('UTC')
+      .onRun(async (context) => {
+        await updateCurrentPrices();
+        return null;
+      });
+
+    console.log(`Scheduled update for ${timeString} UTC`);
+  });
+}
+
 async function frequentUpdatesNearClose() {
+  if (!(await isAnyMarketOpen())) {
+    console.log('Ningún mercado está abierto. No se realizarán actualizaciones frecuentes.');
+    return;
+  }
+
   const marketHours = await getMarketHours();
   const now = new Date();
-  const utcHour = now.getUTCHours() + now.getUTCMinutes() / 60 + now.getUTCSeconds() / 3600;
+  const utcHour = now.getUTCHours() + now.getUTCMinutes() / 60;
 
   for (const [market, hours] of Object.entries(marketHours)) {
     const timeToClose = hours.close - utcHour;
@@ -106,15 +189,19 @@ async function frequentUpdatesNearClose() {
   }
 }
 
+// Programar la actualización cada 5 minutos durante el horario de mercado
 exports.scheduledUpdatePrices = functions.pubsub
-  .schedule('every 5 minutes')
+  .schedule('*/5 * * * 1-5')
+  .timeZone('UTC')
   .onRun(async (context) => {
     await updateCurrentPrices();
     return null;
   });
 
+// Esta función se ejecutará cada minuto durante los días hábiles
 exports.frequentUpdatesNearClose = functions.pubsub
-  .schedule('every 1 minutes')
+  .schedule('* * * * 1-5')
+  .timeZone('UTC')
   .onRun(async (context) => {
     await frequentUpdatesNearClose();
     return null;
@@ -125,5 +212,9 @@ exports.clearMarketHoursCache = functions.firestore
   .onWrite(async (change, context) => {
     marketHoursCache.del('marketHours');
     console.log('Caché de horarios de mercado limpiada debido a cambios en la colección markets');
+    await scheduleMarketUpdates(); // Reprogramar las actualizaciones de mercado
     return null;
   });
+
+// Inicializar las funciones programadas para las actualizaciones de mercado
+scheduleMarketUpdates();
