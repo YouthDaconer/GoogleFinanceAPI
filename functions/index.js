@@ -14,8 +14,9 @@ const { scrapeSimpleCurrencie } = require("./services/scrapeCurrencies");
 const { scrapeGainers } = require("./services/scrapeGainers");
 const { scrapeLosers } = require("./services/scrapeLosers");
 const { scrapeNews } = require("./services/scrapeNews");
+const { saveSp500HistoryData } = require("./services/saveSp500HistoryData");
 const updateCurrencyRates = require('./services/updateCurrencyRates');
-const { scheduledUpdatePrices, clearMarketHoursCache, frequentUpdatesNearClose } = require('./services/updateCurrentPrices');
+const { scheduledUpdatePrices, clearMarketHoursCache } = require('./services/updateCurrentPrices');
 
 const app = express();
 const port = 3100;
@@ -195,4 +196,4 @@ exports.app = onRequest(app);
 exports.updateCurrencyRates = updateCurrencyRates.updateCurrencyRates;
 exports.scheduledUpdatePrices = scheduledUpdatePrices;
 exports.clearMarketHoursCache = clearMarketHoursCache;
-exports.frequentUpdatesNearClose = frequentUpdatesNearClose;
+exports.saveSp500HistoryData = saveSp500HistoryData;

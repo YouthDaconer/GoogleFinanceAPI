@@ -169,41 +169,12 @@ async function scheduleMarketUpdates() {
   });
 }
 
-async function frequentUpdatesNearClose() {
-  if (!(await isAnyMarketOpen())) {
-    console.log('Ningún mercado está abierto. No se realizarán actualizaciones frecuentes.');
-    return;
-  }
-
-  const marketHours = await getMarketHours();
-  const now = new Date();
-  const utcHour = now.getUTCHours() + now.getUTCMinutes() / 60;
-
-  for (const [market, hours] of Object.entries(marketHours)) {
-    const timeToClose = hours.close - utcHour;
-    if (timeToClose <= 0.0833 && timeToClose > 0) { // Últimos 5 minutos (0.0833 horas)
-      console.log(`Ejecutando actualización frecuente para ${market} cerca del cierre`);
-      await updateCurrentPrices();
-      break;
-    }
-  }
-}
-
 // Programar la actualización cada 5 minutos durante el horario de mercado
 exports.scheduledUpdatePrices = functions.pubsub
   .schedule('*/5 * * * 1-5')
   .timeZone('UTC')
   .onRun(async (context) => {
     await updateCurrentPrices();
-    return null;
-  });
-
-// Esta función se ejecutará cada minuto durante los días hábiles
-exports.frequentUpdatesNearClose = functions.pubsub
-  .schedule('* * * * 1-5')
-  .timeZone('UTC')
-  .onRun(async (context) => {
-    await frequentUpdatesNearClose();
     return null;
   });
 
