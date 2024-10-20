@@ -16,6 +16,7 @@ const { scrapeLosers } = require("./services/scrapeLosers");
 const { scrapeNews } = require("./services/scrapeNews");
 const { saveSp500HistoryData } = require("./services/saveSp500HistoryData");
 const updateCurrencyRates = require('./services/updateCurrencyRates');
+const calcDailyPortfolioPerf = require('./services/calculateDailyPortfolioPerformance');
 const { scheduledUpdatePrices, clearMarketHoursCache } = require('./services/updateCurrentPrices');
 
 const app = express();
@@ -197,3 +198,4 @@ exports.updateCurrencyRates = updateCurrencyRates.updateCurrencyRates;
 exports.scheduledUpdatePrices = scheduledUpdatePrices;
 exports.clearMarketHoursCache = clearMarketHoursCache;
 exports.saveSp500HistoryData = saveSp500HistoryData;
+exports.calcDailyPortfolioPerf = calcDailyPortfolioPerf;
