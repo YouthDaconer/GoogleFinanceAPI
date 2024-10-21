@@ -3,7 +3,8 @@ const admin = require('./firebaseAdmin');
 const scrapeIndicesByCountry = require('./scrapeIndicesByCountry');
 
 exports.saveSp500HistoryData = functions.pubsub
-  .schedule('0 21 * * 1-5')  // Se ejecuta a las 21:00 UTC (después del cierre del mercado) de lunes a viernes
+  .schedule('0 21 * * 1-5')
+  .timeZone('America/New_York')
   .onRun(async (context) => {
     try {
       // Realizar el scraping

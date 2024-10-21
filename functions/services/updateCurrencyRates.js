@@ -22,6 +22,7 @@ function isNYSEMarketOpen() {
 
 exports.updateCurrencyRates = functions.pubsub
   .schedule('*/5 * * * 1-5')
+  .timeZone('America/New_York')
   .onRun(async (context) => {
     if (!isNYSEMarketOpen()) {
       console.log('El mercado NYSE está cerrado. No se actualizarán las tasas de cambio.');
