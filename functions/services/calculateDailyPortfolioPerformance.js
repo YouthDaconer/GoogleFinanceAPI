@@ -3,7 +3,7 @@ const admin = require('firebase-admin');
 const { calculateAccountPerformance } = require('../utils/portfolioCalculations');
 
 exports.calcDailyPortfolioPerf = functions.pubsub
-    .schedule('0 21 * * 1-5')
+    .schedule('0 17 * * 1-5')
     .timeZone('America/New_York')
     .onRun(async (context) => {
         const db = admin.firestore();

@@ -52,34 +52,10 @@ const convertCurrency = (amount, fromCurrency, toCurrency, currencies, acquisiti
     const fromRate = currencies.find(c => c.code === fromCurrency)?.exchangeRate || 1;
     const toRate = currencies.find(c => c.code === toCurrency)?.exchangeRate || 1;
 
-    if (fromCurrency === 'USD' && toCurrency === 'COP' && acquisitionDollarValue) {
+    if (fromCurrency === 'USD' && toCurrency !== 'USD' && acquisitionDollarValue) {
         return amount * acquisitionDollarValue;
     }
     return (amount * toRate) / fromRate;
-};
-
-/**
- * @param {Asset[]} assets
- * @param {CurrentPrice[]} currentPrices
- * @param {string} selectedCurrency
- * @param {Currency[]} currencies
- * @returns {{totalInvestment: number, totalValue: number}}
- */
-const calculateTotalInvestmentAndValue = (assets, currentPrices, selectedCurrency, currencies) => {
-    const activeAssets = assets.filter(asset => asset.isActive);
-
-    const totalInvestment = activeAssets.reduce((sum, asset) => {
-        const convertedValue = convertCurrency(asset.unitValue * asset.units, asset.currency, selectedCurrency, currencies, asset.acquisitionDollarValue);
-        return sum + convertedValue;
-    }, 0);
-
-    const totalValue = activeAssets.reduce((sum, asset) => {
-        const currentPrice = currentPrices.find(cp => cp.symbol === asset.name)?.price || 0;
-        const convertedValue = convertCurrency(currentPrice * asset.units, asset.currency, selectedCurrency, currencies, asset.acquisitionDollarValue);
-        return sum + convertedValue;
-    }, 0);
-
-    return { totalInvestment, totalValue };
 };
 
 /**
@@ -118,30 +94,6 @@ const calculateTotalROIAndReturns = (totalInvestment, totalValue, maxDaysInveste
 };
 
 /**
- * @param {Asset[]} assets
- * @param {CurrentPrice[]} currentPrices
- * @param {string} selectedCurrency
- * @param {Currency[]} currencies
- * @returns {{totalInvestment: number, totalValue: number, totalROI: number, dailyReturn: number, monthlyReturn: number, annualReturn: number}}
- */
-const calculatePerformanceForPortfolioSummary = (assets, currentPrices, selectedCurrency, currencies) => {
-    const activeAssets = assets.filter(asset => asset.isActive);
-
-    const { totalInvestment, totalValue } = calculateTotalInvestmentAndValue(activeAssets, currentPrices, selectedCurrency, currencies);
-    const maxDaysInvested = calculateMaxDaysInvested(activeAssets);
-    const { totalROI, dailyReturn, monthlyReturn, annualReturn } = calculateTotalROIAndReturns(totalInvestment, totalValue, maxDaysInvested);
-
-    return {
-        totalInvestment,
-        totalValue,
-        totalROI,
-        dailyReturn,
-        monthlyReturn,
-        annualReturn
-    };
-};
-
-/**
  * @param {number} totalValue
  * @param {number} totalValueYesterday
  * @returns {number}
@@ -158,33 +110,43 @@ const calculateDailyChangePercentage = (totalValue, totalValueYesterday) => {
  * @param {Object.<string, number>} totalValueYesterday
  * @returns {Object.<string, {totalInvestment: number, totalValue: number, totalROI: number, dailyReturn: number, monthlyReturn: number, annualReturn: number, dailyChangePercentage: number}>}
  */
-const calculateAccountPerformance = (assets, currentPrices, currencies, totalValueYesterday) => {
+function calculateAccountPerformance(assets, currentPrices, currencies, totalValueYesterday) {
     const performanceByCurrency = {};
-
+  
     for (const currency of currencies) {
-        const { totalInvestment, totalValue } = calculateTotalInvestmentAndValue(assets, currentPrices, currency.code, currencies);
-        const maxDaysInvested = calculateMaxDaysInvested(assets);
-        const { totalROI, dailyReturn, monthlyReturn, annualReturn } = calculateTotalROIAndReturns(totalInvestment, totalValue, maxDaysInvested);
-        const dailyChangePercentage = calculateDailyChangePercentage(totalValue, totalValueYesterday[currency.code] || 0);
-
-        performanceByCurrency[currency.code] = {
-            totalInvestment,
-            totalValue,
-            totalROI,
-            dailyReturn,
-            monthlyReturn,
-            annualReturn,
-            dailyChangePercentage
-        };
+      let totalInvestment = 0;
+      let totalValue = 0;
+  
+      for (const asset of assets) {
+        const currentPrice = currentPrices.find(cp => cp.symbol === asset.name)?.price || 0;
+        const assetValueUSD = currentPrice * asset.units;
+  
+        const initialInvestmentUSD = asset.unitValue * asset.units;
+        totalInvestment += convertCurrency(initialInvestmentUSD, 'USD', currency.code, currencies, asset.acquisitionDollarValue);
+  
+        totalValue += convertCurrency(assetValueUSD, 'USD', currency.code, currencies);
+      }
+  
+      const maxDaysInvested = calculateMaxDaysInvested(assets);
+      const { totalROI, dailyReturn, monthlyReturn, annualReturn } = calculateTotalROIAndReturns(totalInvestment, totalValue, maxDaysInvested);
+      const dailyChangePercentage = calculateDailyChangePercentage(totalValue, totalValueYesterday[currency.code] || 0);
+  
+      performanceByCurrency[currency.code] = {
+        totalInvestment,
+        totalValue,
+        totalROI,
+        dailyReturn,
+        monthlyReturn,
+        annualReturn,
+        dailyChangePercentage
+      };
     }
-
+  
     return performanceByCurrency;
-};
+  }
 
 module.exports = {
-    calculatePerformanceForPortfolioSummary,
     convertCurrency,
-    calculateTotalInvestmentAndValue,
     calculateMaxDaysInvested,
     calculateTotalROIAndReturns,
     calculateDailyChangePercentage,
