@@ -31,20 +31,56 @@ exports.calcDailyPortfolioPerf = functions.pubsub
                 return acc;
             }, {});
 
-            const batch = db.batch();
-
             for (const [userId, accounts] of Object.entries(userPortfolios)) {
-                const userPerformanceData = { accounts: {}, overall: {} };
+                const batch = db.batch();
+
+                // Ensure user document exists
+                const userPerformanceRef = db.collection('portfolioPerformance').doc(userId);
+                const userPerformanceDoc = await userPerformanceRef.get();
+                if (!userPerformanceDoc.exists) {
+                    batch.set(userPerformanceRef, { userId });
+                }
+
+                const yesterdayOverallPerformanceDoc = await userPerformanceRef
+                    .collection('dates')
+                    .doc(formattedYesterday)
+                    .get();
+
+                const yesterdayOverallTotalValue = yesterdayOverallPerformanceDoc.exists
+                    ? yesterdayOverallPerformanceDoc.data()?.totalValue || {}
+                    : currencies.reduce((acc, cur) => ({ ...acc, [cur.code]: 0 }), {});
+
+                const allUserAssets = assets.filter(asset => accounts.some(account => account.id === asset.portfolioAccount));
+
+                const overallPerformance = calculateAccountPerformance(
+                    allUserAssets,
+                    currentPrices,
+                    currencies,
+                    yesterdayOverallTotalValue
+                );
+
+                // Save overall user performance
+                const userOverallPerformanceRef = userPerformanceRef
+                    .collection('dates')
+                    .doc(formattedDate);
+                batch.set(userOverallPerformanceRef, {
+                    date: formattedDate,
+                    ...overallPerformance
+                });
 
                 for (const account of accounts) {
                     const accountAssets = assets.filter(asset => asset.portfolioAccount === account.id);
 
-                    const yesterdayPerformanceDoc = await db.collection('portfolioPerformance')
-                        .doc(`${formattedYesterday}`)
-                        .collection('users')
-                        .doc(userId)
-                        .collection('accounts')
-                        .doc(account.id)
+                    // Ensure account document exists
+                    const accountRef = userPerformanceRef.collection('accounts').doc(account.id);
+                    const accountDoc = await accountRef.get();
+                    if (!accountDoc.exists) {
+                        batch.set(accountRef, { accountId: account.id });
+                    }
+
+                    const yesterdayPerformanceDoc = await accountRef
+                        .collection('dates')
+                        .doc(formattedYesterday)
                         .get();
 
                     const yesterdayTotalValue = yesterdayPerformanceDoc.exists
@@ -58,55 +94,24 @@ exports.calcDailyPortfolioPerf = functions.pubsub
                         yesterdayTotalValue
                     );
 
-                    userPerformanceData.accounts[account.id] = accountPerformance;
-
-                    // Guardar rendimiento de la cuenta
-                    const accountPerformanceRef = db.collection('portfolioPerformance')
-                        .doc(formattedDate)
-                        .collection('users')
-                        .doc(userId)
-                        .collection('accounts')
-                        .doc(account.id);
-                    batch.set(accountPerformanceRef, accountPerformance);
+                    // Save account performance
+                    const accountPerformanceRef = accountRef
+                        .collection('dates')
+                        .doc(formattedDate);
+                    batch.set(accountPerformanceRef, {
+                        date: formattedDate,
+                        ...accountPerformance
+                    });
                 }
 
-                // Calcular rendimiento general del usuario
-                const allUserAssets = assets.filter(asset => accounts.some(account => account.id === asset.portfolioAccount));
-
-                const yesterdayOverallPerformanceDoc = await db.collection('portfolioPerformance')
-                    .doc(formattedYesterday)
-                    .collection('users')
-                    .doc(userId)
-                    .get();
-
-                const yesterdayOverallTotalValue = yesterdayOverallPerformanceDoc.exists
-                    ? yesterdayOverallPerformanceDoc.data()?.totalValue || {}
-                    : currencies.reduce((acc, cur) => ({ ...acc, [cur.code]: 0 }), {});
-
-                const overallPerformance = calculateAccountPerformance(
-                    allUserAssets,
-                    currentPrices,
-                    currencies,
-                    yesterdayOverallTotalValue
-                );
-
-                userPerformanceData.overall = overallPerformance;
-
-                // Guardar rendimiento general del usuario
-                const userOverallPerformanceRef = db.collection('portfolioPerformance')
-                    .doc(formattedDate)
-                    .collection('users')
-                    .doc(userId);
-                batch.set(userOverallPerformanceRef, overallPerformance);
-
-                console.log(`Datos de rendimiento del portafolio calculados para el usuario ${userId} en ${formattedDate}`);
+                await batch.commit();
+                console.log(`Portfolio performance data calculated for user ${userId} on ${formattedDate}`);
             }
 
-            await batch.commit();
-            console.log(`Cálculo de rendimiento diario del portafolio completado para ${formattedDate}`);
+            console.log(`Daily portfolio performance calculation completed for ${formattedDate}`);
             return null;
         } catch (error) {
-            console.error('Error al calcular el rendimiento diario del portafolio:', error);
+            console.error('Error calculating daily portfolio performance:', error);
             return null;
         }
     });
