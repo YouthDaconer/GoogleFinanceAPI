@@ -7,9 +7,9 @@ exports.calcDailyPortfolioPerf = functions.pubsub
     .schedule('0 17 * * 1-5')
     .timeZone('America/New_York')
     .onRun(async (context) => {
+        const db = admin.firestore();
         const now = DateTime.now().setZone('America/New_York');
         const formattedDate = now.toISODate();
-
         const yesterday = now.minus({ days: 1 });
         const formattedYesterday = yesterday.toISODate();
 
