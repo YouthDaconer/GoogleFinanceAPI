@@ -1,16 +1,17 @@
 const functions = require('firebase-functions');
 const admin = require('firebase-admin');
 const { calculateAccountPerformance } = require('../utils/portfolioCalculations');
+const { DateTime } = require('luxon');
 
 exports.calcDailyPortfolioPerf = functions.pubsub
     .schedule('0 17 * * 1-5')
     .timeZone('America/New_York')
     .onRun(async (context) => {
-        const db = admin.firestore();
-        const now = new Date();
-        const formattedDate = now.toISOString().split('T')[0];
-        const yesterday = new Date(now.setDate(now.getDate() - 1));
-        const formattedYesterday = yesterday.toISOString().split('T')[0];
+        const now = DateTime.now().setZone('America/New_York');
+        const formattedDate = now.toISODate();
+
+        const yesterday = now.minus({ days: 1 });
+        const formattedYesterday = yesterday.toISODate();
 
         try {
             const [assetsSnapshot, currentPricesSnapshot, currenciesSnapshot, portfolioAccountsSnapshot] = await Promise.all([
@@ -45,9 +46,12 @@ exports.calcDailyPortfolioPerf = functions.pubsub
                     .collection('dates')
                     .doc(formattedYesterday)
                     .get();
-
+                console.log(yesterdayOverallPerformanceDoc.data());
                 const yesterdayOverallTotalValue = yesterdayOverallPerformanceDoc.exists
-                    ? yesterdayOverallPerformanceDoc.data()?.totalValue || {}
+                    ? Object.entries(yesterdayOverallPerformanceDoc.data()).reduce((acc, [currency, data]) => {
+                        acc[currency] = data.totalValue || 0;
+                        return acc;
+                    }, {})
                     : currencies.reduce((acc, cur) => ({ ...acc, [cur.code]: 0 }), {});
 
                 const allUserAssets = assets.filter(asset => accounts.some(account => account.id === asset.portfolioAccount));
@@ -84,7 +88,10 @@ exports.calcDailyPortfolioPerf = functions.pubsub
                         .get();
 
                     const yesterdayTotalValue = yesterdayPerformanceDoc.exists
-                        ? yesterdayPerformanceDoc.data()?.totalValue || {}
+                        ? Object.entries(yesterdayPerformanceDoc.data()).reduce((acc, [currency, data]) => {
+                            acc[currency] = data.totalValue || 0;
+                            return acc;
+                        }, {})
                         : currencies.reduce((acc, cur) => ({ ...acc, [cur.code]: 0 }), {});
 
                     const accountPerformance = calculateAccountPerformance(
