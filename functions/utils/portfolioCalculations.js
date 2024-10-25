@@ -71,26 +71,6 @@ const convertCurrency = (amount, fromCurrency, toCurrency, currencies, acquisiti
 };
 
 /**
- * @param {Asset[]} assets
- * @returns {number}
- */
-const calculateMaxDaysInvested = (assets) => {
-  const activeAssets = assets.filter(asset => asset.isActive);
-  const now = new Date();
-
-  if (activeAssets.length === 0) return 0;
-
-  return Math.max(...activeAssets.map(asset => {
-    const acquisitionDate = new Date(asset.acquisitionDate);
-    const adjustedAcquisition = new Date(acquisitionDate.getTime() - acquisitionDate.getTimezoneOffset() * 60000);
-    adjustedAcquisition.setHours(0, 0, 0, 0);
-    const adjustedNow = new Date(now.getTime() - now.getTimezoneOffset() * 60000);
-    adjustedNow.setHours(0, 0, 0, 0);
-    return Math.floor((adjustedNow.getTime() - adjustedAcquisition.getTime()) / (1000 * 60 * 60 * 24));
-  }));
-};
-
-/**
  * @param {number} totalInvestment
  * @param {number} totalValue
  * @param {number} maxDaysInvested
@@ -122,35 +102,112 @@ const calculateDailyChangePercentage = (totalValue, totalValueYesterday) => {
  * @param {Object.<string, number>} totalValueYesterday
  * @returns {Object.<string, {totalInvestment: number, totalValue: number, totalROI: number, dailyReturn: number, monthlyReturn: number, annualReturn: number, dailyChangePercentage: number, assetPerformance: Object.<string, AssetPerformance>}>}
  */
-function calculateAccountPerformance(assets, currentPrices, currencies, totalValueYesterday) {
+const calculateAccountPerformance = (assets, currentPrices, currencies, totalValueYesterday) => {
   const performanceByCurrency = {};
+
+  // Group assets by name and assetType
+  const groupedAssets = assets.reduce((acc, asset) => {
+    const key = `${asset.name}_${asset.assetType}`;
+    if (!acc[key]) {
+      acc[key] = [];
+    }
+    acc[key].push(asset);
+    return acc;
+  }, {});
 
   for (const currency of currencies) {
     let totalInvestment = 0;
     let totalValue = 0;
     const assetPerformance = {};
 
-    for (const asset of assets) {
-      const currentPrice = currentPrices.find(cp => cp.symbol === asset.name)?.price || 0;
-      const assetValueUSD = currentPrice * asset.units;
+    for (const [groupKey, groupAssets] of Object.entries(groupedAssets)) {
+      let groupInvestment = 0;
+      let groupValue = 0;
+      let groupUnits = 0;
+      const groupReturns = {
+        dailyReturns: [],
+        monthlyReturns: [],
+        yearlyReturns: [],
+        dailyWeights: [],
+        monthlyWeights: [],
+        yearlyWeights: [],
+        totalMonthlyInvestment: 0,
+        totalYearlyInvestment: 0
+      };
 
-      const initialInvestmentUSD = asset.unitValue * asset.units;
-      const assetInvestment = convertCurrency(initialInvestmentUSD, 'USD', currency.code, currencies, asset.acquisitionDollarValue);
-      const assetValue = convertCurrency(assetValueUSD, 'USD', currency.code, currencies);
+      for (const asset of groupAssets) {
+        const currentPrice = currentPrices.find(cp => cp.symbol === asset.name)?.price || 0;
+        const assetValueUSD = currentPrice * asset.units;
 
-      totalInvestment += assetInvestment;
-      totalValue += assetValue;
+        const initialInvestmentUSD = asset.unitValue * asset.units;
+        const assetInvestment = convertCurrency(initialInvestmentUSD, 'USD', currency.code, currencies, asset.acquisitionDollarValue);
+        const assetValue = convertCurrency(assetValueUSD, 'USD', currency.code, currencies);
 
-      const assetMaxDaysInvested = calculateMaxDaysInvested([asset]);
-      const assetROI = calculateTotalROIAndReturns(assetInvestment, assetValue, assetMaxDaysInvested);
-      const assetDailyChangePercentage = calculateDailyChangePercentage(assetValue, totalValueYesterday[currency.code] ? (totalValueYesterday[currency.code][asset.name]?.totalValue || 0) : 0);
+        groupInvestment += assetInvestment;
+        groupValue += assetValue;
+        groupUnits += parseFloat(asset.units);
 
-      assetPerformance[asset.name] = {
-        totalInvestment: assetInvestment,
-        totalValue: assetValue,
-        ...assetROI,
-        dailyChangePercentage: assetDailyChangePercentage,
-        units: asset.units
+        const daysSinceAcquisition = calculateDaysInvested(asset.acquisitionDate);
+        const roi = (assetValue - assetInvestment) / assetInvestment;
+        const dailyReturn = daysSinceAcquisition > 0 ? Math.pow(1 + roi, 1 / daysSinceAcquisition) - 1 : 0;
+        const monthlyReturn = daysSinceAcquisition >= 30 ? Math.pow(1 + dailyReturn, 30) - 1 : 0;
+        const yearlyReturn = daysSinceAcquisition >= 365 ? Math.pow(1 + dailyReturn, 365) - 1 : 0;
+
+        groupReturns.dailyReturns.push(dailyReturn);
+        groupReturns.dailyWeights.push(assetInvestment);
+
+        if (daysSinceAcquisition >= 30 && monthlyReturn > 0) {
+          groupReturns.monthlyReturns.push(monthlyReturn);
+          groupReturns.monthlyWeights.push(assetInvestment);
+          groupReturns.totalMonthlyInvestment += assetInvestment;
+        }
+        if (daysSinceAcquisition >= 365 && yearlyReturn > 0) {
+          groupReturns.yearlyReturns.push(yearlyReturn);
+          groupReturns.yearlyWeights.push(assetInvestment);
+          groupReturns.totalYearlyInvestment += assetInvestment;
+        }
+      }
+
+      totalInvestment += groupInvestment;
+      totalValue += groupValue;
+
+      const groupROI = (groupValue - groupInvestment) / groupInvestment;
+
+      const dailyWeightedReturn = groupInvestment > 0
+        ? groupReturns.dailyReturns.reduce((sum, ret, idx) => sum + ret * (groupReturns.dailyWeights[idx] / groupInvestment), 0)
+        : 0;
+
+      let monthlyWeightedReturn = 0;
+      if (groupReturns.totalMonthlyInvestment > 0) {
+        for (let idx = 0; idx < groupReturns.monthlyReturns.length; idx++) {
+          const weight = groupReturns.monthlyWeights[idx] / groupReturns.totalMonthlyInvestment;
+          if (!isNaN(weight)) {
+            monthlyWeightedReturn += groupReturns.monthlyReturns[idx] * weight;
+          }
+        }
+      }
+
+      let yearlyWeightedReturn = 0;
+      if (groupReturns.totalYearlyInvestment > 0) {
+        for (let idx = 0; idx < groupReturns.yearlyReturns.length; idx++) {
+          const weight = groupReturns.yearlyWeights[idx] / groupReturns.totalYearlyInvestment;
+          if (!isNaN(weight)) {
+            yearlyWeightedReturn += groupReturns.yearlyReturns[idx] * weight;
+          }
+        }
+      }
+
+      const groupDailyChangePercentage = calculateDailyChangePercentage(groupValue, totalValueYesterday[currency.code]?.[groupKey]?.totalValue || 0);
+
+      assetPerformance[groupKey] = {
+        totalInvestment: groupInvestment,
+        totalValue: groupValue,
+        totalROI: groupROI * 100,
+        dailyReturn: dailyWeightedReturn * 100,
+        monthlyReturn: monthlyWeightedReturn * 100,
+        annualReturn: yearlyWeightedReturn * 100,
+        dailyChangePercentage: groupDailyChangePercentage,
+        units: groupUnits
       };
     }
 
@@ -171,11 +228,51 @@ function calculateAccountPerformance(assets, currentPrices, currencies, totalVal
   }
 
   return performanceByCurrency;
-}
+};
+
+const calculateDaysInvested = (acquisitionDate) => {
+  const approximateNewYorkTime = (date) => {
+    return new Date(date.getTime() - 4 * 60 * 60 * 1000);
+  };
+
+  const setToMidnightNY = (date) => {
+    const nyDate = approximateNewYorkTime(date);
+    nyDate.setHours(0, 0, 0, 0);
+    return nyDate;
+  };
+
+  const acquisition = setToMidnightNY(new Date(acquisitionDate));
+  const today = setToMidnightNY(new Date());
+  return Math.floor((today - acquisition) / (1000 * 60 * 60 * 24));
+};
+
+// Función para calcular el máximo de días invertidos (sin cambios)
+const calculateMaxDaysInvested = (assets) => {
+  const approximateNewYorkTime = (date) => {
+    return new Date(date.getTime() - 4 * 60 * 60 * 1000);
+  };
+
+  const setToMidnightNY = (date) => {
+    const nyDate = approximateNewYorkTime(date);
+    nyDate.setHours(0, 0, 0, 0);
+    return nyDate;
+  };
+
+  const activeAssets = assets.filter(asset => asset.isActive);
+  const now = setToMidnightNY(new Date());
+
+  if (activeAssets.length === 0) return 0;
+
+  return Math.max(...activeAssets.map(asset => {
+    const acquisitionDate = setToMidnightNY(new Date(asset.acquisitionDate));
+    return Math.floor((now - acquisitionDate) / (1000 * 60 * 60 * 24));
+  }));
+};
 
 module.exports = {
   convertCurrency,
   calculateMaxDaysInvested,
+  calculateDaysInvested,
   calculateTotalROIAndReturns,
   calculateDailyChangePercentage,
   calculateAccountPerformance

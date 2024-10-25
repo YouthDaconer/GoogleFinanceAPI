@@ -48,7 +48,7 @@ exports.calcDailyPortfolioPerf = functions.pubsub
           .get();
 
         const yesterdayOverallTotalValue = yesterdayOverallPerformanceDoc.exists
-          ? Object.entries(yesterdayOverallPerformanceDoc.data()).reduce((acc, [currency, data]) => {
+          ? Object.entries(yesterdayOverallPerformanceDoc.data() || {}).reduce((acc, [currency, data]) => {
               acc[currency] = {
                 totalValue: data.totalValue || 0,
                 ...Object.entries(data.assetPerformance || {}).reduce((assetAcc, [assetName, assetData]) => {
@@ -94,7 +94,7 @@ exports.calcDailyPortfolioPerf = functions.pubsub
             .get();
 
           const yesterdayTotalValue = yesterdayPerformanceDoc.exists
-            ? Object.entries(yesterdayPerformanceDoc.data()).reduce((acc, [currency, data]) => {
+            ? Object.entries(yesterdayPerformanceDoc.data() || {}).reduce((acc, [currency, data]) => {
                 acc[currency] = {
                   totalValue: data.totalValue || 0,
                   ...Object.entries(data.assetPerformance || {}).reduce((assetAcc, [assetName, assetData]) => {
@@ -124,13 +124,13 @@ exports.calcDailyPortfolioPerf = functions.pubsub
         }
 
         await batch.commit();
-        console.log(`Datos de rendimiento de la cartera calculados y sobrescritos para el usuario ${userId} en ${formattedDate}`);
+        console.log(`Portfolio performance data calculated and overwritten for user ${userId} on ${formattedDate}`);
       }
 
-      console.log(`Cálculo diario del rendimiento de la cartera completado y sobrescrito para ${formattedDate}`);
+      console.log(`Daily portfolio performance calculation completed and overwritten for ${formattedDate}`);
       return null;
     } catch (error) {
-      console.error('Error al calcular el rendimiento diario de la cartera:', error);
+      console.error('Error calculating daily portfolio performance:', error);
       return null;
     }
   });
