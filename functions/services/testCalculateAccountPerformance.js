@@ -1,12 +1,8 @@
-const functions = require('firebase-functions');
 const admin = require('firebase-admin');
 const { calculateAccountPerformance } = require('../utils/portfolioCalculations');
 const { DateTime } = require('luxon');
 
-exports.calcDailyPortfolioPerf = functions.pubsub
-  .schedule('0 17 * * 1-5')
-  .timeZone('America/New_York')
-  .onRun(async (context) => {
+async function calculatePortfolioPerformance() {
     const db = admin.firestore();
     const now = DateTime.now().setZone('America/New_York');
     const formattedDate = now.toISODate();
@@ -133,4 +129,7 @@ exports.calcDailyPortfolioPerf = functions.pubsub
       console.error('Error al calcular el rendimiento diario de la cartera:', error);
       return null;
     }
-  });
+}
+
+// Llamar a la función
+calculatePortfolioPerformance();
