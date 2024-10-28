@@ -10,8 +10,6 @@ exports.calcDailyPortfolioPerf = functions.pubsub
     const db = admin.firestore();
     const now = DateTime.now().setZone('America/New_York');
     const formattedDate = now.toISODate();
-    const yesterday = now.minus({ days: 1 });
-    const formattedYesterday = yesterday.toISODate();
 
     try {
       const [assetsSnapshot, currentPricesSnapshot, currenciesSnapshot, portfolioAccountsSnapshot] = await Promise.all([
@@ -42,13 +40,20 @@ exports.calcDailyPortfolioPerf = functions.pubsub
           batch.set(userPerformanceRef, { userId });
         }
 
-        const yesterdayOverallPerformanceDoc = await userPerformanceRef
+        // Find the most recent date with performance data
+        const lastPerformanceQuery = await userPerformanceRef
           .collection('dates')
-          .doc(formattedYesterday)
+          .where('date', '<', formattedDate)
+          .orderBy('date', 'desc')
+          .limit(1)
           .get();
 
-        const yesterdayOverallTotalValue = yesterdayOverallPerformanceDoc.exists
-          ? Object.entries(yesterdayOverallPerformanceDoc.data() || {}).reduce((acc, [currency, data]) => {
+        let lastOverallTotalValue = currencies.reduce((acc, cur) => ({ ...acc, [cur.code]: { totalValue: 0 } }), {});
+
+        if (!lastPerformanceQuery.empty) {
+          const lastPerformanceDoc = lastPerformanceQuery.docs[0];
+          lastOverallTotalValue = Object.entries(lastPerformanceDoc.data() || {}).reduce((acc, [currency, data]) => {
+            if (currency !== 'date') {
               acc[currency] = {
                 totalValue: data.totalValue || 0,
                 ...Object.entries(data.assetPerformance || {}).reduce((assetAcc, [assetName, assetData]) => {
@@ -56,9 +61,10 @@ exports.calcDailyPortfolioPerf = functions.pubsub
                   return assetAcc;
                 }, {})
               };
-              return acc;
-            }, {})
-          : currencies.reduce((acc, cur) => ({ ...acc, [cur.code]: { totalValue: 0 } }), {});
+            }
+            return acc;
+          }, {});
+        }
 
         const allUserAssets = assets.filter(asset => accounts.some(account => account.id === asset.portfolioAccount));
 
@@ -66,7 +72,7 @@ exports.calcDailyPortfolioPerf = functions.pubsub
           allUserAssets,
           currentPrices,
           currencies,
-          yesterdayOverallTotalValue
+          lastOverallTotalValue
         );
 
         // Save overall user performance (overwrite existing data)
@@ -76,7 +82,7 @@ exports.calcDailyPortfolioPerf = functions.pubsub
         batch.set(userOverallPerformanceRef, {
           date: formattedDate,
           ...overallPerformance
-        }, { merge: false }); // Use merge: false to overwrite existing data
+        }, { merge: false });
 
         for (const account of accounts) {
           const accountAssets = assets.filter(asset => asset.portfolioAccount === account.id);
@@ -88,13 +94,20 @@ exports.calcDailyPortfolioPerf = functions.pubsub
             batch.set(accountRef, { accountId: account.id });
           }
 
-          const yesterdayPerformanceDoc = await accountRef
+          // Find the most recent date with performance data for this account
+          const lastAccountPerformanceQuery = await accountRef
             .collection('dates')
-            .doc(formattedYesterday)
+            .where('date', '<', formattedDate)
+            .orderBy('date', 'desc')
+            .limit(1)
             .get();
 
-          const yesterdayTotalValue = yesterdayPerformanceDoc.exists
-            ? Object.entries(yesterdayPerformanceDoc.data() || {}).reduce((acc, [currency, data]) => {
+          let lastAccountTotalValue = currencies.reduce((acc, cur) => ({ ...acc, [cur.code]: { totalValue: 0 } }), {});
+
+          if (!lastAccountPerformanceQuery.empty) {
+            const lastAccountPerformanceDoc = lastAccountPerformanceQuery.docs[0];
+            lastAccountTotalValue = Object.entries(lastAccountPerformanceDoc.data() || {}).reduce((acc, [currency, data]) => {
+              if (currency !== 'date') {
                 acc[currency] = {
                   totalValue: data.totalValue || 0,
                   ...Object.entries(data.assetPerformance || {}).reduce((assetAcc, [assetName, assetData]) => {
@@ -102,15 +115,16 @@ exports.calcDailyPortfolioPerf = functions.pubsub
                     return assetAcc;
                   }, {})
                 };
-                return acc;
-              }, {})
-            : currencies.reduce((acc, cur) => ({ ...acc, [cur.code]: { totalValue: 0 } }), {});
+              }
+              return acc;
+            }, {});
+          }
 
           const accountPerformance = calculateAccountPerformance(
             accountAssets,
             currentPrices,
             currencies,
-            yesterdayTotalValue
+            lastAccountTotalValue
           );
 
           // Save account performance (overwrite existing data)
@@ -120,7 +134,7 @@ exports.calcDailyPortfolioPerf = functions.pubsub
           batch.set(accountPerformanceRef, {
             date: formattedDate,
             ...accountPerformance
-          }, { merge: false }); // Use merge: false to overwrite existing data
+          }, { merge: false });
         }
 
         await batch.commit();
