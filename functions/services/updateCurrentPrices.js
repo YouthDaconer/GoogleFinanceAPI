@@ -107,7 +107,8 @@ async function updateCurrentPrices() {
             lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
             name: quoteData.name || doc.data().name,
             change: quoteData.change,
-            percentChange: quoteData.percentChange
+            percentChange: quoteData.percentChange,
+            currencySymbol: quoteData.currencySymbol
           };
 
           batch.update(doc.ref, updatedData);
