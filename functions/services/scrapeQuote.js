@@ -75,19 +75,26 @@ async function scrapeFullQuote(symbol, exchange) {
  * Scrapes the simple information for a quote from Google Finance.
  * @param {string} symbol - The stock symbol.
  * @param {string} exchange - The stock exchange.
+ * @param {string} currencySymbol - The currency symbol.
  * @see {@link createSimpleQuote}
  * @returns {object} The simple stock quote object with the current price.
  */
-async function scrapeSimpleQuote(symbol, exchange) {
+async function scrapeSimpleQuote(symbol, exchange, currencySymbol = "$") {
   const url = `https://www.google.com/finance/quote/${symbol}:${exchange}`;
-  console.log("Probando " + url)
+  console.log("Probando " + url);
   const { data } = await axios.get(url);
-  console.log(data)
+  console.log(data);
   const $ = cheerio.load(data);
-  const dataArray = $(".P6K39c").text().split("$");
+  const dataArray = $(".P6K39c").text().split(currencySymbol);
 
   const name = $(".zzDege").text();
-  const current = $(".YMlKec.fxKbKc").text().replace("$", "").split("$")[0];
+  const current = $(".YMlKec.fxKbKc").text().replace(currencySymbol, "").split(currencySymbol)[0];
+  
+  // Verificar si 'current' es un número válido
+  if (isNaN(parseFloat(current))) {
+    throw new Error(`El valor actual '${current}' no es un número válido.`);
+  }
+
   const previousClose = dataArray[1];
   const change = (current - previousClose).toFixed(2);
   const percentChange = `${change >= 0 ? "+" : "-"}${((Math.abs(change) / previousClose) * 100).toFixed(2)}%`;
@@ -96,7 +103,7 @@ async function scrapeSimpleQuote(symbol, exchange) {
     current,
     change,
     percentChange
-  )
+  );
 }
 
 module.exports = { scrapeFullQuote, scrapeSimpleQuote };

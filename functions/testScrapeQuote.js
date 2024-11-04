@@ -3,7 +3,7 @@ const { onRequest } = require("firebase-functions/v2/https");
 const express = require("express");
 const rateLimit = require("express-rate-limit");
 const YAML = require("yamljs");
-const swaggerDocument = YAML.load("./swagger.yaml");
+const swaggerDocument = YAML.load("./functions/swagger.yaml");
 const swaggerUi = require("swagger-ui-express");
 const scrapeIndices = require("./services/scrapeIndices");
 const scrapeIndicesByCountry = require("./services/scrapeIndicesByCountry");
@@ -14,10 +14,6 @@ const { scrapeSimpleCurrencie } = require("./services/scrapeCurrencies");
 const { scrapeGainers } = require("./services/scrapeGainers");
 const { scrapeLosers } = require("./services/scrapeLosers");
 const { scrapeNews } = require("./services/scrapeNews");
-const { saveSp500HistoryData } = require("./services/saveSp500HistoryData");
-const updateCurrencyRates = require('./services/updateCurrencyRates');
-const calcDailyPortfolioPerf = require('./services/calculateDailyPortfolioPerformance');
-const { scheduledUpdatePrices, clearMarketHoursCache } = require('./services/updateCurrentPrices');
 
 const app = express();
 const port = 3100;
@@ -200,8 +196,3 @@ app.listen(port, () => {
 });
 
 exports.app = onRequest(app);
-exports.updateCurrencyRates = updateCurrencyRates.updateCurrencyRates;
-exports.scheduledUpdatePrices = scheduledUpdatePrices;
-exports.clearMarketHoursCache = clearMarketHoursCache;
-exports.saveSp500HistoryData = saveSp500HistoryData;
-exports.calcDailyPortfolioPerf = calcDailyPortfolioPerf;

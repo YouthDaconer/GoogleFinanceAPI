@@ -5,7 +5,7 @@
             "type": "node",
             "request": "launch",
             "name": "Iniciar Script",
-            "program": "${workspaceFolder}/functions/services/testCalculateAccountPerformance.js",
+            "program": "${workspaceFolder}/functions/testScrapeQuote.js",
             "console": "integratedTerminal"
         }
     ]

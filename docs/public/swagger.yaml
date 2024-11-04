@@ -210,6 +210,13 @@ paths:
             required: true
             description: "The exchange the stock is listed on"
             default: "NASDAQ"
+        - in: query
+          name: currencySymbol
+          schema:
+            type: string
+            required: true
+            description: "The currency symbol the stock is listed on"
+            default: "$"    
       responses:
         "200":
           description: "Successful response"
