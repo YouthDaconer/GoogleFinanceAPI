@@ -79,13 +79,16 @@ async function scrapeFullQuote(symbol, exchange) {
  * @see {@link createSimpleQuote}
  * @returns {object} The simple stock quote object with the current price.
  */
-async function scrapeSimpleQuote(symbol, exchange, currencySymbol = "$") {
+async function scrapeSimpleQuote(symbol, exchange) {
   const url = `https://www.google.com/finance/quote/${symbol}:${exchange}`;
   console.log("Probando " + url);
   const { data } = await axios.get(url);
   console.log(data);
   const $ = cheerio.load(data);
-  const dataArray = $(".P6K39c").text().split(currencySymbol);
+
+  const rawData = $(".P6K39c").text();
+  const currencySymbol = rawData.charAt(0);
+  const dataArray = rawData.split(currencySymbol);
 
   const name = $(".zzDege").text();
   const current = $(".YMlKec.fxKbKc").text().replace(currencySymbol, "").split(currencySymbol)[0];
@@ -98,11 +101,13 @@ async function scrapeSimpleQuote(symbol, exchange, currencySymbol = "$") {
   const previousClose = dataArray[1];
   const change = (current - previousClose).toFixed(2);
   const percentChange = `${change >= 0 ? "+" : "-"}${((Math.abs(change) / previousClose) * 100).toFixed(2)}%`;
+  
   return createSimpleQuote(
     name,
     current,
     change,
-    percentChange
+    percentChange,
+    currencySymbol
   );
 }
 

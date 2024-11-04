@@ -8,7 +8,7 @@ const swaggerUi = require("swagger-ui-express");
 const scrapeIndices = require("./services/scrapeIndices");
 const scrapeIndicesByCountry = require("./services/scrapeIndicesByCountry");
 const cors = require('cors');
-const {scrapeFullQuote, scrapeSimpleQuote,} = require("./services/scrapeQuote");
+const { scrapeFullQuote, scrapeSimpleQuote } = require("./services/scrapeQuote");
 const { scrapeActiveStock } = require("./services/scrapeActiveStock");
 const { scrapeSimpleCurrencie } = require("./services/scrapeCurrencies");
 const { scrapeGainers } = require("./services/scrapeGainers");
@@ -92,15 +92,15 @@ app.get("/fullQuote", async (req, res) => {
 });
 
 app.get("/quote", async (req, res) => {
-  const { symbol, exchange, currencySymbol } = req.query;
+  const { symbol, exchange } = req.query;
   try {
-    if (!symbol || !exchange || !currencySymbol) {
+    if (!symbol || !exchange) {
       res.status(400).json({
-        error: "Please provide both symbol and exchange and currencySymbol query parameters",
+        error: "Please provide both symbol and exchange query parameters",
       });
       return;
     }
-    const fullQuote = await scrapeSimpleQuote(symbol, exchange, currencySymbol);
+    const fullQuote = await scrapeSimpleQuote(symbol, exchange);
     res.status(200).json(fullQuote);
   } catch (error) {
     console.error(error);
