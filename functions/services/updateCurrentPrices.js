@@ -108,7 +108,8 @@ async function updateCurrentPrices() {
             name: quoteData.name || doc.data().name,
             change: quoteData.change,
             percentChange: quoteData.percentChange,
-            currencySymbol: quoteData.currencySymbol
+            currencySymbol: quoteData.currencySymbol,
+            currencyCode: quoteData.currencyCode
           };
 
           batch.update(doc.ref, updatedData);

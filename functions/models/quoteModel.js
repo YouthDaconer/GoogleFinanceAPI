@@ -82,6 +82,7 @@ function createFullStockQuote(
  * @param {string} change - The change in value of the stock.
  * @param {string} percentChange - The percentage change in the stock price.
  * @param {string} currencySymbol - The currency symbol in the stock price.
+ * @param {string} currencyCode - The currency code in the stock price.
  * @returns {object} The simple stock quote object with the basic details.
  */
 function createSimpleQuote(
@@ -89,14 +90,16 @@ function createSimpleQuote(
     current,
     change,
     percentChange,
-    currencySymbol
+    currencySymbol,
+    currencyCode
 ) {
     return {
         name,
         current,
         change,
         percentChange,
-        currencySymbol
+        currencySymbol,
+        currencyCode
     };
 }
 

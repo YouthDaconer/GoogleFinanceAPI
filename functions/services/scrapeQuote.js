@@ -1,5 +1,3 @@
-
-
 /* eslint-disable require-jsdoc */
 const axios = require("axios");
 const cheerio = require("cheerio");
@@ -87,6 +85,13 @@ async function scrapeSimpleQuote(symbol, exchange) {
   const $ = cheerio.load(data);
 
   const rawData = $(".P6K39c").text();
+  const currencyCodeMatch = $(".ygUjEc").text().match(/· (\w{3}) ·/);
+  
+  if (!currencyCodeMatch) {
+    throw new Error("No se encontró el código de la moneda.");
+  }
+  
+  const currencyCode = currencyCodeMatch[1];
   const currencySymbol = rawData.charAt(0);
   const dataArray = rawData.split(currencySymbol);
 
@@ -107,7 +112,8 @@ async function scrapeSimpleQuote(symbol, exchange) {
     current,
     change,
     percentChange,
-    currencySymbol
+    currencySymbol,
+    currencyCode
   );
 }
 
