@@ -99,15 +99,15 @@ const calculateDailyChangePercentage = (totalValue, totalValueYesterday) => {
  * @param {Asset[]} assets
  * @param {CurrentPrice[]} currentPrices
  * @param {Currency[]} currencies
- * @param {Object.<string, number>} totalValueYesterday
+ * @param {Object.<string, {totalValue: number, assetPerformance: Object.<string, {totalValue: number}>}>} totalValueYesterday
  * @returns {Object.<string, {totalInvestment: number, totalValue: number, totalROI: number, dailyReturn: number, monthlyReturn: number, annualReturn: number, dailyChangePercentage: number, assetPerformance: Object.<string, AssetPerformance>}>}
  */
 const calculateAccountPerformance = (assets, currentPrices, currencies, totalValueYesterday) => {
   const performanceByCurrency = {};
 
-  // Group assets by name and assetType
+  // Group assets by name, assetType, and market
   const groupedAssets = assets.reduce((acc, asset) => {
-    const key = `${asset.name}_${asset.assetType}`;
+    const key = `${asset.name}_${asset.assetType}_${asset.market}`;
     if (!acc[key]) {
       acc[key] = [];
     }
@@ -136,7 +136,7 @@ const calculateAccountPerformance = (assets, currentPrices, currencies, totalVal
       };
 
       for (const asset of groupAssets) {
-        const currentPrice = currentPrices.find(cp => cp.symbol === asset.name)?.price || 0;
+        const currentPrice = currentPrices.find(cp => cp.symbol === asset.name && cp.market === asset.market)?.price || 0;
         const assetValueUSD = currentPrice * asset.units;
 
         const initialInvestmentUSD = asset.unitValue * asset.units;

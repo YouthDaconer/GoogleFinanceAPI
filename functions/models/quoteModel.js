@@ -103,4 +103,32 @@ function createSimpleQuote(
     };
 }
 
-module.exports = {createFullStockQuote, createSimpleQuote};
+/**
+ * Creates a simple stock quote object.
+ * @param {string} name - The name of the stock.
+ * @param {string} current - The current price of the stock.
+ * @param {string} change - The change in value of the stock.
+ * @param {string} percentChange - The percentage change in the stock price.
+ * @param {string} currencyCode - The currency code in the stock price.
+ * @param {string} market - The market in the stock price.
+ * @returns {object} The simple stock quote object with the basic details.
+ */
+function createSimpleQuoteForYahoo(
+    name,
+    current,
+    change,
+    percentChange,
+    currencyCode,
+    market
+) {
+    return {
+        name,
+        current,
+        change,
+        percentChange,
+        currencyCode,
+        market
+    };
+}
+
+module.exports = {createFullStockQuote, createSimpleQuote, createSimpleQuoteForYahoo};

@@ -8,7 +8,8 @@ const swaggerUi = require("swagger-ui-express");
 const scrapeIndices = require("./services/scrapeIndices");
 const scrapeIndicesByCountry = require("./services/scrapeIndicesByCountry");
 const cors = require('cors');
-const {scrapeFullQuote, scrapeSimpleQuote,} = require("./services/scrapeQuote");
+const { scrapeFullQuote, scrapeSimpleQuote, } = require("./services/scrapeQuote");
+const { fetchPriceFromYahooFinance } = require("./services/yahoo/scrapeQuote");
 const { scrapeActiveStock } = require("./services/scrapeActiveStock");
 const { scrapeSimpleCurrencie } = require("./services/scrapeCurrencies");
 const { scrapeGainers } = require("./services/scrapeGainers");
@@ -52,10 +53,10 @@ app.use((req, res, next) => {
 app.use("/api-docs", swaggerUi.serve, swaggerUi.setup(swaggerDocument));
 
 app.get("/indices", async (req, res) => {
-  const { region, country} = req.query;
+  const { region, country } = req.query;
   if (!region) {
     res.status(400).json({
-      error: "Please provide region query parameter (americas, europe-middle-east-africa, or asia-pacific)",
+      error: "Por favor, proporcione el parámetro de consulta de región (americas, europe-middle-east-africa, o asia-pacific)",
     });
     return;
   }
@@ -70,7 +71,7 @@ app.get("/indices", async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({
-      error: "An error occurred while scraping the website: " + error.message,
+      error: "Ocurrió un error al raspar el sitio web: " + error.message,
     });
   }
 });
@@ -80,7 +81,7 @@ app.get("/fullQuote", async (req, res) => {
   try {
     if (!symbol || !exchange) {
       res.status(400).json({
-        error: "Please provide both symbol and exchange query parameters",
+        error: "Por favor, proporcione ambos parámetros de consulta: símbolo y bolsa",
       });
       return;
     }
@@ -89,32 +90,65 @@ app.get("/fullQuote", async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({
-      error:
-        "An error occurred while searching for the stock: " + error.message,
+      error: "Ocurrió un error al buscar la acción: " + error.message,
     });
   }
 });
 
 app.get("/quote", async (req, res) => {
-  const { symbol, exchange, currencySymbol } = req.query;
+  const { symbol, exchange } = req.query;
   try {
-    if (!symbol || !exchange || !currencySymbol) {
+    if (!symbol || !exchange) {
       res.status(400).json({
-        error: "Please provide both symbol and exchange and currencySymbol query parameters",
+        error: "Por favor, proporcione ambos parámetros de consulta: símbolo y bolsa",
       });
       return;
     }
-    const fullQuote = await scrapeSimpleQuote(symbol, exchange, currencySymbol);
+    const fullQuote = await scrapeSimpleQuote(symbol, exchange);
     res.status(200).json(fullQuote);
   } catch (error) {
     console.error(error);
     if (error.message.includes("no es un número válido")) {
       res.status(400).json({
-        error: "Datos invalidos devueltos por el API: " + error.message,
+        error: "Datos inválidos devueltos por el API: " + error.message,
       });
     } else {
       res.status(500).json({
-        error: "An error occurred while searching for the stock: " + error.message,
+        error: "Ocurrió un error al buscar la acción: " + error.message,
+      });
+    }
+  }
+});
+
+app.get("/apiQuote", async (req, res) => {
+  const { symbols } = req.query;
+  try {
+    if (!symbols) {
+      res.status(400).json({
+        error: "Por favor, proporcione el parámetro de consulta de símbolo",
+      });
+      return;
+    }
+
+    // Convertir symbols a un array de strings
+    const symbolsArray = symbols.split(',').map(s => s.trim());
+
+    // Verificar si el array es válido
+    if (symbolsArray.length === 0 || symbolsArray.some(s => s === "")) {
+      throw new Error("Formato de símbolos inválido");
+    }
+
+    const fullQuote = await fetchPriceFromYahooFinance(symbolsArray);
+    res.status(200).json(fullQuote);
+  } catch (error) {
+    console.error(error);
+    if (error.message === "Formato de símbolos inválido") {
+      res.status(400).json({
+        error: "Formato de símbolos inválido. Por favor, proporcione una lista de símbolos separados por comas.",
+      });
+    } else {
+      res.status(500).json({
+        error: "Ocurrió un error al buscar la acción: " + error.message,
       });
     }
   }
@@ -125,7 +159,7 @@ app.get("/currencie", async (req, res) => {
   try {
     if (!origin || !target) {
       res.status(400).json({
-        error: "Please provide both origin and target query parameters",
+        error: "Por favor, proporcione ambos parámetros de consulta: origen y destino",
       });
       return;
     }
@@ -134,7 +168,7 @@ app.get("/currencie", async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({
-      error: "An error occurred while searching for the currencie: " + error.message,
+      error: "Ocurrió un error al buscar la moneda: " + error.message,
     });
   }
 });
@@ -146,7 +180,7 @@ app.get("/active", async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({
-      error: "An error occurred while scraping the website: " + error.message,
+      error: "Ocurrió un error al raspar el sitio web: " + error.message,
     });
   }
 });
@@ -158,7 +192,7 @@ app.get("/gainers", async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({
-      error: "An error occurred while scraping the website: " + error.message,
+      error: "Ocurrió un error al raspar el sitio web: " + error.message,
     });
   }
 });
@@ -170,7 +204,7 @@ app.get("/losers", async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({
-      error: "An error occurred while scraping the website: " + error.message,
+      error: "Ocurrió un error al raspar el sitio web: " + error.message,
     });
   }
 });
@@ -180,7 +214,7 @@ app.get("/news", async (req, res) => {
   try {
     if (!symbol || !exchange) {
       res.status(400).json({
-        error: "Please provide both symbol and exchange query parameters",
+        error: "Por favor, proporcione ambos parámetros de consulta: símbolo y bolsa",
       });
       return;
     }
@@ -189,8 +223,7 @@ app.get("/news", async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({
-      error:
-        "An error occurred while searching for the stock: " + error.message,
+      error: "Ocurrió un error al buscar la acción: " + error.message,
     });
   }
 });

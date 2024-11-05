@@ -11,7 +11,8 @@ info:
     url: "https://opensource.org/licenses/MIT"
 servers:
   - url: "http://localhost:3100"
-  - url: "https://app-sgrxuanvjq-uc.a.run.app"
+  - url: "https://app-dt7wehvfba-uc.a.run.app"
+  - url: "http://localhost:5001/portafolio-inversiones/us-central1/app"
 
 paths:
   /indices:
@@ -228,6 +229,48 @@ paths:
                     type: string
                     description: "Error message"
                     default: "Please provide both symbol and exchange query parameters"
+        "500":
+          description: "Unable to scrape the website"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    description: "Error message"
+                    default: "An error occurred while scraping the website"
+  /apiQuote:
+    get:
+      security:
+        - ApiKeyAuth: []
+      summary: "Get the simple stock price and information from Yahoo Finance"
+      parameters:
+        - in: query
+          name: symbols
+          schema:
+            type: string
+            required: true
+            description: "The stocks symbols separated by comma (,)"
+            default: "AAPL,ATKR,INTC"
+      responses:
+        "200":
+          description: "Successful response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SimpleQuote"
+        "400":
+          description: "No symbols provided"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    description: "Error message"
+                    default: "Please provide symbols query parameters"
         "500":
           description: "Unable to scrape the website"
           content:

@@ -28,6 +28,7 @@
     "luxon": "^3.5.0",
     "moment": "^2.30.1",
     "node-cache": "^5.1.2",
+    "puppeteer": "^23.7.0",
     "swagger-jsdoc": "^6.2.8",
     "swagger-ui-express": "^5.0.0",
     "yamljs": "^0.3.0"
