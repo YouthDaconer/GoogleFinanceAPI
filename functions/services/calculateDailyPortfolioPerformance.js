@@ -12,17 +12,36 @@ exports.calcDailyPortfolioPerf = functions.pubsub
     const formattedDate = now.toISODate();
 
     try {
-      const [assetsSnapshot, currentPricesSnapshot, currenciesSnapshot, portfolioAccountsSnapshot] = await Promise.all([
+      // Obtener todos los usuarios y sus monedas por defecto
+      const userDataSnapshot = await db.collection('userData').get();
+      const userDefaultCurrencies = userDataSnapshot.docs.reduce((acc, doc) => {
+        const data = doc.data();
+        acc[doc.id] = data.defaultCurrency || 'USD'; // Asume 'USD' si no se encuentra la moneda por defecto
+        return acc;
+      }, {});
+
+      const [assetsSnapshot, currentPricesSnapshot, currenciesSnapshot, portfolioAccountsSnapshot, transactionsSnapshot] = await Promise.all([
         db.collection('assets').where('isActive', '==', true).get(),
         db.collection('currentPrices').get(),
         db.collection('currencies').where('isActive', '==', true).get(),
-        db.collection('portfolioAccounts').where('isActive', '==', true).get()
+        db.collection('portfolioAccounts').where('isActive', '==', true).get(),
+        db.collection('transactions').where('date', '==', formattedDate).get()
       ]);
 
       const assets = assetsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
       const currentPrices = currentPricesSnapshot.docs.map(doc => ({ symbol: doc.id.split(':')[0], ...doc.data() }));
       const currencies = currenciesSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
       const portfolioAccounts = portfolioAccountsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      const todaysTransactions = transactionsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+
+      // Intenta obtener los dividendos, pero no falla si la colección no existe
+      let todaysDividends = [];
+      try {
+        const dividendsSnapshot = await db.collection('dividends').where('date', '==', formattedDate).get();
+        todaysDividends = dividendsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      } catch (error) {
+        console.log('La colección de dividendos no se encontró o hubo un error al obtener los dividendos:', error);
+      }
 
       const userPortfolios = portfolioAccounts.reduce((acc, account) => {
         if (!acc[account.userId]) acc[account.userId] = [];
@@ -32,6 +51,9 @@ exports.calcDailyPortfolioPerf = functions.pubsub
 
       for (const [userId, accounts] of Object.entries(userPortfolios)) {
         const batch = db.batch();
+
+        // Obtener la moneda por defecto del usuario
+        const defaultCurrency = userDefaultCurrencies[userId] || 'USD';
 
         // Ensure user document exists
         const userPerformanceRef = db.collection('portfolioPerformance').doc(userId);
@@ -67,12 +89,17 @@ exports.calcDailyPortfolioPerf = functions.pubsub
         }
 
         const allUserAssets = assets.filter(asset => accounts.some(account => account.id === asset.portfolioAccount));
+        const userTransactions = todaysTransactions.filter(t => accounts.some(account => account.id === t.portfolioAccountId));
+        const userDividends = todaysDividends.filter(d => allUserAssets.some(asset => asset.id === d.assetId));
 
         const overallPerformance = calculateAccountPerformance(
           allUserAssets,
           currentPrices,
           currencies,
-          lastOverallTotalValue
+          lastOverallTotalValue,
+          userTransactions,
+          userDividends,
+          defaultCurrency
         );
 
         // Save overall user performance (overwrite existing data)
@@ -120,11 +147,17 @@ exports.calcDailyPortfolioPerf = functions.pubsub
             }, {});
           }
 
+          const accountTransactions = userTransactions.filter(t => t.portfolioAccountId === account.id);
+          const accountDividends = userDividends.filter(d => accountAssets.some(asset => asset.id === d.assetId));
+
           const accountPerformance = calculateAccountPerformance(
             accountAssets,
             currentPrices,
             currencies,
-            lastAccountTotalValue
+            lastAccountTotalValue,
+            accountTransactions,
+            accountDividends,
+            defaultCurrency
           );
 
           // Save account performance (overwrite existing data)
@@ -138,13 +171,13 @@ exports.calcDailyPortfolioPerf = functions.pubsub
         }
 
         await batch.commit();
-        console.log(`Portfolio performance data calculated and overwritten for user ${userId} on ${formattedDate}`);
+        console.log(`Datos de rendimiento de la cartera calculados y sobrescritos para el usuario ${userId} en ${formattedDate}`);
       }
 
-      console.log(`Daily portfolio performance calculation completed and overwritten for ${formattedDate}`);
+      console.log(`Cálculo del rendimiento diario de la cartera completado y sobrescrito para ${formattedDate}`);
       return null;
     } catch (error) {
-      console.error('Error calculating daily portfolio performance:', error);
+      console.error('Error al calcular el rendimiento diario de la cartera:', error);
       return null;
     }
   });
