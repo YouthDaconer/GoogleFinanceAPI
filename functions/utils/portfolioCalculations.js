@@ -131,7 +131,7 @@ const calculateAccountPerformance = (assets, currentPrices, currencies, totalVal
         currency.code,
         currencies,
         defaultCurrency,
-        t.dollarPriceToDate
+        parseFloat(t.dollarPriceToDate.toString())
       ),
       dayFraction: calculateDayFraction(t.date)
     }));
@@ -183,7 +183,7 @@ const calculateAccountPerformance = (assets, currentPrices, currencies, totalVal
             currency.code,
             currencies,
             defaultCurrency,
-            t.dollarPriceToDate
+            parseFloat(t.dollarPriceToDate.toString())
           );
 
           groupTransactions.push({
@@ -279,6 +279,7 @@ const calculateAccountPerformance = (assets, currentPrices, currencies, totalVal
         annualReturn: yearlyWeightedReturn * 100,
         dailyChangePercentage: groupDailyChangePercentage,
         adjustedDailyChangePercentage: groupAdjustedDailyChangePercentage,
+        totalCashFlow: groupCashFlow,
         units: groupUnits
       };
     }
@@ -304,7 +305,8 @@ const calculateAccountPerformance = (assets, currentPrices, currencies, totalVal
       annualReturn,
       dailyChangePercentage,
       adjustedDailyChangePercentage,
-      assetPerformance
+      assetPerformance,
+      totalCashFlow
     };
   }
 
