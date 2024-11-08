@@ -126,7 +126,7 @@ const calculateAccountPerformance = (assets, currentPrices, currencies, totalVal
     // Acumular transacciones y dividendos convertidos para la moneda actual
     const convertedTransactions = todaysTransactions.map(t => ({
       amount: convertCurrency(
-        t.type === 'buy' ? (-t.amount * t.price) + t.commission : (t.amount * t.price) + t.commission,
+        t.type === 'buy' ? (-t.amount * t.price) : (t.amount * t.price),
         t.currency,
         currency.code,
         currencies,
@@ -178,7 +178,7 @@ const calculateAccountPerformance = (assets, currentPrices, currencies, totalVal
         const assetTransactions = todaysTransactions.filter(t => t.assetId === asset.id);
         assetTransactions.forEach(t => {
           const convertedAmount = convertCurrency(
-            t.type === 'buy' ? (-t.amount * t.price) + t.commission : (t.amount * t.price) + t.commission,
+            t.type === 'buy' ? (-t.amount * t.price) : (t.amount * t.price),
             t.currency,
             currency.code,
             currencies,
