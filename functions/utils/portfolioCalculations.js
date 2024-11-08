@@ -132,13 +132,11 @@ const calculateAccountPerformance = (assets, currentPrices, currencies, totalVal
         currencies,
         defaultCurrency,
         parseFloat(t.dollarPriceToDate.toString())
-      ),
-      dayFraction: calculateDayFraction(t.date)
+      )
     }));
 
     const convertedDividends = todaysDividends.map(d => ({
-      amount: convertCurrency(d.amount, d.currency, currency.code, currencies),
-      dayFraction: calculateDayFraction(d.date)
+      amount: convertCurrency(d.amount, d.currency, currency.code, currencies)
     }));
 
     for (const [groupKey, groupAssets] of Object.entries(groupedAssets)) {
@@ -187,8 +185,7 @@ const calculateAccountPerformance = (assets, currentPrices, currencies, totalVal
           );
 
           groupTransactions.push({
-            amount: convertedAmount,
-            dayFraction: calculateDayFraction(t.date)
+            amount: convertedAmount
           });
 
           // Calcular flujo de efectivo para este activo
@@ -199,8 +196,7 @@ const calculateAccountPerformance = (assets, currentPrices, currencies, totalVal
         if (todaysDividends.length > 0) {
           const assetDividends = todaysDividends.filter(d => d.assetId === asset.id);
           groupDividendsList.push(...assetDividends.map(d => ({
-            amount: convertCurrency(d.amount, d.currency, currency.code, currencies),
-            dayFraction: calculateDayFraction(d.date)
+            amount: convertCurrency(d.amount, d.currency, currency.code, currencies)
           })));
           const assetDividendsTotal = assetDividends.reduce((sum, d) => {
             return sum + convertCurrency(d.amount, d.currency, currency.code, currencies);
@@ -263,7 +259,7 @@ const calculateAccountPerformance = (assets, currentPrices, currencies, totalVal
       const groupDailyChangePercentage = calculateDailyChangePercentage(groupValue, totalValueYesterday[currency.code]?.[groupKey]?.totalValue || 0);
 
       // Calcular adjusted daily change percentage usando las transacciones acumuladas
-      const groupAdjustedDailyChangePercentage = calculateModifiedDietzReturn(
+      const groupAdjustedDailyChangePercentage = calculatePureReturnWithoutCashflows(
         totalValueYesterday[currency.code]?.[groupKey]?.totalValue || 0,
         groupValue,
         groupTransactions,
@@ -289,7 +285,7 @@ const calculateAccountPerformance = (assets, currentPrices, currencies, totalVal
     const dailyChangePercentage = calculateDailyChangePercentage(totalValue, totalValueYesterday[currency.code]?.totalValue || 0);
     
     // Calcular adjusted daily change percentage para toda la cartera usando el método Modified Dietz
-    const adjustedDailyChangePercentage = calculateModifiedDietzReturn(
+    const adjustedDailyChangePercentage = calculatePureReturnWithoutCashflows(
       totalValueYesterday[currency.code]?.totalValue || 0,
       totalValue,
       convertedTransactions,
@@ -318,31 +314,24 @@ const calculateDailyChangePercentage = (currentValue, previousValue) => {
   return ((currentValue - previousValue) / previousValue) * 100;
 };
 
-const calculateModifiedDietzReturn = (startValue, endValue, cashFlows, dividends = []) => {
-  let weightedCashFlows = 0;
+const calculatePureReturnWithoutCashflows = (startValue, endValue, cashFlows, dividends = []) => {
   let totalCashFlow = 0;
 
   cashFlows.forEach(cf => {
-    weightedCashFlows += cf.amount * (1 - cf.dayFraction);
     totalCashFlow += cf.amount;
   });
 
   const totalDividends = dividends.reduce((sum, div) => sum + div.amount, 0);
 
-  const denominator = startValue + weightedCashFlows;
+  const denominator = startValue;
   if (denominator === 0) {
     return 0;
   }
 
-  const modifiedDietzReturn = (endValue - startValue + totalCashFlow + totalDividends) / denominator;
-  return modifiedDietzReturn * 100;
+  const pureReturn = (endValue - startValue + totalCashFlow + totalDividends) / denominator;
+  return pureReturn * 100;
 };
 
-const calculateDayFraction = (transactionDate) => {
-  const date = DateTime.fromISO(transactionDate).setZone('America/New_York');
-  const startOfDay = date.startOf('day');
-  return date.diff(startOfDay, 'days').days;
-};
 
 const calculateDaysInvested = (acquisitionDate) => {
   const approximateNewYorkTime = (date) => {
@@ -390,5 +379,5 @@ module.exports = {
   calculateTotalROIAndReturns,
   calculateAccountPerformance,
   calculateDailyChangePercentage,
-  calculateModifiedDietzReturn
+  calculatePureReturnWithoutCashflows
 };
