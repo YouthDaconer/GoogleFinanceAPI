@@ -1,8 +1,6 @@
 // Definiciones de modelos
 // Nota: En JavaScript, estas son solo para referencia y documentación
 
-const { DateTime } = require('luxon');
-
 /**
  * @typedef {Object} Asset
  * @property {string} id
@@ -18,6 +16,7 @@ const { DateTime } = require('luxon');
  * @property {boolean} isActive
  * @property {string} market
  * @property {number} commission
+ * @property {string} defaultCurrencyForAdquisitionDollar
  */
 
 /**
@@ -46,6 +45,7 @@ const { DateTime } = require('luxon');
  * @property {number} commission
  * @property {string} assetType
  * @property {number} dollarPriceToDate
+ * @property {string} defaultCurrencyForAdquisitionDollar
  */
 
 /**
@@ -64,8 +64,8 @@ const { DateTime } = require('luxon');
  * @param {number} amount
  * @param {string} fromCurrency
  * @param {string} toCurrency
- * @param {string} defaultCurrency
  * @param {Currency[]} currencies
+ * @param {string} defaultCurrency
  * @param {number} [acquisitionDollarValue]
  * @returns {number}
  */
@@ -103,7 +103,7 @@ const calculateTotalROIAndReturns = (totalInvestment, totalValue, maxDaysInveste
  * @param {Dividend[]} [todaysDividends=[]]
  * @returns {Object.<string, {totalInvestment: number, totalValue: number, totalROI: number, dailyReturn: number, monthlyReturn: number, annualReturn: number, dailyChangePercentage: number, adjustedDailyChangePercentage: number, assetPerformance: Object.<string, AssetPerformance>}>}
  */
-const calculateAccountPerformance = (assets, currentPrices, currencies, totalValueYesterday, todaysTransactions, todaysDividends = [], defaultCurrency) => {
+const calculateAccountPerformance = (assets, currentPrices, currencies, totalValueYesterday, todaysTransactions, todaysDividends = []) => {
   const performanceByCurrency = {};
 
   // Group assets by name, assetType, and market
@@ -130,7 +130,7 @@ const calculateAccountPerformance = (assets, currentPrices, currencies, totalVal
         t.currency,
         currency.code,
         currencies,
-        defaultCurrency,
+        t.defaultCurrencyForAdquisitionDollar,
         parseFloat(t.dollarPriceToDate.toString())
       )
     }));
@@ -165,7 +165,7 @@ const calculateAccountPerformance = (assets, currentPrices, currencies, totalVal
         const assetValueUSD = currentPrice * asset.units;
 
         const initialInvestmentUSD = asset.unitValue * asset.units;
-        const assetInvestment = convertCurrency(initialInvestmentUSD, 'USD', currency.code, currencies, defaultCurrency, asset.acquisitionDollarValue);
+        const assetInvestment = convertCurrency(initialInvestmentUSD, 'USD', currency.code, currencies, asset.defaultCurrencyForAdquisitionDollar, asset.acquisitionDollarValue);
         const assetValue = convertCurrency(assetValueUSD, 'USD', currency.code, currencies);
 
         groupInvestment += assetInvestment;
@@ -180,7 +180,7 @@ const calculateAccountPerformance = (assets, currentPrices, currencies, totalVal
             t.currency,
             currency.code,
             currencies,
-            defaultCurrency,
+            t.defaultCurrencyForAdquisitionDollar,
             parseFloat(t.dollarPriceToDate.toString())
           );
 

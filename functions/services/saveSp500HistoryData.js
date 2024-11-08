@@ -3,7 +3,7 @@ const admin = require('./firebaseAdmin');
 const scrapeIndicesByCountry = require('./scrapeIndicesByCountry');
 
 exports.saveSp500HistoryData = functions.pubsub
-  .schedule('0 17 * * 1-5')
+  .schedule('*/5 9-16 * * 1-5')
   .timeZone('America/New_York')
   .onRun(async (context) => {
     try {

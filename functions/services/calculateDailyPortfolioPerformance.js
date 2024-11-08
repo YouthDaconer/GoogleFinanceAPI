@@ -4,7 +4,7 @@ const { calculateAccountPerformance } = require('../utils/portfolioCalculations'
 const { DateTime } = require('luxon');
 
 exports.calcDailyPortfolioPerf = functions.pubsub
-  .schedule('0 17 * * 1-5')
+  .schedule('*/5 9-16 * * 1-5')
   .timeZone('America/New_York')
   .onRun(async (context) => {
     const db = admin.firestore();
@@ -13,12 +13,12 @@ exports.calcDailyPortfolioPerf = functions.pubsub
 
     try {
       // Obtener todos los usuarios y sus monedas por defecto
-      const userDataSnapshot = await db.collection('userData').get();
+      /*const userDataSnapshot = await db.collection('userData').get();
       const userDefaultCurrencies = userDataSnapshot.docs.reduce((acc, doc) => {
         const data = doc.data();
         acc[doc.id] = data.defaultCurrency || 'USD'; // Asume 'USD' si no se encuentra la moneda por defecto
         return acc;
-      }, {});
+      }, {});*/
 
       const [assetsSnapshot, currentPricesSnapshot, currenciesSnapshot, portfolioAccountsSnapshot, transactionsSnapshot] = await Promise.all([
         db.collection('assets').where('isActive', '==', true).get(),
@@ -53,7 +53,7 @@ exports.calcDailyPortfolioPerf = functions.pubsub
         const batch = db.batch();
 
         // Obtener la moneda por defecto del usuario
-        const defaultCurrency = userDefaultCurrencies[userId] || 'USD';
+        //const defaultCurrency = userDefaultCurrencies[userId] || 'USD';
 
         // Ensure user document exists
         const userPerformanceRef = db.collection('portfolioPerformance').doc(userId);
@@ -98,8 +98,7 @@ exports.calcDailyPortfolioPerf = functions.pubsub
           currencies,
           lastOverallTotalValue,
           userTransactions,
-          userDividends,
-          defaultCurrency
+          userDividends
         );
 
         // Save overall user performance (overwrite existing data)
@@ -156,8 +155,7 @@ exports.calcDailyPortfolioPerf = functions.pubsub
             currencies,
             lastAccountTotalValue,
             accountTransactions,
-            accountDividends,
-            defaultCurrency
+            accountDividends
           );
 
           // Save account performance (overwrite existing data)
