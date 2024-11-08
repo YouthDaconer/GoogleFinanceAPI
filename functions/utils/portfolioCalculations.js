@@ -319,7 +319,6 @@ const calculateDailyChangePercentage = (currentValue, previousValue) => {
 };
 
 const calculateModifiedDietzReturn = (startValue, endValue, cashFlows, dividends = []) => {
-  const totalDays = 1; // Asumimos cálculo diario
   let weightedCashFlows = 0;
   let totalCashFlow = 0;
 
