@@ -19,6 +19,7 @@ const { saveSp500HistoryData } = require("./services/saveSp500HistoryData");
 const updateCurrencyRates = require('./services/updateCurrencyRates');
 const calcDailyPortfolioPerf = require('./services/calculateDailyPortfolioPerformance');
 const { scheduledUpdatePrices, clearMarketHoursCache } = require('./services/updateCurrentPrices');
+const fetchHistoricalExchangeRate = require('./services/fetchHistoricalExchangeRate');
 
 const app = express();
 const port = 3100;
@@ -224,6 +225,35 @@ app.get("/news", async (req, res) => {
     console.error(error);
     res.status(500).json({
       error: "Ocurrió un error al buscar la acción: " + error.message,
+    });
+  }
+});
+
+app.get("/api/historicalExchangeRate", async (req, res) => {
+  const { currency, date } = req.query;
+
+  if (!currency || !date) {
+    res.status(400).json({
+      error: 'Faltan parámetros requeridos: currency y date',
+    });
+    return;
+  }
+
+  try {
+    const dateObj = new Date(date);
+    const exchangeRate = await fetchHistoricalExchangeRate(currency, dateObj);
+
+    if (exchangeRate !== null) {
+      res.status(200).json({ exchangeRate });
+    } else {
+      res.status(404).json({
+        error: `No se pudo obtener el tipo de cambio para ${currency} en la fecha especificada`,
+      });
+    }
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({
+      error: 'Error al obtener el tipo de cambio histórico desde la API',
     });
   }
 });
