@@ -1,8 +1,14 @@
 const functions = require('firebase-functions');
-const admin = require('firebase-admin');
+const admin = require('./firebaseAdmin');
 const { scrapeSimpleQuote } = require('./scrapeQuote');
 const NodeCache = require('node-cache');
 
+// Inicializa Firebase Admin si no se ha inicializado ya
+if (!admin.apps.length) {
+  admin.initializeApp();
+}
+
+const priceCache = new NodeCache({ stdTTL: 420 });
 const marketHoursCache = new NodeCache({ stdTTL: 86400 });
 
 async function getMarketHours() {
@@ -45,7 +51,6 @@ async function isMarketOpen(market) {
   if (!isWeekday(now)) return { isOpen: false, isClosing: false };
 
   const utcHour = now.getUTCHours() + now.getUTCMinutes() / 60;
-
   const marketHours = await getMarketHours();
   const hours = marketHours[market];
   if (!hours) {
@@ -75,12 +80,22 @@ async function updateCurrentPrices() {
 
     for (const doc of snapshot.docs) {
       const { symbol, market, price: lastPrice } = doc.data();
+      const cacheKey = `${symbol}:${market}`;
 
       // Verificar si el mercado está abierto o a punto de cerrar
       const { isOpen, isClosing } = await isMarketOpen(market);
       if (!isOpen && !isClosing) {
         console.log(`Mercado cerrado para ${symbol}:${market}`);
         continue;
+      }
+
+      // Si el mercado no está a punto de cerrar, se usa la caché
+      if (!isClosing) {
+        const cachedData = priceCache.get(cacheKey);
+        if (cachedData) {
+          console.log(`Usando datos en caché para ${symbol}:${market}`);
+          continue;
+        }
       }
 
       try {
@@ -101,6 +116,7 @@ async function updateCurrentPrices() {
           };
 
           batch.update(doc.ref, updatedData);
+          priceCache.set(cacheKey, updatedData);
           updatesCount++;
           console.log(`Actualizado precio para ${symbol}:${market}${isClosing ? ' (cierre de mercado)' : ''}`);
         } else {
@@ -158,23 +174,40 @@ async function scheduleMarketUpdates() {
   });
 }
 
-// Programar la actualización cada 5 minutos durante el horario de mercado
+// Función programada adicional
 exports.scheduledUpdatePrices = functions.pubsub
-  .schedule('*/2 9-16 * * 1-5')
+  .schedule('*/4 9-16 * * 1-5')
   .timeZone('America/New_York')
   .onRun(async (context) => {
     await updateCurrentPrices();
     return null;
   });
 
+// Limpia la caché de horarios cuando hay cambios en la colección 'markets'
 exports.clearMarketHoursCache = functions.firestore
   .document('markets/{marketId}')
   .onWrite(async (change, context) => {
     marketHoursCache.del('marketHours');
     console.log('Caché de horarios de mercado limpiada debido a cambios en la colección markets');
-    await scheduleMarketUpdates(); // Reprogramar las actualizaciones de mercado
+    await scheduleMarketUpdates(); // Reprograma las actualizaciones
     return null;
   });
 
-// Inicializar las funciones programadas para las actualizaciones de mercado
-scheduleMarketUpdates();
+// Solo programa las actualizaciones si no estamos en modo debug local
+if (!process.env.LOCAL_DEBUG) {
+  scheduleMarketUpdates();
+}
+
+// Bloque para debug local: si ejecutas este archivo directamente, se llama a updateCurrentPrices()
+if (require.main === module) {
+  console.log('Ejecutando updateCurrentPrices en modo debug local...');
+  updateCurrentPrices()
+    .then(() => {
+      console.log('Actualización completada.');
+      process.exit(0);
+    })
+    .catch((err) => {
+      console.error('Error durante la actualización:', err);
+      process.exit(1);
+    });
+}

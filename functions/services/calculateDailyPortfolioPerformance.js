@@ -4,7 +4,7 @@ const { calculateAccountPerformance } = require('../utils/portfolioCalculations'
 const { DateTime } = require('luxon');
 
 exports.calcDailyPortfolioPerf = functions.pubsub
-  .schedule('*/5 9-16 * * 1-5')
+  .schedule('*/3 9-16 * * 1-5')
   .timeZone('America/New_York')
   .onRun(async (context) => {
     const db = admin.firestore();
@@ -12,14 +12,6 @@ exports.calcDailyPortfolioPerf = functions.pubsub
     const formattedDate = now.toISODate();
 
     try {
-      // Obtener todos los usuarios y sus monedas por defecto
-      /*const userDataSnapshot = await db.collection('userData').get();
-      const userDefaultCurrencies = userDataSnapshot.docs.reduce((acc, doc) => {
-        const data = doc.data();
-        acc[doc.id] = data.defaultCurrency || 'USD'; // Asume 'USD' si no se encuentra la moneda por defecto
-        return acc;
-      }, {});*/
-
       const [assetsSnapshot, currentPricesSnapshot, currenciesSnapshot, portfolioAccountsSnapshot, transactionsSnapshot] = await Promise.all([
         db.collection('assets').where('isActive', '==', true).get(),
         db.collection('currentPrices').get(),
@@ -51,9 +43,6 @@ exports.calcDailyPortfolioPerf = functions.pubsub
 
       for (const [userId, accounts] of Object.entries(userPortfolios)) {
         const batch = db.batch();
-
-        // Obtener la moneda por defecto del usuario
-        //const defaultCurrency = userDefaultCurrencies[userId] || 'USD';
 
         // Ensure user document exists
         const userPerformanceRef = db.collection('portfolioPerformance').doc(userId);

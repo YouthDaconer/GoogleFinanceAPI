@@ -1,9 +1,6 @@
 const functions = require('firebase-functions');
 const admin = require('./firebaseAdmin');
 const { scrapeSimpleCurrencie } = require('./scrapeCurrencies');
-const NodeCache = require('node-cache');
-
-const cache = new NodeCache({ stdTTL: 420 });
 
 // Horarios estáticos para NYSE (en UTC)
 const NYSE_OPEN_HOUR = 13.5;  // 9:30 AM EST
@@ -21,7 +18,7 @@ function isNYSEMarketOpen() {
 }
 
 exports.updateCurrencyRates = functions.pubsub
-  .schedule('*/4 9-16 * * 1-5')
+  .schedule('*/2 9-16 * * 1-5')
   .timeZone('America/New_York')
   .onRun(async (context) => {
     if (!isNYSEMarketOpen()) {
@@ -39,14 +36,6 @@ exports.updateCurrencyRates = functions.pubsub
 
       for (const doc of snapshot.docs) {
         const { code, name, symbol, exchangeRate: lastRate } = doc.data();
-        const cacheKey = `USD:${code}`;
-
-        // Verificar si los datos están en caché
-        const cachedData = cache.get(cacheKey);
-        if (cachedData) {
-          console.log(`Usando datos en caché para USD:${code}`);
-          continue;
-        }
 
         try {
           const currencyData = await scrapeSimpleCurrencie('USD', code);
@@ -63,7 +52,6 @@ exports.updateCurrencyRates = functions.pubsub
               };
 
               batch.update(doc.ref, updatedData);
-              cache.set(cacheKey, updatedData);
               updatesCount++;
               console.log(`Actualizada tasa de cambio para USD:${code}`);
             } else {
