@@ -81,7 +81,6 @@ async function scrapeSimpleQuote(symbol, exchange) {
   const url = `https://www.google.com/finance/quote/${symbol}:${exchange}`;
   console.log("Probando " + url);
   const { data } = await axios.get(url);
-  console.log(data);
   const $ = cheerio.load(data);
 
   const rawData = $(".P6K39c").text();
@@ -106,7 +105,7 @@ async function scrapeSimpleQuote(symbol, exchange) {
   const previousClose = dataArray[1];
   const change = (current - previousClose).toFixed(2);
   const percentChange = `${change >= 0 ? "+" : "-"}${((Math.abs(change) / previousClose) * 100).toFixed(2)}%`;
-  
+  console.log("Ticker: " + name + " Precio: " + current);
   return createSimpleQuote(
     name,
     current,

@@ -1,6 +1,6 @@
 const functions = require('firebase-functions');
 const admin = require('firebase-admin');
-const { scrapeSimpleQuote } = require('./scrapeQuote');
+const { getQuotes } = require('./financeQuery'); 
 const NodeCache = require('node-cache');
 
 const marketHoursCache = new NodeCache({ stdTTL: 86400 });
@@ -25,7 +25,7 @@ async function getMarketHours() {
 
 function isWeekday(date) {
   const day = date.getUTCDay();
-  return day >= 1 && day <= 5; // 1 (Lunes) a 5 (Viernes)
+  return day >= 1 && day <= 7; // 1 (Lunes) a 7 (Viernes)
 }
 
 async function isAnyMarketOpen() {
@@ -60,11 +60,6 @@ async function isMarketOpen(market) {
 }
 
 async function updateCurrentPrices() {
-  if (!(await isAnyMarketOpen())) {
-    console.log('Ningún mercado está abierto. No se realizarán actualizaciones.');
-    return;
-  }
-
   const db = admin.firestore();
   const currentPricesRef = db.collection('currentPrices');
 
@@ -73,21 +68,22 @@ async function updateCurrentPrices() {
     const batch = db.batch();
     let updatesCount = 0;
 
-    for (const doc of snapshot.docs) {
-      const { symbol, market, price: lastPrice } = doc.data();
+    // Acumular símbolos de los documentos
+    const symbols = snapshot.docs.map(doc => doc.data().symbol).join(',');
 
-      // Verificar si el mercado está abierto o a punto de cerrar
-      const { isOpen, isClosing } = await isMarketOpen(market);
-      if (!isOpen && !isClosing) {
-        console.log(`Mercado cerrado para ${symbol}:${market}`);
-        continue;
-      }
+    // Obtener cotizaciones para todos los símbolos
+    const quotes = await getQuotes(symbols);
 
-      try {
-        const quoteData = await scrapeSimpleQuote(symbol, market);
+    if (quotes) {
+      const quotesMap = new Map(quotes.map(quote => [quote.symbol, quote]));
 
-        if (quoteData && quoteData.current) {
-          const newPrice = parseFloat(quoteData.current);
+      for (const doc of snapshot.docs) {
+        const { symbol, market } = doc.data();
+
+        const quoteData = quotesMap.get(symbol);
+
+        if (quoteData && quoteData.price) {
+          const newPrice = parseFloat(quoteData.price);
           const updatedData = {
             symbol: symbol,
             market: market,
@@ -95,19 +91,15 @@ async function updateCurrentPrices() {
             lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
             name: quoteData.name || doc.data().name,
             change: quoteData.change,
-            percentChange: quoteData.percentChange,
-            currencySymbol: quoteData.currencySymbol,
-            currencyCode: quoteData.currencyCode
+            percentChange: quoteData.percentChange
           };
 
           batch.update(doc.ref, updatedData);
           updatesCount++;
-          console.log(`Actualizado precio para ${symbol}:${market}${isClosing ? ' (cierre de mercado)' : ''}`);
+          console.log(`Actualizado precio para ${symbol}:${market}`);
         } else {
           console.warn(`No se pudo obtener el precio para ${symbol}:${market}`);
         }
-      } catch (error) {
-        console.error(`Error al obtener datos para ${symbol}:${market}:`, error);
       }
     }
 
@@ -144,7 +136,7 @@ async function scheduleMarketUpdates() {
   times.forEach(time => {
     const timeString = convertDecimalToTime(time);
     const [hours, minutes] = timeString.split(':').map(Number);
-    const cronExpression = `${minutes} ${hours} * * 1-5`;
+    const cronExpression = `${minutes} ${hours} * * 1-7`;
 
     exports[`updatePricesAt_${hours}_${minutes}`] = functions.pubsub
       .schedule(cronExpression)
@@ -160,7 +152,7 @@ async function scheduleMarketUpdates() {
 
 // Programar la actualización cada 5 minutos durante el horario de mercado
 exports.scheduledUpdatePrices = functions.pubsub
-  .schedule('*/2 9-16 * * 1-5')
+  .schedule('*/2 9-19 * * 1-7')
   .timeZone('America/New_York')
   .onRun(async (context) => {
     await updateCurrentPrices();

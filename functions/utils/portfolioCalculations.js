@@ -106,9 +106,9 @@ const calculateTotalROIAndReturns = (totalInvestment, totalValue, maxDaysInveste
 const calculateAccountPerformance = (assets, currentPrices, currencies, totalValueYesterday, todaysTransactions, todaysDividends = []) => {
   const performanceByCurrency = {};
 
-  // Group assets by name, assetType, and market
+  // Group assets by name and assetType
   const groupedAssets = assets.reduce((acc, asset) => {
-    const key = `${asset.name}_${asset.assetType}_${asset.market}`;
+    const key = `${asset.name}_${asset.assetType}`;
     if (!acc[key]) {
       acc[key] = [];
     }
@@ -161,7 +161,7 @@ const calculateAccountPerformance = (assets, currentPrices, currencies, totalVal
       const groupDividendsList = [];
 
       for (const asset of groupAssets) {
-        const currentPrice = currentPrices.find(cp => cp.symbol === asset.name && cp.market === asset.market)?.price || 0;
+        const currentPrice = currentPrices.find(cp => cp.symbol === asset.name)?.price || 0;
         const assetValueUSD = currentPrice * asset.units;
 
         const initialInvestmentUSD = asset.unitValue * asset.units;
