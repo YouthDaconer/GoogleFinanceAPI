@@ -25,7 +25,7 @@ async function getMarketHours() {
 
 function isWeekday(date) {
   const day = date.getUTCDay();
-  return day >= 1 && day <= 7; // 1 (Lunes) a 7 (Viernes)
+  return day >= 1 && day <= 5; // 1 (Lunes) a 5 (Viernes)
 }
 
 async function isAnyMarketOpen() {
@@ -91,8 +91,22 @@ async function updateCurrentPrices() {
             lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
             name: quoteData.name || doc.data().name,
             change: quoteData.change,
-            percentChange: quoteData.percentChange
+            percentChange: quoteData.percentChange,
           };
+
+          // Lista de campos adicionales a agregar si están en quoteData
+          const optionalKeys = [
+            'logo', 'open', 'high', 'low',
+            'yearHigh', 'yearLow', 'volume', 'avgVolume',
+            'marketCap', 'beta', 'pe', 'eps',
+            'earningsDate', 'industry', 'about', 'employees'
+          ];
+
+          optionalKeys.forEach(key => {
+            if (quoteData[key] !== null && quoteData[key] !== undefined) {
+              updatedData[key] = quoteData[key];
+            }
+          });
 
           batch.update(doc.ref, updatedData);
           updatesCount++;
