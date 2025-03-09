@@ -4,7 +4,7 @@ const { calculateAccountPerformance } = require('../utils/portfolioCalculations'
 const { DateTime } = require('luxon');
 
 exports.calcDailyPortfolioPerf = functions.pubsub
-  .schedule('*/3 9-16 * * 1-5')
+  .schedule('*/3 9-17 * * 1-5')
   .timeZone('America/New_York')
   .onRun(async (context) => {
     const db = admin.firestore();

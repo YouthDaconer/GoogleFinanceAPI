@@ -152,7 +152,7 @@ async function scheduleMarketUpdates() {
 
 // Programar la actualización cada 5 minutos durante el horario de mercado
 exports.scheduledUpdatePrices = functions.pubsub
-  .schedule('*/2 9-19 * * 1-7')
+  .schedule('*/2 9-17 * * 1-5')
   .timeZone('America/New_York')
   .onRun(async (context) => {
     await updateCurrentPrices();

@@ -18,7 +18,7 @@ function isNYSEMarketOpen() {
 }
 
 exports.updateCurrencyRates = functions.pubsub
-  .schedule('*/2 9-16 * * 1-5')
+  .schedule('*/2 9-17 * * 1-5')
   .timeZone('America/New_York')
   .onRun(async (context) => {
     if (!isNYSEMarketOpen()) {
