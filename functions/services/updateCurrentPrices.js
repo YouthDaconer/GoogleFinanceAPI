@@ -88,7 +88,7 @@ async function updateCurrentPrices() {
             symbol: symbol,
             market: market,
             price: newPrice,
-            lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
+            lastUpdated: Date.now(),
             name: quoteData.name || doc.data().name,
             change: quoteData.change,
             percentChange: quoteData.percentChange,
