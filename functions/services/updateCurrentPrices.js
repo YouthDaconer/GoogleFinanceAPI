@@ -69,7 +69,7 @@ async function updateCurrentPrices() {
     let updatesCount = 0;
 
     const symbols = snapshot.docs.map(doc => doc.data().symbol);
-    const batchSize = 5;
+    const batchSize = 50;
     for (let i = 0; i < symbols.length; i += batchSize) {
       const symbolBatch = symbols.slice(i, i + batchSize).join(',');
 
