@@ -24,21 +24,32 @@ exports.saveAllIndicesHistoryData = functions.pubsub
           return parseFloat(value.replace(/[%,]/g, ''));
         };
 
-        // Datos a guardar
-        const indexData = {
+        // Datos a guardar en la colección principal
+        const generalData = {
           name: index.name,
           code: index.code,
-          score: index.value,  
+          region: index.region,
+        };
+
+        // Referencia al documento de información general
+        const generalDocRef = admin.firestore()
+          .collection('indexHistories')
+          .doc(index.code);
+
+        // Guardar información general
+        batch.set(generalDocRef, generalData, { merge: true });
+
+        // Datos específicos a guardar en la subcolección 'dates'
+        const indexData = {
+          score: index.value,
           change: index.change,
           percentChange: normalizeNumber(index.percentChange),
           date: formattedDate,
-          timestamp: admin.firestore.FieldValue.serverTimestamp()
+          timestamp: Date.now()
         };
 
-        // Referencia al documento
-        const docRef = admin.firestore()
-          .collection('indexHistories')
-          .doc(index.code)
+        // Referencia al documento en la subcolección 'dates'
+        const docRef = generalDocRef
           .collection('dates')
           .doc(formattedDate);
 
