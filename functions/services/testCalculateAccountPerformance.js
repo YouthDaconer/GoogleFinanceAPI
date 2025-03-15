@@ -6,7 +6,7 @@ async function calculatePortfolioPerformance() {
     const db = admin.firestore();
     const now = DateTime.now().setZone('America/New_York');
     //const formattedDate = now.toISODate();
-    const formattedDate = '2025-02-21';
+    const formattedDate = '2025-03-15';
 
     try {
       const [assetsSnapshot, currentPricesSnapshot, currenciesSnapshot, portfolioAccountsSnapshot, transactionsSnapshot] = await Promise.all([

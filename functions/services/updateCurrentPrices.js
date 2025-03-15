@@ -101,7 +101,7 @@ async function updateCurrentPrices() {
               'logo', 'open', 'high', 'low',
               'yearHigh', 'yearLow', 'volume', 'avgVolume',
               'marketCap', 'beta', 'pe', 'eps',
-              'earningsDate', 'industry', 'about', 'employees'
+              'earningsDate', 'industry', 'sector', 'about', 'employees'
             ];
 
             optionalKeys.forEach(key => {
