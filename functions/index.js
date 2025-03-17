@@ -20,7 +20,7 @@ const updateCurrencyRates = require('./services/updateCurrencyRates');
 const calcDailyPortfolioPerf = require('./services/calculateDailyPortfolioPerformance');
 const { scheduledUpdatePrices, clearMarketHoursCache } = require('./services/updateCurrentPrices');
 const fetchHistoricalExchangeRate = require('./services/fetchHistoricalExchangeRate');
-const { getQuotes, getSimpleQuotes } = require('./services/financeQuery');
+const { getQuotes, getSimpleQuotes, getNewsFromSymbol, search } = require('./services/financeQuery');
 
 const app = express();
 const port = 3100;
@@ -295,6 +295,46 @@ app.get('/simple-quotes', async (req, res) => {
     console.error(error);
     res.status(500).json({
       error: 'Ocurrió un error al obtener las cotizaciones simplificadas: ' + error.message,
+    });
+  }
+});
+
+app.get('/news-from-quote', async (req, res) => {
+  const { symbol } = req.query;
+  try {
+    if (!symbol) {
+      res.status(400).json({
+        error: 'Por favor, proporcione el parámetro de consulta símbolo',
+      });
+      return;
+    }
+
+    const newsFromQuote = await getNewsFromSymbol(symbol);
+    res.status(200).json(newsFromQuote);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({
+      error: 'Ocurrió un error al obtener las noticias del símbolo: ' + error.message,
+    });
+  }
+});
+
+app.get('/search', async (req, res) => {
+  const { query } = req.query;
+  try {
+    if (!query) {
+      res.status(400).json({
+        error: 'Por favor, proporcione el parámetro de consulta de búsqueda',
+      });
+      return;
+    }
+
+    const searchResult = await search(query);
+    res.status(200).json(searchResult);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({
+      error: 'Ocurrió un error al obtener resultados de la búsqueda: ' + error.message,
     });
   }
 });

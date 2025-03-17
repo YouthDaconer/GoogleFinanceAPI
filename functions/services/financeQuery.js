@@ -40,6 +40,7 @@ const getActives = () => fetchData('/actives');
 const getGainers = () => fetchData('/gainers');
 const getLosers = () => fetchData('/losers');
 const getNews = () => fetchData('/news');
+const getNewsFromSymbol = (symbol) => fetchData(`/news?symbol=${symbol}`);
 const getQuotes = (symbols) => fetchData(`/quotes?symbols=${symbols}`);
 const getSimpleQuotes = (symbols) => fetchData(`/simple-quotes/?symbols=${symbols}`);
 const getSimilarStocks = (symbol) => fetchData(`/similar-stocks/?symbol=${symbol}`);
@@ -66,4 +67,5 @@ module.exports = {
   getData: () => data,
   isLoading: () => loading,
   getError: () => error,
+  getNewsFromSymbol
 }; 
