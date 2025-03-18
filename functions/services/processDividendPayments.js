@@ -116,8 +116,9 @@ exports.processDividendPayments = functions.pubsub
 
         // Calcular el monto del dividendo
         const annualDividend = parseFloat(portfolioSymbolData.dividend.dividend || 0);
+        const quarterlyDividend = annualDividend / 4; // Dividir por 4 trimestres
         const totalUnits = portfolioSymbolData.units;
-        const amount = annualDividend * totalUnits;
+        const amount = quarterlyDividend * totalUnits;
 
         if (amount <= 0 || totalUnits <= 0) {
           console.log(`Monto de dividendo calculado es cero o negativo para ${portfolioSymbolData.symbol} en cuenta ${portfolioSymbolData.portfolioAccountId}`);
@@ -131,7 +132,7 @@ exports.processDividendPayments = functions.pubsub
           symbol: portfolioSymbolData.symbol,
           type: 'dividendPay',
           amount: totalUnits,
-          price: annualDividend,
+          price: quarterlyDividend,
           currency: portfolioSymbolData.currency || 'USD',
           date: formattedDate,
           portfolioAccountId: portfolioSymbolData.portfolioAccountId,
