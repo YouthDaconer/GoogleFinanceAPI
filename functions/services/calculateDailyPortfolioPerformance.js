@@ -26,15 +26,6 @@ exports.calcDailyPortfolioPerf = functions.pubsub
       const portfolioAccounts = portfolioAccountsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
       const todaysTransactions = transactionsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
 
-      // Intenta obtener los dividendos, pero no falla si la colección no existe
-      let todaysDividends = [];
-      try {
-        const dividendsSnapshot = await db.collection('dividends').where('date', '==', formattedDate).get();
-        todaysDividends = dividendsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-      } catch (error) {
-        console.log('La colección de dividendos no se encontró o hubo un error al obtener los dividendos:', error);
-      }
-
       const userPortfolios = portfolioAccounts.reduce((acc, account) => {
         if (!acc[account.userId]) acc[account.userId] = [];
         acc[account.userId].push(account);
@@ -79,15 +70,13 @@ exports.calcDailyPortfolioPerf = functions.pubsub
 
         const allUserAssets = assets.filter(asset => accounts.some(account => account.id === asset.portfolioAccount));
         const userTransactions = todaysTransactions.filter(t => accounts.some(account => account.id === t.portfolioAccountId));
-        const userDividends = todaysDividends.filter(d => allUserAssets.some(asset => asset.id === d.assetId));
 
         const overallPerformance = calculateAccountPerformance(
           allUserAssets,
           currentPrices,
           currencies,
           lastOverallTotalValue,
-          userTransactions,
-          userDividends
+          userTransactions
         );
 
         // Save overall user performance (overwrite existing data)
@@ -136,15 +125,13 @@ exports.calcDailyPortfolioPerf = functions.pubsub
           }
 
           const accountTransactions = userTransactions.filter(t => t.portfolioAccountId === account.id);
-          const accountDividends = userDividends.filter(d => accountAssets.some(asset => asset.id === d.assetId));
 
           const accountPerformance = calculateAccountPerformance(
             accountAssets,
             currentPrices,
             currencies,
             lastAccountTotalValue,
-            accountTransactions,
-            accountDividends
+            accountTransactions
           );
 
           // Save account performance (overwrite existing data)

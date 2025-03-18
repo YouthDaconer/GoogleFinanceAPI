@@ -100,10 +100,9 @@ const calculateTotalROIAndReturns = (totalInvestment, totalValue, maxDaysInveste
  * @param {Currency[]} currencies
  * @param {Object.<string, {totalValue: number, assetPerformance: Object.<string, {totalValue: number}>}>} totalValueYesterday
  * @param {Transaction[]} todaysTransactions
- * @param {Dividend[]} [todaysDividends=[]]
  * @returns {Object.<string, {totalInvestment: number, totalValue: number, totalROI: number, dailyReturn: number, monthlyReturn: number, annualReturn: number, dailyChangePercentage: number, adjustedDailyChangePercentage: number, assetPerformance: Object.<string, AssetPerformance>}>}
  */
-const calculateAccountPerformance = (assets, currentPrices, currencies, totalValueYesterday, todaysTransactions, todaysDividends = []) => {
+const calculateAccountPerformance = (assets, currentPrices, currencies, totalValueYesterday, todaysTransactions) => {
   const performanceByCurrency = {};
 
   // Group assets by name and assetType
@@ -116,6 +115,11 @@ const calculateAccountPerformance = (assets, currentPrices, currencies, totalVal
     return acc;
   }, {});
 
+  // Separar transacciones por tipo
+  const buyTransactions = todaysTransactions.filter(t => t.type === 'buy');
+  const sellTransactions = todaysTransactions.filter(t => t.type === 'sell');
+  const dividendTransactions = todaysTransactions.filter(t => t.type === 'dividendPay');
+
   for (const currency of currencies) {
     let totalInvestment = 0;
     let totalValue = 0;
@@ -123,10 +127,10 @@ const calculateAccountPerformance = (assets, currentPrices, currencies, totalVal
     let totalDividends = 0;
     const assetPerformance = {};
     
-    // Acumular transacciones y dividendos convertidos para la moneda actual
-    const convertedTransactions = todaysTransactions.map(t => ({
+    // Convertir transacciones para la moneda actual
+    const convertedBuyTransactions = buyTransactions.map(t => ({
       amount: convertCurrency(
-        t.type === 'buy' ? (-t.amount * t.price) : (t.amount * t.price),
+        -t.amount * t.price,
         t.currency,
         currency.code,
         currencies,
@@ -135,9 +139,34 @@ const calculateAccountPerformance = (assets, currentPrices, currencies, totalVal
       )
     }));
 
-    const convertedDividends = todaysDividends.map(d => ({
-      amount: convertCurrency(d.amount, d.currency, currency.code, currencies)
+    const convertedSellTransactions = sellTransactions.map(t => ({
+      amount: convertCurrency(
+        t.amount * t.price,
+        t.currency,
+        currency.code,
+        currencies,
+        t.defaultCurrencyForAdquisitionDollar,
+        parseFloat(t.dollarPriceToDate.toString())
+      )
     }));
+
+    const convertedDividends = dividendTransactions.map(d => ({
+      amount: convertCurrency(
+        d.amount,
+        d.currency,
+        currency.code,
+        currencies,
+        d.defaultCurrencyForAdquisitionDollar,
+        parseFloat(d.dollarPriceToDate.toString())
+      )
+    }));
+
+    // Combinar todas las transacciones para el flujo de caja total
+    const convertedTransactions = [
+      ...convertedBuyTransactions,
+      ...convertedSellTransactions,
+      ...convertedDividends
+    ];
 
     for (const [groupKey, groupAssets] of Object.entries(groupedAssets)) {
       let groupInvestment = 0;
@@ -173,10 +202,12 @@ const calculateAccountPerformance = (assets, currentPrices, currencies, totalVal
         groupUnits += parseFloat(asset.units);
 
         // Acumular transacciones para el grupo
-        const assetTransactions = todaysTransactions.filter(t => t.assetId === asset.id);
-        assetTransactions.forEach(t => {
+        const assetBuyTransactions = buyTransactions.filter(t => t.assetId === asset.id);
+        const assetSellTransactions = sellTransactions.filter(t => t.assetId === asset.id);
+        
+        assetBuyTransactions.forEach(t => {
           const convertedAmount = convertCurrency(
-            t.type === 'buy' ? (-t.amount * t.price) : (t.amount * t.price),
+            -t.amount * t.price,
             t.currency,
             currency.code,
             currencies,
@@ -187,22 +218,45 @@ const calculateAccountPerformance = (assets, currentPrices, currencies, totalVal
           groupTransactions.push({
             amount: convertedAmount
           });
-
-          // Calcular flujo de efectivo para este activo
+          
           groupCashFlow += convertedAmount;
         });
 
-        // Acumular dividendos para el grupo
-        if (todaysDividends.length > 0) {
-          const assetDividends = todaysDividends.filter(d => d.assetId === asset.id);
-          groupDividendsList.push(...assetDividends.map(d => ({
-            amount: convertCurrency(d.amount, d.currency, currency.code, currencies)
-          })));
-          const assetDividendsTotal = assetDividends.reduce((sum, d) => {
-            return sum + convertCurrency(d.amount, d.currency, currency.code, currencies);
-          }, 0);
-          groupDividends += assetDividendsTotal;
-        }
+        assetSellTransactions.forEach(t => {
+          const convertedAmount = convertCurrency(
+            t.amount * t.price,
+            t.currency,
+            currency.code,
+            currencies,
+            t.defaultCurrencyForAdquisitionDollar,
+            parseFloat(t.dollarPriceToDate.toString())
+          );
+
+          groupTransactions.push({
+            amount: convertedAmount
+          });
+          
+          groupCashFlow += convertedAmount;
+        });
+
+        // Acumular dividendos para el grupo (desde transacciones de tipo dividendPay)
+        const assetDividends = dividendTransactions.filter(d => d.assetId === asset.id);
+        assetDividends.forEach(d => {
+          const convertedAmount = convertCurrency(
+            d.amount,
+            d.currency,
+            currency.code,
+            currencies,
+            d.defaultCurrencyForAdquisitionDollar,
+            parseFloat(d.dollarPriceToDate.toString())
+          );
+
+          groupDividendsList.push({
+            amount: convertedAmount
+          });
+          
+          groupDividends += convertedAmount;
+        });
 
         const daysSinceAcquisition = calculateDaysInvested(asset.acquisitionDate);
         const roi = (assetValue - assetInvestment) / assetInvestment;
@@ -258,12 +312,18 @@ const calculateAccountPerformance = (assets, currentPrices, currencies, totalVal
 
       const groupDailyChangePercentage = calculateDailyChangePercentage(groupValue, totalValueYesterday[currency.code]?.[groupKey]?.totalValue || 0);
 
-      // Calcular adjusted daily change percentage usando las transacciones acumuladas
+      // Calcular adjusted daily change percentage usando las transacciones acumuladas y dividendos
       const groupAdjustedDailyChangePercentage = calculatePureReturnWithoutCashflows(
         totalValueYesterday[currency.code]?.[groupKey]?.totalValue || 0,
         groupValue,
         groupTransactions,
         groupDividendsList
+      );
+      
+      // Añadir un nuevo campo para el cambio porcentual sin flujos de caja
+      const groupRawDailyChangePercentage = calculateRawDailyChange(
+        totalValueYesterday[currency.code]?.[groupKey]?.totalValue || 0,
+        groupValue
       );
 
       assetPerformance[groupKey] = {
@@ -275,6 +335,7 @@ const calculateAccountPerformance = (assets, currentPrices, currencies, totalVal
         annualReturn: yearlyWeightedReturn * 100,
         dailyChangePercentage: groupDailyChangePercentage,
         adjustedDailyChangePercentage: groupAdjustedDailyChangePercentage,
+        rawDailyChangePercentage: groupRawDailyChangePercentage,
         totalCashFlow: groupCashFlow,
         units: groupUnits
       };
@@ -291,6 +352,12 @@ const calculateAccountPerformance = (assets, currentPrices, currencies, totalVal
       convertedTransactions,
       convertedDividends
     );
+    
+    // Añadir un nuevo campo para el cambio porcentual sin flujos de caja para toda la cartera
+    const rawDailyChangePercentage = calculateRawDailyChange(
+      totalValueYesterday[currency.code]?.totalValue || 0,
+      totalValue
+    );
 
     performanceByCurrency[currency.code] = {
       totalInvestment,
@@ -301,6 +368,7 @@ const calculateAccountPerformance = (assets, currentPrices, currencies, totalVal
       annualReturn,
       dailyChangePercentage,
       adjustedDailyChangePercentage,
+      rawDailyChangePercentage,
       assetPerformance,
       totalCashFlow
     };
@@ -332,6 +400,15 @@ const calculatePureReturnWithoutCashflows = (startValue, endValue, cashFlows, di
   return pureReturn * 100;
 };
 
+// Nueva función para calcular el retorno sin considerar flujos de caja
+const calculateRawDailyChange = (startValue, endValue) => {
+  const denominator = startValue;
+  if (denominator === 0) {
+    return 0;
+  }
+  
+  return ((endValue - startValue) / denominator) * 100;
+};
 
 const calculateDaysInvested = (acquisitionDate) => {
   const approximateNewYorkTime = (date) => {
@@ -379,5 +456,6 @@ module.exports = {
   calculateTotalROIAndReturns,
   calculateAccountPerformance,
   calculateDailyChangePercentage,
-  calculatePureReturnWithoutCashflows
+  calculatePureReturnWithoutCashflows,
+  calculateRawDailyChange
 };

@@ -21,6 +21,7 @@ const calcDailyPortfolioPerf = require('./services/calculateDailyPortfolioPerfor
 const { scheduledUpdatePrices, clearMarketHoursCache } = require('./services/updateCurrentPrices');
 const fetchHistoricalExchangeRate = require('./services/fetchHistoricalExchangeRate');
 const { getQuotes, getSimpleQuotes, getNewsFromSymbol, search } = require('./services/financeQuery');
+const processDividendPayments = require('./services/processDividendPayments');
 
 const app = express();
 const port = 3100;
@@ -349,3 +350,4 @@ exports.scheduledUpdatePrices = scheduledUpdatePrices;
 exports.clearMarketHoursCache = clearMarketHoursCache;
 exports.saveAllIndicesAndSectorsHistoryData = saveAllIndicesAndSectorsHistoryData;
 exports.calcDailyPortfolioPerf = calcDailyPortfolioPerf;
+exports.processDividendPayments = processDividendPayments.processDividendPayments;

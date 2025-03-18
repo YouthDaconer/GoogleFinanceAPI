@@ -43,7 +43,9 @@ async function testUpdateCurrentPrices() {
               'logo', 'open', 'high', 'low',
               'yearHigh', 'yearLow', 'volume', 'avgVolume',
               'marketCap', 'beta', 'pe', 'eps',
-              'earningsDate', 'industry', 'about', 'employees'
+              'earningsDate', 'industry', 'sector', 'about', 'employees', 
+              'dividend', 'exDividend', 'yield', 'dividendDate',
+              'threeMonthReturn', 'sixMonthReturn', 'ytdReturn', 'threeYearReturn', 'yearReturn'
             ];
 
             optionalKeys.forEach(key => {
