@@ -4,7 +4,7 @@ const { DateTime } = require('luxon');
 async function testProcessDividendPayments() {
   const db = admin.firestore();
   const now = DateTime.now().setZone('America/New_York');
-  const formattedDate = now.toISODate();
+  const formattedDate = '2025-03-18';//now.toISODate();
   
   console.log(`Verificando dividendos para la fecha ${formattedDate}`);
   
@@ -127,8 +127,8 @@ async function testProcessDividendPayments() {
         id: transactionRef.id,
         symbol: portfolioSymbolData.symbol,
         type: 'dividendPay',
-        amount: amount,
-        price: quarterlyDividend, // Precio por unidad (dividendo trimestral)
+        amount: totalUnits,
+        price: quarterlyDividend,
         currency: portfolioSymbolData.currency || 'USD',
         date: formattedDate,
         portfolioAccountId: portfolioSymbolData.portfolioAccountId,
