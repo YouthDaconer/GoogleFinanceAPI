@@ -103,7 +103,8 @@ async function updateCurrentPrices() {
               'marketCap', 'beta', 'pe', 'eps',
               'earningsDate', 'industry', 'sector', 'about', 'employees', 
               'dividend', 'exDividend', 'yield', 'dividendDate',
-              'threeMonthReturn', 'sixMonthReturn', 'ytdReturn', 'threeYearReturn', 'yearReturn'
+              'threeMonthReturn', 'sixMonthReturn', 'ytdReturn', 
+              'threeYearReturn', 'yearReturn', 'fiveYearReturn'
             ];
 
             optionalKeys.forEach(key => {

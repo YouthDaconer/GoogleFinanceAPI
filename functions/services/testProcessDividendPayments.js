@@ -1,14 +1,22 @@
 const admin = require('./firebaseAdmin');
 const { DateTime } = require('luxon');
+const { scrapeDividendsInfoFromStockEvents } = require('./scrapeDividendsInfoFromStockEvents');
 
-async function testProcessDividendPayments() {
+async function testProcessDividendPayments(testDate) {
   const db = admin.firestore();
-  const now = DateTime.now().setZone('America/New_York');
-  const formattedDate = '2025-03-18';//now.toISODate();
+  
+  // Si no se proporciona una fecha de prueba, usar la fecha actual
+  const now = testDate ? DateTime.fromISO(testDate).setZone('America/New_York') : DateTime.now().setZone('America/New_York');
+  const formattedDate = testDate || now.toISODate();
   
   console.log(`Verificando dividendos para la fecha ${formattedDate}`);
   
   try {
+    // Primero actualizar información de dividendos para ETFs
+    console.log('Actualizando información de dividendos de ETFs...');
+    await scrapeDividendsInfoFromStockEvents();
+    console.log('Actualización de información de dividendos completada');
+    
     // Obtener los precios actuales
     const currentPricesSnapshot = await db.collection('currentPrices').get();
     const currentPrices = currentPricesSnapshot.docs.map(doc => ({ 
@@ -112,11 +120,9 @@ async function testProcessDividendPayments() {
       
       // Calcular el monto del dividendo
       const annualDividend = parseFloat(portfolioSymbolData.dividend.dividend || 0);
-      const quarterlyDividend = annualDividend / 4; // Dividir por 4 trimestres
       const totalUnits = portfolioSymbolData.units;
-      const amount = quarterlyDividend * totalUnits;
       
-      if (amount <= 0 || totalUnits <= 0) {
+      if (annualDividend <= 0 || totalUnits <= 0) {
         console.log(`Monto de dividendo calculado es cero o negativo para ${portfolioSymbolData.symbol} en cuenta ${portfolioSymbolData.portfolioAccountId}`);
         continue;
       }
@@ -128,7 +134,7 @@ async function testProcessDividendPayments() {
         symbol: portfolioSymbolData.symbol,
         type: 'dividendPay',
         amount: totalUnits,
-        price: quarterlyDividend,
+        price: annualDividend,
         currency: portfolioSymbolData.currency || 'USD',
         date: formattedDate,
         portfolioAccountId: portfolioSymbolData.portfolioAccountId,
@@ -136,7 +142,7 @@ async function testProcessDividendPayments() {
         assetType: portfolioSymbolData.assetType,
         dollarPriceToDate: currencies.find(c => c.code === 'USD')?.exchangeRate || 1,
         defaultCurrencyForAdquisitionDollar: portfolioSymbolData.defaultCurrencyForAdquisitionDollar || 'USD',
-        description: `Pago de dividendo trimestral de ${portfolioSymbolData.dividend.name || portfolioSymbolData.symbol} (${totalUnits} unidades)`,
+        description: `Pago de dividendo anual de ${portfolioSymbolData.dividend.name || portfolioSymbolData.symbol} (${totalUnits} unidades)`,
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
         userId: portfolioSymbolData.userId,
         relatedAssets: portfolioSymbolData.relatedAssets  // Guardamos referencia a todos los assets relacionados
@@ -145,6 +151,7 @@ async function testProcessDividendPayments() {
       batch.set(transactionRef, transaction);
       transactionsCreated++;
       
+      const amount = annualDividend * totalUnits;
       console.log(`Creada transacción de dividendo para ${portfolioSymbolData.symbol} en cuenta ${portfolioSymbolData.portfolioAccountId}, unidades totales: ${totalUnits}, monto: ${amount} ${transaction.currency}`);
     }
     
@@ -162,5 +169,6 @@ async function testProcessDividendPayments() {
   }
 }
 
-// Llamar a la función de prueba
+// Llamar a la función de prueba con una fecha específica opcional
+// testProcessDividendPayments("2023-10-17"); // Descomentar para probar con fecha específica
 testProcessDividendPayments();

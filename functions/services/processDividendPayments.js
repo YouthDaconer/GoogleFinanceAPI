@@ -1,18 +1,26 @@
 const functions = require('firebase-functions');
 const admin = require('firebase-admin');
 const { DateTime } = require('luxon');
+const { scrapeDividendsInfoFromStockEvents } = require('./scrapeDividendsInfoFromStockEvents');
 
 exports.processDividendPayments = functions.pubsub
   .schedule('0 7,18 * * *')  // Ejecutar a las 7:00 AM y 6:00 PM todos los días
   .timeZone('America/New_York')
   .onRun(async (context) => {
     const db = admin.firestore();
-    const now = DateTime.now().setZone('America/New_York');
-    const formattedDate = now.toISODate();
+
+    // Si no se proporciona una fecha de prueba, usar la fecha actual
+    const now = testDate ? DateTime.fromISO(testDate).setZone('America/New_York') : DateTime.now().setZone('America/New_York');
+    const formattedDate = testDate || now.toISODate();
 
     console.log(`Verificando dividendos para la fecha ${formattedDate}`);
 
     try {
+      // Primero actualizar información de dividendos para ETFs
+      console.log('Actualizando información de dividendos de ETFs...');
+      await scrapeDividendsInfoFromStockEvents();
+      console.log('Actualización de información de dividendos completada');
+
       // Obtener los precios actuales
       const currentPricesSnapshot = await db.collection('currentPrices').get();
       const currentPrices = currentPricesSnapshot.docs.map(doc => ({
@@ -116,11 +124,9 @@ exports.processDividendPayments = functions.pubsub
 
         // Calcular el monto del dividendo
         const annualDividend = parseFloat(portfolioSymbolData.dividend.dividend || 0);
-        const quarterlyDividend = annualDividend / 4; // Dividir por 4 trimestres
         const totalUnits = portfolioSymbolData.units;
-        const amount = quarterlyDividend * totalUnits;
 
-        if (amount <= 0 || totalUnits <= 0) {
+        if (annualDividend <= 0 || totalUnits <= 0) {
           console.log(`Monto de dividendo calculado es cero o negativo para ${portfolioSymbolData.symbol} en cuenta ${portfolioSymbolData.portfolioAccountId}`);
           continue;
         }
@@ -132,7 +138,7 @@ exports.processDividendPayments = functions.pubsub
           symbol: portfolioSymbolData.symbol,
           type: 'dividendPay',
           amount: totalUnits,
-          price: quarterlyDividend,
+          price: annualDividend,
           currency: portfolioSymbolData.currency || 'USD',
           date: formattedDate,
           portfolioAccountId: portfolioSymbolData.portfolioAccountId,
@@ -140,7 +146,7 @@ exports.processDividendPayments = functions.pubsub
           assetType: portfolioSymbolData.assetType,
           dollarPriceToDate: currencies.find(c => c.code === 'USD')?.exchangeRate || 1,
           defaultCurrencyForAdquisitionDollar: portfolioSymbolData.defaultCurrencyForAdquisitionDollar || 'USD',
-          description: `Pago de dividendo trimestral de ${portfolioSymbolData.dividend.name || portfolioSymbolData.symbol} (${totalUnits} unidades)`,
+          description: `Pago de dividendo anual de ${portfolioSymbolData.dividend.name || portfolioSymbolData.symbol} (${totalUnits} unidades)`,
           createdAt: admin.firestore.FieldValue.serverTimestamp(),
           userId: portfolioSymbolData.userId,
           relatedAssets: portfolioSymbolData.relatedAssets  // Guardamos referencia a todos los assets relacionados
@@ -149,6 +155,7 @@ exports.processDividendPayments = functions.pubsub
         batch.set(transactionRef, transaction);
         transactionsCreated++;
 
+        const amount = annualDividend * totalUnits;
         console.log(`Creada transacción de dividendo para ${portfolioSymbolData.symbol} en cuenta ${portfolioSymbolData.portfolioAccountId}, unidades totales: ${totalUnits}, monto: ${amount} ${transaction.currency}`);
       }
 
