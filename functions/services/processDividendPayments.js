@@ -1,23 +1,21 @@
 const functions = require('firebase-functions');
 const admin = require('firebase-admin');
 const { DateTime } = require('luxon');
-const { scrapeDividendsInfoFromStockEvents } = require('./scrapeDividendsInfoFromStockEvents');
+const { scrapeDividendsInfoFromStockEvents } = require('./scrapeDividendsInfoFromStock');
 
 exports.processDividendPayments = functions.pubsub
   .schedule('0 7,18 * * *')  // Ejecutar a las 7:00 AM y 6:00 PM todos los días
   .timeZone('America/New_York')
   .onRun(async (context) => {
     const db = admin.firestore();
-
-    // Si no se proporciona una fecha de prueba, usar la fecha actual
-    const now = testDate ? DateTime.fromISO(testDate).setZone('America/New_York') : DateTime.now().setZone('America/New_York');
-    const formattedDate = testDate || now.toISODate();
+    const now = DateTime.now().setZone('America/New_York');
+    const formattedDate = now.toISODate();
 
     console.log(`Verificando dividendos para la fecha ${formattedDate}`);
 
     try {
-      // Primero actualizar información de dividendos para ETFs
-      console.log('Actualizando información de dividendos de ETFs...');
+      // Primero actualizar información de dividendos para ETFs y acciones sin datos
+      console.log('Actualizando información de dividendos de activos...');
       await scrapeDividendsInfoFromStockEvents();
       console.log('Actualización de información de dividendos completada');
 
@@ -171,4 +169,4 @@ exports.processDividendPayments = functions.pubsub
       console.error('Error al procesar dividendos:', error);
       return null;
     }
-  }); 
+  });

@@ -98,36 +98,55 @@ async function scrapeDividendsInfoFromStockEvents() {
   const db = admin.firestore();
   
   try {
-    // Obtener todos los ETFs de la colección currentPrices
-    const etfsSnapshot = await db.collection('currentPrices')
-      .where('type', '==', 'etf')
+    // Hacer una única consulta eficiente para obtener todos los ETFs y acciones
+    const snapshot = await db.collection('currentPrices')
+      .where('type', 'in', ['etf', 'stock'])
       .get();
     
-    if (etfsSnapshot.empty) {
-      console.log('No se encontraron ETFs en la colección currentPrices');
+    if (snapshot.empty) {
+      console.log('No se encontraron ETFs o acciones en la colección currentPrices');
       return;
     }
     
-    console.log(`Actualizando información de dividendos para ${etfsSnapshot.size} ETFs`);
+    // Filtrar en memoria aquellos sin información de dividendos
+    const assetsToUpdate = snapshot.docs.filter(doc => {
+      const data = doc.data();
+      // Verificar si los campos no existen o son null
+      return data.dividend === undefined || data.dividend === null || 
+             data.dividendDate === undefined || data.dividendDate === null;
+    });
     
+    if (assetsToUpdate.length === 0) {
+      console.log('Todos los activos ya tienen información de dividendos');
+      return;
+    }
+    
+    console.log(`Actualizando información de dividendos para ${assetsToUpdate.length} activos (ETFs y acciones)`);
+    
+    // Control de flujo para evitar bloqueos
     let batch = db.batch();
     let updatesCount = 0;
     let errorsCount = 0;
+    let waitTime = 3000; // Comenzar con 3 segundos para ser conservadores
+    const MAX_BATCH_SIZE = 20;
+    const MAX_ASSETS_PER_RUN = 50; // Reducir a 50 para ser más conservadores
     
-    // Procesar cada ETF en lotes para evitar exceder límites de API
-    for (const doc of etfsSnapshot.docs) {
-      const etfData = doc.data();
-      const symbol = etfData.symbol;
+    // Procesar solo un subconjunto de activos por ejecución
+    const assetsToProcess = assetsToUpdate.slice(0, MAX_ASSETS_PER_RUN);
+    
+    for (const doc of assetsToProcess) {
+      const data = doc.data();
+      const symbol = data.symbol;
       
       try {
-        // Esperar un tiempo entre solicitudes para evitar ser bloqueado
-        await new Promise(resolve => setTimeout(resolve, 2000));
+        console.log(`Procesando ${symbol} (${data.type})...`);
         
-        // Obtener información de dividendos
+        // Esperar entre solicitudes para prevenir bloqueos
+        await new Promise(resolve => setTimeout(resolve, waitTime));
+        
         const dividendInfo = await scrapeDividendInfo(symbol);
         
         if (dividendInfo) {
-          // Actualizar documento en Firestore
           batch.update(doc.ref, {
             yield: dividendInfo.yield,
             dividend: dividendInfo.dividend,
@@ -136,16 +155,20 @@ async function scrapeDividendsInfoFromStockEvents() {
             lastDividendUpdate: admin.firestore.FieldValue.serverTimestamp()
           });
           
-          console.log(`Actualizada información de dividendos para ${symbol}`);
+          console.log(`Actualizada información de dividendos para ${symbol} (${data.type})`);
           updatesCount++;
           
-          // Commit batch cada 20 actualizaciones para evitar exceder límites
-          if (updatesCount % 20 === 0) {
+          // Commit batch cada cierto número de actualizaciones
+          if (updatesCount % MAX_BATCH_SIZE === 0) {
             await batch.commit();
-            console.log(`Lote de ${updatesCount} actualizaciones guardado`);
-            // Crear un nuevo batch
+            console.log(`Lote de ${MAX_BATCH_SIZE} actualizaciones guardado`);
             batch = db.batch();
+            
+            // Pausa adicional entre lotes
+            await new Promise(resolve => setTimeout(resolve, 2000));
           }
+        } else {
+          console.log(`No se encontró información de dividendos para ${symbol} (${data.type})`);
         }
       } catch (error) {
         console.error(`Error procesando ${symbol}:`, error);
@@ -153,12 +176,17 @@ async function scrapeDividendsInfoFromStockEvents() {
       }
     }
     
-    // Guardar las actualizaciones restantes
-    if (updatesCount % 20 !== 0) {
+    // Guardar actualizaciones pendientes
+    if (updatesCount % MAX_BATCH_SIZE !== 0 && updatesCount > 0) {
       await batch.commit();
+      console.log(`Lote final de ${updatesCount % MAX_BATCH_SIZE} actualizaciones guardado`);
     }
     
-    console.log(`Proceso completado: ${updatesCount} ETFs actualizados, ${errorsCount} errores`);
+    console.log(`Proceso completado: ${updatesCount} activos actualizados, ${errorsCount} errores`);
+    
+    if (assetsToUpdate.length > MAX_ASSETS_PER_RUN) {
+      console.log(`Atención: Quedan ${assetsToUpdate.length - MAX_ASSETS_PER_RUN} activos pendientes por actualizar.`);
+    }
     
   } catch (error) {
     console.error('Error al actualizar información de dividendos:', error);

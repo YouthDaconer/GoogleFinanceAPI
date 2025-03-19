@@ -1,19 +1,19 @@
 const admin = require('./firebaseAdmin');
 const { DateTime } = require('luxon');
-const { scrapeDividendsInfoFromStockEvents } = require('./scrapeDividendsInfoFromStockEvents');
+const { scrapeDividendsInfoFromStockEvents } = require('./scrapeDividendsInfoFromStock');
 
 async function testProcessDividendPayments(testDate) {
   const db = admin.firestore();
   
   // Si no se proporciona una fecha de prueba, usar la fecha actual
   const now = testDate ? DateTime.fromISO(testDate).setZone('America/New_York') : DateTime.now().setZone('America/New_York');
-  const formattedDate = testDate || now.toISODate();
+  const formattedDate = testDate ? DateTime.fromISO(testDate).toISODate() : now.toISODate();
   
   console.log(`Verificando dividendos para la fecha ${formattedDate}`);
   
   try {
-    // Primero actualizar información de dividendos para ETFs
-    console.log('Actualizando información de dividendos de ETFs...');
+    // Primero actualizar información de dividendos para ETFs y acciones sin datos
+    console.log('Actualizando información de dividendos de activos...');
     await scrapeDividendsInfoFromStockEvents();
     console.log('Actualización de información de dividendos completada');
     
