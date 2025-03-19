@@ -47,7 +47,8 @@ async function updateCurrentPrices() {
               'earningsDate', 'industry', 'sector', 'about', 'employees', 
               'dividend', 'exDividend', 'yield', 'dividendDate',
               'threeMonthReturn', 'sixMonthReturn', 'ytdReturn', 
-              'threeYearReturn', 'yearReturn', 'fiveYearReturn'
+              'threeYearReturn', 'yearReturn', 'fiveYearReturn', 
+              'currency', 'currencySymbol', 'exchangeName'
             ];
 
             optionalKeys.forEach(key => {
