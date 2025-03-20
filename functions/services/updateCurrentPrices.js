@@ -23,7 +23,7 @@ async function updateCurrentPrices() {
         const quotesMap = new Map(quotes.map(quote => [quote.symbol, quote]));
 
         for (const doc of snapshot.docs) {
-          const { symbol, market } = doc.data();
+          const { symbol } = doc.data();
 
           const quoteData = quotesMap.get(symbol);
 
@@ -31,7 +31,6 @@ async function updateCurrentPrices() {
             const newPrice = parseFloat(quoteData.price);
             const updatedData = {
               symbol: symbol,
-              market: market,
               price: newPrice,
               lastUpdated: Date.now(),
               name: quoteData.name || doc.data().name,
@@ -59,9 +58,9 @@ async function updateCurrentPrices() {
 
             batch.update(doc.ref, updatedData);
             updatesCount++;
-            console.log(`Actualizado precio para ${symbol}:${market}`);
+            console.log(`Actualizado precio para ${symbol}`);
           } else {
-            console.warn(`No se pudo obtener el precio para ${symbol}:${market}`);
+            console.warn(`No se pudo obtener el precio para ${symbol}`);
           }
         }
       }

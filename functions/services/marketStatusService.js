@@ -1,4 +1,3 @@
-// services/marketStatusService.js
 const functions = require('firebase-functions');
 const admin = require('firebase-admin');
 const axios = require('axios');
@@ -34,11 +33,9 @@ async function updateMarketStatus() {
   const now = DateTime.now().setZone('America/New_York');
   
   try {
-    // Verificar si es fin de semana (sábado=6, domingo=7)
     const dayOfWeek = now.weekday;
     const isWeekend = dayOfWeek === 6 || dayOfWeek === 7;
     
-    // Si es fin de semana, no consultamos la API y actualizamos directamente
     if (isWeekend) {
       await db.collection('markets').doc(MARKET_DOC_ID).set({
         exchange: 'US',
@@ -54,10 +51,8 @@ async function updateMarketStatus() {
       return;
     }
     
-    // Consultar estado desde la API
     const marketStatus = await fetchMarketStatus();
     
-    // Guardar en Firestore con metadatos adicionales
     await db.collection('markets').doc(MARKET_DOC_ID).set({
       ...marketStatus,
       lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
@@ -84,7 +79,6 @@ async function getMarketStatus() {
     const doc = await db.collection('markets').doc(MARKET_DOC_ID).get();
     
     if (!doc.exists) {
-      // Si no existe el documento, realizar consulta inicial
       await updateMarketStatus();
       return (await db.collection('markets').doc(MARKET_DOC_ID).get()).data();
     }
@@ -93,11 +87,9 @@ async function getMarketStatus() {
     const lastUpdated = data.lastUpdated?.toDate() || new Date(0);
     const now = new Date();
     
-    // Verificar si los datos son recientes (menos de 30 minutos)
     const diffMinutes = (now - lastUpdated) / (1000 * 60);
     
     if (diffMinutes > 30) {
-      // Si los datos son antiguos, actualizar
       await updateMarketStatus();
       return (await db.collection('markets').doc(MARKET_DOC_ID).get()).data();
     }
@@ -109,9 +101,17 @@ async function getMarketStatus() {
   }
 }
 
-// Programar la función para ejecutarse en momentos estratégicos
+// Programar las funciones para ejecutarse en los horarios definidos
 exports.scheduledMarketStatusUpdate = functions.pubsub
-  .schedule('0 4,8,9,10,16,20,21 * * 1-5') // 4AM, 9AM, 4PM, 8PM de lunes a viernes
+  .schedule('0 4,8,9,10,16,20,21 * * 1-5') // 4AM, 8AM, 9AM, 10AM, 4PM, 8PM, 9PM de lunes a viernes
+  .timeZone('America/New_York')
+  .onRun(async () => {
+    await updateMarketStatus();
+    return null;
+  });
+
+exports.scheduledMarketStatusUpdateAdditional = functions.pubsub
+  .schedule('30 8,9,16 * * 1-5') // 8:30AM, 9:30AM, 4:30PM de lunes a viernes
   .timeZone('America/New_York')
   .onRun(async () => {
     await updateMarketStatus();
@@ -128,10 +128,11 @@ exports.updateMarketStatusHttp = functions.https.onRequest(async (req, res) => {
   }
 });
 
-// Exportar todas las funciones al final
+// Exportar todas las funciones
 module.exports = {
   updateMarketStatus,
   getMarketStatus,
   scheduledMarketStatusUpdate: exports.scheduledMarketStatusUpdate,
+  scheduledMarketStatusUpdateAdditional: exports.scheduledMarketStatusUpdateAdditional,
   updateMarketStatusHttp: exports.updateMarketStatusHttp
 };
