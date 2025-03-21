@@ -353,4 +353,3 @@ exports.calcDailyPortfolioPerf = calcDailyPortfolioPerf;
 exports.processDividendPayments = processDividendPayments.processDividendPayments;
 exports.scheduledMarketStatusUpdate = marketStatusService.scheduledMarketStatusUpdate;
 exports.scheduledMarketStatusUpdateAdditional = marketStatusService.scheduledMarketStatusUpdateAdditional;
-exports.updateMarketStatusHttp = marketStatusService.updateMarketStatusHttp;

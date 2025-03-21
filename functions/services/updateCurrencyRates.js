@@ -1,14 +1,35 @@
 const functions = require('firebase-functions');
 const admin = require('./firebaseAdmin');
-const { scrapeSimpleCurrencie } = require('./scrapeCurrencies');
+const axios = require('axios');
 
 // Horarios estáticos para NYSE (en UTC)
 const NYSE_OPEN_HOUR = 13.5;  // 9:30 AM EST
 const NYSE_CLOSE_HOUR = 20;   // 4:00 PM EST
 
-function normalizeAndParseFloat(value) {
-  const normalizedValue = value.replace(/[,$\s]/g, '');
-  return parseFloat(normalizedValue);
+
+/**
+ * Obtiene la tasa de cambio actual de una moneda usando Yahoo Finance
+ * @param {string} currencyCode - Código de la moneda a consultar
+ * @return {Promise<number|null>} - Retorna la tasa de cambio o null si hay error
+ */
+async function getCurrencyRateFromYahoo(currencyCode) {
+  try {
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${currencyCode}=X?lang=en-US&region=US`;
+    console.log(`Consultando tasa para ${currencyCode} en Yahoo Finance: ${url}`);
+    
+    const { data } = await axios.get(url);
+    
+    // Verificar si hay resultados y meta datos en la respuesta
+    if (data?.chart?.result?.[0]?.meta) {
+      const meta = data.chart.result[0].meta;
+      return meta.regularMarketPrice || null;
+    }
+    
+    return null;
+  } catch (error) {
+    console.error(`Error al obtener tasa para ${currencyCode} desde Yahoo Finance:`, error.message);
+    return null;
+  }
 }
 
 function isNYSEMarketOpen() {
@@ -35,30 +56,26 @@ exports.updateCurrencyRates = functions.pubsub
       let updatesCount = 0;
 
       for (const doc of snapshot.docs) {
-        const { code, name, symbol, exchangeRate: lastRate } = doc.data();
+        const { code, name, symbol } = doc.data();
 
         try {
-          const currencyData = await scrapeSimpleCurrencie('USD', code);
+          // Obtener tasa de cambio desde Yahoo Finance
+          const newRate = await getCurrencyRateFromYahoo(code);
 
-          if (currencyData && currencyData.current) {
-            const newRate = normalizeAndParseFloat(currencyData.current);
-            if (!isNaN(newRate)) {
-              const updatedData = {
-                code: code,
-                name: name,
-                symbol: symbol,
-                exchangeRate: newRate,
-                lastUpdated: admin.firestore.FieldValue.serverTimestamp()
-              };
+          if (newRate && !isNaN(newRate) && newRate > 0) {
+            const updatedData = {
+              code: code,
+              name: name,
+              symbol: symbol,
+              exchangeRate: newRate,
+              lastUpdated: admin.firestore.FieldValue.serverTimestamp()
+            };
 
-              batch.update(doc.ref, updatedData);
-              updatesCount++;
-              console.log(`Actualizada tasa de cambio para USD:${code}`);
-            } else {
-              console.warn(`Valor inválido para USD:${code}: ${currencyData.current}`);
-            }
+            batch.update(doc.ref, updatedData);
+            updatesCount++;
+            console.log(`Actualizada tasa de cambio para USD:${code} a ${newRate}`);
           } else {
-            console.warn(`No se pudo obtener la tasa de cambio para USD:${code}`);
+            console.warn(`Valor inválido para USD:${code}: ${newRate}`);
           }
         } catch (error) {
           console.error(`Error al obtener datos para USD:${code}:`, error);
