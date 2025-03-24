@@ -28,7 +28,10 @@ async function updateCurrentPrices() {
           const quoteData = quotesMap.get(symbol);
 
           if (quoteData && quoteData.price) {
-            const newPrice = parseFloat(quoteData.price);
+            // Normalizar el precio eliminando comas
+            const normalizedPrice = quoteData.price.replace(/,/g, ''); 
+            const newPrice = parseFloat(normalizedPrice);
+            
             const updatedData = {
               symbol: symbol,
               price: newPrice,

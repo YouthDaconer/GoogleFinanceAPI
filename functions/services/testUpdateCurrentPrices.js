@@ -1,5 +1,5 @@
 const admin = require('./firebaseAdmin');
-const { getQuotes } = require('./financeQuery'); 
+const { getQuotes } = require('./financeQuery');
 
 async function testUpdateCurrentPrices() {
   const db = admin.firestore();
@@ -27,7 +27,10 @@ async function testUpdateCurrentPrices() {
           const quoteData = quotesMap.get(symbol);
 
           if (quoteData && quoteData.price) {
-            const newPrice = parseFloat(quoteData.price);
+            // Normalizar el precio eliminando comas
+            const normalizedPrice = quoteData.price.replace(/,/g, ''); // Eliminar comas
+            const newPrice = parseFloat(normalizedPrice);
+            
             const updatedData = {
               symbol: symbol,
               price: newPrice,
@@ -42,10 +45,10 @@ async function testUpdateCurrentPrices() {
               'logo', 'open', 'high', 'low',
               'yearHigh', 'yearLow', 'volume', 'avgVolume',
               'marketCap', 'beta', 'pe', 'eps',
-              'earningsDate', 'industry', 'sector', 'about', 'employees', 
+              'earningsDate', 'industry', 'sector', 'about', 'employees',
               'dividend', 'exDividend', 'yield', 'dividendDate',
-              'threeMonthReturn', 'sixMonthReturn', 'ytdReturn', 
-              'threeYearReturn', 'yearReturn', 'fiveYearReturn', 
+              'threeMonthReturn', 'sixMonthReturn', 'ytdReturn',
+              'threeYearReturn', 'yearReturn', 'fiveYearReturn',
               'currency', 'currencySymbol', 'exchangeName'
             ];
 
