@@ -134,7 +134,7 @@ async function testProcessDividendPayments(testDate) {
         symbol: portfolioSymbolData.symbol,
         type: 'dividendPay',
         amount: totalUnits,
-        price: annualDividend,
+        price: annualDividend / 4,
         currency: portfolioSymbolData.currency || 'USD',
         date: formattedDate,
         portfolioAccountId: portfolioSymbolData.portfolioAccountId,
@@ -151,7 +151,7 @@ async function testProcessDividendPayments(testDate) {
       batch.set(transactionRef, transaction);
       transactionsCreated++;
       
-      const amount = annualDividend * totalUnits;
+      const amount = (annualDividend / 4) * totalUnits;
       console.log(`Creada transacción de dividendo para ${portfolioSymbolData.symbol} en cuenta ${portfolioSymbolData.portfolioAccountId}, unidades totales: ${totalUnits}, monto: ${amount} ${transaction.currency}`);
     }
     
@@ -171,4 +171,4 @@ async function testProcessDividendPayments(testDate) {
 
 // Llamar a la función de prueba con una fecha específica opcional
 // testProcessDividendPayments("2023-10-17"); // Descomentar para probar con fecha específica
-testProcessDividendPayments();
+testProcessDividendPayments("2025-03-26");

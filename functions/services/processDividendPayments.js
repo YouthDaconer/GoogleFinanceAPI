@@ -136,7 +136,7 @@ exports.processDividendPayments = functions.pubsub
           symbol: portfolioSymbolData.symbol,
           type: 'dividendPay',
           amount: totalUnits,
-          price: annualDividend,
+          price: annualDividend / 4,
           currency: portfolioSymbolData.currency || 'USD',
           date: formattedDate,
           portfolioAccountId: portfolioSymbolData.portfolioAccountId,
@@ -153,7 +153,7 @@ exports.processDividendPayments = functions.pubsub
         batch.set(transactionRef, transaction);
         transactionsCreated++;
 
-        const amount = annualDividend * totalUnits;
+        const amount = (annualDividend / 4) * totalUnits;
         console.log(`Creada transacción de dividendo para ${portfolioSymbolData.symbol} en cuenta ${portfolioSymbolData.portfolioAccountId}, unidades totales: ${totalUnits}, monto: ${amount} ${transaction.currency}`);
       }
 

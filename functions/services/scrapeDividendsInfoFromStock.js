@@ -108,20 +108,12 @@ async function scrapeDividendsInfoFromStockEvents() {
       return;
     }
     
-    // Filtrar en memoria aquellos sin información de dividendos
-    const assetsToUpdate = snapshot.docs.filter(doc => {
-      const data = doc.data();
-      // Verificar si los campos no existen o son null
-      return data.dividend === undefined || data.dividend === null || 
-             data.dividendDate === undefined || data.dividendDate === null;
-    });
-    
-    if (assetsToUpdate.length === 0) {
+    if (snapshot.docs.length === 0) {
       console.log('Todos los activos ya tienen información de dividendos');
       return;
     }
     
-    console.log(`Actualizando información de dividendos para ${assetsToUpdate.length} activos (ETFs y acciones)`);
+    console.log(`Actualizando información de dividendos para ${snapshot.docs.length} activos (ETFs y acciones)`);
     
     // Control de flujo para evitar bloqueos
     let batch = db.batch();
@@ -132,7 +124,7 @@ async function scrapeDividendsInfoFromStockEvents() {
     const MAX_ASSETS_PER_RUN = 50; // Reducir a 50 para ser más conservadores
     
     // Procesar solo un subconjunto de activos por ejecución
-    const assetsToProcess = assetsToUpdate.slice(0, MAX_ASSETS_PER_RUN);
+    const assetsToProcess = snapshot.docs.slice(0, MAX_ASSETS_PER_RUN);
     
     for (const doc of assetsToProcess) {
       const data = doc.data();
@@ -140,7 +132,6 @@ async function scrapeDividendsInfoFromStockEvents() {
       
       try {
         console.log(`Procesando ${symbol} (${data.type})...`);
-        
         // Esperar entre solicitudes para prevenir bloqueos
         await new Promise(resolve => setTimeout(resolve, waitTime));
         
@@ -184,8 +175,8 @@ async function scrapeDividendsInfoFromStockEvents() {
     
     console.log(`Proceso completado: ${updatesCount} activos actualizados, ${errorsCount} errores`);
     
-    if (assetsToUpdate.length > MAX_ASSETS_PER_RUN) {
-      console.log(`Atención: Quedan ${assetsToUpdate.length - MAX_ASSETS_PER_RUN} activos pendientes por actualizar.`);
+    if (snapshot.docs.length > MAX_ASSETS_PER_RUN) {
+      console.log(`Atención: Quedan ${snapshot.docs.length - MAX_ASSETS_PER_RUN} activos pendientes por actualizar.`);
     }
     
   } catch (error) {
