@@ -103,6 +103,9 @@ exports.processDividendPayments = functions.pubsub
 
       const batch = db.batch();
       let transactionsCreated = 0;
+      
+      // Mapa para acumular los dividendos por cuenta y moneda
+      const portfolioAccountUpdates = {};
 
       // Crear transacciones por cuenta y símbolo
       for (const key of Object.keys(portfolioSymbolAssets)) {
@@ -147,7 +150,7 @@ exports.processDividendPayments = functions.pubsub
           description: `Pago de dividendo anual de ${portfolioSymbolData.dividend.name || portfolioSymbolData.symbol} (${totalUnits} unidades)`,
           createdAt: admin.firestore.FieldValue.serverTimestamp(),
           userId: portfolioSymbolData.userId,
-          relatedAssets: portfolioSymbolData.relatedAssets  // Guardamos referencia a todos los assets relacionados
+          relatedAssets: portfolioSymbolData.relatedAssets
         };
 
         batch.set(transactionRef, transaction);
@@ -155,11 +158,50 @@ exports.processDividendPayments = functions.pubsub
 
         const amount = (annualDividend / 4) * totalUnits;
         console.log(`Creada transacción de dividendo para ${portfolioSymbolData.symbol} en cuenta ${portfolioSymbolData.portfolioAccountId}, unidades totales: ${totalUnits}, monto: ${amount} ${transaction.currency}`);
+        
+        // Acumular los montos de dividendos por cuenta y moneda
+        const accountKey = portfolioSymbolData.portfolioAccountId;
+        const currency = transaction.currency;
+        
+        if (!portfolioAccountUpdates[accountKey]) {
+          portfolioAccountUpdates[accountKey] = {};
+        }
+        
+        if (!portfolioAccountUpdates[accountKey][currency]) {
+          portfolioAccountUpdates[accountKey][currency] = 0;
+        }
+        
+        portfolioAccountUpdates[accountKey][currency] += amount;
+      }
+      
+      // Actualizar los balances de las cuentas después de acumular todos los dividendos
+      for (const [accountId, currencyAmounts] of Object.entries(portfolioAccountUpdates)) {
+        const portfolioAccountRef = db.collection('portfolioAccounts').doc(accountId);
+        const portfolioAccountDoc = await portfolioAccountRef.get();
+        const portfolioAccountData = portfolioAccountDoc.data();
+        
+        // Inicializar balances si no existe
+        if (!portfolioAccountData.balances) {
+          portfolioAccountData.balances = {};
+        }
+        
+        // Actualizar el balance para cada moneda
+        for (const [currency, amount] of Object.entries(currencyAmounts)) {
+          const currentCurrencyBalance = portfolioAccountData.balances[currency] || 0;
+          portfolioAccountData.balances[currency] = currentCurrencyBalance + amount;
+          console.log(`Acumulado dividendo de ${amount} ${currency} para la cuenta ${accountId}. Nuevo balance: ${portfolioAccountData.balances[currency]}`);
+        }
+        
+        // Actualizar la cuenta del portafolio en el batch
+        batch.update(portfolioAccountRef, {
+          balances: portfolioAccountData.balances
+        });
+        console.log(`Preparada actualización de balances para la cuenta ${accountId}`);
       }
 
       if (transactionsCreated > 0) {
         await batch.commit();
-        console.log(`${transactionsCreated} transacciones de dividendos procesadas exitosamente`);
+        console.log(`${transactionsCreated} transacciones de dividendos procesadas exitosamente y balances actualizados`);
       } else {
         console.log('No se crearon transacciones de dividendos');
       }
