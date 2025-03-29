@@ -1,4 +1,5 @@
-const functions = require('firebase-functions');
+const { onSchedule } = require("firebase-functions/v2/scheduler");
+const { onRequest } = require("firebase-functions/v2/https");
 const admin = require('firebase-admin');
 const axios = require('axios');
 const { DateTime } = require('luxon');
@@ -7,7 +8,7 @@ const { DateTime } = require('luxon');
 const FINNHUB_TOKEN = process.env.FINNHUB_TOKEN || 
   (process.env.FUNCTIONS_EMULATOR ? 
     require('dotenv').config().parsed.FINNHUB_TOKEN : 
-    functions.config().finnhub.token);
+    process.env.FINNHUB_TOKEN);
 
 // Documento donde almacenaremos el estado del mercado
 const MARKET_DOC_ID = 'US';
@@ -102,24 +103,27 @@ async function getMarketStatus() {
 }
 
 // Programar las funciones para ejecutarse en los horarios definidos
-exports.scheduledMarketStatusUpdate = functions.pubsub
-  .schedule('0 4,8,9,10,16,20,21 * * 1-5') // 4AM, 8AM, 9AM, 10AM, 4PM, 8PM, 9PM de lunes a viernes
-  .timeZone('America/New_York')
-  .onRun(async () => {
-    await updateMarketStatus();
-    return null;
-  });
+exports.scheduledMarketStatusUpdate = onSchedule({
+  schedule: '0 4,8,9,10,16,20,21 * * 1-5', // 4AM, 8AM, 9AM, 10AM, 4PM, 8PM, 9PM de lunes a viernes
+  timeZone: 'America/New_York',
+  retryCount: 3,
+}, async (event) => {
+  await updateMarketStatus();
+  return null;
+});
 
-exports.scheduledMarketStatusUpdateAdditional = functions.pubsub
-  .schedule('30 8,9,16 * * 1-5') // 8:30AM, 9:30AM, 4:30PM de lunes a viernes
-  .timeZone('America/New_York')
-  .onRun(async () => {
-    await updateMarketStatus();
-    return null;
-  });
+exports.scheduledMarketStatusUpdateAdditional = onSchedule({
+  schedule: '30 8,9,16 * * 1-5', // 8:30AM, 9:30AM, 4:30PM de lunes a viernes
+  timeZone: 'America/New_York',
+  retryCount: 3,
+}, async (event) => {
+  await updateMarketStatus();
+  return null;
+});
 
 // Actualización bajo demanda a través de HTTP
-exports.updateMarketStatusHttp = functions.https.onRequest(async (req, res) => {
+exports.updateMarketStatusHttp = onRequest({
+}, async (req, res) => {
   try {
     await updateMarketStatus();
     res.status(200).send({ success: true, message: 'Estado del mercado actualizado' });

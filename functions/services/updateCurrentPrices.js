@@ -1,4 +1,4 @@
-const functions = require('firebase-functions');
+const { onSchedule } = require("firebase-functions/v2/scheduler");
 const admin = require('firebase-admin');
 const { getQuotes } = require('./financeQuery'); 
 
@@ -80,11 +80,12 @@ async function updateCurrentPrices() {
   }
 }
 
-// Programar la actualización cada 5 minutos
-exports.scheduledUpdatePrices = functions.pubsub
-  .schedule('*/2 9-17 * * 1-5')
-  .timeZone('America/New_York')
-  .onRun(async (context) => {
-    await updateCurrentPrices();
-    return null;
-  });
+// Programar la actualización cada 2 minutos durante el horario de mercado
+exports.scheduledUpdatePrices = onSchedule({
+  schedule: '*/2 9-17 * * 1-5',
+  timeZone: 'America/New_York',
+  retryCount: 3,
+}, async (event) => {
+  await updateCurrentPrices();
+  return null;
+});

@@ -1,4 +1,4 @@
-const functions = require('firebase-functions');
+const { onSchedule } = require("firebase-functions/v2/scheduler");
 const admin = require('./firebaseAdmin');
 const axios = require('axios');
 
@@ -38,62 +38,64 @@ function isNYSEMarketOpen() {
   return utcHour >= NYSE_OPEN_HOUR && utcHour < NYSE_CLOSE_HOUR;
 }
 
-exports.updateCurrencyRates = functions.pubsub
-  .schedule('*/2 9-17 * * 1-5')
-  .timeZone('America/New_York')
-  .onRun(async (context) => {
-    if (!isNYSEMarketOpen()) {
-      console.log('El mercado NYSE está cerrado. No se actualizarán las tasas de cambio.');
-      return null;
-    }
-
-    const db = admin.firestore();
-    const currenciesRef = db.collection('currencies');
-
-    try {
-      const snapshot = await currenciesRef.where('isActive', '==', true).get();
-      const batch = db.batch();
-      let updatesCount = 0;
-
-      for (const doc of snapshot.docs) {
-        const { code, name, symbol } = doc.data();
-
-        try {
-          // Obtener tasa de cambio desde Yahoo Finance
-          const newRate = await getCurrencyRateFromYahoo(code);
-
-          if (newRate && !isNaN(newRate) && newRate > 0) {
-            const updatedData = {
-              code: code,
-              name: name,
-              symbol: symbol,
-              exchangeRate: newRate,
-              lastUpdated: admin.firestore.FieldValue.serverTimestamp()
-            };
-
-            batch.update(doc.ref, updatedData);
-            updatesCount++;
-            console.log(`Actualizada tasa de cambio para USD:${code} a ${newRate}`);
-          } else {
-            console.warn(`Valor inválido para USD:${code}: ${newRate}`);
-          }
-        } catch (error) {
-          console.error(`Error al obtener datos para USD:${code}:`, error);
-        }
-      }
-
-      if (updatesCount > 0) {
-        await batch.commit();
-        console.log(`${updatesCount} tasas de cambio han sido actualizadas`);
-      } else {
-        console.log('No se requirieron actualizaciones');
-      }
-    } catch (error) {
-      console.error('Error al actualizar tasas de cambio:', error);
-    }
-
+// Actualización para usar Firebase Functions v5+
+exports.updateCurrencyRates = onSchedule({
+  schedule: '*/2 9-17 * * 1-5',
+  timeZone: 'America/New_York',
+  retryCount: 3,
+}, async (event) => {
+  if (!isNYSEMarketOpen()) {
+    console.log('El mercado NYSE está cerrado. No se actualizarán las tasas de cambio.');
     return null;
-  });
+  }
+
+  const db = admin.firestore();
+  const currenciesRef = db.collection('currencies');
+
+  try {
+    const snapshot = await currenciesRef.where('isActive', '==', true).get();
+    const batch = db.batch();
+    let updatesCount = 0;
+
+    for (const doc of snapshot.docs) {
+      const { code, name, symbol } = doc.data();
+
+      try {
+        // Obtener tasa de cambio desde Yahoo Finance
+        const newRate = await getCurrencyRateFromYahoo(code);
+
+        if (newRate && !isNaN(newRate) && newRate > 0) {
+          const updatedData = {
+            code: code,
+            name: name,
+            symbol: symbol,
+            exchangeRate: newRate,
+            lastUpdated: admin.firestore.FieldValue.serverTimestamp()
+          };
+
+          batch.update(doc.ref, updatedData);
+          updatesCount++;
+          console.log(`Actualizada tasa de cambio para USD:${code} a ${newRate}`);
+        } else {
+          console.warn(`Valor inválido para USD:${code}: ${newRate}`);
+        }
+      } catch (error) {
+        console.error(`Error al obtener datos para USD:${code}:`, error);
+      }
+    }
+
+    if (updatesCount > 0) {
+      await batch.commit();
+      console.log(`${updatesCount} tasas de cambio han sido actualizadas`);
+    } else {
+      console.log('No se requirieron actualizaciones');
+    }
+  } catch (error) {
+    console.error('Error al actualizar tasas de cambio:', error);
+  }
+
+  return null;
+});
 
 // Función HTTP para pruebas locales (opcional)
 /*exports.httpUpdateCurrencyRates = functions.https.onRequest(async (req, res) => {
