@@ -82,6 +82,26 @@ exports.processDividendPayments = onSchedule({
       const matchingDividend = todaysDividends.find(div => div.symbol === asset.name);
       if (!matchingDividend) continue;
 
+      // Verificar si el asset tiene fecha de adquisición y si la fecha de exDividend está disponible
+      if (!matchingDividend.exDividend || !asset.adquisitionDate) {
+        console.log(`Activo ${asset.id} (${asset.name}) excluido del pago de dividendos: ${!matchingDividend.exDividend ? 'falta fecha exDividend' : 'falta fecha de adquisición'}`);
+        continue;
+      }
+      
+      try {
+        // Convertir la fecha de exDividend a formato ISO
+        const exDividendDate = DateTime.fromFormat(matchingDividend.exDividend, 'MMM d, yyyy').toISODate();
+        
+        // Verificar si la fecha de adquisición es después de la fecha exDividend
+        if (asset.adquisitionDate > exDividendDate) {
+          console.log(`Activo ${asset.id} (${asset.name}) excluido del pago de dividendos: fue adquirido el ${asset.adquisitionDate} después de la fecha exDividend ${exDividendDate}`);
+          continue;
+        }
+      } catch (error) {
+        console.log(`Error al procesar fecha exDividend para ${matchingDividend.symbol}: ${error.message}, activo excluido`);
+        continue;
+      }
+
       const key = `${asset.portfolioAccount}_${asset.name}`;
 
       if (!portfolioSymbolAssets[key]) {
