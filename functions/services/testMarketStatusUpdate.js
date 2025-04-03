@@ -3,11 +3,11 @@ const admin = require('./firebaseAdmin');
 const { DateTime } = require('luxon');
 const axios = require('axios');
 
+// Cargar variables de entorno desde el archivo .env
+require('dotenv').config();
+
 // Token de Finnhub desde variables de entorno
-const FINNHUB_TOKEN = process.env.FINNHUB_TOKEN || 
-  (process.env.FUNCTIONS_EMULATOR ? 
-    require('dotenv').config().parsed.FINNHUB_TOKEN : 
-    functions.config().finnhub.token);
+const FINNHUB_TOKEN = process.env.FINNHUB_TOKEN;
 
 // Documento donde almacenaremos el estado del mercado
 const MARKET_DOC_ID = 'US';

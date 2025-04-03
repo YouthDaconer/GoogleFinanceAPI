@@ -83,7 +83,7 @@ exports.processDividendPayments = onSchedule({
       if (!matchingDividend) continue;
 
       // Verificar si el asset tiene fecha de adquisición y si la fecha de exDividend está disponible
-      if (!matchingDividend.exDividend || !asset.adquisitionDate) {
+      if (!matchingDividend.exDividend || !asset.acquisitionDate) {
         console.log(`Activo ${asset.id} (${asset.name}) excluido del pago de dividendos: ${!matchingDividend.exDividend ? 'falta fecha exDividend' : 'falta fecha de adquisición'}`);
         continue;
       }
@@ -93,8 +93,8 @@ exports.processDividendPayments = onSchedule({
         const exDividendDate = DateTime.fromFormat(matchingDividend.exDividend, 'MMM d, yyyy').toISODate();
         
         // Verificar si la fecha de adquisición es después de la fecha exDividend
-        if (asset.adquisitionDate > exDividendDate) {
-          console.log(`Activo ${asset.id} (${asset.name}) excluido del pago de dividendos: fue adquirido el ${asset.adquisitionDate} después de la fecha exDividend ${exDividendDate}`);
+        if (asset.acquisitionDate > exDividendDate) {
+          console.log(`Activo ${asset.id} (${asset.name}) excluido del pago de dividendos: fue adquirido el ${asset.acquisitionDate} después de la fecha exDividend ${exDividendDate}`);
           continue;
         }
       } catch (error) {

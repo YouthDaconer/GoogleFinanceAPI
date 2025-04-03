@@ -3,12 +3,17 @@ const { onRequest } = require("firebase-functions/v2/https");
 const admin = require('firebase-admin');
 const axios = require('axios');
 const { DateTime } = require('luxon');
+const functions = require('firebase-functions');
 
-// Token de Finnhub
-const FINNHUB_TOKEN = process.env.FINNHUB_TOKEN || 
-  (process.env.FUNCTIONS_EMULATOR ? 
-    require('dotenv').config().parsed.FINNHUB_TOKEN : 
-    process.env.FINNHUB_TOKEN);
+// Cargar variables de entorno desde el archivo .env en desarrollo
+if (process.env.NODE_ENV !== 'production') {
+  require('dotenv').config();
+}
+
+// Token de Finnhub desde variables de entorno o configuración de Firebase
+const FINNHUB_TOKEN = process.env.NODE_ENV !== 'production'
+  ? process.env.FINNHUB_TOKEN
+  : functions.config().finnhub?.token;
 
 // Documento donde almacenaremos el estado del mercado
 const MARKET_DOC_ID = 'US';
