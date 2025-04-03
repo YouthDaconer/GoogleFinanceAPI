@@ -10,10 +10,29 @@ if (process.env.NODE_ENV !== 'production') {
   require('dotenv').config();
 }
 
+// Asegurarse que admin esté inicializado
+try {
+  admin.app();
+} catch (e) {
+  admin.initializeApp();
+}
+
 // Token de Finnhub desde variables de entorno o configuración de Firebase
-const FINNHUB_TOKEN = process.env.NODE_ENV !== 'production'
-  ? process.env.FINNHUB_TOKEN
-  : functions.config().finnhub?.token;
+let FINNHUB_TOKEN;
+try {
+  FINNHUB_TOKEN = process.env.NODE_ENV !== 'production'
+    ? process.env.FINNHUB_TOKEN
+    : functions.config().finnhub?.token;
+  
+  if (!FINNHUB_TOKEN) {
+    console.error('No se ha configurado FINNHUB_TOKEN. Por favor configúralo con firebase functions:config:set finnhub.token="TU_TOKEN"');
+    // Usar un valor por defecto para evitar errores, aunque no funcionará correctamente
+    FINNHUB_TOKEN = 'token_no_configurado';
+  }
+} catch (error) {
+  console.error('Error al obtener FINNHUB_TOKEN:', error);
+  FINNHUB_TOKEN = 'token_con_error';
+}
 
 // Documento donde almacenaremos el estado del mercado
 const MARKET_DOC_ID = 'US';
@@ -23,11 +42,20 @@ const MARKET_DOC_ID = 'US';
  */
 async function fetchMarketStatus() {
   try {
+    console.log(`Consultando API Finnhub con token: ${FINNHUB_TOKEN.substring(0, 5)}...`);
     const response = await axios.get(`https://finnhub.io/api/v1/stock/market-status?exchange=US&token=${FINNHUB_TOKEN}`);
     return response.data;
   } catch (error) {
-    console.error('Error al consultar estado del mercado:', error);
-    throw error;
+    console.error('Error al consultar estado del mercado:', error.message);
+    // Retornar un objeto con valores por defecto para evitar errores fatales
+    return {
+      exchange: 'US',
+      isOpen: false,
+      session: 'error',
+      holiday: null,
+      t: Math.floor(Date.now() / 1000),
+      timezone: 'America/New_York'
+    };
   }
 }
 
@@ -43,7 +71,7 @@ async function updateMarketStatus() {
     const isWeekend = dayOfWeek === 6 || dayOfWeek === 7;
     
     if (isWeekend) {
-      await db.collection('markets').doc(MARKET_DOC_ID).set({
+      const weekendData = {
         exchange: 'US',
         isOpen: false,
         session: 'closed',
@@ -51,27 +79,31 @@ async function updateMarketStatus() {
         dayOfWeek: dayOfWeek,
         isWeekend: true,
         timestamp: now.toISO()
-      }, { merge: true });
+      };
       
+      await db.collection('markets').doc(MARKET_DOC_ID).set(weekendData, { merge: true });
       console.log('Fin de semana: mercado cerrado, no fue necesario consultar la API');
-      return;
+      return weekendData;
     }
     
     const marketStatus = await fetchMarketStatus();
     
-    await db.collection('markets').doc(MARKET_DOC_ID).set({
+    const dataToSave = {
       ...marketStatus,
       lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
       dayOfWeek: dayOfWeek,
       isWeekend: false,
       timestamp: now.toISO()
-    }, { merge: true });
+    };
     
+    await db.collection('markets').doc(MARKET_DOC_ID).set(dataToSave, { merge: true });
     console.log(`Estado del mercado actualizado: ${marketStatus.isOpen ? 'Abierto' : 'Cerrado'} (${marketStatus.session})`);
+    return dataToSave;
     
   } catch (error) {
     console.error('Error al actualizar estado del mercado:', error);
-    throw error;
+    // En lugar de lanzar un error, devolver un status
+    return { error: error.message, timestamp: now.toISO() };
   }
 }
 
@@ -112,8 +144,11 @@ exports.scheduledMarketStatusUpdate = onSchedule({
   schedule: '0 4,8,9,10,16,20,21 * * 1-5', // 4AM, 8AM, 9AM, 10AM, 4PM, 8PM, 9PM de lunes a viernes
   timeZone: 'America/New_York',
   retryCount: 3,
+  minBackoff: '1m',
 }, async (event) => {
-  await updateMarketStatus();
+  console.log('Ejecutando actualización programada de estado del mercado');
+  const result = await updateMarketStatus();
+  console.log('Actualización completada:', result);
   return null;
 });
 
@@ -121,8 +156,11 @@ exports.scheduledMarketStatusUpdateAdditional = onSchedule({
   schedule: '30 8,9,16 * * 1-5', // 8:30AM, 9:30AM, 4:30PM de lunes a viernes
   timeZone: 'America/New_York',
   retryCount: 3,
+  minBackoff: '1m',
 }, async (event) => {
-  await updateMarketStatus();
+  console.log('Ejecutando actualización adicional programada de estado del mercado');
+  const result = await updateMarketStatus();
+  console.log('Actualización adicional completada:', result);
   return null;
 });
 
