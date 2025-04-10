@@ -13,19 +13,57 @@ exports.calcDailyPortfolioPerf = onSchedule({
   const formattedDate = now.toISODate();
 
   try {
-    const [assetsSnapshot, currentPricesSnapshot, currenciesSnapshot, portfolioAccountsSnapshot, transactionsSnapshot] = await Promise.all([
-      db.collection('assets').where('isActive', '==', true).get(),
+    // Obtener activos activos e inactivos por separado
+    const [activeAssetsSnapshot, allAssetsSnapshot, currentPricesSnapshot, currenciesSnapshot, portfolioAccountsSnapshot, transactionsSnapshot] = await Promise.all([
+      db.collection('assets').where('isActive', '==', true).get(), // Solo assets activos
+      db.collection('assets').get(), // Todos los assets (activos e inactivos)
       db.collection('currentPrices').get(),
       db.collection('currencies').where('isActive', '==', true).get(),
       db.collection('portfolioAccounts').where('isActive', '==', true).get(),
       db.collection('transactions').where('date', '==', formattedDate).get()
     ]);
 
-    const assets = assetsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+    const activeAssets = activeAssetsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+    const allAssets = allAssetsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+    
+    // Obtener assets inactivos
+    const inactiveAssets = allAssets.filter(asset => !asset.isActive);
+    
     const currentPrices = currentPricesSnapshot.docs.map(doc => ({ symbol: doc.id.split(':')[0], ...doc.data() }));
     const currencies = currenciesSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
     const portfolioAccounts = portfolioAccountsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
     const todaysTransactions = transactionsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+
+    // Filtrar transacciones de venta de activos inactivos
+    const sellTransactions = todaysTransactions.filter(t => t.type === 'sell');
+    
+    // Agrupar transacciones de venta por portfolioAccountId y assetId
+    const sellTransactionsByAccount = sellTransactions.reduce((acc, transaction) => {
+      if (!acc[transaction.portfolioAccountId]) {
+        acc[transaction.portfolioAccountId] = [];
+      }
+      acc[transaction.portfolioAccountId].push(transaction);
+      return acc;
+    }, {});
+
+    // Identificar assets inactivos que tuvieron ventas hoy
+    const inactiveAssetsWithSellTransactions = new Set();
+    sellTransactions.forEach(transaction => {
+      if (transaction.assetId) {
+        const asset = inactiveAssets.find(a => a.id === transaction.assetId);
+        if (asset) {
+          inactiveAssetsWithSellTransactions.add(asset.id);
+        }
+      }
+    });
+    
+    // Incluir assets inactivos que tuvieron ventas hoy
+    const assetsToInclude = [
+      ...activeAssets,
+      ...inactiveAssets.filter(asset => inactiveAssetsWithSellTransactions.has(asset.id))
+    ];
+    
+    console.log(`Incluyendo ${inactiveAssetsWithSellTransactions.size} assets inactivos con transacciones de venta para hoy`);
 
     const userPortfolios = portfolioAccounts.reduce((acc, account) => {
       if (!acc[account.userId]) acc[account.userId] = [];
@@ -69,8 +107,14 @@ exports.calcDailyPortfolioPerf = onSchedule({
         }, {});
       }
 
-      const allUserAssets = assets.filter(asset => accounts.some(account => account.id === asset.portfolioAccount));
-      const userTransactions = todaysTransactions.filter(t => accounts.some(account => account.id === t.portfolioAccountId));
+      // Incluir tanto activos como inactivos que tuvieron transacciones de venta
+      const allUserAssets = assetsToInclude.filter(asset => 
+        accounts.some(account => account.id === asset.portfolioAccount)
+      );
+      
+      const userTransactions = todaysTransactions.filter(t => 
+        accounts.some(account => account.id === t.portfolioAccountId)
+      );
 
       const overallPerformance = calculateAccountPerformance(
         allUserAssets,
@@ -90,7 +134,18 @@ exports.calcDailyPortfolioPerf = onSchedule({
       }, { merge: false });
 
       for (const account of accounts) {
-        const accountAssets = assets.filter(asset => asset.portfolioAccount === account.id);
+        // Incluir activos inactivos que tuvieron ventas para esta cuenta
+        const accountSellTransactions = sellTransactionsByAccount[account.id] || [];
+        const inactiveAccountAssetsWithSells = inactiveAssets.filter(asset => 
+          asset.portfolioAccount === account.id && 
+          accountSellTransactions.some(t => t.assetId === asset.id)
+        );
+        
+        // Combinar activos activos e inactivos con ventas hoy para esta cuenta
+        const accountAssets = [
+          ...activeAssets.filter(asset => asset.portfolioAccount === account.id),
+          ...inactiveAccountAssetsWithSells
+        ];
 
         // Ensure account document exists
         const accountRef = userPerformanceRef.collection('accounts').doc(account.id);
