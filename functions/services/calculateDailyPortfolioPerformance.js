@@ -1,6 +1,6 @@
 const { onSchedule } = require("firebase-functions/v2/scheduler");
 const admin = require('firebase-admin');
-const { calculateAccountPerformance } = require('../utils/portfolioCalculations');
+const { calculateAccountPerformance, convertCurrency } = require('../utils/portfolioCalculations');
 const { DateTime } = require('luxon');
 
 exports.calcDailyPortfolioPerf = onSchedule({
@@ -11,31 +11,89 @@ exports.calcDailyPortfolioPerf = onSchedule({
   const db = admin.firestore();
   const now = DateTime.now().setZone('America/New_York');
   const formattedDate = now.toISODate();
-
+  
   try {
-    // Obtener activos activos e inactivos por separado
-    const [activeAssetsSnapshot, allAssetsSnapshot, currentPricesSnapshot, currenciesSnapshot, portfolioAccountsSnapshot, transactionsSnapshot] = await Promise.all([
-      db.collection('assets').where('isActive', '==', true).get(), // Solo assets activos
-      db.collection('assets').get(), // Todos los assets (activos e inactivos)
+    // Obtener transacciones para el día actual primero
+    const transactionsSnapshot = await db.collection('transactions')
+      .where('date', '==', formattedDate)
+      .get();
+    
+    const todaysTransactions = transactionsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+    
+    // Filtrar transacciones por tipo
+    const sellTransactions = todaysTransactions.filter(t => t.type === 'sell');
+    
+    // Extraer IDs de activos involucrados en ventas hoy
+    const assetIdsInSellTransactions = [...new Set(sellTransactions.map(t => t.assetId).filter(id => id))];
+    
+    // Obtener activos activos
+    const activeAssetsSnapshot = await db.collection('assets')
+      .where('isActive', '==', true)
+      .get();
+    
+    const activeAssets = activeAssetsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+    
+    // Obtener activos inactivos específicos involucrados en ventas (solo si hay ventas)
+    let inactiveAssets = [];
+    if (assetIdsInSellTransactions.length > 0) {
+      // Firestore no permite usar .where('id', 'in', [...]) directamente, así que hacemos una consulta más amplia
+      const inactiveAssetsSnapshot = await db.collection('assets')
+        .where('isActive', '==', false)
+        .get();
+      
+      // Filtrar manualmente los activos inactivos que están en transacciones de venta
+      inactiveAssets = inactiveAssetsSnapshot.docs
+        .map(doc => ({ id: doc.id, ...doc.data() }))
+        .filter(asset => assetIdsInSellTransactions.includes(asset.id));
+      
+      console.log(`Obtenidos ${inactiveAssets.length} activos inactivos involucrados en ventas hoy`);
+    } else {
+      console.log('No hay activos inactivos involucrados en ventas hoy');
+    }
+    
+    // Ahora tenemos activeAssets y inactiveAssets, que es el equivalente a allAssets filtrado
+    const allAssets = [...activeAssets, ...inactiveAssets];
+    
+    // Consultar el resto de datos necesarios
+    const [currentPricesSnapshot, currenciesSnapshot, portfolioAccountsSnapshot] = await Promise.all([
       db.collection('currentPrices').get(),
       db.collection('currencies').where('isActive', '==', true).get(),
-      db.collection('portfolioAccounts').where('isActive', '==', true).get(),
-      db.collection('transactions').where('date', '==', formattedDate).get()
+      db.collection('portfolioAccounts').where('isActive', '==', true).get()
     ]);
-
-    const activeAssets = activeAssetsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-    const allAssets = allAssetsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-    
-    // Obtener assets inactivos
-    const inactiveAssets = allAssets.filter(asset => !asset.isActive);
     
     const currentPrices = currentPricesSnapshot.docs.map(doc => ({ symbol: doc.id.split(':')[0], ...doc.data() }));
     const currencies = currenciesSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
     const portfolioAccounts = portfolioAccountsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-    const todaysTransactions = transactionsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-
-    // Filtrar transacciones de venta de activos inactivos
-    const sellTransactions = todaysTransactions.filter(t => t.type === 'sell');
+    
+    // Obtener todas las transacciones de compra para los activos vendidos hoy
+    const assetIdsWithSells = new Set(assetIdsInSellTransactions);
+    
+    // Variables para almacenar las transacciones de compra históricas
+    let historicalBuyTransactions = [];
+    let buyTransactionsByAssetId = {};
+    
+    // Solo realizar la consulta si hay assetIds con ventas
+    if (assetIdsWithSells.size > 0) {
+      console.log(`Obteniendo transacciones de compra históricas para ${assetIdsWithSells.size} activos vendidos`);
+      // Obtener todas las transacciones de compra históricas para estos activos
+      const historicalBuyTransactionsSnapshot = await db.collection('transactions')
+        .where('type', '==', 'buy')
+        .where('assetId', 'in', [...assetIdsWithSells])
+        .get();
+      
+      historicalBuyTransactions = historicalBuyTransactionsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      
+      // Agrupar transacciones de compra por assetId
+      buyTransactionsByAssetId = historicalBuyTransactions.reduce((acc, t) => {
+        if (!acc[t.assetId]) {
+          acc[t.assetId] = [];
+        }
+        acc[t.assetId].push(t);
+        return acc;
+      }, {});
+    } else {
+      console.log('No hay transacciones de venta con assetId válido para hoy');
+    }
     
     // Agrupar transacciones de venta por portfolioAccountId y assetId
     const sellTransactionsByAccount = sellTransactions.reduce((acc, transaction) => {
@@ -47,15 +105,11 @@ exports.calcDailyPortfolioPerf = onSchedule({
     }, {});
 
     // Identificar assets inactivos que tuvieron ventas hoy
-    const inactiveAssetsWithSellTransactions = new Set();
-    sellTransactions.forEach(transaction => {
-      if (transaction.assetId) {
-        const asset = inactiveAssets.find(a => a.id === transaction.assetId);
-        if (asset) {
-          inactiveAssetsWithSellTransactions.add(asset.id);
-        }
-      }
-    });
+    const inactiveAssetsWithSellTransactions = new Set(
+      inactiveAssets.filter(asset => 
+        sellTransactions.some(tx => tx.assetId === asset.id)
+      ).map(asset => asset.id)
+    );
     
     // Incluir assets inactivos que tuvieron ventas hoy
     const assetsToInclude = [
@@ -124,6 +178,119 @@ exports.calcDailyPortfolioPerf = onSchedule({
         userTransactions
       );
 
+      // Calcular doneProfitAndLoss para cada moneda a nivel de usuario
+      const userDoneProfitAndLossByCurrency = {};
+      
+      // Filtrar transacciones de venta del usuario
+      const userSellTransactions = sellTransactions.filter(t => 
+        accounts.some(account => account.id === t.portfolioAccountId)
+      );
+      
+      // Para cada moneda, calcular doneProfitAndLoss
+      for (const currency of currencies) {
+        let totalDoneProfitAndLoss = 0;
+        const assetDoneProfitAndLoss = {};
+        
+        // Procesar ventas y calcular doneProfitAndLoss
+        userSellTransactions.forEach(sellTx => {
+          const sellAmountConverted = convertCurrency(
+            sellTx.amount * sellTx.price,
+            sellTx.currency,
+            currency.code,
+            currencies,
+            sellTx.defaultCurrencyForAdquisitionDollar,
+            parseFloat(sellTx.dollarPriceToDate.toString())
+          );
+          
+          // Si hay assetId, calcular doneProfitAndLoss
+          if (sellTx.assetId) {
+            // Encontrar el activo correspondiente (activo o inactivo)
+            const asset = allAssets.find(a => a.id === sellTx.assetId);
+            if (asset) {
+              const assetKey = `${asset.name}_${asset.assetType}`;
+              if (!assetDoneProfitAndLoss[assetKey]) {
+                assetDoneProfitAndLoss[assetKey] = 0;
+              }
+              
+              // Calcular doneProfitAndLoss (ganancias o pérdidas realizadas)
+              const buyTxsForAsset = buyTransactionsByAssetId[sellTx.assetId] || [];
+              
+              if (buyTxsForAsset.length > 0) {
+                // Calcular el costo promedio de adquisición para esas unidades
+                let totalBuyCost = 0;
+                let totalBuyUnits = 0;
+                
+                buyTxsForAsset.forEach(buyTx => {
+                  totalBuyCost += buyTx.amount * buyTx.price;
+                  totalBuyUnits += buyTx.amount;
+                });
+                
+                const avgCostPerUnit = totalBuyCost / totalBuyUnits;
+                const costOfSoldUnits = sellTx.amount * avgCostPerUnit;
+                
+                // Convertir el costo de adquisición a la moneda actual
+                const costOfSoldUnitsConverted = convertCurrency(
+                  costOfSoldUnits,
+                  sellTx.currency,
+                  currency.code,
+                  currencies,
+                  sellTx.defaultCurrencyForAdquisitionDollar,
+                  parseFloat(sellTx.dollarPriceToDate.toString())
+                );
+                
+                // El PnL es la diferencia entre el valor de venta y el costo de adquisición
+                const profitAndLoss = sellAmountConverted - costOfSoldUnitsConverted;
+                
+                // Acumular para el asset específico
+                assetDoneProfitAndLoss[assetKey] += profitAndLoss;
+                totalDoneProfitAndLoss += profitAndLoss;
+                
+                console.log(`Calculado P&L para venta de ${sellTx.amount} unidades de ${assetKey}: ${profitAndLoss} ${currency.code}`);
+              }
+            }
+          }
+        });
+        
+        userDoneProfitAndLossByCurrency[currency.code] = { 
+          doneProfitAndLoss: totalDoneProfitAndLoss,
+          assetDoneProfitAndLoss
+        };
+      }
+
+      // Agregar doneProfitAndLoss a overallPerformance
+      for (const [currencyCode, data] of Object.entries(userDoneProfitAndLossByCurrency)) {
+        if (overallPerformance[currencyCode]) {
+          overallPerformance[currencyCode].doneProfitAndLoss = data.doneProfitAndLoss;
+          
+          // Calcular y añadir unrealizedProfitAndLoss
+          const unrealizedProfitAndLoss = overallPerformance[currencyCode].totalValue - overallPerformance[currencyCode].totalInvestment;
+          overallPerformance[currencyCode].unrealizedProfitAndLoss = unrealizedProfitAndLoss;
+          console.log(`Calculado unrealizedProfitAndLoss para ${currencyCode} a nivel de usuario: ${unrealizedProfitAndLoss}`);
+          
+          // Agregar doneProfitAndLoss a nivel de activo para los que tuvieron ventas
+          if (overallPerformance[currencyCode].assetPerformance) {
+            // Primero: Asignar doneProfitAndLoss a los activos que tuvieron ventas
+            for (const [assetKey, pnl] of Object.entries(data.assetDoneProfitAndLoss)) {
+              if (overallPerformance[currencyCode].assetPerformance[assetKey]) {
+                overallPerformance[currencyCode].assetPerformance[assetKey].doneProfitAndLoss = pnl;
+              }
+            }
+            
+            // Segundo: Calcular unrealizedProfitAndLoss para TODOS los activos
+            console.log(`Calculando unrealizedProfitAndLoss para todos los activos en ${currencyCode}`);
+            for (const [assetKey, assetData] of Object.entries(overallPerformance[currencyCode].assetPerformance)) {
+              const assetTotalValue = assetData.totalValue || 0;
+              const assetTotalInvestment = assetData.totalInvestment || 0;
+              const assetUnrealizedPnL = assetTotalValue - assetTotalInvestment;
+              
+              // Asignar unrealizedProfitAndLoss para este activo
+              overallPerformance[currencyCode].assetPerformance[assetKey].unrealizedProfitAndLoss = assetUnrealizedPnL;
+              console.log(`Calculado unrealizedProfitAndLoss para ${assetKey} en ${currencyCode}: ${assetUnrealizedPnL}`);
+            }
+          }
+        }
+      }
+
       // Save overall user performance (overwrite existing data)
       const userOverallPerformanceRef = userPerformanceRef
         .collection('dates')
@@ -131,7 +298,7 @@ exports.calcDailyPortfolioPerf = onSchedule({
       batch.set(userOverallPerformanceRef, {
         date: formattedDate,
         ...overallPerformance
-      }, { merge: false });
+      }, { merge: true }); // Usar merge:true para preservar otros campos existentes
 
       for (const account of accounts) {
         // Incluir activos inactivos que tuvieron ventas para esta cuenta
@@ -190,6 +357,114 @@ exports.calcDailyPortfolioPerf = onSchedule({
           accountTransactions
         );
 
+        // Calcular doneProfitAndLoss para cada moneda a nivel de cuenta
+        const accountDoneProfitAndLossByCurrency = {};
+        
+        // Para cada moneda, calcular doneProfitAndLoss a nivel de cuenta
+        for (const currency of currencies) {
+          let accountDoneProfitAndLoss = 0;
+          const accountAssetDoneProfitAndLoss = {};
+          
+          // Procesar ventas y calcular doneProfitAndLoss
+          accountSellTransactions.forEach(sellTx => {
+            const sellAmountConverted = convertCurrency(
+              sellTx.amount * sellTx.price,
+              sellTx.currency,
+              currency.code,
+              currencies,
+              sellTx.defaultCurrencyForAdquisitionDollar,
+              parseFloat(sellTx.dollarPriceToDate.toString())
+            );
+            
+            // Si hay assetId, calcular doneProfitAndLoss
+            if (sellTx.assetId) {
+              // Encontrar el activo correspondiente (activo o inactivo)
+              const asset = allAssets.find(a => a.id === sellTx.assetId);
+              if (asset) {
+                const assetKey = `${asset.name}_${asset.assetType}`;
+                if (!accountAssetDoneProfitAndLoss[assetKey]) {
+                  accountAssetDoneProfitAndLoss[assetKey] = 0;
+                }
+                
+                // Calcular doneProfitAndLoss (ganancias o pérdidas realizadas)
+                const buyTxsForAsset = buyTransactionsByAssetId[sellTx.assetId] || [];
+                
+                if (buyTxsForAsset.length > 0) {
+                  // Calcular el costo promedio de adquisición para esas unidades
+                  let totalBuyCost = 0;
+                  let totalBuyUnits = 0;
+                  
+                  buyTxsForAsset.forEach(buyTx => {
+                    totalBuyCost += buyTx.amount * buyTx.price;
+                    totalBuyUnits += buyTx.amount;
+                  });
+                  
+                  const avgCostPerUnit = totalBuyCost / totalBuyUnits;
+                  const costOfSoldUnits = sellTx.amount * avgCostPerUnit;
+                  
+                  // Convertir el costo de adquisición a la moneda actual
+                  const costOfSoldUnitsConverted = convertCurrency(
+                    costOfSoldUnits,
+                    sellTx.currency,
+                    currency.code,
+                    currencies,
+                    sellTx.defaultCurrencyForAdquisitionDollar,
+                    parseFloat(sellTx.dollarPriceToDate.toString())
+                  );
+                  
+                  // El PnL es la diferencia entre el valor de venta y el costo de adquisición
+                  const profitAndLoss = sellAmountConverted - costOfSoldUnitsConverted;
+                  
+                  // Acumular para el asset específico
+                  accountAssetDoneProfitAndLoss[assetKey] += profitAndLoss;
+                  accountDoneProfitAndLoss += profitAndLoss;
+                  
+                  console.log(`Calculado P&L para venta de ${sellTx.amount} unidades de ${assetKey} en cuenta ${account.id}: ${profitAndLoss} ${currency.code}`);
+                }
+              }
+            }
+          });
+          
+          accountDoneProfitAndLossByCurrency[currency.code] = { 
+            doneProfitAndLoss: accountDoneProfitAndLoss,
+            assetDoneProfitAndLoss: accountAssetDoneProfitAndLoss
+          };
+        }
+
+        // Agregar doneProfitAndLoss a accountPerformance
+        for (const [currencyCode, data] of Object.entries(accountDoneProfitAndLossByCurrency)) {
+          if (accountPerformance[currencyCode]) {
+            accountPerformance[currencyCode].doneProfitAndLoss = data.doneProfitAndLoss;
+            
+            // Calcular y añadir unrealizedProfitAndLoss
+            const accountUnrealizedPnL = accountPerformance[currencyCode].totalValue - accountPerformance[currencyCode].totalInvestment;
+            accountPerformance[currencyCode].unrealizedProfitAndLoss = accountUnrealizedPnL;
+            console.log(`Calculado unrealizedProfitAndLoss para cuenta ${account.id} en ${currencyCode}: ${accountUnrealizedPnL}`);
+            
+            // Agregar doneProfitAndLoss a nivel de activo
+            if (accountPerformance[currencyCode].assetPerformance) {
+              // Primero: Asignar doneProfitAndLoss a los activos que tuvieron ventas
+              for (const [assetKey, pnl] of Object.entries(data.assetDoneProfitAndLoss)) {
+                if (accountPerformance[currencyCode].assetPerformance[assetKey]) {
+                  accountPerformance[currencyCode].assetPerformance[assetKey].doneProfitAndLoss = pnl;
+                }
+              }
+              
+              // Segundo: Calcular unrealizedProfitAndLoss para TODOS los activos
+              console.log(`Calculando unrealizedProfitAndLoss para todos los activos en cuenta ${account.id}, moneda ${currencyCode}`);
+              for (const [assetKey, assetData] of Object.entries(accountPerformance[currencyCode].assetPerformance)) {
+                const accountAssetTotalValue = assetData.totalValue || 0;
+                const accountAssetTotalInvestment = assetData.totalInvestment || 0;
+                const accountAssetUnrealizedPnL = accountAssetTotalValue - accountAssetTotalInvestment;
+                
+                // Asignar unrealizedProfitAndLoss para este activo
+                accountPerformance[currencyCode].assetPerformance[assetKey].unrealizedProfitAndLoss = accountAssetUnrealizedPnL;
+                console.log(`Calculado unrealizedProfitAndLoss para ${assetKey} en cuenta ${account.id}, moneda ${currencyCode}: ${accountAssetUnrealizedPnL}`);
+              }
+            }
+          }
+        }
+
         // Save account performance (overwrite existing data)
         const accountPerformanceRef = accountRef
           .collection('dates')
@@ -197,14 +472,14 @@ exports.calcDailyPortfolioPerf = onSchedule({
         batch.set(accountPerformanceRef, {
           date: formattedDate,
           ...accountPerformance
-        }, { merge: false });
+        }, { merge: true }); // Usar merge:true para preservar otros campos existentes
       }
 
       await batch.commit();
-      console.log(`Datos de rendimiento de la cartera calculados y sobrescritos para el usuario ${userId} en ${formattedDate}`);
+      console.log(`Datos de rendimiento de la cartera calculados y actualizados para el usuario ${userId} en ${formattedDate}`);
     }
 
-    console.log(`Cálculo del rendimiento diario de la cartera completado y sobrescrito para ${formattedDate}`);
+    console.log(`Cálculo del rendimiento diario de la cartera completado para ${formattedDate}`);
     return null;
   } catch (error) {
     console.error('Error al calcular el rendimiento diario de la cartera:', error);

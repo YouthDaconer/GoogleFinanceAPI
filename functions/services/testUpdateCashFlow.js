@@ -371,22 +371,31 @@ async function updateTotalCashFlow(startDate, endDate) {
         // Actualizar cada moneda en el documento de fecha del usuario
         for (const [currencyCode, data] of Object.entries(userCashFlowByCurrency)) {
           // Actualizar totalCashFlow y doneProfitAndLoss a nivel de moneda
-          batch.update(userDateRef, {
+          const updateData = {
             [`${currencyCode}.totalCashFlow`]: data.totalCashFlow,
             [`${currencyCode}.doneProfitAndLoss`]: data.doneProfitAndLoss
-          });
+          };
+          
+          batch.update(userDateRef, updateData);
           
           // Verificar si existe assetPerformance para esta moneda
           if (dateDocData[currencyCode]?.assetPerformance) {
-            // Para cada activo en assetPerformance, verificar si necesita actualización
+            // En lugar de actualizar cada activo individualmente, primero copiamos la estructura existente
+            const completeAssetPerformance = {};
+            
+            // Copiar datos existentes
+            Object.entries(dateDocData[currencyCode].assetPerformance).forEach(([assetKey, assetData]) => {
+              completeAssetPerformance[assetKey] = { ...assetData };
+            });
+            
+            // Actualizar totalCashFlow y doneProfitAndLoss para activos que tienen transacciones
             for (const [assetKey, assetCashFlow] of Object.entries(data.assetCashFlows)) {
               // Si el activo ya existe en assetPerformance
               if (dateDocData[currencyCode].assetPerformance[assetKey]) {
-                // Actualizar totalCashFlow y doneProfitAndLoss para el activo específico
-                batch.update(userDateRef, {
-                  [`${currencyCode}.assetPerformance.${assetKey}.totalCashFlow`]: assetCashFlow,
-                  [`${currencyCode}.assetPerformance.${assetKey}.doneProfitAndLoss`]: data.assetDoneProfitAndLoss[assetKey] || 0
-                });
+                // Actualizar totalCashFlow y doneProfitAndLoss
+                completeAssetPerformance[assetKey].totalCashFlow = assetCashFlow;
+                completeAssetPerformance[assetKey].doneProfitAndLoss = data.assetDoneProfitAndLoss[assetKey] || 0;
+                
                 console.log(`Actualizando totalCashFlow y doneProfitAndLoss para activo ${assetKey} en moneda ${currencyCode}`);
               } 
               // Si es un activo que se vendió totalmente y no existe en assetPerformance
@@ -398,7 +407,7 @@ async function updateTotalCashFlow(startDate, endDate) {
                 
                 if (matchesInactiveAsset) {
                   // Crear un nuevo registro en assetPerformance para el activo vendido
-                  const newAssetPerformance = {
+                  completeAssetPerformance[assetKey] = {
                     totalInvestment: 0,
                     totalValue: 0,
                     totalROI: 0,
@@ -413,14 +422,34 @@ async function updateTotalCashFlow(startDate, endDate) {
                     units: 0
                   };
                   
-                  // Actualizar el documento para añadir el nuevo activo
-                  batch.update(userDateRef, {
-                    [`${currencyCode}.assetPerformance.${assetKey}`]: newAssetPerformance
-                  });
                   console.log(`Creando registro en assetPerformance para activo vendido ${assetKey} en moneda ${currencyCode}`);
                 }
               }
             }
+            
+            // Calculamos unrealizedProfitAndLoss para todos los activos
+            console.log(`Calculando unrealizedProfitAndLoss para todos los activos en ${currencyCode}`);
+            
+            Object.entries(dateDocData[currencyCode].assetPerformance).forEach(([assetKey, assetData]) => {
+              // Solo calculamos si el activo existe en nuestro objeto (para asegurarnos)
+              if (completeAssetPerformance[assetKey]) {
+                const assetTotalValue = assetData.totalValue || 0;
+                const assetTotalInvestment = assetData.totalInvestment || 0;
+                const assetUnrealizedPnL = assetTotalValue - assetTotalInvestment;
+                
+                // Añadimos el campo calculado
+                completeAssetPerformance[assetKey].unrealizedProfitAndLoss = assetUnrealizedPnL;
+                
+                console.log(`Calculado unrealizedProfitAndLoss para activo ${assetKey} en ${currencyCode}: ${assetUnrealizedPnL}`);
+              }
+            });
+            
+            // Actualizamos todo el objeto assetPerformance de una vez
+            batch.update(userDateRef, {
+              [`${currencyCode}.assetPerformance`]: completeAssetPerformance
+            });
+            
+            console.log(`Actualizado totalCashFlow, doneProfitAndLoss y unrealizedProfitAndLoss para todos los activos en ${currencyCode}`);
           }
         }
         
@@ -613,22 +642,31 @@ async function updateTotalCashFlow(startDate, endDate) {
           // Actualizar cada moneda en el documento de fecha de la cuenta
           for (const [currencyCode, data] of Object.entries(accountCashFlowByCurrency)) {
             // Actualizar totalCashFlow y doneProfitAndLoss a nivel de moneda
-            batch.update(accountDateRef, {
+            const accountUpdateData = {
               [`${currencyCode}.totalCashFlow`]: data.totalCashFlow,
               [`${currencyCode}.doneProfitAndLoss`]: data.doneProfitAndLoss
-            });
+            };
+            
+            batch.update(accountDateRef, accountUpdateData);
             
             // Verificar si existe assetPerformance para esta moneda
             if (accountDateData[currencyCode]?.assetPerformance) {
-              // Para cada activo en assetPerformance, verificar si necesita actualización
+              // En lugar de actualizar cada activo individualmente, primero copiamos la estructura existente
+              const completeAccountAssetPerformance = {};
+              
+              // Copiar datos existentes
+              Object.entries(accountDateData[currencyCode].assetPerformance).forEach(([assetKey, assetData]) => {
+                completeAccountAssetPerformance[assetKey] = { ...assetData };
+              });
+              
+              // Actualizar totalCashFlow y doneProfitAndLoss para activos con transacciones
               for (const [assetKey, assetCashFlow] of Object.entries(data.assetCashFlows)) {
                 // Si el activo ya existe en assetPerformance
                 if (accountDateData[currencyCode].assetPerformance[assetKey]) {
-                  // Actualizar totalCashFlow y doneProfitAndLoss para el activo específico
-                  batch.update(accountDateRef, {
-                    [`${currencyCode}.assetPerformance.${assetKey}.totalCashFlow`]: assetCashFlow,
-                    [`${currencyCode}.assetPerformance.${assetKey}.doneProfitAndLoss`]: data.assetDoneProfitAndLoss[assetKey] || 0
-                  });
+                  // Actualizar totalCashFlow y doneProfitAndLoss
+                  completeAccountAssetPerformance[assetKey].totalCashFlow = assetCashFlow;
+                  completeAccountAssetPerformance[assetKey].doneProfitAndLoss = data.assetDoneProfitAndLoss[assetKey] || 0;
+                  
                   console.log(`Actualizando totalCashFlow y doneProfitAndLoss para activo ${assetKey} en cuenta ${accountId} para moneda ${currencyCode}`);
                 }
                 // Si es un activo que se vendió totalmente y no existe en assetPerformance
@@ -639,7 +677,7 @@ async function updateTotalCashFlow(startDate, endDate) {
                   
                   if (matchesInactiveAsset) {
                     // Crear un nuevo registro en assetPerformance para el activo vendido
-                    const newAssetPerformance = {
+                    completeAccountAssetPerformance[assetKey] = {
                       totalInvestment: 0,
                       totalValue: 0,
                       totalROI: 0,
@@ -654,28 +692,48 @@ async function updateTotalCashFlow(startDate, endDate) {
                       units: 0
                     };
                     
-                    // Actualizar el documento para añadir el nuevo activo
-                    batch.update(accountDateRef, {
-                      [`${currencyCode}.assetPerformance.${assetKey}`]: newAssetPerformance
-                    });
                     console.log(`Creando registro en assetPerformance para activo vendido ${assetKey} en cuenta ${accountId} para moneda ${currencyCode}`);
                   }
                 }
               }
+              
+              // Calculamos unrealizedProfitAndLoss para todos los activos
+              console.log(`Calculando unrealizedProfitAndLoss para todos los activos en cuenta ${accountId}, moneda ${currencyCode}`);
+              
+              Object.entries(accountDateData[currencyCode].assetPerformance).forEach(([assetKey, assetData]) => {
+                // Solo calculamos si el activo existe en nuestro objeto (para asegurarnos)
+                if (completeAccountAssetPerformance[assetKey]) {
+                  const accountAssetTotalValue = assetData.totalValue || 0;
+                  const accountAssetTotalInvestment = assetData.totalInvestment || 0;
+                  const accountAssetUnrealizedPnL = accountAssetTotalValue - accountAssetTotalInvestment;
+                  
+                  // Añadimos el campo calculado
+                  completeAccountAssetPerformance[assetKey].unrealizedProfitAndLoss = accountAssetUnrealizedPnL;
+                  
+                  console.log(`Calculado unrealizedProfitAndLoss para activo ${assetKey} en cuenta ${accountId}, moneda ${currencyCode}: ${accountAssetUnrealizedPnL}`);
+                }
+              });
+              
+              // Actualizamos todo el objeto assetPerformance de una vez
+              batch.update(accountDateRef, {
+                [`${currencyCode}.assetPerformance`]: completeAccountAssetPerformance
+              });
+              
+              console.log(`Actualizado totalCashFlow, doneProfitAndLoss y unrealizedProfitAndLoss para todos los activos en cuenta ${accountId}, moneda ${currencyCode}`);
             }
           }
         }
         
         // Comprometer todos los cambios en batch
         await batch.commit();
-        console.log(`Actualizado totalCashFlow y doneProfitAndLoss para la fecha ${currentDate} del usuario ${userId}`);
+        console.log(`Actualizado totalCashFlow, doneProfitAndLoss y unrealizedProfitAndLoss para la fecha ${currentDate} del usuario ${userId}`);
       }
     }
     
-    console.log(`Actualización de totalCashFlow y doneProfitAndLoss completada desde ${formattedStartDate} hasta ${formattedEndDate}`);
+    console.log(`Actualización de datos financieros completada desde ${formattedStartDate} hasta ${formattedEndDate}`);
     return null;
   } catch (error) {
-    console.error('Error al actualizar totalCashFlow y doneProfitAndLoss:', error);
+    console.error('Error al actualizar datos financieros:', error);
     return null;
   }
 }
@@ -701,8 +759,8 @@ module.exports = { updateTotalCashFlow, getCurrencyRatesForDateRange };
 
 // Comentar esta sección cuando se quiera usar con argumentos de línea de comando
 
-const startDate = '2025-02-01';
-const endDate = '2025-02-28';
+const startDate = '2024-11-01';
+const endDate = '2024-11-30';
 updateTotalCashFlow(startDate, endDate)
   .then(() => {
     console.log('Proceso completado');
