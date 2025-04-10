@@ -449,83 +449,6 @@ const calculateMaxDaysInvested = (assets) => {
   }));
 };
 
-/**
- * Calcula el rendimiento ponderado por tiempo (Time-Weighted Return) para un período
- * Esta función maneja escenarios donde hay múltiples flujos de caja durante el período
- * Considera correctamente cuando un activo se compra y vende completamente dentro del período
- * 
- * @param {number} startValue - Valor al inicio del período
- * @param {number} endValue - Valor al final del período
- * @param {Array} cashFlows - Array de objetos con las transacciones (cada objeto debe tener amount y date)
- * @returns {number} - El rendimiento ponderado por tiempo como porcentaje
- */
-const calculateTimeWeightedReturn = (startValue, endValue, cashFlows) => {
-  // Si no hay valor inicial y no hay valor final, retornar 0
-  if (startValue === 0 && endValue === 0) {
-    // Si hubo flujos de caja, calcular retorno de operaciones intermedias
-    if (cashFlows && cashFlows.length > 0) {
-      // Ordenar flujos por fecha
-      const sortedFlows = [...cashFlows].sort((a, b) => {
-        if (a.date && b.date) {
-          return new Date(a.date) - new Date(b.date);
-        }
-        return 0;
-      });
-      
-      // Calcular retorno de operaciones intermedias
-      let netCashFlow = 0;
-      sortedFlows.forEach(flow => {
-        netCashFlow += flow.amount;
-      });
-      
-      // Si el flujo neto es positivo, hubo ganancia
-      if (netCashFlow > 0) {
-        // Calcular aproximación de retorno para inversiones temporales
-        const totalInvested = sortedFlows
-          .filter(flow => flow.amount < 0)
-          .reduce((sum, flow) => sum + Math.abs(flow.amount), 0);
-        
-        if (totalInvested > 0) {
-          return (netCashFlow / totalInvested) * 100;
-        }
-      }
-      return 0;
-    }
-    return 0;
-  }
-  
-  // Si no hay flujos de caja, calcular retorno simple
-  if (!cashFlows || cashFlows.length === 0) {
-    if (startValue === 0) return 0;
-    return ((endValue - startValue) / startValue) * 100;
-  }
-  
-  // Si hay valor inicial o valor final y flujos de caja, usar método modified Dietz
-  // Calcular flujo de caja neto
-  let netCashFlow = 0;
-  cashFlows.forEach(flow => {
-    netCashFlow += flow.amount;
-  });
-  
-  // Si el valor inicial es 0 (nueva posición), usar el primer flujo negativo como denominador
-  if (startValue === 0) {
-    const initialInvestment = cashFlows
-      .filter(flow => flow.amount < 0)
-      .reduce((sum, flow) => sum + Math.abs(flow.amount), 0);
-    
-    if (initialInvestment === 0) return 0;
-    
-    // Fórmula modificada para posiciones nuevas
-    return ((endValue - initialInvestment) / initialInvestment) * 100;
-  }
-  
-  // Fórmula Modified Dietz
-  const denominator = startValue;
-  if (denominator === 0) return 0;
-  
-  return ((endValue - startValue - netCashFlow) / denominator) * 100;
-};
-
 module.exports = {
   convertCurrency,
   calculateMaxDaysInvested,
@@ -534,6 +457,5 @@ module.exports = {
   calculateAccountPerformance,
   calculateDailyChangePercentage,
   calculatePureReturnWithoutCashflows,
-  calculateRawDailyChange,
-  calculateTimeWeightedReturn
+  calculateRawDailyChange
 };
