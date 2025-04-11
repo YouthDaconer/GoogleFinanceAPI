@@ -1,4 +1,4 @@
-const admin = require('./firebaseAdmin');
+const admin = require('firebase-admin');
 const { DateTime } = require('luxon');
 
 /**
