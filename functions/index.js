@@ -9,6 +9,13 @@ const processDividendPayments = require('./services/processDividendPayments');
 const marketStatusService = require('./services/marketStatusService');
 const { saveAllIndicesAndSectorsHistoryData } = require("./services/saveAllIndicesAndSectorsHistoryData");
 
+// Calcular semanalmente el porcentaje de semanas rentables
+const { onSchedule } = require("firebase-functions/v2/scheduler");
+const { calculateProfitableWeeks } = require('./services/calculateProfitableWeeks');
+
+// Calcular diariamente el riesgo del portafolio basado en beta
+const { calculatePortfolioRisk } = require('./services/calculatePortfolioRisk');
+
 // Configuración para habilitar la recolección de basura explícita
 // Solo funciona cuando se ejecuta con --expose-gc
 try {
@@ -60,3 +67,35 @@ exports.processDividendPaymentsV2 = processDividendPayments.processDividendPayme
 exports.scheduledMarketStatusUpdateV2 = marketStatusService.scheduledMarketStatusUpdate;
 exports.scheduledMarketStatusUpdateAdditionalV2 = marketStatusService.scheduledMarketStatusUpdateAdditional;
 exports.updateMarketStatusHttpV2 = marketStatusService.updateMarketStatusHttp;
+
+exports.weeklyProfitableWeeksCalculation = onSchedule({
+  schedule: "every sunday 23:00",
+  timeZone: "America/New_York",
+  retryCount: 3,
+}, async (event) => {
+  try {
+    console.log('Iniciando cálculo semanal de semanas rentables');
+    await calculateProfitableWeeks();
+    console.log('Cálculo semanal de semanas rentables completado con éxito');
+    return null;
+  } catch (error) {
+    console.error('Error en cálculo semanal de semanas rentables:', error);
+    return null;
+  }
+});
+
+exports.dailyPortfolioRiskCalculation = onSchedule({
+  schedule: "*/3 9-17 * * 1-5",
+  timeZone: "America/New_York",
+  retryCount: 3,
+}, async (event) => {
+  try {
+    console.log('Iniciando cálculo diario de riesgo del portafolio');
+    await calculatePortfolioRisk();
+    console.log('Cálculo diario de riesgo del portafolio completado con éxito');
+    return null;
+  } catch (error) {
+    console.error('Error en cálculo diario de riesgo del portafolio:', error);
+    return null;
+  }
+});
