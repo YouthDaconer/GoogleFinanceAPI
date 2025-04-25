@@ -310,19 +310,28 @@ const calculateAccountPerformance = (assets, currentPrices, currencies, totalVal
         }
       }
 
-      const groupDailyChangePercentage = calculateDailyChangePercentage(groupValue, totalValueYesterday[currency.code]?.[groupKey]?.totalValue || 0);
+      // Obtener datos del día anterior para este grupo
+      const previousGroupData = totalValueYesterday[currency.code]?.[groupKey] || {};
+      const previousGroupUnits = previousGroupData.units || 0;
+      
+      // Determinar si es una nueva inversión después de vender todo
+      const isNewInvestment = groupUnits > 0 && previousGroupUnits === 0;
+      
+      const groupDailyChangePercentage = calculateDailyChangePercentage(groupValue, previousGroupData?.totalValue || 0);
 
       // Calcular adjusted daily change percentage usando las transacciones acumuladas y dividendos
+      // Pasar isNewInvestment para resetear el cálculo cuando es una nueva inversión
       const groupAdjustedDailyChangePercentage = calculatePureReturnWithoutCashflows(
-        totalValueYesterday[currency.code]?.[groupKey]?.totalValue || 0,
+        previousGroupData?.totalValue || 0,
         groupValue,
         groupTransactions,
-        groupDividendsList
+        groupDividendsList,
+        isNewInvestment
       );
       
       // Añadir un nuevo campo para el cambio porcentual sin flujos de caja
       const groupRawDailyChangePercentage = calculateRawDailyChange(
-        totalValueYesterday[currency.code]?.[groupKey]?.totalValue || 0,
+        previousGroupData?.totalValue || 0,
         groupValue
       );
 
@@ -341,16 +350,27 @@ const calculateAccountPerformance = (assets, currentPrices, currencies, totalVal
       };
     }
 
+    // Verificar si hay activos en el portafolio
+    const hasAnyAssets = totalValue > 0;
+    
+    // Determinar si el portafolio completo es una nueva inversión
+    // (si tenemos activos ahora pero no teníamos ayer)
+    const isPortfolioNewInvestment = hasAnyAssets && 
+                                     (!totalValueYesterday[currency.code] || 
+                                      totalValueYesterday[currency.code].totalValue === 0);
+    
     const maxDaysInvested = calculateMaxDaysInvested(assets);
     const { totalROI, dailyReturn, monthlyReturn, annualReturn } = calculateTotalROIAndReturns(totalInvestment, totalValue, maxDaysInvested);
     const dailyChangePercentage = calculateDailyChangePercentage(totalValue, totalValueYesterday[currency.code]?.totalValue || 0);
     
     // Calcular adjusted daily change percentage para toda la cartera usando el método Modified Dietz
+    // Pasar isPortfolioNewInvestment para resetear el cálculo cuando el portafolio es nuevo
     const adjustedDailyChangePercentage = calculatePureReturnWithoutCashflows(
       totalValueYesterday[currency.code]?.totalValue || 0,
       totalValue,
       convertedTransactions,
-      convertedDividends
+      convertedDividends,
+      isPortfolioNewInvestment
     );
     
     // Añadir un nuevo campo para el cambio porcentual sin flujos de caja para toda la cartera
@@ -382,7 +402,13 @@ const calculateDailyChangePercentage = (currentValue, previousValue) => {
   return ((currentValue - previousValue) / previousValue) * 100;
 };
 
-const calculatePureReturnWithoutCashflows = (startValue, endValue, cashFlows, dividends = []) => {
+const calculatePureReturnWithoutCashflows = (startValue, endValue, cashFlows, dividends = [], isNewInvestment = false) => {
+  // Si es una nueva inversión después de haber vendido todas las posiciones anteriores,
+  // el rendimiento debe ser 0% en el primer día
+  if (isNewInvestment) {
+    return 0;
+  }
+
   let totalCashFlow = 0;
 
   cashFlows.forEach(cf => {
