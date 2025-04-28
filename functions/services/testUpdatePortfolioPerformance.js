@@ -147,7 +147,10 @@ async function updatePortfolioPerformance() {
             acc[currency] = {
               totalValue: data.totalValue || 0,
               ...Object.entries(data.assetPerformance || {}).reduce((assetAcc, [assetName, assetData]) => {
-                assetAcc[assetName] = { totalValue: assetData.totalValue || 0 };
+                assetAcc[assetName] = { 
+                  totalValue: assetData.totalValue || 0,
+                  units: assetData.units || 0
+                };
                 return assetAcc;
               }, {})
             };
@@ -333,7 +336,10 @@ async function updatePortfolioPerformance() {
               acc[currency] = {
                 totalValue: data.totalValue || 0,
                 ...Object.entries(data.assetPerformance || {}).reduce((assetAcc, [assetName, assetData]) => {
-                  assetAcc[assetName] = { totalValue: assetData.totalValue || 0 };
+                  assetAcc[assetName] = { 
+                    totalValue: assetData.totalValue || 0,
+                    units: assetData.units || 0
+                  };
                   return assetAcc;
                 }, {})
               };

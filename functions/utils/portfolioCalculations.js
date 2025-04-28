@@ -302,7 +302,7 @@ const calculateAccountPerformance = (assets, currentPrices, currencies, totalVal
 
       let yearlyWeightedReturn = 0;
       if (groupReturns.totalYearlyInvestment > 0) {
-        for (let idx = 0; idx < groupReturns.yearlyReturns.length; idx) {
+        for (let idx = 0; idx < groupReturns.yearlyReturns.length; idx++) {
           const weight = groupReturns.yearlyWeights[idx] / groupReturns.totalYearlyInvestment;
           if (!isNaN(weight)) {
             yearlyWeightedReturn += groupReturns.yearlyReturns[idx] * weight;
@@ -416,6 +416,23 @@ const calculatePureReturnWithoutCashflows = (startValue, endValue, cashFlows, di
   });
 
   const totalDividends = dividends.reduce((sum, div) => sum + div.amount, 0);
+
+  // Si el valor inicial es 0 pero hay flujos de caja (como compras recientes)
+  if (startValue === 0 && (totalCashFlow !== 0 || endValue > 0)) {
+    // Si es una compra reciente (cashFlow negativo), el rendimiento sería 
+    // la diferencia entre el valor final y la cantidad invertida, dividido por la cantidad invertida
+    if (totalCashFlow < 0) {
+      // Tomamos el valor absoluto de totalCashFlow porque es negativo para compras
+      const invested = Math.abs(totalCashFlow);
+      return ((endValue - invested) / invested) * 100;
+    }
+    // Si es una venta completa (cashFlow positivo), usar el cashflow como base
+    else if (totalCashFlow > 0) {
+      return 0; // Ya se vendió todo, así que no hay rendimiento para calcular
+    }
+    // Si no hay cashflow pero hay valor final (caso extremadamente raro)
+    return 0;
+  }
 
   const denominator = startValue;
   if (denominator === 0) {
