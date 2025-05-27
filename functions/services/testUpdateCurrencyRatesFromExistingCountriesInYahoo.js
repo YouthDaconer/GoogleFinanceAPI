@@ -8,7 +8,7 @@ const axios = require('axios');
  */
 async function getCurrencyRateFromYahoo(currencyCode) {
   try {
-    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${currencyCode}=X?lang=en-US&region=US`;
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${currencyCode}%3DX?lang=en-US&region=US`;
     console.log(`Consultando tasa para ${currencyCode} en Yahoo Finance: ${url}`);
     
     const { data } = await axios.get(url);

@@ -2,7 +2,7 @@ const fetch = require('node-fetch');
 
 async function fetchHistoricalExchangeRate(currency, date) {
   const timestamp = Math.floor(date.getTime() / 1000);
-  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${currency}=X?period1=${timestamp}&period2=${timestamp}&interval=1d`;
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${currency}%3DX?period1=${timestamp}&period2=${timestamp}&interval=1d`;
 
   try {
     const response = await fetch(url);

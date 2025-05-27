@@ -5,7 +5,8 @@ const { DateTime } = require('luxon');
 async function updatePortfolioPerformance() {
   const db = admin.firestore();
   const now = DateTime.now().setZone('America/New_York');
-  const formattedDate = now.toISODate();
+  //const formattedDate = now.toISODate();
+  const formattedDate = '2025-05-09';
   
   try {
     // Obtener transacciones para el día actual primero

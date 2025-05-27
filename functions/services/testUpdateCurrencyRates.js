@@ -1,33 +1,52 @@
 const admin = require('./firebaseAdmin');
 const axios = require('axios');
 
+// Horarios estáticos para NYSE (en UTC)
+const NYSE_OPEN_HOUR = 13.5;  // 9:30 AM EST
+const NYSE_CLOSE_HOUR = 20;   // 4:00 PM EST
+
 /**
- * Obtiene la tasa de cambio actual de una moneda usando Yahoo Finance
- * @param {string} currencyCode - Código de la moneda a consultar
- * @return {Promise<number|null>} - Retorna la tasa de cambio o null si hay error
+ * Obtiene las tasas de cambio actuales de múltiples monedas en una sola petición
+ * @param {string[]} currencyCodes - Array de códigos de monedas a consultar
+ * @return {Promise<Object|null>} - Retorna un objeto con las tasas de cambio o null si hay error
  */
-async function getCurrencyRateFromYahoo(currencyCode) {
+async function getCurrencyRatesBatch(currencyCodes) {
   try {
-    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${currencyCode}=X?lang=en-US&region=US`;
-    console.log(`Consultando tasa para ${currencyCode} en Yahoo Finance: ${url}`);
+    // Formatea los códigos de moneda para la URL
+    const symbolsParam = currencyCodes.map(code => `${code}%3DX`).join(',');
+    const url = `https://dmn46d7xas3rvio6tugd2vzs2q0hxbmb.lambda-url.us-east-1.on.aws/v1/market-quotes?symbols=${symbolsParam}`;
+    
+    console.log(`Consultando tasas para múltiples monedas: ${url}`);
     
     const { data } = await axios.get(url);
     
-    // Verificar si hay resultados y meta datos en la respuesta
-    if (data?.chart?.result?.[0]?.meta) {
-      const meta = data.chart.result[0].meta;
-      const rate = meta.regularMarketPrice || null;
+    // Procesar los resultados y organizarlos por código de moneda
+    const rates = {};
+    
+    if (Array.isArray(data)) {
+      data.forEach(currencyData => {
+        // Extraer el código de la moneda del símbolo (eliminando '%3DX')
+        const code = currencyData.symbol.replace('%3DX', '');
+        if (currencyData.regularMarketPrice && !isNaN(currencyData.regularMarketPrice)) {
+          rates[code] = currencyData.regularMarketPrice;
+        }
+      });
       
-      console.log(`✓ Tasa obtenida para ${currencyCode}: ${rate}`);
-      return rate;
+      return rates;
     }
     
-    console.warn(`✗ No se encontraron datos para ${currencyCode}`);
+    console.warn('Formato de respuesta inesperado:', data);
     return null;
   } catch (error) {
-    console.error(`✗ Error al obtener tasa para ${currencyCode} desde Yahoo Finance:`, error.message);
+    console.error(`Error al obtener tasas de cambio en lote:`, error.message);
     return null;
   }
+}
+
+function isNYSEMarketOpen() {
+  const now = new Date();
+  const utcHour = now.getUTCHours() + now.getUTCMinutes() / 60;
+  return utcHour >= NYSE_OPEN_HOUR && utcHour < NYSE_CLOSE_HOUR;
 }
 
 /**
@@ -35,104 +54,68 @@ async function getCurrencyRateFromYahoo(currencyCode) {
  * con los datos más recientes de Yahoo Finance
  */
 async function testUpdateCurrencyRates() {
-  try {
-    const db = admin.firestore();
-    const currenciesRef = db.collection('currencies');
+  /*if (!isNYSEMarketOpen()) {
+    console.log('El mercado NYSE está cerrado. No se actualizarán las tasas de cambio.');
+    return null;
+  }*/
 
-    // Obtener todas las monedas activas
+  const db = admin.firestore();
+  const currenciesRef = db.collection('currencies');
+
+  try {
     const snapshot = await currenciesRef.where('isActive', '==', true).get();
-    
-    if (snapshot.empty) {
-      console.log('No hay monedas activas en la colección "currencies"');
-      return 0;
-    }
-    
-    console.log(`Se encontraron ${snapshot.size} monedas activas`);
-    
-    // Crear batch para actualización masiva
     const batch = db.batch();
     let updatesCount = 0;
 
-    // Procesar cada moneda
-    for (const doc of snapshot.docs) {
-      const { code, name, symbol } = doc.data();
-
-      try {
-        // Obtener tasa de cambio desde Yahoo Finance
-        const newRate = await getCurrencyRateFromYahoo(code);
-
+    // Extraer todos los códigos de moneda activos
+    const activeCurrencies = snapshot.docs.map(doc => ({
+      code: doc.data().code,
+      ref: doc.ref,
+      data: doc.data()
+    }));
+    
+    const currencyCodes = activeCurrencies.map(currency => currency.code);
+    
+    // Obtener todas las tasas de cambio en una sola petición
+    const exchangeRates = await getCurrencyRatesBatch(currencyCodes);
+    
+    if (exchangeRates) {
+      activeCurrencies.forEach(currency => {
+        const { code, ref, data } = currency;
+        const newRate = exchangeRates[`${code}=X`];
+        
         if (newRate && !isNaN(newRate) && newRate > 0) {
           const updatedData = {
             code: code,
-            name: name,
-            symbol: symbol,
+            name: data.name,
+            symbol: data.symbol,
             exchangeRate: newRate,
             lastUpdated: admin.firestore.FieldValue.serverTimestamp()
           };
 
-          batch.update(doc.ref, updatedData);
+          batch.update(ref, updatedData);
           updatesCount++;
+          console.log(`Actualizada tasa de cambio para USD:${code} a ${newRate}`);
         } else {
-          console.warn(`✗ Valor inválido para ${code}: ${newRate}`);
+          console.warn(`Valor inválido para USD:${code}: ${newRate}`);
         }
-      } catch (error) {
-        console.error(`✗ Error al procesar ${code}:`, error.message);
+      });
+
+      if (updatesCount > 0) {
+        await batch.commit();
+        console.log(`${updatesCount} tasas de cambio han sido actualizadas`);
+      } else {
+        console.log('No se requirieron actualizaciones');
       }
-    }
-
-    // Guardar cambios en Firestore
-    if (updatesCount > 0) {
-      await batch.commit();
-      console.log(`✅ ${updatesCount} tasas de cambio han sido actualizadas`);
     } else {
-      console.log('No se requirieron actualizaciones');
+      console.error('No se pudieron obtener las tasas de cambio');
     }
-    
-    return updatesCount;
   } catch (error) {
-    console.error('🔥 Error general al actualizar tasas de cambio:', error);
-    throw error;
+    console.error('Error al actualizar tasas de cambio:', error);
   }
+
+  return null;
 }
 
-/**
- * Prueba la obtención de tasa de cambio para una moneda específica
- * @param {string} currencyCode - Código de la moneda a probar
- */
-async function testSingleCurrency(currencyCode) {
-  try {
-    console.log(`Probando obtención de tasa para: ${currencyCode}`);
-    const rate = await getCurrencyRateFromYahoo(currencyCode);
-    
-    if (rate) {
-      console.log(`✅ Prueba exitosa para ${currencyCode}: ${rate}`);
-    } else {
-      console.log(`❌ Prueba fallida para ${currencyCode}: no se pudo obtener la tasa`);
-    }
-    
-    return rate;
-  } catch (error) {
-    console.error(`❌ Error en prueba para ${currencyCode}:`, error);
-    return null;
-  }
-}
+testUpdateCurrencyRates();
 
-// Ejecutar prueba de una sola moneda (USD a COP)
-testSingleCurrency('COP')
-  .then(() => {
-    // Luego de probar una moneda específica, actualizar todas si la prueba fue exitosa
-    console.log('\n--- Actualizando todas las monedas activas ---\n');
-    return testUpdateCurrencyRates();
-  })
-  .then(count => {
-    console.log(`Proceso de prueba completado. ${count} monedas actualizadas.`);
-  })
-  .catch(error => {
-    console.error('Error en el proceso de prueba:', error);
-  });
-
-module.exports = { 
-  getCurrencyRateFromYahoo, 
-  testUpdateCurrencyRates,
-  testSingleCurrency
-}; 

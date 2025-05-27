@@ -4,7 +4,7 @@ const httpApp = require('./httpApi');
 // Habilitar las funciones actualizadas a v2
 const updateCurrencyRates = require('./services/updateCurrencyRates');
 const calcDailyPortfolioPerf = require('./services/calculateDailyPortfolioPerformance');
-const { scheduledUpdatePrices } = require('./services/updateCurrentPrices');
+const { scheduledUpdatePrices, scheduledUpdateQuotes } = require('./services/updateCurrentPrices');
 const processDividendPayments = require('./services/processDividendPayments');
 const marketStatusService = require('./services/marketStatusService');
 const { saveAllIndicesAndSectorsHistoryData } = require("./services/saveAllIndicesAndSectorsHistoryData");
@@ -61,6 +61,7 @@ exports.app = onRequest(etfProcessingOpts, httpApp);
 // Exportar las funciones actualizadas con un nombre diferente para v2
 exports.updateCurrencyRatesV2 = updateCurrencyRates.updateCurrencyRates;
 exports.scheduledUpdatePricesV2 = scheduledUpdatePrices;
+exports.scheduledUpdateQuotesV2 = scheduledUpdateQuotes;
 exports.saveAllIndicesAndSectorsHistoryDataV2 = saveAllIndicesAndSectorsHistoryData;
 exports.calcDailyPortfolioPerfV2 = calcDailyPortfolioPerf.calcDailyPortfolioPerf;
 exports.processDividendPaymentsV2 = processDividendPayments.processDividendPayments;

@@ -36,7 +36,8 @@ async function testSaveAllIndicesAndSectorsHistoryData() {
     };
 
     const batch = admin.firestore().batch();
-    const formattedDate = new Date().toISOString().split('T')[0];
+    //const formattedDate = new Date().toISOString().split('T')[0];
+    const formattedDate = '2025-05-09';
 
     indices.forEach(index => {
       // Datos a guardar en la colección principal
