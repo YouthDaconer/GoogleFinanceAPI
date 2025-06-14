@@ -5,6 +5,9 @@ const httpApp = require('./httpApi');
 // Nueva función unificada que combina updateCurrencyRates, updateCurrentPrices y calculateDailyPortfolioPerformance
 const { unifiedMarketDataUpdate } = require('./services/unifiedMarketDataUpdate');
 
+// Función para actualizaciones completas de datos de activos (mantener para ISINs y optionalKeys)
+const { scheduledUpdatePrices } = require('./services/updateCurrentPrices');
+
 const processDividendPayments = require('./services/processDividendPayments');
 const marketStatusService = require('./services/marketStatusService');
 const { saveAllIndicesAndSectorsHistoryData } = require("./services/saveAllIndicesAndSectorsHistoryData");
@@ -57,6 +60,9 @@ exports.app = onRequest(etfProcessingOpts, httpApp);
 
 // Nueva función unificada que reemplaza las tres funciones individuales
 exports.unifiedMarketDataUpdateV2 = unifiedMarketDataUpdate;
+
+// Función específica para actualizaciones completas de datos (ISINs y metadatos)
+exports.scheduledUpdatePricesV2 = scheduledUpdatePrices;
 
 // Exportar las demás funciones
 exports.saveAllIndicesAndSectorsHistoryDataV2 = saveAllIndicesAndSectorsHistoryData;
