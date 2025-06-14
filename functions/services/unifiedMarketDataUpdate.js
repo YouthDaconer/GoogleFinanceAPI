@@ -18,40 +18,66 @@ function isNYSEMarketOpen() {
 }
 
 /**
- * Obtiene las tasas de cambio actuales de múltiples monedas en una sola petición
+ * 🚀 OPTIMIZACIÓN: Función unificada que obtiene todos los datos de mercado en una sola llamada
+ * Combina monedas y símbolos de activos para minimizar llamadas a la API Lambda
  */
-async function getCurrencyRatesBatch(currencyCodes) {
+async function getAllMarketDataBatch(currencyCodes, assetSymbols) {
   try {
-    const symbolsParam = currencyCodes.map(code => `${code}%3DX`).join(',');
-    const url = `${API_BASE_URL}/market-quotes?symbols=${symbolsParam}`;
+    // Preparar símbolos de monedas (agregar %3DX para codificación URL)
+    const currencySymbols = currencyCodes.map(code => `${code}%3DX`);
     
-    console.log(`Consultando tasas para múltiples monedas: ${url}`);
+    // Combinar todos los símbolos en una sola consulta
+    const allSymbols = [...currencySymbols, ...assetSymbols];
     
-    const { data } = await axios.get(url);
-    const rates = {};
+    // Dividir en lotes más grandes (100 símbolos por llamada para optimizar)
+    const batchSize = 100;
+    const results = {
+      currencies: {},
+      assets: new Map()
+    };
     
-    if (Array.isArray(data)) {
-      data.forEach(currencyData => {
-        const code = currencyData.symbol.replace('%3DX', '');
-        if (currencyData.regularMarketPrice && !isNaN(currencyData.regularMarketPrice)) {
-          rates[code] = currencyData.regularMarketPrice;
-        }
-      });
-      return rates;
+    console.log(`📡 Consultando ${allSymbols.length} símbolos en ${Math.ceil(allSymbols.length / batchSize)} lotes optimizados`);
+    
+    for (let i = 0; i < allSymbols.length; i += batchSize) {
+      const symbolBatch = allSymbols.slice(i, i + batchSize);
+      const symbolsParam = symbolBatch.join(',');
+      
+      const url = `${API_BASE_URL}/market-quotes?symbols=${symbolsParam}`;
+      console.log(`🔄 Lote ${Math.floor(i/batchSize) + 1}: ${symbolBatch.length} símbolos`);
+      
+      const { data } = await axios.get(url);
+      
+      if (Array.isArray(data)) {
+        data.forEach(item => {
+          if (item.symbol && item.regularMarketPrice) {
+            // Si es una moneda (termina en =X en la respuesta)
+            if (item.symbol.includes('=X')) {
+              const currencyCode = item.symbol.replace('=X', '');
+              if (currencyCodes.includes(currencyCode)) {
+                results.currencies[currencyCode] = item.regularMarketPrice;
+              }
+            } 
+            // Si es un activo normal
+            else if (assetSymbols.includes(item.symbol)) {
+              results.assets.set(item.symbol, item);
+            }
+          }
+        });
+      }
     }
     
-    console.warn('Formato de respuesta inesperado para tasas de cambio:', data);
-    return null;
+    console.log(`✅ Datos obtenidos: ${Object.keys(results.currencies).length} monedas, ${results.assets.size} activos`);
+    return results;
   } catch (error) {
-    console.error(`Error al obtener tasas de cambio en lote:`, error.message);
-    return null;
+    console.error(`❌ Error al obtener datos de mercado en lote:`, error.message);
+    return { currencies: {}, assets: new Map() };
   }
 }
 
 /**
- * Actualiza las tasas de cambio de monedas
+ * Actualiza las tasas de cambio de monedas usando datos ya obtenidos
  */
-async function updateCurrencyRates(db) {
+async function updateCurrencyRates(db, currencyRates) {
   console.log('🔄 Actualizando tasas de cambio...');
   
   const currenciesRef = db.collection('currencies');
@@ -65,44 +91,39 @@ async function updateCurrencyRates(db) {
     data: doc.data()
   }));
   
-  const currencyCodes = activeCurrencies.map(currency => currency.code);
-  const exchangeRates = await getCurrencyRatesBatch(currencyCodes);
-  
-  if (exchangeRates) {
-    activeCurrencies.forEach(currency => {
-      const { code, ref, data } = currency;
-      const newRate = exchangeRates[code];
-      
-      if (newRate && !isNaN(newRate) && newRate > 0) {
-        const updatedData = {
-          code: code,
-          name: data.name,
-          symbol: data.symbol,
-          exchangeRate: newRate,
-          lastUpdated: admin.firestore.FieldValue.serverTimestamp()
-        };
+  activeCurrencies.forEach(currency => {
+    const { code, ref, data } = currency;
+    const newRate = currencyRates[code];
+    
+    if (newRate && !isNaN(newRate) && newRate > 0) {
+      const updatedData = {
+        code: code,
+        name: data.name,
+        symbol: data.symbol,
+        exchangeRate: newRate,
+        lastUpdated: admin.firestore.FieldValue.serverTimestamp()
+      };
 
-        batch.update(ref, updatedData);
-        updatesCount++;
-        console.log(`Actualizada tasa de cambio para USD:${code} a ${newRate}`);
-      } else {
-        console.warn(`Valor inválido para USD:${code}: ${newRate}`);
-      }
-    });
-
-    if (updatesCount > 0) {
-      await batch.commit();
-      console.log(`✅ ${updatesCount} tasas de cambio actualizadas`);
+      batch.update(ref, updatedData);
+      updatesCount++;
+      console.log(`Actualizada tasa de cambio para USD:${code} a ${newRate}`);
+    } else {
+      console.warn(`Valor inválido para USD:${code}: ${newRate}`);
     }
+  });
+
+  if (updatesCount > 0) {
+    await batch.commit();
+    console.log(`✅ ${updatesCount} tasas de cambio actualizadas`);
   }
   
   return updatesCount;
 }
 
 /**
- * Actualiza los precios actuales de los activos
+ * Actualiza los precios actuales de los activos usando datos ya obtenidos
  */
-async function updateCurrentPrices(db) {
+async function updateCurrentPrices(db, assetQuotes) {
   console.log('🔄 Actualizando precios actuales...');
   
   const currentPricesRef = db.collection('currentPrices');
@@ -110,59 +131,36 @@ async function updateCurrentPrices(db) {
   const batch = db.batch();
   let updatesCount = 0;
 
-  const symbols = snapshot.docs.map(doc => doc.data().symbol);
-  const batchSize = 50;
-  
-  for (let i = 0; i < symbols.length; i += batchSize) {
-    const symbolBatch = symbols.slice(i, i + batchSize);
-    const symbolsParam = symbolBatch.join(',');
+  snapshot.docs.forEach(doc => {
+    const docData = doc.data();
+    const symbol = docData.symbol;
+    const quote = assetQuotes.get(symbol);
     
-    try {
-      const response = await axios.get(`${API_BASE_URL}/market-quotes?symbols=${symbolsParam}`);
+    if (quote && quote.regularMarketPrice) {
+      const updatedData = {
+        symbol: symbol,
+        price: quote.regularMarketPrice,
+        lastUpdated: Date.now(),
+        change: quote.regularMarketChange,
+        percentChange: quote.regularMarketChangePercent,
+        previousClose: quote.regularMarketPreviousClose,
+        currency: quote.currency,
+        marketState: quote.marketState,
+        quoteType: quote.quoteType,
+        exchange: quote.exchange,
+        fullExchangeName: quote.fullExchangeName
+      };
       
-      if (Array.isArray(response.data)) {
-        const quotesMap = new Map(response.data.map(quote => [quote.symbol, quote]));
-        
-        for (const symbol of symbolBatch) {
-          const quote = quotesMap.get(symbol);
-          
-          if (quote && quote.regularMarketPrice) {
-            const matchingDocs = snapshot.docs.filter(doc => doc.data().symbol === symbol);
-            
-            if (matchingDocs.length > 0) {
-              const doc = matchingDocs[0];
-              const docData = doc.data();
-              
-              const updatedData = {
-                symbol: symbol,
-                price: quote.regularMarketPrice,
-                lastUpdated: Date.now(),
-                change: quote.regularMarketChange,
-                percentChange: quote.regularMarketChangePercent,
-                previousClose: quote.regularMarketPreviousClose,
-                currency: quote.currency,
-                marketState: quote.marketState,
-                quoteType: quote.quoteType,
-                exchange: quote.exchange,
-                fullExchangeName: quote.fullExchangeName
-              };
-              
-              // Mantener campos existentes
-              if (docData.name) updatedData.name = docData.name;
-              if (docData.isin) updatedData.isin = docData.isin;
-              if (docData.type) updatedData.type = docData.type;
-              
-              batch.update(doc.ref, updatedData);
-              updatesCount++;
-              console.log(`Actualizado precio para ${symbol}: ${quote.regularMarketPrice} ${quote.currency}`);
-            }
-          }
-        }
-      }
-    } catch (error) {
-      console.error(`Error al obtener cotizaciones para el lote:`, error.message);
+      // Mantener campos existentes
+      if (docData.name) updatedData.name = docData.name;
+      if (docData.isin) updatedData.isin = docData.isin;
+      if (docData.type) updatedData.type = docData.type;
+      
+      batch.update(doc.ref, updatedData);
+      updatesCount++;
+      console.log(`Actualizado precio para ${symbol}: ${quote.regularMarketPrice} ${quote.currency}`);
     }
-  }
+  });
 
   if (updatesCount > 0) {
     await batch.commit();
@@ -610,17 +608,31 @@ exports.unifiedMarketDataUpdate = onSchedule({
   const db = admin.firestore();
   const startTime = Date.now();
   
-  try {
-    // Paso 1: Actualizar tasas de cambio
-    const currencyUpdates = await updateCurrencyRates(db);
+      try {
+    // Paso 1: Obtener códigos de monedas y símbolos de activos dinámicamente
+    const [currenciesSnapshot, currentPricesSnapshot] = await Promise.all([
+      db.collection('currencies').where('isActive', '==', true).get(),
+      db.collection('currentPrices').get()
+    ]);
     
-    // Paso 2: Actualizar precios actuales
-    const priceUpdates = await updateCurrentPrices(db);
+    const currencyCodes = currenciesSnapshot.docs.map(doc => doc.data().code);
+    const assetSymbols = currentPricesSnapshot.docs.map(doc => doc.data().symbol);
     
-    // Paso 3: Calcular rendimiento del portafolio
+    console.log(`📊 Obteniendo datos para ${currencyCodes.length} monedas y ${assetSymbols.length} activos`);
+    
+    // Paso 2: Obtener TODOS los datos de mercado en llamadas optimizadas
+    const marketData = await getAllMarketDataBatch(currencyCodes, assetSymbols);
+    
+    // Paso 3: Actualizar tasas de cambio con datos ya obtenidos
+    const currencyUpdates = await updateCurrencyRates(db, marketData.currencies);
+    
+    // Paso 4: Actualizar precios actuales con datos ya obtenidos
+    const priceUpdates = await updateCurrentPrices(db, marketData.assets);
+    
+    // Paso 5: Calcular rendimiento del portafolio
     const portfolioCalculations = await calculateDailyPortfolioPerformance(db);
     
-    // Paso 4: Calcular riesgo del portafolio (usando datos actualizados)
+    // Paso 6: Calcular riesgo del portafolio (usando datos actualizados)
     console.log('🔄 Calculando riesgo del portafolio...');
     await calculatePortfolioRisk();
     console.log('✅ Riesgo del portafolio calculado');
