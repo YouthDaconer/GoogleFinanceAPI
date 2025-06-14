@@ -1,10 +1,10 @@
 require('dotenv').config();
 const { onRequest } = require("firebase-functions/v2/https");
 const httpApp = require('./httpApi');
-// Habilitar las funciones actualizadas a v2
-const updateCurrencyRates = require('./services/updateCurrencyRates');
-const calcDailyPortfolioPerf = require('./services/calculateDailyPortfolioPerformance');
-const { scheduledUpdatePrices, scheduledUpdateQuotes } = require('./services/updateCurrentPrices');
+
+// Nueva función unificada que combina updateCurrencyRates, updateCurrentPrices y calculateDailyPortfolioPerformance
+const { unifiedMarketDataUpdate } = require('./services/unifiedMarketDataUpdate');
+
 const processDividendPayments = require('./services/processDividendPayments');
 const marketStatusService = require('./services/marketStatusService');
 const { saveAllIndicesAndSectorsHistoryData } = require("./services/saveAllIndicesAndSectorsHistoryData");
@@ -12,9 +12,6 @@ const { saveAllIndicesAndSectorsHistoryData } = require("./services/saveAllIndic
 // Calcular semanalmente el porcentaje de semanas rentables
 const { onSchedule } = require("firebase-functions/v2/scheduler");
 const { calculateProfitableWeeks } = require('./services/calculateProfitableWeeks');
-
-// Calcular diariamente el riesgo del portafolio basado en beta
-const { calculatePortfolioRisk } = require('./services/calculatePortfolioRisk');
 
 // Configuración para habilitar la recolección de basura explícita
 // Solo funciona cuando se ejecuta con --expose-gc
@@ -58,12 +55,11 @@ const etfProcessingOpts = {
 // Exportar la app HTTP con las configuraciones específicas
 exports.app = onRequest(etfProcessingOpts, httpApp);
 
-// Exportar las funciones actualizadas con un nombre diferente para v2
-exports.updateCurrencyRatesV2 = updateCurrencyRates.updateCurrencyRates;
-exports.scheduledUpdatePricesV2 = scheduledUpdatePrices;
-exports.scheduledUpdateQuotesV2 = scheduledUpdateQuotes;
+// Nueva función unificada que reemplaza las tres funciones individuales
+exports.unifiedMarketDataUpdateV2 = unifiedMarketDataUpdate;
+
+// Exportar las demás funciones
 exports.saveAllIndicesAndSectorsHistoryDataV2 = saveAllIndicesAndSectorsHistoryData;
-exports.calcDailyPortfolioPerfV2 = calcDailyPortfolioPerf.calcDailyPortfolioPerf;
 exports.processDividendPaymentsV2 = processDividendPayments.processDividendPayments;
 exports.scheduledMarketStatusUpdateV2 = marketStatusService.scheduledMarketStatusUpdate;
 exports.scheduledMarketStatusUpdateAdditionalV2 = marketStatusService.scheduledMarketStatusUpdateAdditional;
@@ -81,22 +77,6 @@ exports.weeklyProfitableWeeksCalculation = onSchedule({
     return null;
   } catch (error) {
     console.error('Error en cálculo semanal de semanas rentables:', error);
-    return null;
-  }
-});
-
-exports.dailyPortfolioRiskCalculation = onSchedule({
-  schedule: "*/3 9-17 * * 1-5",
-  timeZone: "America/New_York",
-  retryCount: 3,
-}, async (event) => {
-  try {
-    console.log('Iniciando cálculo diario de riesgo del portafolio');
-    await calculatePortfolioRisk();
-    console.log('Cálculo diario de riesgo del portafolio completado con éxito');
-    return null;
-  } catch (error) {
-    console.error('Error en cálculo diario de riesgo del portafolio:', error);
     return null;
   }
 });
