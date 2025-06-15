@@ -171,32 +171,168 @@ async function updateCurrentPrices(db, assetQuotes) {
 }
 
 /**
- * Calcula el rendimiento diario del portafolio
+ * 🚀 OPTIMIZACIÓN: Sistema de caché para datos históricos
+ */
+class PerformanceDataCache {
+  constructor() {
+    this.userLastPerformance = new Map();
+    this.accountLastPerformance = new Map();
+    this.buyTransactionsByAsset = new Map();
+  }
+
+  async preloadHistoricalData(db, formattedDate, userPortfolios, sellTransactions) {
+    console.log('📁 Precargando datos históricos (OPTIMIZACIÓN)...');
+    
+    const allUserIds = Object.keys(userPortfolios);
+    const allAccountIds = Object.values(userPortfolios).flat().map(acc => acc.id);
+    const assetIdsWithSells = [...new Set(sellTransactions.map(t => t.assetId).filter(id => id))];
+
+    // ✨ OPTIMIZACIÓN: Consultas paralelas masivas
+    const [userPerformanceResults, accountPerformanceResults, buyTransactionsResults] = await Promise.all([
+      Promise.all(allUserIds.map(async (userId) => {
+        const userRef = db.collection('portfolioPerformance').doc(userId);
+        const query = await userRef.collection('dates')
+          .where('date', '<', formattedDate)
+          .orderBy('date', 'desc')
+          .limit(1)
+          .get();
+        return { userId, data: query.empty ? null : query.docs[0].data() };
+      })),
+      
+      Promise.all(allAccountIds.map(async (accountId) => {
+        const userId = Object.keys(userPortfolios).find(uid => 
+          userPortfolios[uid].some(acc => acc.id === accountId)
+        );
+        const accountRef = db.collection('portfolioPerformance')
+          .doc(userId)
+          .collection('accounts')
+          .doc(accountId);
+        const query = await accountRef.collection('dates')
+          .where('date', '<', formattedDate)
+          .orderBy('date', 'desc')
+          .limit(1)
+          .get();
+        return { accountId, data: query.empty ? null : query.docs[0].data() };
+      })),
+      
+      assetIdsWithSells.length > 0 ? 
+        db.collection('transactions')
+          .where('type', '==', 'buy')
+          .where('assetId', 'in', assetIdsWithSells)
+          .get() : 
+        { docs: [] }
+    ]);
+
+    // Procesar resultados
+    userPerformanceResults.forEach(({ userId, data }) => {
+      if (data) this.userLastPerformance.set(userId, data);
+    });
+
+    accountPerformanceResults.forEach(({ accountId, data }) => {
+      if (data) this.accountLastPerformance.set(accountId, data);
+    });
+
+    if (buyTransactionsResults.docs) {
+      const buyTransactions = buyTransactionsResults.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      buyTransactions.forEach(tx => {
+        if (!this.buyTransactionsByAsset.has(tx.assetId)) {
+          this.buyTransactionsByAsset.set(tx.assetId, []);
+        }
+        this.buyTransactionsByAsset.get(tx.assetId).push(tx);
+      });
+    }
+
+    console.log(`✅ Caché precargado: ${this.userLastPerformance.size} usuarios, ${this.accountLastPerformance.size} cuentas`);
+  }
+
+  getUserLastPerformance(userId, currencies) {
+    const data = this.userLastPerformance.get(userId);
+    if (!data) {
+      return currencies.reduce((acc, cur) => ({ ...acc, [cur.code]: { totalValue: 0 } }), {});
+    }
+    
+    return Object.entries(data).reduce((acc, [currency, currencyData]) => {
+      if (currency !== 'date') {
+        acc[currency] = {
+          totalValue: currencyData.totalValue || 0,
+          ...Object.entries(currencyData.assetPerformance || {}).reduce((assetAcc, [assetName, assetData]) => {
+            assetAcc[assetName] = { 
+              totalValue: assetData.totalValue || 0,
+              units: assetData.units || 0
+            };
+            return assetAcc;
+          }, {})
+        };
+      }
+      return acc;
+    }, {});
+  }
+
+  getAccountLastPerformance(accountId, currencies) {
+    const data = this.accountLastPerformance.get(accountId);
+    if (!data) {
+      return currencies.reduce((acc, cur) => ({ ...acc, [cur.code]: { totalValue: 0 } }), {});
+    }
+    
+    return Object.entries(data).reduce((acc, [currency, currencyData]) => {
+      if (currency !== 'date') {
+        acc[currency] = {
+          totalValue: currencyData.totalValue || 0,
+          ...Object.entries(currencyData.assetPerformance || {}).reduce((assetAcc, [assetName, assetData]) => {
+            assetAcc[assetName] = { 
+              totalValue: assetData.totalValue || 0,
+              units: assetData.units || 0
+            };
+            return assetAcc;
+          }, {})
+        };
+      }
+      return acc;
+    }, {});
+  }
+
+  getBuyTransactionsForAsset(assetId) {
+    return this.buyTransactionsByAsset.get(assetId) || [];
+  }
+}
+
+/**
+ * 🚀 OPTIMIZACIÓN: Calcula el rendimiento diario del portafolio con caché
  */
 async function calculateDailyPortfolioPerformance(db) {
-  console.log('🔄 Calculando rendimiento diario del portafolio...');
+  console.log('🔄 Calculando rendimiento diario del portafolio (OPTIMIZADO)...');
   
   const now = DateTime.now().setZone('America/New_York');
   const formattedDate = now.toISODate();
   let calculationsCount = 0;
   
-  // Obtener transacciones para el día actual
-  const transactionsSnapshot = await db.collection('transactions')
-    .where('date', '==', formattedDate)
-    .get();
+  console.log(`📅 Fecha de cálculo (NY): ${formattedDate}`);
+  
+  // ✨ OPTIMIZACIÓN: Todas las consultas iniciales en paralelo
+  const [
+    transactionsSnapshot,
+    activeAssetsSnapshot,
+    currenciesSnapshot,
+    portfolioAccountsSnapshot,
+    currentPricesSnapshot
+  ] = await Promise.all([
+    db.collection('transactions').where('date', '==', formattedDate).get(),
+    db.collection('assets').where('isActive', '==', true).get(),
+    db.collection('currencies').where('isActive', '==', true).get(),
+    db.collection('portfolioAccounts').where('isActive', '==', true).get(),
+    db.collection('currentPrices').get()
+  ]);
   
   const todaysTransactions = transactionsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
   const sellTransactions = todaysTransactions.filter(t => t.type === 'sell');
   const assetIdsInSellTransactions = [...new Set(sellTransactions.map(t => t.assetId).filter(id => id))];
   
-  // Obtener activos activos e inactivos necesarios
-  const [activeAssetsSnapshot, currenciesSnapshot, portfolioAccountsSnapshot] = await Promise.all([
-    db.collection('assets').where('isActive', '==', true).get(),
-    db.collection('currencies').where('isActive', '==', true).get(),
-    db.collection('portfolioAccounts').where('isActive', '==', true).get()
-  ]);
+  console.log(`📊 Transacciones encontradas para ${formattedDate}: ${todaysTransactions.length} (${sellTransactions.length} ventas)`);
   
   const activeAssets = activeAssetsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+  const currencies = currenciesSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+  const portfolioAccounts = portfolioAccountsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+  const currentPrices = currentPricesSnapshot.docs.map(doc => ({ symbol: doc.id.split(':')[0], ...doc.data() }));
   
   // Obtener activos inactivos involucrados en ventas
   let inactiveAssets = [];
@@ -214,33 +350,7 @@ async function calculateDailyPortfolioPerformance(db) {
   
   const allAssets = [...activeAssets, ...inactiveAssets];
   
-  // Obtener datos adicionales necesarios
-  const [currentPricesSnapshot] = await Promise.all([
-    db.collection('currentPrices').get()
-  ]);
-  
-  const currentPrices = currentPricesSnapshot.docs.map(doc => ({ symbol: doc.id.split(':')[0], ...doc.data() }));
-  const currencies = currenciesSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-  const portfolioAccounts = portfolioAccountsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-  
-  // Obtener transacciones de compra históricas para activos vendidos
-  const assetIdsWithSells = new Set(assetIdsInSellTransactions);
-  let buyTransactionsByAssetId = {};
-  
-  if (assetIdsWithSells.size > 0) {
-    const historicalBuyTransactionsSnapshot = await db.collection('transactions')
-      .where('type', '==', 'buy')
-      .where('assetId', 'in', [...assetIdsWithSells])
-      .get();
-    
-    const historicalBuyTransactions = historicalBuyTransactionsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-    
-    buyTransactionsByAssetId = historicalBuyTransactions.reduce((acc, t) => {
-      if (!acc[t.assetId]) acc[t.assetId] = [];
-      acc[t.assetId].push(t);
-      return acc;
-    }, {});
-  }
+  // ✨ OPTIMIZACIÓN: Las transacciones de compra ya están en el caché
   
   // Agrupar transacciones de venta por cuenta
   const sellTransactionsByAccount = sellTransactions.reduce((acc, transaction) => {
@@ -269,45 +379,22 @@ async function calculateDailyPortfolioPerformance(db) {
     return acc;
   }, {});
 
-  // Procesar cada usuario
+  // ✨ OPTIMIZACIÓN: Sistema de caché para datos históricos
+  const cache = new PerformanceDataCache();
+  await cache.preloadHistoricalData(db, formattedDate, userPortfolios, sellTransactions);
+
+  // ✨ OPTIMIZACIÓN: Batch único para todas las operaciones
+  const BATCH_SIZE = 450;
+  let batch = db.batch();
+  let batchCount = 0;
+
+  // Procesar cada usuario con datos precargados
+  console.log(`👥 Procesando ${Object.keys(userPortfolios).length} usuarios con cuentas activas`);
+  
   for (const [userId, accounts] of Object.entries(userPortfolios)) {
-    const batch = db.batch();
-
-    // Asegurar que el documento de usuario existe
-    const userPerformanceRef = db.collection('portfolioPerformance').doc(userId);
-    const userPerformanceDoc = await userPerformanceRef.get();
-    if (!userPerformanceDoc.exists) {
-      batch.set(userPerformanceRef, { userId });
-    }
-
-    // Encontrar la fecha más reciente con datos de rendimiento
-    const lastPerformanceQuery = await userPerformanceRef
-      .collection('dates')
-      .where('date', '<', formattedDate)
-      .orderBy('date', 'desc')
-      .limit(1)
-      .get();
-
-    let lastOverallTotalValue = currencies.reduce((acc, cur) => ({ ...acc, [cur.code]: { totalValue: 0 } }), {});
-
-    if (!lastPerformanceQuery.empty) {
-      const lastPerformanceDoc = lastPerformanceQuery.docs[0];
-      lastOverallTotalValue = Object.entries(lastPerformanceDoc.data() || {}).reduce((acc, [currency, data]) => {
-        if (currency !== 'date') {
-          acc[currency] = {
-            totalValue: data.totalValue || 0,
-            ...Object.entries(data.assetPerformance || {}).reduce((assetAcc, [assetName, assetData]) => {
-              assetAcc[assetName] = { 
-                totalValue: assetData.totalValue || 0,
-                units: assetData.units || 0
-              };
-              return assetAcc;
-            }, {})
-          };
-        }
-        return acc;
-      }, {});
-    }
+    console.log(`👤 Procesando usuario ${userId} con ${accounts.length} cuentas`);
+    // ✨ OPTIMIZACIÓN: Usar datos del caché en lugar de consultas individuales
+    const lastOverallTotalValue = cache.getUserLastPerformance(userId, currencies);
 
     const allUserAssets = assetsToInclude.filter(asset => 
       accounts.some(account => account.id === asset.portfolioAccount)
@@ -353,9 +440,9 @@ async function calculateDailyPortfolioPerformance(db) {
               assetDoneProfitAndLoss[assetKey] = 0;
             }
             
-            const buyTxsForAsset = buyTransactionsByAssetId[sellTx.assetId] || [];
-            
-            if (buyTxsForAsset.length > 0) {
+                          const buyTxsForAsset = cache.getBuyTransactionsForAsset(sellTx.assetId);
+              
+              if (buyTxsForAsset.length > 0) {
               let totalBuyCost = 0;
               let totalBuyUnits = 0;
               
@@ -417,14 +504,18 @@ async function calculateDailyPortfolioPerformance(db) {
       }
     }
 
+    // ✨ OPTIMIZACIÓN: Asegurar documento de usuario (idempotente)
+    const userPerformanceRef = db.collection('portfolioPerformance').doc(userId);
+    batch.set(userPerformanceRef, { userId }, { merge: true });
+    batchCount++;
+
     // Guardar rendimiento general del usuario
-    const userOverallPerformanceRef = userPerformanceRef
-      .collection('dates')
-      .doc(formattedDate);
+    const userOverallPerformanceRef = userPerformanceRef.collection('dates').doc(formattedDate);
     batch.set(userOverallPerformanceRef, {
       date: formattedDate,
       ...overallPerformance
-    }, { merge: true });
+    });
+    batchCount++;
 
     // Procesar cada cuenta del usuario
     for (const account of accounts) {
@@ -439,39 +530,8 @@ async function calculateDailyPortfolioPerformance(db) {
         ...inactiveAccountAssetsWithSells
       ];
 
-      const accountRef = userPerformanceRef.collection('accounts').doc(account.id);
-      const accountDoc = await accountRef.get();
-      if (!accountDoc.exists) {
-        batch.set(accountRef, { accountId: account.id });
-      }
-
-      const lastAccountPerformanceQuery = await accountRef
-        .collection('dates')
-        .where('date', '<', formattedDate)
-        .orderBy('date', 'desc')
-        .limit(1)
-        .get();
-
-      let lastAccountTotalValue = currencies.reduce((acc, cur) => ({ ...acc, [cur.code]: { totalValue: 0 } }), {});
-
-      if (!lastAccountPerformanceQuery.empty) {
-        const lastAccountPerformanceDoc = lastAccountPerformanceQuery.docs[0];
-        lastAccountTotalValue = Object.entries(lastAccountPerformanceDoc.data() || {}).reduce((acc, [currency, data]) => {
-          if (currency !== 'date') {
-            acc[currency] = {
-              totalValue: data.totalValue || 0,
-              ...Object.entries(data.assetPerformance || {}).reduce((assetAcc, [assetName, assetData]) => {
-                assetAcc[assetName] = { 
-                  totalValue: assetData.totalValue || 0,
-                  units: assetData.units || 0
-                };
-                return assetAcc;
-              }, {})
-            };
-          }
-          return acc;
-        }, {});
-      }
+      // ✨ OPTIMIZACIÓN: Usar datos del caché para la cuenta
+      const lastAccountTotalValue = cache.getAccountLastPerformance(account.id, currencies);
 
       const accountTransactions = userTransactions.filter(t => t.portfolioAccountId === account.id);
       const accountPerformance = calculateAccountPerformance(
@@ -507,7 +567,7 @@ async function calculateDailyPortfolioPerformance(db) {
                 accountAssetDoneProfitAndLoss[assetKey] = 0;
               }
               
-              const buyTxsForAsset = buyTransactionsByAssetId[sellTx.assetId] || [];
+              const buyTxsForAsset = cache.getBuyTransactionsForAsset(sellTx.assetId);
               
               if (buyTxsForAsset.length > 0) {
                 let totalBuyCost = 0;
@@ -571,22 +631,40 @@ async function calculateDailyPortfolioPerformance(db) {
         }
       }
 
+      // ✨ OPTIMIZACIÓN: Asegurar documento de cuenta (idempotente)
+      const accountRef = userPerformanceRef.collection('accounts').doc(account.id);
+      batch.set(accountRef, { accountId: account.id }, { merge: true });
+      batchCount++;
+
       // Guardar rendimiento de la cuenta
-      const accountPerformanceRef = accountRef
-        .collection('dates')
-        .doc(formattedDate);
+      const accountPerformanceRef = accountRef.collection('dates').doc(formattedDate);
       batch.set(accountPerformanceRef, {
         date: formattedDate,
         ...accountPerformance
-      }, { merge: true });
+      });
+      batchCount++;
+
+      // ✨ Commit batch si se acerca al límite
+      if (batchCount >= BATCH_SIZE) {
+        await batch.commit();
+        console.log(`📦 Batch de ${batchCount} operaciones completado y guardado en Firestore`);
+        batch = db.batch();
+        batchCount = 0;
+      }
     }
 
-    await batch.commit();
     calculationsCount++;
-    console.log(`Rendimiento calculado para usuario ${userId}`);
   }
 
-  console.log(`✅ Rendimiento calculado para ${calculationsCount} usuarios`);
+  // ✨ Commit final del batch
+  if (batchCount > 0) {
+    await batch.commit();
+    console.log(`📦 Batch final de ${batchCount} operaciones completado y guardado en Firestore`);
+  } else {
+    console.log(`ℹ️ No hay operaciones pendientes para guardar`);
+  }
+
+  console.log(`✅ Rendimiento calculado para ${calculationsCount} usuarios (OPTIMIZADO)`);
   return calculationsCount;
 }
 
