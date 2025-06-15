@@ -1,4 +1,4 @@
-const admin = require('./firebaseAdmin');
+const admin = require('../services/firebaseAdmin');
 const fs = require('fs');
 const path = require('path');
 

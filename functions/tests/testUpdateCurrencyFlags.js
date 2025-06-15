@@ -1,4 +1,4 @@
-const admin = require('./firebaseAdmin');
+const admin = require('../services/firebaseAdmin');
 const axios = require('axios');
 
 /**

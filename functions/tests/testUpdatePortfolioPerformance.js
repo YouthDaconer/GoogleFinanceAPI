@@ -1,4 +1,4 @@
-const admin = require('./firebaseAdmin');
+const admin = require('../services/firebaseAdmin');
 const { calculateAccountPerformance, convertCurrency } = require('../utils/portfolioCalculations');
 const { DateTime } = require('luxon');
 

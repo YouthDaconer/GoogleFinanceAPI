@@ -1,5 +1,5 @@
-const admin = require('./firebaseAdmin');
-const { getQuotes } = require('./financeQuery');
+const admin = require('../services/firebaseAdmin');
+const { getQuotes } = require('../services/financeQuery');
 const axios = require('axios'); // Asegúrate de tener esta dependencia instalada
 
 const API_BASE_URL = 'https://dmn46d7xas3rvio6tugd2vzs2q0hxbmb.lambda-url.us-east-1.on.aws/v1';

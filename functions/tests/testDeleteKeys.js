@@ -1,4 +1,4 @@
-const admin = require('./firebaseAdmin');
+const admin = require('../services/firebaseAdmin');
 const { FieldValue } = admin.firestore;
 
 async function forceDeleteLegacyKeys(userId) {

@@ -1,7 +1,7 @@
-const admin = require('./firebaseAdmin');
+const admin = require('../services/firebaseAdmin');
 const { convertCurrency } = require('../utils/portfolioCalculations');
 const { DateTime } = require('luxon');
-const fetchHistoricalExchangeRate = require('./fetchHistoricalExchangeRate');
+const fetchHistoricalExchangeRate = require('../services/fetchHistoricalExchangeRate');
 
 /**
  * Obtiene las tasas de cambio para todas las monedas en un rango de fechas

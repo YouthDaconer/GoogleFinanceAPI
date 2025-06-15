@@ -1,5 +1,5 @@
 // functions/services/testMarketStatusUpdate.js
-const admin = require('./firebaseAdmin');
+const admin = require('../services/firebaseAdmin');
 const { DateTime } = require('luxon');
 const axios = require('axios');
 

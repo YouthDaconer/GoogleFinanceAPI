@@ -1,6 +1,6 @@
-const admin = require('./firebaseAdmin');
+const admin = require('../services/firebaseAdmin');
 const { DateTime } = require('luxon');
-const { scrapeDividendsInfoFromStockEvents } = require('./scrapeDividendsInfoFromStock');
+const { scrapeDividendsInfoFromStockEvents } = require('../services/scrapeDividendsInfoFromStock');
 
 async function testProcessDividendPayments(testDate) {
   const db = admin.firestore();

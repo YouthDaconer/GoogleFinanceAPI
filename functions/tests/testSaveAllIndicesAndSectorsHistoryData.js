@@ -1,5 +1,5 @@
-const admin = require('./firebaseAdmin');
-const requestIndicesFromFinance = require('./requestIndicesFromFinance');
+const admin = require('../services/firebaseAdmin');
+const requestIndicesFromFinance = require('../services/requestIndicesFromFinance');
 const axios = require('axios');
 
 const normalizeNumber = (value) => {
