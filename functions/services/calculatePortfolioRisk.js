@@ -1,6 +1,26 @@
 const admin = require('firebase-admin');
 const { DateTime } = require('luxon');
 
+// 🚀 OPTIMIZACIÓN: Control de logging para reducir costos
+const LOG_LEVEL = process.env.LOG_LEVEL || 'INFO'; // 'DEBUG', 'INFO', 'WARN', 'ERROR'
+const ENABLE_DETAILED_LOGS = process.env.ENABLE_DETAILED_LOGS === 'true';
+
+function logDebug(...args) {
+  if (LOG_LEVEL === 'DEBUG') console.log(...args);
+}
+
+function logInfo(...args) {
+  if (['DEBUG', 'INFO'].includes(LOG_LEVEL)) console.log(...args);
+}
+
+function logWarn(...args) {
+  if (['DEBUG', 'INFO', 'WARN'].includes(LOG_LEVEL)) console.warn(...args);
+}
+
+function logError(...args) {
+  console.error(...args); // Siempre loguear errores
+}
+
 /**
  * Calcula el riesgo del portafolio basado en el beta de los activos
  * @returns {Promise<null>}
@@ -32,9 +52,18 @@ async function calculatePortfolioRisk() {
     const currenciesSnapshot = await db.collection('currencies').where('isActive', '==', true).get();
     const currencies = currenciesSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
     
+    // 🚀 OPTIMIZACIÓN: Log consolidado inicial
+    logInfo(`📊 Iniciando cálculo de riesgo para ${userIds.length} usuarios`);
+    
+    let processedUsers = 0;
+    let usersWithData = 0;
+    let totalAccounts = 0;
+    let totalAssets = 0;
+    
     // Para cada usuario
     for (const userId of userIds) {
-      console.log(`Calculando riesgo para usuario: ${userId}`);
+      // 🚀 OPTIMIZACIÓN: Solo log detallado si está habilitado
+      logDebug(`Calculando riesgo para usuario: ${userId}`);
       
       // Obtener cuentas del usuario
       const accountsSnapshot = await db.collection('portfolioAccounts')
@@ -48,7 +77,8 @@ async function calculatePortfolioRisk() {
       }));
       
       if (accounts.length === 0) {
-        console.log(`No hay cuentas activas para el usuario ${userId}`);
+        logDebug(`No hay cuentas activas para el usuario ${userId}`);
+        processedUsers++;
         continue;
       }
       
@@ -67,7 +97,8 @@ async function calculatePortfolioRisk() {
       }));
       
       if (assets.length === 0) {
-        console.log(`No hay activos activos para el usuario ${userId}`);
+        logDebug(`No hay activos activos para el usuario ${userId}`);
+        processedUsers++;
         continue;
       }
       
@@ -140,13 +171,24 @@ async function calculatePortfolioRisk() {
       
       // Guardar todos los cambios
       await batch.commit();
-      console.log(`Datos de riesgo calculados y actualizados para el usuario ${userId}`);
+      
+      // 🚀 OPTIMIZACIÓN: Contadores para log consolidado
+      processedUsers++;
+      usersWithData++;
+      totalAccounts += accounts.length;
+      totalAssets += assets.length;
+      
+      // 🚀 OPTIMIZACIÓN: Solo log detallado si está habilitado
+      if (ENABLE_DETAILED_LOGS) {
+        logDebug(`Datos de riesgo calculados para usuario ${userId} (${accounts.length} cuentas, ${assets.length} activos)`);
+      }
     }
     
-    console.log('Cálculo de riesgo del portafolio completado');
+    // 🚀 OPTIMIZACIÓN: Log consolidado final
+    logInfo(`✅ Cálculo de riesgo completado: ${usersWithData}/${processedUsers} usuarios procesados, ${totalAccounts} cuentas, ${totalAssets} activos`);
     return null;
   } catch (error) {
-    console.error('Error al calcular riesgo del portafolio:', error);
+    logError('❌ Error al calcular riesgo del portafolio:', error);
     return null;
   }
 }
@@ -296,11 +338,11 @@ if (require.main === module) {
   
   calculatePortfolioRisk()
     .then(() => {
-      console.log('Proceso completado');
+      logInfo('✅ Proceso completado');
       process.exit(0);
     })
     .catch(error => {
-      console.error('Error en el proceso principal:', error);
+      logError('❌ Error en el proceso principal:', error);
       process.exit(1);
     });
 } 

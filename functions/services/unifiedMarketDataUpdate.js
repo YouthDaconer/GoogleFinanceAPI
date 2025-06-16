@@ -11,6 +11,26 @@ const API_BASE_URL = 'https://dmn46d7xas3rvio6tugd2vzs2q0hxbmb.lambda-url.us-eas
 const NYSE_OPEN_HOUR = 13.5;  // 9:30 AM EST
 const NYSE_CLOSE_HOUR = 20;   // 4:00 PM EST
 
+// 🚀 OPTIMIZACIÓN: Control de logging para reducir costos
+const LOG_LEVEL = process.env.LOG_LEVEL || 'INFO'; // 'DEBUG', 'INFO', 'WARN', 'ERROR'
+const ENABLE_DETAILED_LOGS = process.env.ENABLE_DETAILED_LOGS === 'true';
+
+function logDebug(...args) {
+  if (LOG_LEVEL === 'DEBUG') console.log(...args);
+}
+
+function logInfo(...args) {
+  if (['DEBUG', 'INFO'].includes(LOG_LEVEL)) console.log(...args);
+}
+
+function logWarn(...args) {
+  if (['DEBUG', 'INFO', 'WARN'].includes(LOG_LEVEL)) console.warn(...args);
+}
+
+function logError(...args) {
+  console.error(...args); // Siempre loguear errores
+}
+
 function isNYSEMarketOpen() {
   const now = new Date();
   const utcHour = now.getUTCHours() + now.getUTCMinutes() / 60;
@@ -36,14 +56,14 @@ async function getAllMarketDataBatch(currencyCodes, assetSymbols) {
       assets: new Map()
     };
     
-    console.log(`📡 Consultando ${allSymbols.length} símbolos en ${Math.ceil(allSymbols.length / batchSize)} lotes optimizados`);
+    logInfo(`📡 Consultando ${allSymbols.length} símbolos en ${Math.ceil(allSymbols.length / batchSize)} lotes optimizados`);
     
     for (let i = 0; i < allSymbols.length; i += batchSize) {
       const symbolBatch = allSymbols.slice(i, i + batchSize);
       const symbolsParam = symbolBatch.join(',');
       
       const url = `${API_BASE_URL}/market-quotes?symbols=${symbolsParam}`;
-      console.log(`🔄 Lote ${Math.floor(i/batchSize) + 1}: ${symbolBatch.length} símbolos`);
+      logDebug(`🔄 Lote ${Math.floor(i/batchSize) + 1}: ${symbolBatch.length} símbolos`);
       
       const { data } = await axios.get(url);
       
@@ -66,10 +86,10 @@ async function getAllMarketDataBatch(currencyCodes, assetSymbols) {
       }
     }
     
-    console.log(`✅ Datos obtenidos: ${Object.keys(results.currencies).length} monedas, ${results.assets.size} activos`);
+    logInfo(`✅ Datos obtenidos: ${Object.keys(results.currencies).length} monedas, ${results.assets.size} activos`);
     return results;
   } catch (error) {
-    console.error(`❌ Error al obtener datos de mercado en lote:`, error.message);
+    logError(`❌ Error al obtener datos de mercado en lote:`, error.message);
     return { currencies: {}, assets: new Map() };
   }
 }
@@ -78,12 +98,13 @@ async function getAllMarketDataBatch(currencyCodes, assetSymbols) {
  * Actualiza las tasas de cambio de monedas usando datos ya obtenidos
  */
 async function updateCurrencyRates(db, currencyRates) {
-  console.log('🔄 Actualizando tasas de cambio...');
+  logDebug('🔄 Actualizando tasas de cambio...');
   
   const currenciesRef = db.collection('currencies');
   const snapshot = await currenciesRef.where('isActive', '==', true).get();
   const batch = db.batch();
   let updatesCount = 0;
+  let invalidCount = 0;
 
   const activeCurrencies = snapshot.docs.map(doc => ({
     code: doc.data().code,
@@ -106,15 +127,20 @@ async function updateCurrencyRates(db, currencyRates) {
 
       batch.update(ref, updatedData);
       updatesCount++;
-      console.log(`Actualizada tasa de cambio para USD:${code} a ${newRate}`);
+      
+      // 🚀 OPTIMIZACIÓN: Solo log detallado si está habilitado
+      if (ENABLE_DETAILED_LOGS) {
+        logDebug(`Actualizada tasa de cambio para USD:${code} a ${newRate}`);
+      }
     } else {
-      console.warn(`Valor inválido para USD:${code}: ${newRate}`);
+      invalidCount++;
+      logWarn(`Valor inválido para USD:${code}: ${newRate}`);
     }
   });
 
   if (updatesCount > 0) {
     await batch.commit();
-    console.log(`✅ ${updatesCount} tasas de cambio actualizadas`);
+    logInfo(`✅ ${updatesCount} tasas de cambio actualizadas${invalidCount > 0 ? ` (${invalidCount} inválidas)` : ''}`);
   }
   
   return updatesCount;
@@ -124,12 +150,13 @@ async function updateCurrencyRates(db, currencyRates) {
  * Actualiza los precios actuales de los activos usando datos ya obtenidos
  */
 async function updateCurrentPrices(db, assetQuotes) {
-  console.log('🔄 Actualizando precios actuales...');
+  logDebug('🔄 Actualizando precios actuales...');
   
   const currentPricesRef = db.collection('currentPrices');
   const snapshot = await currentPricesRef.get();
   const batch = db.batch();
   let updatesCount = 0;
+  let failedUpdates = 0;
 
   snapshot.docs.forEach(doc => {
     const docData = doc.data();
@@ -158,13 +185,19 @@ async function updateCurrentPrices(db, assetQuotes) {
       
       batch.update(doc.ref, updatedData);
       updatesCount++;
-      console.log(`Actualizado precio para ${symbol}: ${quote.regularMarketPrice} ${quote.currency}`);
+      
+      // 🚀 OPTIMIZACIÓN: Solo log detallado si está habilitado
+      if (ENABLE_DETAILED_LOGS) {
+        logDebug(`Actualizado precio para ${symbol}: ${quote.regularMarketPrice} ${quote.currency}`);
+      }
+    } else {
+      failedUpdates++;
     }
   });
 
   if (updatesCount > 0) {
     await batch.commit();
-    console.log(`✅ ${updatesCount} precios actualizados`);
+    logInfo(`✅ ${updatesCount} precios actualizados${failedUpdates > 0 ? ` (${failedUpdates} fallidos)` : ''}`);
   }
   
   return updatesCount;
@@ -181,7 +214,7 @@ class PerformanceDataCache {
   }
 
   async preloadHistoricalData(db, formattedDate, userPortfolios, sellTransactions) {
-    console.log('📁 Precargando datos históricos (OPTIMIZACIÓN)...');
+    logDebug('📁 Precargando datos históricos (OPTIMIZACIÓN)...');
     
     const allUserIds = Object.keys(userPortfolios);
     const allAccountIds = Object.values(userPortfolios).flat().map(acc => acc.id);
@@ -242,7 +275,7 @@ class PerformanceDataCache {
       });
     }
 
-    console.log(`✅ Caché precargado: ${this.userLastPerformance.size} usuarios, ${this.accountLastPerformance.size} cuentas`);
+    logInfo(`✅ Caché precargado: ${this.userLastPerformance.size} usuarios, ${this.accountLastPerformance.size} cuentas`);
   }
 
   getUserLastPerformance(userId, currencies) {
@@ -300,13 +333,13 @@ class PerformanceDataCache {
  * 🚀 OPTIMIZACIÓN: Calcula el rendimiento diario del portafolio con caché
  */
 async function calculateDailyPortfolioPerformance(db) {
-  console.log('🔄 Calculando rendimiento diario del portafolio (OPTIMIZADO)...');
+  logInfo('🔄 Calculando rendimiento diario del portafolio (OPTIMIZADO)...');
   
   const now = DateTime.now().setZone('America/New_York');
   const formattedDate = now.toISODate();
   let calculationsCount = 0;
   
-  console.log(`📅 Fecha de cálculo (NY): ${formattedDate}`);
+  logDebug(`📅 Fecha de cálculo (NY): ${formattedDate}`);
   
   // ✨ OPTIMIZACIÓN: Todas las consultas iniciales en paralelo
   const [
@@ -327,7 +360,8 @@ async function calculateDailyPortfolioPerformance(db) {
   const sellTransactions = todaysTransactions.filter(t => t.type === 'sell');
   const assetIdsInSellTransactions = [...new Set(sellTransactions.map(t => t.assetId).filter(id => id))];
   
-  console.log(`📊 Transacciones encontradas para ${formattedDate}: ${todaysTransactions.length} (${sellTransactions.length} ventas)`);
+  // 🚀 OPTIMIZACIÓN: Log consolidado de transacciones
+  logInfo(`📊 Transacciones para ${formattedDate}: ${todaysTransactions.length} total (${sellTransactions.length} ventas)`);
   
   const activeAssets = activeAssetsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
   const currencies = currenciesSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
@@ -345,7 +379,7 @@ async function calculateDailyPortfolioPerformance(db) {
       .map(doc => ({ id: doc.id, ...doc.data() }))
       .filter(asset => assetIdsInSellTransactions.includes(asset.id));
     
-    console.log(`Obtenidos ${inactiveAssets.length} activos inactivos involucrados en ventas`);
+    logDebug(`Obtenidos ${inactiveAssets.length} activos inactivos involucrados en ventas`);
   }
   
   const allAssets = [...activeAssets, ...inactiveAssets];
@@ -387,12 +421,15 @@ async function calculateDailyPortfolioPerformance(db) {
   const BATCH_SIZE = 450;
   let batch = db.batch();
   let batchCount = 0;
+  let totalBatchesCommitted = 0;
 
-  // Procesar cada usuario con datos precargados
-  console.log(`👥 Procesando ${Object.keys(userPortfolios).length} usuarios con cuentas activas`);
+  // 🚀 OPTIMIZACIÓN: Log consolidado de procesamiento
+  const userCount = Object.keys(userPortfolios).length;
+  const totalAccounts = Object.values(userPortfolios).flat().length;
+  logInfo(`👥 Procesando ${userCount} usuarios con ${totalAccounts} cuentas activas`);
   
   for (const [userId, accounts] of Object.entries(userPortfolios)) {
-    console.log(`👤 Procesando usuario ${userId} con ${accounts.length} cuentas`);
+    logDebug(`👤 Procesando usuario ${userId} con ${accounts.length} cuentas`);
     // ✨ OPTIMIZACIÓN: Usar datos del caché en lugar de consultas individuales
     const lastOverallTotalValue = cache.getUserLastPerformance(userId, currencies);
 
@@ -647,7 +684,8 @@ async function calculateDailyPortfolioPerformance(db) {
       // ✨ Commit batch si se acerca al límite
       if (batchCount >= BATCH_SIZE) {
         await batch.commit();
-        console.log(`📦 Batch de ${batchCount} operaciones completado y guardado en Firestore`);
+        totalBatchesCommitted++;
+        logDebug(`📦 Batch ${totalBatchesCommitted} de ${batchCount} operaciones completado`);
         batch = db.batch();
         batchCount = 0;
       }
@@ -659,12 +697,11 @@ async function calculateDailyPortfolioPerformance(db) {
   // ✨ Commit final del batch
   if (batchCount > 0) {
     await batch.commit();
-    console.log(`📦 Batch final de ${batchCount} operaciones completado y guardado en Firestore`);
-  } else {
-    console.log(`ℹ️ No hay operaciones pendientes para guardar`);
+    totalBatchesCommitted++;
+    logDebug(`📦 Batch final ${totalBatchesCommitted} de ${batchCount} operaciones completado`);
   }
 
-  console.log(`✅ Rendimiento calculado para ${calculationsCount} usuarios (OPTIMIZADO)`);
+  logInfo(`✅ Rendimiento calculado para ${calculationsCount} usuarios (${totalBatchesCommitted} batches)`);
   return calculationsCount;
 }
 
@@ -677,11 +714,11 @@ exports.unifiedMarketDataUpdate = onSchedule({
   retryCount: 3,
 }, async (event) => {
   if (!isNYSEMarketOpen()) {
-    console.log('🔴 El mercado NYSE está cerrado. Omitiendo actualizaciones.');
+    logInfo('🔴 El mercado NYSE está cerrado. Omitiendo actualizaciones.');
     return null;
   }
 
-  console.log('🚀 Iniciando actualización unificada de datos de mercado...');
+  logInfo('🚀 Iniciando actualización unificada de datos de mercado...');
   
   const db = admin.firestore();
   const startTime = Date.now();
@@ -696,7 +733,7 @@ exports.unifiedMarketDataUpdate = onSchedule({
     const currencyCodes = currenciesSnapshot.docs.map(doc => doc.data().code);
     const assetSymbols = currentPricesSnapshot.docs.map(doc => doc.data().symbol);
     
-    console.log(`📊 Obteniendo datos para ${currencyCodes.length} monedas y ${assetSymbols.length} activos`);
+    logInfo(`📊 Obteniendo datos para ${currencyCodes.length} monedas y ${assetSymbols.length} activos`);
     
     // Paso 2: Obtener TODOS los datos de mercado en llamadas optimizadas
     const marketData = await getAllMarketDataBatch(currencyCodes, assetSymbols);
@@ -711,22 +748,22 @@ exports.unifiedMarketDataUpdate = onSchedule({
     const portfolioCalculations = await calculateDailyPortfolioPerformance(db);
     
     // Paso 6: Calcular riesgo del portafolio (usando datos actualizados)
-    console.log('🔄 Calculando riesgo del portafolio...');
+    logDebug('🔄 Calculando riesgo del portafolio...');
     await calculatePortfolioRisk();
-    console.log('✅ Riesgo del portafolio calculado');
+    logDebug('✅ Riesgo del portafolio calculado');
     
     const endTime = Date.now();
     const executionTime = (endTime - startTime) / 1000;
     
-    console.log(`🎉 Actualización unificada completada en ${executionTime}s:`);
-    console.log(`   - ${currencyUpdates} tasas de cambio actualizadas`);
-    console.log(`   - ${priceUpdates} precios actualizados`);
-    console.log(`   - ${portfolioCalculations} portafolios calculados`);
-    console.log(`   - ✅ Riesgo de portafolios calculado`);
+    logInfo(`🎉 Actualización unificada completada en ${executionTime}s:`);
+    logInfo(`   - ${currencyUpdates} tasas de cambio actualizadas`);
+    logInfo(`   - ${priceUpdates} precios actualizados`);
+    logInfo(`   - ${portfolioCalculations} portafolios calculados`);
+    logInfo(`   - ✅ Riesgo de portafolios calculado`);
     
     return null;
   } catch (error) {
-    console.error('❌ Error en actualización unificada:', error);
+    logError('❌ Error en actualización unificada:', error);
     return null;
   }
 }); 
