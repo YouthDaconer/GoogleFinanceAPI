@@ -153,6 +153,18 @@ exports.processDividendPayments = onSchedule({
         continue;
       }
 
+      // Obtener información de la cuenta para aplicar deducción de impuestos
+      const portfolioAccountRef = db.collection('portfolioAccounts').doc(portfolioSymbolData.portfolioAccountId);
+      const portfolioAccountDoc = await portfolioAccountRef.get();
+      const portfolioAccountData = portfolioAccountDoc.data();
+      const taxDeductionPercentage = portfolioAccountData?.taxDeductionPercentage || 0;
+
+      // Calcular montos bruto y neto
+      const quarterlyDividendPerUnit = annualDividend / 4;
+      const grossAmount = quarterlyDividendPerUnit * totalUnits;
+      const taxDeductionAmount = grossAmount * (taxDeductionPercentage / 100);
+      const netAmount = grossAmount - taxDeductionAmount;
+
       // Crear una única transacción de dividendo para esta cuenta y símbolo
       const transactionRef = db.collection('transactions').doc();
       const transaction = {
@@ -160,7 +172,7 @@ exports.processDividendPayments = onSchedule({
         symbol: portfolioSymbolData.symbol,
         type: 'dividendPay',
         amount: totalUnits,
-        price: annualDividend / 4,
+        price: netAmount / totalUnits, // Precio por unidad después de impuestos
         currency: portfolioSymbolData.currency || 'USD',
         date: formattedDate,
         portfolioAccountId: portfolioSymbolData.portfolioAccountId,
@@ -168,19 +180,21 @@ exports.processDividendPayments = onSchedule({
         assetType: portfolioSymbolData.assetType,
         dollarPriceToDate: currencies.find(c => c.code === 'USD')?.exchangeRate || 1,
         defaultCurrencyForAdquisitionDollar: portfolioSymbolData.defaultCurrencyForAdquisitionDollar || 'USD',
-        description: `Pago de dividendo anual de ${portfolioSymbolData.dividend.name || portfolioSymbolData.symbol} (${totalUnits} unidades)`,
+        description: `Pago de dividendo anual de ${portfolioSymbolData.dividend.name || portfolioSymbolData.symbol} (${totalUnits} unidades)${taxDeductionPercentage > 0 ? ` - Impuestos deducidos: ${taxDeductionPercentage}%` : ''}`,
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
         userId: portfolioSymbolData.userId,
-        relatedAssets: portfolioSymbolData.relatedAssets
+        relatedAssets: portfolioSymbolData.relatedAssets,
+        taxDeductionPercentage: taxDeductionPercentage,
+        taxDeductionAmount: taxDeductionAmount,
+        grossAmount: grossAmount
       };
 
       batch.set(transactionRef, transaction);
       transactionsCreated++;
 
-      const amount = (annualDividend / 4) * totalUnits;
-      console.log(`Creada transacción de dividendo para ${portfolioSymbolData.symbol} en cuenta ${portfolioSymbolData.portfolioAccountId}, unidades totales: ${totalUnits}, monto: ${amount} ${transaction.currency}`);
+      console.log(`Creada transacción de dividendo para ${portfolioSymbolData.symbol} en cuenta ${portfolioSymbolData.portfolioAccountId}, unidades totales: ${totalUnits}, monto bruto: ${grossAmount.toFixed(4)}, impuestos deducidos: ${taxDeductionAmount.toFixed(4)} (${taxDeductionPercentage}%), monto neto: ${netAmount.toFixed(4)} ${transaction.currency}`);
       
-      // Acumular los montos de dividendos por cuenta y moneda
+      // Acumular los montos de dividendos por cuenta y moneda (usar monto neto)
       const accountKey = portfolioSymbolData.portfolioAccountId;
       const currency = transaction.currency;
       
@@ -192,7 +206,7 @@ exports.processDividendPayments = onSchedule({
         portfolioAccountUpdates[accountKey][currency] = 0;
       }
       
-      portfolioAccountUpdates[accountKey][currency] += amount;
+      portfolioAccountUpdates[accountKey][currency] += netAmount;
     }
     
     // Actualizar los balances de las cuentas después de acumular todos los dividendos
@@ -210,7 +224,7 @@ exports.processDividendPayments = onSchedule({
       for (const [currency, amount] of Object.entries(currencyAmounts)) {
         const currentCurrencyBalance = portfolioAccountData.balances[currency] || 0;
         portfolioAccountData.balances[currency] = currentCurrencyBalance + amount;
-        console.log(`Acumulado dividendo de ${amount} ${currency} para la cuenta ${accountId}. Nuevo balance: ${portfolioAccountData.balances[currency]}`);
+        console.log(`Acumulado dividendo neto de ${amount.toFixed(4)} ${currency} para la cuenta ${accountId}. Nuevo balance: ${portfolioAccountData.balances[currency].toFixed(4)}`);
       }
       
       // Actualizar la cuenta del portafolio en el batch
