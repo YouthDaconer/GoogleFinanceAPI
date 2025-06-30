@@ -460,15 +460,6 @@ async function calculateDailyPortfolioPerformance(db) {
       const assetDoneProfitAndLoss = {};
       
       userSellTransactions.forEach(sellTx => {
-        const sellAmountConverted = convertCurrency(
-          sellTx.amount * sellTx.price,
-          sellTx.currency,
-          currency.code,
-          currencies,
-          sellTx.defaultCurrencyForAdquisitionDollar,
-          parseFloat(sellTx.dollarPriceToDate.toString())
-        );
-        
         if (sellTx.assetId) {
           const asset = allAssets.find(a => a.id === sellTx.assetId);
           if (asset) {
@@ -477,22 +468,23 @@ async function calculateDailyPortfolioPerformance(db) {
               assetDoneProfitAndLoss[assetKey] = 0;
             }
             
-                          const buyTxsForAsset = cache.getBuyTransactionsForAsset(sellTx.assetId);
-              
-              if (buyTxsForAsset.length > 0) {
-              let totalBuyCost = 0;
-              let totalBuyUnits = 0;
-              
-              buyTxsForAsset.forEach(buyTx => {
-                totalBuyCost += buyTx.amount * buyTx.price;
-                totalBuyUnits += buyTx.amount;
-              });
-              
-              const avgCostPerUnit = totalBuyCost / totalBuyUnits;
-              const costOfSoldUnits = sellTx.amount * avgCostPerUnit;
-              
-              const costOfSoldUnitsConverted = convertCurrency(
-                costOfSoldUnits,
+            let profitAndLoss = 0;
+            
+            // ✨ OPTIMIZACIÓN: Usar valuePnL si está disponible
+            if (sellTx.valuePnL !== undefined && sellTx.valuePnL !== null) {
+              // Usar PnL precalculada y convertir a moneda objetivo
+              profitAndLoss = convertCurrency(
+                sellTx.valuePnL,
+                sellTx.currency,
+                currency.code,
+                currencies,
+                sellTx.defaultCurrencyForAdquisitionDollar,
+                parseFloat(sellTx.dollarPriceToDate.toString())
+              );
+            } else {
+              // Fallback: calcular PnL manualmente (método anterior)
+              const sellAmountConverted = convertCurrency(
+                sellTx.amount * sellTx.price,
                 sellTx.currency,
                 currency.code,
                 currencies,
@@ -500,11 +492,35 @@ async function calculateDailyPortfolioPerformance(db) {
                 parseFloat(sellTx.dollarPriceToDate.toString())
               );
               
-              const profitAndLoss = sellAmountConverted - costOfSoldUnitsConverted;
+              const buyTxsForAsset = cache.getBuyTransactionsForAsset(sellTx.assetId);
               
-              assetDoneProfitAndLoss[assetKey] += profitAndLoss;
-              totalDoneProfitAndLoss += profitAndLoss;
+              if (buyTxsForAsset.length > 0) {
+                let totalBuyCost = 0;
+                let totalBuyUnits = 0;
+                
+                buyTxsForAsset.forEach(buyTx => {
+                  totalBuyCost += buyTx.amount * buyTx.price;
+                  totalBuyUnits += buyTx.amount;
+                });
+                
+                const avgCostPerUnit = totalBuyCost / totalBuyUnits;
+                const costOfSoldUnits = sellTx.amount * avgCostPerUnit;
+                
+                const costOfSoldUnitsConverted = convertCurrency(
+                  costOfSoldUnits,
+                  sellTx.currency,
+                  currency.code,
+                  currencies,
+                  sellTx.defaultCurrencyForAdquisitionDollar,
+                  parseFloat(sellTx.dollarPriceToDate.toString())
+                );
+                
+                profitAndLoss = sellAmountConverted - costOfSoldUnitsConverted;
+              }
             }
+            
+            assetDoneProfitAndLoss[assetKey] += profitAndLoss;
+            totalDoneProfitAndLoss += profitAndLoss;
           }
         }
       });
@@ -587,15 +603,6 @@ async function calculateDailyPortfolioPerformance(db) {
         const accountAssetDoneProfitAndLoss = {};
         
         accountSellTransactions.forEach(sellTx => {
-          const sellAmountConverted = convertCurrency(
-            sellTx.amount * sellTx.price,
-            sellTx.currency,
-            currency.code,
-            currencies,
-            sellTx.defaultCurrencyForAdquisitionDollar,
-            parseFloat(sellTx.dollarPriceToDate.toString())
-          );
-          
           if (sellTx.assetId) {
             const asset = allAssets.find(a => a.id === sellTx.assetId);
             if (asset) {
@@ -604,22 +611,23 @@ async function calculateDailyPortfolioPerformance(db) {
                 accountAssetDoneProfitAndLoss[assetKey] = 0;
               }
               
-              const buyTxsForAsset = cache.getBuyTransactionsForAsset(sellTx.assetId);
+              let profitAndLoss = 0;
               
-              if (buyTxsForAsset.length > 0) {
-                let totalBuyCost = 0;
-                let totalBuyUnits = 0;
-                
-                buyTxsForAsset.forEach(buyTx => {
-                  totalBuyCost += buyTx.amount * buyTx.price;
-                  totalBuyUnits += buyTx.amount;
-                });
-                
-                const avgCostPerUnit = totalBuyCost / totalBuyUnits;
-                const costOfSoldUnits = sellTx.amount * avgCostPerUnit;
-                
-                const costOfSoldUnitsConverted = convertCurrency(
-                  costOfSoldUnits,
+              // ✨ OPTIMIZACIÓN: Usar valuePnL si está disponible
+              if (sellTx.valuePnL !== undefined && sellTx.valuePnL !== null) {
+                // Usar PnL precalculada y convertir a moneda objetivo
+                profitAndLoss = convertCurrency(
+                  sellTx.valuePnL,
+                  sellTx.currency,
+                  currency.code,
+                  currencies,
+                  sellTx.defaultCurrencyForAdquisitionDollar,
+                  parseFloat(sellTx.dollarPriceToDate.toString())
+                );
+              } else {
+                // Fallback: calcular PnL manualmente (método anterior)
+                const sellAmountConverted = convertCurrency(
+                  sellTx.amount * sellTx.price,
                   sellTx.currency,
                   currency.code,
                   currencies,
@@ -627,11 +635,35 @@ async function calculateDailyPortfolioPerformance(db) {
                   parseFloat(sellTx.dollarPriceToDate.toString())
                 );
                 
-                const profitAndLoss = sellAmountConverted - costOfSoldUnitsConverted;
+                const buyTxsForAsset = cache.getBuyTransactionsForAsset(sellTx.assetId);
                 
-                accountAssetDoneProfitAndLoss[assetKey] += profitAndLoss;
-                accountDoneProfitAndLoss += profitAndLoss;
+                if (buyTxsForAsset.length > 0) {
+                  let totalBuyCost = 0;
+                  let totalBuyUnits = 0;
+                  
+                  buyTxsForAsset.forEach(buyTx => {
+                    totalBuyCost += buyTx.amount * buyTx.price;
+                    totalBuyUnits += buyTx.amount;
+                  });
+                  
+                  const avgCostPerUnit = totalBuyCost / totalBuyUnits;
+                  const costOfSoldUnits = sellTx.amount * avgCostPerUnit;
+                  
+                  const costOfSoldUnitsConverted = convertCurrency(
+                    costOfSoldUnits,
+                    sellTx.currency,
+                    currency.code,
+                    currencies,
+                    sellTx.defaultCurrencyForAdquisitionDollar,
+                    parseFloat(sellTx.dollarPriceToDate.toString())
+                  );
+                  
+                  profitAndLoss = sellAmountConverted - costOfSoldUnitsConverted;
+                }
               }
+              
+              accountAssetDoneProfitAndLoss[assetKey] += profitAndLoss;
+              accountDoneProfitAndLoss += profitAndLoss;
             }
           }
         });

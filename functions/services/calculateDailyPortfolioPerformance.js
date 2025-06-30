@@ -196,15 +196,6 @@ exports.calcDailyPortfolioPerf = onSchedule({
         
         // Procesar ventas y calcular doneProfitAndLoss
         userSellTransactions.forEach(sellTx => {
-          const sellAmountConverted = convertCurrency(
-            sellTx.amount * sellTx.price,
-            sellTx.currency,
-            currency.code,
-            currencies,
-            sellTx.defaultCurrencyForAdquisitionDollar,
-            parseFloat(sellTx.dollarPriceToDate.toString())
-          );
-          
           // Si hay assetId, calcular doneProfitAndLoss
           if (sellTx.assetId) {
             // Encontrar el activo correspondiente (activo o inactivo)
@@ -215,25 +206,23 @@ exports.calcDailyPortfolioPerf = onSchedule({
                 assetDoneProfitAndLoss[assetKey] = 0;
               }
               
-              // Calcular doneProfitAndLoss (ganancias o pérdidas realizadas)
-              const buyTxsForAsset = buyTransactionsByAssetId[sellTx.assetId] || [];
+              let profitAndLoss = 0;
               
-              if (buyTxsForAsset.length > 0) {
-                // Calcular el costo promedio de adquisición para esas unidades
-                let totalBuyCost = 0;
-                let totalBuyUnits = 0;
-                
-                buyTxsForAsset.forEach(buyTx => {
-                  totalBuyCost += buyTx.amount * buyTx.price;
-                  totalBuyUnits += buyTx.amount;
-                });
-                
-                const avgCostPerUnit = totalBuyCost / totalBuyUnits;
-                const costOfSoldUnits = sellTx.amount * avgCostPerUnit;
-                
-                // Convertir el costo de adquisición a la moneda actual
-                const costOfSoldUnitsConverted = convertCurrency(
-                  costOfSoldUnits,
+              // ✨ OPTIMIZACIÓN: Usar valuePnL si está disponible
+              if (sellTx.valuePnL !== undefined && sellTx.valuePnL !== null) {
+                // Usar PnL precalculada y convertir a moneda objetivo
+                profitAndLoss = convertCurrency(
+                  sellTx.valuePnL,
+                  sellTx.currency,
+                  currency.code,
+                  currencies,
+                  sellTx.defaultCurrencyForAdquisitionDollar,
+                  parseFloat(sellTx.dollarPriceToDate.toString())
+                );
+              } else {
+                // Fallback: calcular PnL manualmente (método anterior)
+                const sellAmountConverted = convertCurrency(
+                  sellTx.amount * sellTx.price,
                   sellTx.currency,
                   currency.code,
                   currencies,
@@ -241,15 +230,42 @@ exports.calcDailyPortfolioPerf = onSchedule({
                   parseFloat(sellTx.dollarPriceToDate.toString())
                 );
                 
-                // El PnL es la diferencia entre el valor de venta y el costo de adquisición
-                const profitAndLoss = sellAmountConverted - costOfSoldUnitsConverted;
+                // Calcular doneProfitAndLoss (ganancias o pérdidas realizadas)
+                const buyTxsForAsset = buyTransactionsByAssetId[sellTx.assetId] || [];
                 
-                // Acumular para el asset específico
-                assetDoneProfitAndLoss[assetKey] += profitAndLoss;
-                totalDoneProfitAndLoss += profitAndLoss;
-                
-                console.log(`Calculado P&L para venta de ${sellTx.amount} unidades de ${assetKey}: ${profitAndLoss} ${currency.code}`);
+                if (buyTxsForAsset.length > 0) {
+                  // Calcular el costo promedio de adquisición para esas unidades
+                  let totalBuyCost = 0;
+                  let totalBuyUnits = 0;
+                  
+                  buyTxsForAsset.forEach(buyTx => {
+                    totalBuyCost += buyTx.amount * buyTx.price;
+                    totalBuyUnits += buyTx.amount;
+                  });
+                  
+                  const avgCostPerUnit = totalBuyCost / totalBuyUnits;
+                  const costOfSoldUnits = sellTx.amount * avgCostPerUnit;
+                  
+                  // Convertir el costo de adquisición a la moneda actual
+                  const costOfSoldUnitsConverted = convertCurrency(
+                    costOfSoldUnits,
+                    sellTx.currency,
+                    currency.code,
+                    currencies,
+                    sellTx.defaultCurrencyForAdquisitionDollar,
+                    parseFloat(sellTx.dollarPriceToDate.toString())
+                  );
+                  
+                  // El PnL es la diferencia entre el valor de venta y el costo de adquisición
+                  profitAndLoss = sellAmountConverted - costOfSoldUnitsConverted;
+                }
               }
+              
+              // Acumular para el asset específico
+              assetDoneProfitAndLoss[assetKey] += profitAndLoss;
+              totalDoneProfitAndLoss += profitAndLoss;
+              
+              console.log(`Calculado P&L para venta de ${sellTx.amount} unidades de ${assetKey}: ${profitAndLoss} ${currency.code}`);
             }
           }
         });
@@ -373,15 +389,6 @@ exports.calcDailyPortfolioPerf = onSchedule({
           
           // Procesar ventas y calcular doneProfitAndLoss
           accountSellTransactions.forEach(sellTx => {
-            const sellAmountConverted = convertCurrency(
-              sellTx.amount * sellTx.price,
-              sellTx.currency,
-              currency.code,
-              currencies,
-              sellTx.defaultCurrencyForAdquisitionDollar,
-              parseFloat(sellTx.dollarPriceToDate.toString())
-            );
-            
             // Si hay assetId, calcular doneProfitAndLoss
             if (sellTx.assetId) {
               // Encontrar el activo correspondiente (activo o inactivo)
@@ -392,25 +399,23 @@ exports.calcDailyPortfolioPerf = onSchedule({
                   accountAssetDoneProfitAndLoss[assetKey] = 0;
                 }
                 
-                // Calcular doneProfitAndLoss (ganancias o pérdidas realizadas)
-                const buyTxsForAsset = buyTransactionsByAssetId[sellTx.assetId] || [];
+                let profitAndLoss = 0;
                 
-                if (buyTxsForAsset.length > 0) {
-                  // Calcular el costo promedio de adquisición para esas unidades
-                  let totalBuyCost = 0;
-                  let totalBuyUnits = 0;
-                  
-                  buyTxsForAsset.forEach(buyTx => {
-                    totalBuyCost += buyTx.amount * buyTx.price;
-                    totalBuyUnits += buyTx.amount;
-                  });
-                  
-                  const avgCostPerUnit = totalBuyCost / totalBuyUnits;
-                  const costOfSoldUnits = sellTx.amount * avgCostPerUnit;
-                  
-                  // Convertir el costo de adquisición a la moneda actual
-                  const costOfSoldUnitsConverted = convertCurrency(
-                    costOfSoldUnits,
+                // ✨ OPTIMIZACIÓN: Usar valuePnL si está disponible
+                if (sellTx.valuePnL !== undefined && sellTx.valuePnL !== null) {
+                  // Usar PnL precalculada y convertir a moneda objetivo
+                  profitAndLoss = convertCurrency(
+                    sellTx.valuePnL,
+                    sellTx.currency,
+                    currency.code,
+                    currencies,
+                    sellTx.defaultCurrencyForAdquisitionDollar,
+                    parseFloat(sellTx.dollarPriceToDate.toString())
+                  );
+                } else {
+                  // Fallback: calcular PnL manualmente (método anterior)
+                  const sellAmountConverted = convertCurrency(
+                    sellTx.amount * sellTx.price,
                     sellTx.currency,
                     currency.code,
                     currencies,
@@ -418,15 +423,42 @@ exports.calcDailyPortfolioPerf = onSchedule({
                     parseFloat(sellTx.dollarPriceToDate.toString())
                   );
                   
-                  // El PnL es la diferencia entre el valor de venta y el costo de adquisición
-                  const profitAndLoss = sellAmountConverted - costOfSoldUnitsConverted;
+                  // Calcular doneProfitAndLoss (ganancias o pérdidas realizadas)
+                  const buyTxsForAsset = buyTransactionsByAssetId[sellTx.assetId] || [];
                   
-                  // Acumular para el asset específico
-                  accountAssetDoneProfitAndLoss[assetKey] += profitAndLoss;
-                  accountDoneProfitAndLoss += profitAndLoss;
-                  
-                  console.log(`Calculado P&L para venta de ${sellTx.amount} unidades de ${assetKey} en cuenta ${account.id}: ${profitAndLoss} ${currency.code}`);
+                  if (buyTxsForAsset.length > 0) {
+                    // Calcular el costo promedio de adquisición para esas unidades
+                    let totalBuyCost = 0;
+                    let totalBuyUnits = 0;
+                    
+                    buyTxsForAsset.forEach(buyTx => {
+                      totalBuyCost += buyTx.amount * buyTx.price;
+                      totalBuyUnits += buyTx.amount;
+                    });
+                    
+                    const avgCostPerUnit = totalBuyCost / totalBuyUnits;
+                    const costOfSoldUnits = sellTx.amount * avgCostPerUnit;
+                    
+                    // Convertir el costo de adquisición a la moneda actual
+                    const costOfSoldUnitsConverted = convertCurrency(
+                      costOfSoldUnits,
+                      sellTx.currency,
+                      currency.code,
+                      currencies,
+                      sellTx.defaultCurrencyForAdquisitionDollar,
+                      parseFloat(sellTx.dollarPriceToDate.toString())
+                    );
+                    
+                    // El PnL es la diferencia entre el valor de venta y el costo de adquisición
+                    profitAndLoss = sellAmountConverted - costOfSoldUnitsConverted;
+                  }
                 }
+                
+                // Acumular para el asset específico
+                accountAssetDoneProfitAndLoss[assetKey] += profitAndLoss;
+                accountDoneProfitAndLoss += profitAndLoss;
+                
+                console.log(`Calculado P&L para venta de ${sellTx.amount} unidades de ${assetKey} en cuenta ${account.id}: ${profitAndLoss} ${currency.code}`);
               }
             }
           });
