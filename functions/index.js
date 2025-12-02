@@ -16,6 +16,9 @@ const { saveAllIndicesAndSectorsHistoryData } = require("./services/saveAllIndic
 const { onSchedule } = require("firebase-functions/v2/scheduler");
 const { calculateProfitableWeeks } = require('./services/calculateProfitableWeeks');
 
+// Cloud Functions Callable para operaciones de assets (REF-002)
+const assetOperations = require('./services/assetOperations');
+
 // Configuración para habilitar la recolección de basura explícita
 // Solo funciona cuando se ejecuta con --expose-gc
 try {
@@ -86,3 +89,41 @@ exports.weeklyProfitableWeeksCalculation = onSchedule({
     return null;
   }
 });
+
+// ============================================================================
+// Cloud Functions Callable - Operaciones de Assets (REF-002)
+// ============================================================================
+
+/**
+ * Crea un nuevo asset con transacción de compra y actualización de balance atómicamente
+ * @see docs/architecture/refactoring-analysis.md - Sección 1.1
+ */
+exports.createAsset = assetOperations.createAsset;
+
+/**
+ * Vende un asset existente (total o parcialmente)
+ * @see docs/architecture/refactoring-analysis.md - Sección 1.2
+ */
+exports.sellAsset = assetOperations.sellAsset;
+
+/**
+ * Vende unidades de múltiples lotes del mismo ticker usando FIFO
+ * @see docs/architecture/refactoring-analysis.md - Sección 1.3
+ */
+exports.sellPartialAssetsFIFO = assetOperations.sellPartialAssetsFIFO;
+
+/**
+ * Registra una transacción de efectivo (ingreso o egreso)
+ * @see docs/architecture/refactoring-analysis.md - Sección 1.4
+ */
+exports.addCashTransaction = assetOperations.addCashTransaction;
+
+/**
+ * Elimina activos de una cuenta de portafolio
+ */
+exports.deleteAssets = assetOperations.deleteAssets;
+
+/**
+ * Actualiza el sector de un stock en currentPrices (fallback manual)
+ */
+exports.updateStockSector = assetOperations.updateStockSector;
