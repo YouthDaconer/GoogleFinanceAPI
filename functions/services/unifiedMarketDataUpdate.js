@@ -3,6 +3,7 @@ const admin = require('firebase-admin');
 const axios = require('axios');
 const { calculateAccountPerformance, convertCurrency } = require('../utils/portfolioCalculations');
 const { calculatePortfolioRisk } = require('./calculatePortfolioRisk');
+const { invalidatePerformanceCacheBatch } = require('./historicalReturnsService');
 const { DateTime } = require('luxon');
 
 const API_BASE_URL = 'https://dmn46d7xas3rvio6tugd2vzs2q0hxbmb.lambda-url.us-east-1.on.aws/v1';
@@ -734,7 +735,7 @@ async function calculateDailyPortfolioPerformance(db) {
   }
 
   logInfo(`✅ Rendimiento calculado para ${calculationsCount} usuarios (${totalBatchesCommitted} batches)`);
-  return calculationsCount;
+  return { count: calculationsCount, userIds: Object.keys(userPortfolios) };
 }
 
 /**
@@ -777,12 +778,28 @@ exports.unifiedMarketDataUpdate = onSchedule({
     const priceUpdates = await updateCurrentPrices(db, marketData.assets);
     
     // Paso 5: Calcular rendimiento del portafolio
-    const portfolioCalculations = await calculateDailyPortfolioPerformance(db);
+    const portfolioResult = await calculateDailyPortfolioPerformance(db);
     
     // Paso 6: Calcular riesgo del portafolio (usando datos actualizados)
     logDebug('🔄 Calculando riesgo del portafolio...');
     await calculatePortfolioRisk();
     logDebug('✅ Riesgo del portafolio calculado');
+    
+    // Paso 7: Invalidar cache de rendimientos históricos (OPT-010)
+    let cacheInvalidationResult = { usersProcessed: 0, cachesDeleted: 0 };
+    if (portfolioResult.userIds && portfolioResult.userIds.length > 0) {
+      try {
+        const invalidationStart = Date.now();
+        cacheInvalidationResult = await invalidatePerformanceCacheBatch(portfolioResult.userIds);
+        const invalidationTime = Date.now() - invalidationStart;
+        
+        if (invalidationTime > 500) {
+          logInfo(`⚠️ Invalidación de cache tomó ${invalidationTime}ms (>500ms)`);
+        }
+      } catch (cacheError) {
+        logError('⚠️ Error invalidando cache (no crítico):', cacheError.message);
+      }
+    }
     
     const endTime = Date.now();
     const executionTime = (endTime - startTime) / 1000;
@@ -790,8 +807,9 @@ exports.unifiedMarketDataUpdate = onSchedule({
     logInfo(`🎉 Actualización unificada completada en ${executionTime}s:`);
     logInfo(`   - ${currencyUpdates} tasas de cambio actualizadas`);
     logInfo(`   - ${priceUpdates} precios actualizados`);
-    logInfo(`   - ${portfolioCalculations} portafolios calculados`);
+    logInfo(`   - ${portfolioResult.count} portafolios calculados`);
     logInfo(`   - ✅ Riesgo de portafolios calculado`);
+    logInfo(`   - 🗑️ ${cacheInvalidationResult.cachesDeleted} caches invalidados de ${cacheInvalidationResult.usersProcessed} usuarios`);
     
     return null;
   } catch (error) {

@@ -558,11 +558,9 @@ const getHistoricalReturns = onCall(callableConfig, async (request) => {
     assetType
   );
 
-  // 6. Guardar en cache con TTL hasta medianoche
+  // 6. Guardar en cache con TTL dinámico basado en horario de mercado
   const now = new Date();
-  const validUntil = new Date();
-  validUntil.setDate(validUntil.getDate() + 1);
-  validUntil.setHours(0, 0, 0, 0);
+  const validUntil = calculateDynamicTTL();
 
   const cacheData = {
     data: result,
@@ -613,7 +611,95 @@ async function invalidatePerformanceCache(userId) {
   }
 }
 
+/**
+ * Calcula el TTL dinámico basado en el estado del mercado NYSE
+ * - Durante horario de mercado (9:30-16:00 ET): 5 minutos
+ * - Fuera de horario: hasta próxima apertura (9:30 AM ET)
+ * - Fines de semana: hasta lunes 9:30 AM ET
+ * 
+ * @returns {Date} Fecha de expiración del cache
+ */
+function calculateDynamicTTL() {
+  const now = DateTime.now().setZone('America/New_York');
+  const hour = now.hour + now.minute / 60;
+  
+  const MARKET_OPEN = 9.5;  // 9:30 AM
+  const MARKET_CLOSE = 16;   // 4:00 PM
+  
+  // Sábado: válido hasta lunes 9:30 AM
+  if (now.weekday === 6) {
+    return now.plus({ days: 2 }).set({ hour: 9, minute: 30, second: 0, millisecond: 0 }).toJSDate();
+  }
+  
+  // Domingo: válido hasta lunes 9:30 AM
+  if (now.weekday === 7) {
+    return now.plus({ days: 1 }).set({ hour: 9, minute: 30, second: 0, millisecond: 0 }).toJSDate();
+  }
+  
+  // Durante horario de mercado: TTL de 5 minutos
+  if (hour >= MARKET_OPEN && hour < MARKET_CLOSE) {
+    return now.plus({ minutes: 5 }).toJSDate();
+  }
+  
+  // Después del cierre
+  if (hour >= MARKET_CLOSE) {
+    // Viernes después del cierre: válido hasta lunes 9:30 AM
+    if (now.weekday === 5) {
+      return now.plus({ days: 3 }).set({ hour: 9, minute: 30, second: 0, millisecond: 0 }).toJSDate();
+    }
+    // Lunes-Jueves después del cierre: válido hasta mañana 9:30 AM
+    return now.plus({ days: 1 }).set({ hour: 9, minute: 30, second: 0, millisecond: 0 }).toJSDate();
+  }
+  
+  // Antes de apertura: válido hasta las 9:30 AM de hoy
+  return now.set({ hour: 9, minute: 30, second: 0, millisecond: 0 }).toJSDate();
+}
+
+/**
+ * Invalida el cache de rendimientos para múltiples usuarios en batch
+ * Optimizado para minimizar lecturas y escrituras de Firestore
+ * 
+ * @param {string[]} userIds - Array de IDs de usuarios
+ * @returns {Promise<{usersProcessed: number, cachesDeleted: number}>}
+ */
+async function invalidatePerformanceCacheBatch(userIds) {
+  if (!userIds || userIds.length === 0) {
+    return { usersProcessed: 0, cachesDeleted: 0 };
+  }
+
+  let totalDeleted = 0;
+
+  // Consultar todos los caches en paralelo (sin límite de usuarios ya que son pocos en producción)
+  const cachePromises = userIds.map(async (userId) => {
+    const cacheCollection = db.collection(`userData/${userId}/performanceCache`);
+    const snapshot = await cacheCollection.limit(20).get();
+    return { userId, docs: snapshot.docs };
+  });
+  
+  const results = await Promise.all(cachePromises);
+  
+  // Agrupar todas las eliminaciones en un solo batch
+  const deleteBatch = db.batch();
+  
+  for (const { docs } of results) {
+    for (const doc of docs) {
+      deleteBatch.delete(doc.ref);
+      totalDeleted++;
+    }
+  }
+  
+  // Solo commit si hay documentos que eliminar
+  if (totalDeleted > 0) {
+    await deleteBatch.commit();
+  }
+
+  console.log(`[invalidatePerformanceCacheBatch] Eliminados ${totalDeleted} caches para ${userIds.length} usuarios`);
+  return { usersProcessed: userIds.length, cachesDeleted: totalDeleted };
+}
+
 module.exports = {
   getHistoricalReturns,
-  invalidatePerformanceCache
+  invalidatePerformanceCache,
+  invalidatePerformanceCacheBatch,
+  calculateDynamicTTL
 };
