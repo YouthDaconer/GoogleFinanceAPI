@@ -14,6 +14,9 @@ const { onCall, HttpsError } = require("firebase-functions/v2/https");
 const admin = require('./firebaseAdmin');
 const db = admin.firestore();
 
+// Importar función de invalidación de cache de rendimientos (OPT-002)
+const { invalidatePerformanceCache } = require('./historicalReturnsService');
+
 /**
  * Configuración común para Cloud Functions Callable
  */
@@ -207,6 +210,9 @@ exports.createAsset = onCall(callableConfig, async (request) => {
     // 7. Commit de la transacción
     await batch.commit();
 
+    // 8. Invalidar cache de rendimientos (OPT-002)
+    await invalidatePerformanceCache(auth.uid);
+
     console.log(`[createAsset] Éxito - assetId: ${assetRef.id}, transactionId: ${transactionRef.id}`);
 
     return {
@@ -371,6 +377,9 @@ exports.sellAsset = onCall(callableConfig, async (request) => {
 
     // 9. Commit de la transacción
     await batch.commit();
+
+    // 10. Invalidar cache de rendimientos (OPT-002)
+    await invalidatePerformanceCache(auth.uid);
 
     console.log(`[sellAsset] Éxito - transactionId: ${transactionRef.id}, isFullSale: ${isFullSale}`);
 
@@ -557,6 +566,9 @@ exports.sellPartialAssetsFIFO = onCall(callableConfig, async (request) => {
 
     // 8. Commit
     await batch.commit();
+
+    // 9. Invalidar cache de rendimientos (OPT-002)
+    await invalidatePerformanceCache(auth.uid);
 
     console.log(`[sellPartialAssetsFIFO] Éxito - lotes vendidos: ${soldAssets.length}, totalPnL: ${totalPnL}`);
 

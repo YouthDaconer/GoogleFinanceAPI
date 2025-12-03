@@ -19,6 +19,15 @@ const { calculateProfitableWeeks } = require('./services/calculateProfitableWeek
 // Cloud Functions Callable para operaciones de assets (REF-002)
 const assetOperations = require('./services/assetOperations');
 
+// Cloud Function Callable para precios filtrados por usuario (OPT-001)
+const userPricesService = require('./services/userPricesService');
+
+// Cloud Function Callable para rendimientos históricos pre-calculados (OPT-002)
+const historicalReturnsService = require('./services/historicalReturnsService');
+
+// Cloud Function Callable para índices históricos pre-calculados (OPT-009)
+const indexHistoryService = require('./services/indexHistoryService');
+
 // Configuración para habilitar la recolección de basura explícita
 // Solo funciona cuando se ejecuta con --expose-gc
 try {
@@ -127,3 +136,43 @@ exports.deleteAssets = assetOperations.deleteAssets;
  * Actualiza el sector de un stock en currentPrices (fallback manual)
  */
 exports.updateStockSector = assetOperations.updateStockSector;
+
+// ============================================================================
+// Cloud Functions Callable - Optimización de Consultas (OPT-001)
+// ============================================================================
+
+/**
+ * Obtiene precios filtrados por símbolos que el usuario posee
+ * Reduce lecturas de 56 (todos) a ~25 (solo del usuario)
+ * @see docs/stories/6.story.md (OPT-001)
+ */
+exports.getCurrentPricesForUser = userPricesService.getCurrentPricesForUser;
+
+// ============================================================================
+// Cloud Functions Callable - Pre-cálculo de Rendimientos (OPT-002)
+// ============================================================================
+
+/**
+ * Pre-calcula rendimientos históricos en el servidor con cache
+ * Reduce lecturas de ~200 a 1 (cache hit) por montaje del Dashboard
+ * @see docs/stories/7.story.md (OPT-002)
+ */
+exports.getHistoricalReturns = historicalReturnsService.getHistoricalReturns;
+
+// ============================================================================
+// Cloud Functions - Pre-cálculo de Índices Históricos (OPT-009)
+// ============================================================================
+
+/**
+ * Obtiene datos históricos de índices de mercado con cache global
+ * Reduce lecturas de ~1,300 a 1 (cache hit) por consulta
+ * @see docs/stories/14.story.md (OPT-009)
+ */
+exports.getIndexHistory = indexHistoryService.getIndexHistory;
+
+/**
+ * Refresca el cache de todos los índices históricos (scheduled)
+ * Se ejecuta diariamente a las 00:30 UTC
+ * @see docs/stories/14.story.md (OPT-009)
+ */
+exports.refreshIndexCache = indexHistoryService.refreshIndexCache;
