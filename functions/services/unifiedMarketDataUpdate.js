@@ -804,12 +804,32 @@ exports.unifiedMarketDataUpdate = onSchedule({
     const endTime = Date.now();
     const executionTime = (endTime - startTime) / 1000;
     
+    // Paso 8: Notificar al frontend que todo el pipeline completó (OPT-020)
+    // Este documento de señal se actualiza SOLO cuando todo el pipeline ha terminado exitosamente
+    // El frontend escucha este documento para saber cuándo re-fetch de rendimientos históricos
+    try {
+      await db.collection('systemStatus').doc('marketData').set({
+        lastCompleteUpdate: admin.firestore.FieldValue.serverTimestamp(),
+        pricesUpdated: priceUpdates,
+        performanceCalculated: portfolioResult.count,
+        cachesInvalidated: cacheInvalidationResult.cachesDeleted,
+        executionTimeMs: Math.round(executionTime * 1000),
+        marketOpen: true,
+        lastUpdateDate: new Date().toISOString()
+      }, { merge: true });
+      
+      logInfo('📡 Señal de actualización enviada a frontend (OPT-020)');
+    } catch (signalError) {
+      logError('⚠️ Error enviando señal (no crítico):', signalError.message);
+    }
+    
     logInfo(`🎉 Actualización unificada completada en ${executionTime}s:`);
     logInfo(`   - ${currencyUpdates} tasas de cambio actualizadas`);
     logInfo(`   - ${priceUpdates} precios actualizados`);
     logInfo(`   - ${portfolioResult.count} portafolios calculados`);
     logInfo(`   - ✅ Riesgo de portafolios calculado`);
     logInfo(`   - 🗑️ ${cacheInvalidationResult.cachesDeleted} caches invalidados de ${cacheInvalidationResult.usersProcessed} usuarios`);
+    logInfo(`   - 📡 Señal de sincronización enviada`);
     
     return null;
   } catch (error) {
