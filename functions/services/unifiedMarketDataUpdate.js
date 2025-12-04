@@ -804,7 +804,7 @@ exports.unifiedMarketDataUpdate = onSchedule({
     const endTime = Date.now();
     const executionTime = (endTime - startTime) / 1000;
     
-    // Paso 8: Notificar al frontend que todo el pipeline completó (OPT-020)
+    // Paso 8: Notificar al frontend que todo el pipeline completó (OPT-016)
     // Este documento de señal se actualiza SOLO cuando todo el pipeline ha terminado exitosamente
     // El frontend escucha este documento para saber cuándo re-fetch de rendimientos históricos
     try {
@@ -818,7 +818,7 @@ exports.unifiedMarketDataUpdate = onSchedule({
         lastUpdateDate: new Date().toISOString()
       }, { merge: true });
       
-      logInfo('📡 Señal de actualización enviada a frontend (OPT-020)');
+      logInfo('📡 Señal de actualización enviada a frontend (OPT-016)');
     } catch (signalError) {
       logError('⚠️ Error enviando señal (no crítico):', signalError.message);
     }
