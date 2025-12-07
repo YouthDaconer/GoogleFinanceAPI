@@ -159,6 +159,13 @@ exports.getCurrentPricesForUser = userPricesService.getCurrentPricesForUser;
  */
 exports.getHistoricalReturns = historicalReturnsService.getHistoricalReturns;
 
+/**
+ * FEAT-CHART-001: Pre-calcula rendimientos históricos de múltiples cuentas agregados
+ * Permite visualizar rendimientos combinados de un subconjunto de cuentas
+ * @see docs/stories/24.story.md (FEAT-CHART-001)
+ */
+exports.getMultiAccountHistoricalReturns = historicalReturnsService.getMultiAccountHistoricalReturns;
+
 // ============================================================================
 // Cloud Functions - Pre-cálculo de Índices Históricos (OPT-009)
 // ============================================================================
@@ -176,3 +183,4 @@ exports.getIndexHistory = indexHistoryService.getIndexHistory;
  * @see docs/stories/14.story.md (OPT-009)
  */
 exports.refreshIndexCache = indexHistoryService.refreshIndexCache;
+
