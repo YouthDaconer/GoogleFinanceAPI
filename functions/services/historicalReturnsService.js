@@ -4,13 +4,30 @@
  * Pre-calcula los rendimientos históricos del portafolio en el servidor
  * y los cachea para reducir lecturas de Firestore de ~200 a 1.
  * 
+ * Actualizado en Historia 25 para incluir Personal Return (MWR) junto con TWR.
+ * 
  * @module historicalReturnsService
  * @see docs/stories/7.story.md (OPT-002)
+ * @see docs/stories/25.story.md (MWR Dual Metrics)
  */
 
 const { onCall, HttpsError } = require("firebase-functions/v2/https");
 const admin = require('./firebaseAdmin');
 const { DateTime } = require('luxon');
+
+// Importar utilidades compartidas y funciones MWR
+const { 
+  MIN_DOCS,
+  sortDocumentsByDate,
+  extractDocumentData,
+  getPeriodBoundaries,
+  hasEnoughDocuments
+} = require('../utils/periodCalculations');
+
+const {
+  calculateSimplePersonalReturn,
+  calculateModifiedDietzReturn
+} = require('../utils/mwrCalculations');
 
 const db = admin.firestore();
 
@@ -22,19 +39,6 @@ const callableConfig = {
   enforceAppCheck: false,
   timeoutSeconds: 60,
   memory: "512MiB",
-};
-
-/**
- * Umbrales mínimos de documentos por período para considerar datos suficientes
- */
-const MIN_DOCS = {
-  ONE_MONTH: 21,
-  THREE_MONTHS: 63,
-  SIX_MONTHS: 126,
-  YTD: 1,
-  ONE_YEAR: 252,
-  TWO_YEARS: 504,
-  FIVE_YEARS: 1260
 };
 
 /**
@@ -114,6 +118,21 @@ function calculateHistoricalReturns(docs, currency, ticker, assetType) {
   const monthlyStartFactors = {};
   const monthlyEndFactors = {};
   const monthlyCompoundData = {};
+
+  // ============================================================
+  // MWR (Personal Return) - Historia 25
+  // Estructuras para acumular datos de MWR en paralelo con TWR
+  // ============================================================
+  const mwrPeriods = {
+    ytd: { startDate: startOfYear, startValue: null, endValue: null, cashFlows: [], totalCashFlow: 0, found: false },
+    oneMonth: { startDate: oneMonthAgo, startValue: null, endValue: null, cashFlows: [], totalCashFlow: 0, found: false },
+    threeMonths: { startDate: threeMonthsAgo, startValue: null, endValue: null, cashFlows: [], totalCashFlow: 0, found: false },
+    sixMonths: { startDate: sixMonthsAgo, startValue: null, endValue: null, cashFlows: [], totalCashFlow: 0, found: false },
+    oneYear: { startDate: oneYearAgo, startValue: null, endValue: null, cashFlows: [], totalCashFlow: 0, found: false },
+    twoYears: { startDate: twoYearsAgo, startValue: null, endValue: null, cashFlows: [], totalCashFlow: 0, found: false },
+    fiveYears: { startDate: fiveYearsAgo, startValue: null, endValue: null, cashFlows: [], totalCashFlow: 0, found: false }
+  };
+  const todayISO = now.toISODate();
 
   // Primera pasada: agrupar fechas por mes
   documents.forEach((doc) => {
@@ -254,6 +273,32 @@ function calculateHistoricalReturns(docs, currency, ticker, assetType) {
       }
     }
 
+    // ============================================================
+    // MWR: Acumular datos para Personal Return (Historia 25)
+    // ============================================================
+    if (hasData) {
+      Object.keys(mwrPeriods).forEach(periodKey => {
+        const period = mwrPeriods[periodKey];
+        
+        if (data.date >= period.startDate) {
+          // Marcar valor inicial del período
+          if (!period.found) {
+            period.startValue = totalValue;
+            period.found = true;
+          }
+          
+          // Actualizar valor final
+          period.endValue = totalValue;
+          
+          // Acumular cashflows
+          if (totalCashFlow !== 0) {
+            period.cashFlows.push({ date: data.date, amount: totalCashFlow });
+          }
+          period.totalCashFlow += totalCashFlow;
+        }
+      });
+    }
+
     // Actualizar factor compuesto
     if (hasData) {
       currentFactor = currentFactor * (1 + adjustedDailyChange / 100);
@@ -315,16 +360,27 @@ function calculateHistoricalReturns(docs, currency, ticker, assetType) {
   const twoYearReturn = foundTwoYearStart ? (currentFactor / twoYearStartFactor - 1) * 100 : 0;
   const fiveYearReturn = foundFiveYearStart ? (currentFactor / fiveYearStartFactor - 1) * 100 : 0;
 
-  // Calcular rendimientos mensuales
+  // ============================================================
+  // Calcular rendimientos mensuales (TWR + MWR)
+  // Historia 25: Agregar Personal Return mensual
+  // ============================================================
   const performanceByYear = {};
 
   Object.keys(monthlyStartFactors).forEach(year => {
-    performanceByYear[year] = { months: {}, total: 0 };
+    performanceByYear[year] = { 
+      months: {}, 
+      total: 0,
+      // Historia 25: Agregar estructura para MWR mensual
+      personalMonths: {},
+      personalTotal: 0
+    };
     let compoundTotal = 1;
+    let personalCompoundTotal = 1;
 
     // Inicializar meses con 0
     for (let i = 0; i < 12; i++) {
       performanceByYear[year].months[i.toString()] = 0;
+      performanceByYear[year].personalMonths[i.toString()] = 0;
     }
 
     Object.keys(monthlyStartFactors[year]).forEach(month => {
@@ -348,6 +404,45 @@ function calculateHistoricalReturns(docs, currency, ticker, assetType) {
           } else if (monthlyCompoundData[year][month].doneProfitAndLoss !== undefined) {
             monthlyCompoundData[year][month].profit = monthlyCompoundData[year][month].doneProfitAndLoss;
           }
+          
+          // ============================================================
+          // Historia 25: Calcular MWR (Personal Return) mensual
+          // Usando datos de monthlyCompoundData que ya tiene:
+          // - startTotalValue, endTotalValue
+          // - totalCashFlow (suma de cashflows del mes)
+          // ============================================================
+          const startValue = monthlyCompoundData[year][month].startTotalValue || 0;
+          const endValue = monthlyCompoundData[year][month].endTotalValue || 0;
+          const totalCashFlow = monthlyCompoundData[year][month].totalCashFlow || 0;
+          
+          let personalReturn = 0;
+          
+          // Calcular MWR usando fórmula Simple (Modified Dietz simplificado)
+          const netDeposits = -totalCashFlow; // cashflow negativo = depósitos
+          
+          if (startValue === 0 && netDeposits > 0) {
+            // Sin valor inicial, solo depósitos durante el mes
+            personalReturn = ((endValue - netDeposits) / netDeposits) * 100;
+          } else if (startValue > 0) {
+            // Con valor inicial: usar inversión base ponderada
+            const investmentBase = startValue + (netDeposits / 2);
+            if (investmentBase > 0) {
+              const gain = endValue - startValue - netDeposits;
+              personalReturn = (gain / investmentBase) * 100;
+            }
+          }
+          
+          // Protección para valores extremos (>100% o <-100%)
+          // En estos casos, usar el TWR como fallback
+          if (Math.abs(personalReturn) > 100 && Math.abs(monthReturn) < Math.abs(personalReturn)) {
+            personalReturn = monthReturn;
+          }
+          
+          performanceByYear[year].personalMonths[month] = personalReturn;
+          monthlyCompoundData[year][month].personalReturnPct = personalReturn;
+          
+          // Calcular compuesto para MWR anual
+          personalCompoundTotal = personalCompoundTotal * (1 + personalReturn / 100);
         }
 
         compoundTotal = compoundTotal * (1 + monthReturn / 100);
@@ -355,6 +450,7 @@ function calculateHistoricalReturns(docs, currency, ticker, assetType) {
     });
 
     performanceByYear[year].total = (compoundTotal - 1) * 100;
+    performanceByYear[year].personalTotal = (personalCompoundTotal - 1) * 100;
   });
 
   // Determinar años disponibles y fecha de inicio
@@ -389,7 +485,7 @@ function calculateHistoricalReturns(docs, currency, ticker, assetType) {
 
   // Calcular mínimo de documentos para YTD
   const currentMonth = now.month;
-  const minDocsForYtd = Math.max(Math.ceil(currentMonth * 4 / 12), MIN_DOCS.YTD);
+  const minDocsForYtd = Math.max(Math.ceil(currentMonth * 4 / 12), MIN_DOCS.ytd);
 
   // Seleccionar contadores
   const ytdCount = ticker ? validYtdDocsCount : ytdDocsCount;
@@ -402,12 +498,12 @@ function calculateHistoricalReturns(docs, currency, ticker, assetType) {
 
   // Verificar suficientes documentos
   const hasEnoughYtdDocs = ytdCount >= minDocsForYtd;
-  const hasEnoughOneMonthDocs = oneMonthCount >= MIN_DOCS.ONE_MONTH;
-  const hasEnoughThreeMonthDocs = threeMonthCount >= MIN_DOCS.THREE_MONTHS;
-  const hasEnoughSixMonthDocs = sixMonthCount >= MIN_DOCS.SIX_MONTHS;
-  const hasEnoughOneYearDocs = oneYearCount >= MIN_DOCS.ONE_YEAR;
-  const hasEnoughTwoYearDocs = twoYearCount >= MIN_DOCS.TWO_YEARS;
-  const hasEnoughFiveYearDocs = fiveYearCount >= MIN_DOCS.FIVE_YEARS;
+  const hasEnoughOneMonthDocs = oneMonthCount >= MIN_DOCS.oneMonth;
+  const hasEnoughThreeMonthDocs = threeMonthCount >= MIN_DOCS.threeMonths;
+  const hasEnoughSixMonthDocs = sixMonthCount >= MIN_DOCS.sixMonths;
+  const hasEnoughOneYearDocs = oneYearCount >= MIN_DOCS.oneYear;
+  const hasEnoughTwoYearDocs = twoYearCount >= MIN_DOCS.twoYears;
+  const hasEnoughFiveYearDocs = fiveYearCount >= MIN_DOCS.fiveYears;
 
   // Calcular cambio porcentual total
   let overallPercentChange = 0;
@@ -417,8 +513,54 @@ function calculateHistoricalReturns(docs, currency, ticker, assetType) {
     overallPercentChange = ((finalValue - initialValue) / initialValue) * 100;
   }
 
+  // ============================================================
+  // MWR: Calcular Personal Returns (Historia 25)
+  // ============================================================
+  const personalReturns = {};
+  
+  // Mapeo de claves internas a claves de API
+  const periodApiMap = {
+    ytd: 'ytd',
+    oneMonth: 'oneMonth',
+    threeMonths: 'threeMonth',
+    sixMonths: 'sixMonth',
+    oneYear: 'oneYear',
+    twoYears: 'twoYear',
+    fiveYears: 'fiveYear'
+  };
+
+  Object.keys(mwrPeriods).forEach(periodKey => {
+    const period = mwrPeriods[periodKey];
+    const apiKey = periodApiMap[periodKey];
+    
+    if (period.found && period.endValue !== null) {
+      // Usar Modified Dietz si hay cashflows, sino usar Simple
+      if (period.cashFlows.length > 0) {
+        personalReturns[`${apiKey}PersonalReturn`] = calculateModifiedDietzReturn(
+          period.startValue,
+          period.endValue,
+          period.cashFlows,
+          period.startDate,
+          todayISO
+        );
+      } else {
+        personalReturns[`${apiKey}PersonalReturn`] = calculateSimplePersonalReturn(
+          period.startValue,
+          period.endValue,
+          period.totalCashFlow
+        );
+      }
+    } else {
+      personalReturns[`${apiKey}PersonalReturn`] = 0;
+    }
+    
+    // Flag de datos disponibles para MWR
+    personalReturns[`has${apiKey.charAt(0).toUpperCase() + apiKey.slice(1)}PersonalData`] = period.found;
+  });
+
   return {
     returns: {
+      // TWR (Time-Weighted Return) - existente
       ytdReturn,
       oneMonthReturn,
       threeMonthReturn,
@@ -432,7 +574,10 @@ function calculateHistoricalReturns(docs, currency, ticker, assetType) {
       hasSixMonthData: foundSixMonthStart && hasEnoughSixMonthDocs,
       hasOneYearData: foundOneYearStart && hasEnoughOneYearDocs,
       hasTwoYearData: foundTwoYearStart && hasEnoughTwoYearDocs,
-      hasFiveYearData: foundFiveYearStart && hasEnoughFiveYearDocs
+      hasFiveYearData: foundFiveYearStart && hasEnoughFiveYearDocs,
+      
+      // MWR (Money-Weighted Return / Personal Return) - Historia 25
+      ...personalReturns
     },
     validDocsCountByPeriod: {
       ytd: ytdCount,
