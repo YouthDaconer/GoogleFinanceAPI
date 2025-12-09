@@ -307,22 +307,27 @@ function calculateHistoricalReturns(docs, currency, ticker, assetType) {
 
     // Actualizar factor compuesto
     if (hasData) {
-      currentFactor = currentFactor * (1 + adjustedDailyChange / 100);
-
       const date = DateTime.fromISO(data.date);
       const year = date.year.toString();
       const month = (date.month - 1).toString();
 
       const isLastDayOfMonth = lastDaysByMonth[year]?.[month] === data.date;
 
+      // FIX OPT-018: Guardar monthlyStartFactors ANTES de aplicar el cambio del día
+      // para que el rendimiento del primer día del mes se incluya correctamente
       if (!monthlyStartFactors[year][month]) {
         monthlyStartFactors[year][month] = currentFactor;
       }
+
+      // Ahora sí aplicamos el cambio del día
+      currentFactor = currentFactor * (1 + adjustedDailyChange / 100);
+
+      // Guardar el factor final después del cambio
       monthlyEndFactors[year][month] = currentFactor;
 
       if (!monthlyCompoundData[year][month]) {
         monthlyCompoundData[year][month] = {
-          startFactor: currentFactor,
+          startFactor: monthlyStartFactors[year][month],
           endFactor: currentFactor,
           returnPct: 0,
           startTotalValue: totalValue,
@@ -1102,14 +1107,17 @@ const getMultiAccountHistoricalReturns = onCall(callableConfig, async (request) 
 
   // 10. Calcular rendimiento ponderado por valor para cada día
   // 
-  // IMPORTANTE: En lugar de recalcular el adjustedDailyChangePercentage,
-  // usamos los valores pre-calculados de cada cuenta y los ponderamos por su valor.
+  // FIX OPT-018: Usar el VALOR PRE-CAMBIO para ponderar
+  // 
+  // El problema anterior era que usábamos totalValue (que ya incluye el cambio del día)
+  // para calcular los pesos. Esto causaba que las cuentas con mayores ganancias
+  // tuvieran más peso, inflando el rendimiento combinado.
   //
-  // Fórmula de ponderación:
-  // portfolioChange = Σ(cuenta_adjustedChange × cuenta_value) / Σ(cuenta_value)
+  // Solución: Calcular el valor "pre-cambio" de cada cuenta:
+  //   valorPreCambio = valorActual / (1 + cambio/100)
   //
-  // Esto es matemáticamente correcto porque el rendimiento de un portafolio combinado
-  // es el promedio ponderado de los rendimientos de sus componentes.
+  // Fórmula corregida de ponderación:
+  // portfolioChange = Σ(cuenta_adjustedChange × cuenta_valorPreCambio) / Σ(cuenta_valorPreCambio)
   //
   const sortedDates = Array.from(aggregatedByDate.keys()).sort();
   
@@ -1124,21 +1132,34 @@ const getMultiAccountHistoricalReturns = onCall(callableConfig, async (request) 
         ? ((c.totalValue - c.totalInvestment) / c.totalInvestment) * 100 
         : 0;
       
-      // Calcular cambio diario ponderado usando los valores pre-calculados de cada cuenta
-      // Fórmula: portfolioChange = Σ(cuenta_change × cuenta_value) / Σ(cuenta_value)
+      // FIX OPT-018: Calcular el valor PRE-CAMBIO de cada cuenta para ponderar correctamente
       const contributions = c._accountContributions || [];
-      const totalWeight = contributions.reduce((sum, acc) => sum + (acc.totalValue || 0), 0);
       
-      if (totalWeight > 0 && contributions.length > 0) {
-        // Ponderar el adjustedDailyChangePercentage de cada cuenta por su valor
-        const weightedAdjustedChange = contributions.reduce((sum, acc) => {
-          const weight = (acc.totalValue || 0) / totalWeight;
+      // Calcular valor pre-cambio para cada cuenta
+      const contributionsWithPreValue = contributions.map(acc => {
+        const change = acc.adjustedDailyChangePercentage || 0;
+        const currentValue = acc.totalValue || 0;
+        // valor_pre_cambio = valor_actual / (1 + cambio/100)
+        const preChangeValue = change !== 0 ? currentValue / (1 + change / 100) : currentValue;
+        return {
+          ...acc,
+          preChangeValue
+        };
+      });
+      
+      // Usar valor pre-cambio para calcular los pesos
+      const totalWeight = contributionsWithPreValue.reduce((sum, acc) => sum + acc.preChangeValue, 0);
+      
+      if (totalWeight > 0 && contributionsWithPreValue.length > 0) {
+        // Ponderar el adjustedDailyChangePercentage de cada cuenta por su valor PRE-CAMBIO
+        const weightedAdjustedChange = contributionsWithPreValue.reduce((sum, acc) => {
+          const weight = acc.preChangeValue / totalWeight;
           return sum + (acc.adjustedDailyChangePercentage || 0) * weight;
         }, 0);
         
-        // Ponderar el rawDailyChangePercentage de cada cuenta por su valor
-        const weightedRawChange = contributions.reduce((sum, acc) => {
-          const weight = (acc.totalValue || 0) / totalWeight;
+        // Ponderar el rawDailyChangePercentage de cada cuenta por su valor PRE-CAMBIO
+        const weightedRawChange = contributionsWithPreValue.reduce((sum, acc) => {
+          const weight = acc.preChangeValue / totalWeight;
           return sum + (acc.rawDailyChangePercentage || 0) * weight;
         }, 0);
         

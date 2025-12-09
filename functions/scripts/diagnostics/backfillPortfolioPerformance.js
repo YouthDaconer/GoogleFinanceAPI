@@ -18,7 +18,18 @@
  *   --start=YYYY-MM-DD     # Fecha inicio (default: 2025-01-02)
  *   --end=YYYY-MM-DD       # Fecha fin (default: 2025-05-31)
  * 
+ * MÉTODO DE AGREGACIÓN OVERALL:
+ * Para calcular el adjustedDailyChangePercentage de OVERALL (combinación de cuentas),
+ * este script usa el método de "valor pre-cambio":
+ * 
+ *   preChangeValue = currentValue / (1 + change/100)
+ *   combinedChange = Σ(preChangeValue_i × change_i) / Σ(preChangeValue_i)
+ * 
+ * Este método garantiza que el cambio combinado esté siempre entre el mínimo
+ * y máximo de las cuentas individuales, y es matemáticamente correcto para TWR.
+ * 
  * @see docs/stories/26.story.md (Backfill de datos históricos)
+ * @see fixOverallComplete.js (Script alternativo para corregir OVERALL existente)
  */
 
 const admin = require('firebase-admin');
@@ -1017,14 +1028,37 @@ async function main() {
             let totalDoneProfitAndLoss = 0;
             const combinedAssetPerformance = {};
             
+            // =================================================================
+            // PASO 1: Calcular adjustedDailyChangePercentage usando método de
+            // VALOR PRE-CAMBIO (promedio ponderado correcto)
+            // =================================================================
+            let totalPreChangeValue = 0;
+            let weightedAdjustedChange = 0;
+            let weightedRawChange = 0;
+            
             // Sumar valores de todas las cuentas
             accountsData.forEach((perfData, accountId) => {
               const currencyData = perfData[currency];
               if (currencyData) {
-                totalValue += currencyData.totalValue || 0;
+                const accountValue = currencyData.totalValue || 0;
+                const accountAdjChange = currencyData.adjustedDailyChangePercentage || 0;
+                const accountRawChange = currencyData.rawDailyChangePercentage || currencyData.dailyChangePercentage || 0;
+                
+                totalValue += accountValue;
                 totalInvestment += currencyData.totalInvestment || 0;
                 totalCashFlow += currencyData.totalCashFlow || 0;
                 totalDoneProfitAndLoss += currencyData.doneProfitAndLoss || 0;
+                
+                // Calcular valor pre-cambio para ponderación correcta
+                if (accountValue > 0) {
+                  const preChangeValue = accountAdjChange !== 0 
+                    ? accountValue / (1 + accountAdjChange / 100) 
+                    : accountValue;
+                  
+                  totalPreChangeValue += preChangeValue;
+                  weightedAdjustedChange += preChangeValue * accountAdjChange;
+                  weightedRawChange += preChangeValue * accountRawChange;
+                }
                 
                 // Agregar assetPerformance
                 if (currencyData.assetPerformance) {
@@ -1044,6 +1078,10 @@ async function main() {
                         dailyReturn: 0,
                         monthlyReturn: 0,
                         annualReturn: 0,
+                        // Para cálculo de valor pre-cambio
+                        _preChangeValue: 0,
+                        _weightedAdjChange: 0,
+                        _weightedRawChange: 0,
                       };
                     }
                     const combined = combinedAssetPerformance[assetKey];
@@ -1053,6 +1091,21 @@ async function main() {
                     combined.totalCashFlow += assetPerf.totalCashFlow || 0;
                     combined.unrealizedProfitAndLoss += assetPerf.unrealizedProfitAndLoss || 0;
                     combined.doneProfitAndLoss += assetPerf.doneProfitAndLoss || 0;
+                    
+                    // Calcular valor pre-cambio para ponderación correcta del asset
+                    const assetValue = assetPerf.totalValue || 0;
+                    const assetAdjChange = assetPerf.adjustedDailyChangePercentage || 0;
+                    const assetRawChange = assetPerf.rawDailyChangePercentage || assetPerf.dailyChangePercentage || 0;
+                    
+                    if (assetValue > 0) {
+                      const assetPreChange = assetAdjChange !== 0 
+                        ? assetValue / (1 + assetAdjChange / 100) 
+                        : assetValue;
+                      
+                      combined._preChangeValue += assetPreChange;
+                      combined._weightedAdjChange += assetPreChange * assetAdjChange;
+                      combined._weightedRawChange += assetPreChange * assetRawChange;
+                    }
                   });
                 }
               }
@@ -1062,100 +1115,41 @@ async function main() {
             const unrealizedProfitAndLoss = totalValue - totalInvestment;
             const totalROI = totalInvestment > 0 ? ((totalValue - totalInvestment) / totalInvestment) * 100 : 0;
             
-            // Obtener el día anterior para calcular cambios diarios
-            const allDaysSorted = [...allAccountDates].sort();
-            const currentIdx = allDaysSorted.indexOf(date);
-            let previousTotalValue = 0;
-            
-            // Buscar día anterior
-            for (let i = currentIdx - 1; i >= 0; i--) {
-              const prevDate = allDaysSorted[i];
-              if (calculatedOverall.has(prevDate)) {
-                previousTotalValue = calculatedOverall.get(prevDate)[currency]?.totalValue || 0;
-                break;
-              } else if (existingOverall.has(prevDate)) {
-                previousTotalValue = existingOverall.get(prevDate)[currency]?.totalValue || 0;
-                break;
-              }
-            }
-            
-            // Calcular cambios diarios
+            // =================================================================
+            // PASO 2: Usar los cambios ponderados por valor pre-cambio
+            // Este método garantiza que el cambio combinado esté siempre entre
+            // el mínimo y máximo de las cuentas individuales
+            // =================================================================
             let rawDailyChangePercentage = 0;
             let adjustedDailyChangePercentage = 0;
             
-            if (previousTotalValue > 0) {
-              rawDailyChangePercentage = ((totalValue - previousTotalValue) / previousTotalValue) * 100;
-              adjustedDailyChangePercentage = ((totalValue - previousTotalValue + totalCashFlow) / previousTotalValue) * 100;
-              
-              // Corrección para cambios anormales
-              const hasSignificantCashFlow = Math.abs(totalCashFlow) > 50;
-              const isAbnormalChange = Math.abs(adjustedDailyChangePercentage) > 5;
-              
-              if (isAbnormalChange && !hasSignificantCashFlow) {
-                adjustedDailyChangePercentage = 0;
-                rawDailyChangePercentage = 0;
-              }
+            if (totalPreChangeValue > 0) {
+              adjustedDailyChangePercentage = weightedAdjustedChange / totalPreChangeValue;
+              rawDailyChangePercentage = weightedRawChange / totalPreChangeValue;
             }
             
-            // Obtener assetPerformance del día anterior para calcular cambios por asset
-            let previousAssetPerformance = null;
-            for (let i = currentIdx - 1; i >= 0; i--) {
-              const prevDate = allDaysSorted[i];
-              if (calculatedOverall.has(prevDate)) {
-                previousAssetPerformance = calculatedOverall.get(prevDate)[currency]?.assetPerformance;
-                break;
-              } else if (existingOverall.has(prevDate)) {
-                previousAssetPerformance = existingOverall.get(prevDate)[currency]?.assetPerformance;
-                break;
-              }
-            }
-            
-            // Recalcular ROI y cambios diarios por activo
+            // =================================================================
+            // PASO 3: Recalcular ROI y cambios diarios por activo
+            // Usar el método de valor pre-cambio ya calculado durante la agregación
+            // =================================================================
             Object.entries(combinedAssetPerformance).forEach(([assetKey, assetPerf]) => {
               // ROI
               if (assetPerf.totalInvestment > 0) {
                 assetPerf.totalROI = ((assetPerf.totalValue - assetPerf.totalInvestment) / assetPerf.totalInvestment) * 100;
               }
               
-              // Cambios diarios por asset
-              const prevAsset = previousAssetPerformance?.[assetKey];
-              const prevAssetValue = prevAsset?.totalValue || 0;
-              const prevAssetUnits = prevAsset?.units || 0;
-              
-              // Detectar si hubo cashflow en este activo
-              const unitsDiff = assetPerf.units - prevAssetUnits;
-              const hadAssetCashFlow = Math.abs(unitsDiff) > 0.0001;
-              
-              // PROTECCIÓN: Si el valor anterior es muy pequeño o cero, es nueva inversión
-              const isAssetNewInvestment = prevAssetValue < 0.01 && assetPerf.totalValue > 0;
-              
-              if (isAssetNewInvestment) {
-                assetPerf.dailyChangePercentage = 0;
-                assetPerf.rawDailyChangePercentage = 0;
-                assetPerf.adjustedDailyChangePercentage = 0;
-                assetPerf.dailyReturn = 0;
-              } else if (prevAssetValue >= 0.01) {
-                // Calcular cambio bruto
-                assetPerf.rawDailyChangePercentage = ((assetPerf.totalValue - prevAssetValue) / prevAssetValue) * 100;
+              // Usar valores pre-calculados por método de valor pre-cambio
+              if (assetPerf._preChangeValue > 0) {
+                assetPerf.adjustedDailyChangePercentage = assetPerf._weightedAdjChange / assetPerf._preChangeValue;
+                assetPerf.rawDailyChangePercentage = assetPerf._weightedRawChange / assetPerf._preChangeValue;
                 assetPerf.dailyChangePercentage = assetPerf.rawDailyChangePercentage;
-                
-                // Calcular cambio ajustado
-                if (hadAssetCashFlow) {
-                  const assetCashFlow = -(assetPerf.totalInvestment - (prevAsset?.totalInvestment || 0));
-                  assetPerf.adjustedDailyChangePercentage = ((assetPerf.totalValue - prevAssetValue + assetCashFlow) / prevAssetValue) * 100;
-                } else {
-                  assetPerf.adjustedDailyChangePercentage = assetPerf.rawDailyChangePercentage;
-                }
-                
-                // PROTECCIÓN: Limitar cambios extremos a ±50%
-                if (Math.abs(assetPerf.adjustedDailyChangePercentage) > 50) {
-                  assetPerf.adjustedDailyChangePercentage = 0;
-                  assetPerf.rawDailyChangePercentage = 0;
-                  assetPerf.dailyChangePercentage = 0;
-                }
-                
                 assetPerf.dailyReturn = assetPerf.adjustedDailyChangePercentage / 100;
               }
+              
+              // Limpiar campos temporales
+              delete assetPerf._preChangeValue;
+              delete assetPerf._weightedAdjChange;
+              delete assetPerf._weightedRawChange;
             });
             
             aggregatedPerformance[currency] = {
