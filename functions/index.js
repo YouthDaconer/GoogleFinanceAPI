@@ -148,6 +148,80 @@ exports.deleteAssets = assetOperations.deleteAssets;
 exports.updateStockSector = assetOperations.updateStockSector;
 
 // ============================================================================
+// Cloud Functions Callable - Operaciones de Settings (REF-005)
+// ============================================================================
+
+// Cloud Functions para currencies y userData
+const settingsOperations = require('./services/settingsOperations');
+
+/**
+ * Agrega una nueva moneda al sistema
+ * @see docs/stories/27.story.md (REF-005)
+ */
+exports.addCurrency = settingsOperations.addCurrency;
+
+/**
+ * Actualiza una moneda existente
+ * @see docs/stories/27.story.md (REF-005)
+ */
+exports.updateCurrency = settingsOperations.updateCurrency;
+
+/**
+ * Elimina una moneda del sistema
+ * @see docs/stories/27.story.md (REF-005)
+ */
+exports.deleteCurrency = settingsOperations.deleteCurrency;
+
+/**
+ * Actualiza la moneda por defecto del usuario
+ * @see docs/stories/27.story.md (REF-005)
+ */
+exports.updateDefaultCurrency = settingsOperations.updateDefaultCurrency;
+
+/**
+ * Actualiza el país del usuario
+ * @see docs/stories/27.story.md (REF-005)
+ */
+exports.updateUserCountry = settingsOperations.updateUserCountry;
+
+/**
+ * Actualiza el nombre para mostrar del usuario
+ * @see docs/stories/27.story.md (REF-005)
+ */
+exports.updateUserDisplayName = settingsOperations.updateUserDisplayName;
+
+// ============================================================================
+// Cloud Functions Callable - Operaciones de Portfolio Accounts (REF-006)
+// ============================================================================
+
+// Cloud Functions para portfolioAccounts
+const portfolioAccountOperations = require('./services/portfolioAccountOperations');
+
+/**
+ * Crea una nueva cuenta de portafolio
+ * @see docs/stories/27.story.md (REF-006)
+ */
+exports.addPortfolioAccount = portfolioAccountOperations.addPortfolioAccount;
+
+/**
+ * Actualiza una cuenta de portafolio existente
+ * @see docs/stories/27.story.md (REF-006)
+ */
+exports.updatePortfolioAccount = portfolioAccountOperations.updatePortfolioAccount;
+
+/**
+ * Elimina una cuenta de portafolio
+ * @see docs/stories/27.story.md (REF-006)
+ */
+exports.deletePortfolioAccount = portfolioAccountOperations.deletePortfolioAccount;
+
+/**
+ * Actualiza el balance de una moneda en una cuenta
+ * @see docs/stories/27.story.md (REF-006)
+ */
+exports.updatePortfolioAccountBalance = portfolioAccountOperations.updatePortfolioAccountBalance;
+
+// ============================================================================
 // Cloud Functions Callable - Optimización de Consultas (OPT-001)
 // ============================================================================
 
