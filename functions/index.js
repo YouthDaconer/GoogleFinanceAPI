@@ -110,6 +110,11 @@ exports.weeklyProfitableWeeksCalculation = onSchedule({
 exports.createAsset = assetOperations.createAsset;
 
 /**
+ * Actualiza un asset existente con ajuste de balance
+ */
+exports.updateAsset = assetOperations.updateAsset;
+
+/**
  * Vende un asset existente (total o parcialmente)
  * @see docs/architecture/refactoring-analysis.md - Sección 1.2
  */
@@ -128,7 +133,12 @@ exports.sellPartialAssetsFIFO = assetOperations.sellPartialAssetsFIFO;
 exports.addCashTransaction = assetOperations.addCashTransaction;
 
 /**
- * Elimina activos de una cuenta de portafolio
+ * Elimina un asset individual y sus transacciones asociadas
+ */
+exports.deleteAsset = assetOperations.deleteAsset;
+
+/**
+ * Elimina activos de una cuenta de portafolio (todos o por moneda)
  */
 exports.deleteAssets = assetOperations.deleteAssets;
 

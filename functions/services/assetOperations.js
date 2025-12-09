@@ -17,6 +17,9 @@ const db = admin.firestore();
 // Importar función de invalidación de cache de rendimientos (OPT-002)
 const { invalidatePerformanceCache } = require('./historicalReturnsService');
 
+// Importar getQuotes para crear currentPrices de nuevos tickers
+const { getQuotes } = require('./financeQuery');
+
 /**
  * Configuración común para Cloud Functions Callable
  */
@@ -93,6 +96,87 @@ const validateSufficientFunds = (account, currency, requiredAmount) => {
       'failed-precondition',
       `Saldo insuficiente. Disponible: ${currentBalance.toFixed(2)} ${currency}, Requerido: ${requiredAmount.toFixed(2)} ${currency}`
     );
+  }
+};
+
+/**
+ * Crea o actualiza el documento currentPrices para un ticker
+ * 
+ * @description
+ * Verifica si existe el documento currentPrices/{symbol}. Si no existe,
+ * consulta el API para obtener la quote completa (incluido sector) y lo crea.
+ * 
+ * @param {string} symbol - Símbolo del ticker (ej: "NFLX")
+ * @param {string} assetType - Tipo de activo ("stock", "etf", etc.)
+ * @returns {Promise<boolean>} true si se creó/actualizó, false si ya existía
+ */
+const ensureCurrentPriceExists = async (symbol, assetType) => {
+  const priceRef = db.collection('currentPrices').doc(symbol);
+  const priceDoc = await priceRef.get();
+
+  if (priceDoc.exists) {
+    console.log(`[ensureCurrentPriceExists] ${symbol} ya existe en currentPrices`);
+    return false;
+  }
+
+  console.log(`[ensureCurrentPriceExists] ${symbol} no existe, obteniendo quote del API...`);
+
+  try {
+    const quotes = await getQuotes(symbol);
+    
+    if (!quotes || quotes.length === 0) {
+      console.warn(`[ensureCurrentPriceExists] No se obtuvo quote para ${symbol}`);
+      return false;
+    }
+
+    const quote = quotes[0];
+    
+    // Normalizar el precio eliminando comas si es string
+    const price = typeof quote.price === 'string' 
+      ? parseFloat(quote.price.replace(/,/g, '')) 
+      : parseFloat(quote.price);
+
+    // Construir documento currentPrices con todos los campos disponibles
+    const currentPriceData = {
+      symbol: symbol,
+      price: price,
+      lastUpdated: Date.now(),
+      name: quote.name || symbol,
+      type: assetType || 'stock',
+      change: quote.change || null,
+      percentChange: quote.percentChange || null,
+      currency: quote.currency || 'USD',
+      currencySymbol: quote.currencySymbol || '$',
+      exchange: quote.exchange || null,
+      exchangeName: quote.exchangeName || null,
+    };
+
+    // Lista de campos opcionales a incluir si están presentes
+    const optionalFields = [
+      'logo', 'open', 'high', 'low',
+      'yearHigh', 'yearLow', 'volume', 'avgVolume',
+      'marketCap', 'beta', 'pe', 'eps',
+      'earningsDate', 'industry', 'sector', 'about', 'employees',
+      'dividend', 'exDividend', 'yield', 'dividendDate',
+      'threeMonthReturn', 'sixMonthReturn', 'ytdReturn',
+      'threeYearReturn', 'yearReturn', 'fiveYearReturn',
+      'country', 'city'
+    ];
+
+    optionalFields.forEach(field => {
+      if (quote[field] !== null && quote[field] !== undefined) {
+        currentPriceData[field] = quote[field];
+      }
+    });
+
+    await priceRef.set(currentPriceData);
+    console.log(`[ensureCurrentPriceExists] ✅ Creado currentPrices/${symbol} con sector: ${quote.sector || 'N/A'}`);
+    
+    return true;
+  } catch (error) {
+    console.error(`[ensureCurrentPriceExists] Error al crear currentPrices para ${symbol}:`, error);
+    // No lanzamos error para no bloquear la creación del asset
+    return false;
   }
 };
 
@@ -210,7 +294,11 @@ exports.createAsset = onCall(callableConfig, async (request) => {
     // 7. Commit de la transacción
     await batch.commit();
 
-    // 8. Invalidar cache de rendimientos (OPT-002)
+    // 8. Crear currentPrices si es un ticker nuevo (FIX: sector no encontrado)
+    // Esto se ejecuta después del commit para no bloquear la transacción principal
+    await ensureCurrentPriceExists(data.name, data.assetType);
+
+    // 9. Invalidar cache de rendimientos (OPT-002)
     await invalidatePerformanceCache(auth.uid);
 
     console.log(`[createAsset] Éxito - assetId: ${assetRef.id}, transactionId: ${transactionRef.id}`);
@@ -229,6 +317,148 @@ exports.createAsset = onCall(callableConfig, async (request) => {
     }
     
     throw new HttpsError('internal', `Error al crear el activo: ${error.message}`);
+  }
+});
+
+// ============================================================================
+// FUNCIÓN: updateAsset
+// ============================================================================
+
+/**
+ * Actualiza un asset existente con ajuste de balance
+ * 
+ * @description
+ * Esta función reemplaza la lógica de updateAsset() en useFirestore.ts.
+ * Ejecuta atómicamente:
+ * 1. Validar ownership del asset via portfolioAccount
+ * 2. Calcular diferencia de valor (nuevo total - viejo total)
+ * 3. Verificar saldo suficiente si el nuevo valor es mayor
+ * 4. Actualizar el asset
+ * 5. Ajustar balance de la cuenta según la diferencia
+ * 
+ * @param {object} data
+ * @param {string} data.assetId - ID del asset a actualizar
+ * @param {object} data.updates - Campos a actualizar (units, unitValue, commission, etc.)
+ * 
+ * @returns {Promise<object>} { success, assetId, balanceAdjustment }
+ */
+exports.updateAsset = onCall(callableConfig, async (request) => {
+  const { auth, data } = request;
+
+  console.log(`[updateAsset] Iniciando - userId: ${auth?.uid}, assetId: ${data?.assetId}`);
+
+  try {
+    // 1. Validar autenticación
+    validateAuth(auth);
+
+    // 2. Validar datos requeridos
+    if (!data.assetId) {
+      throw new HttpsError('invalid-argument', 'assetId es requerido');
+    }
+    if (!data.updates || typeof data.updates !== 'object') {
+      throw new HttpsError('invalid-argument', 'updates es requerido y debe ser un objeto');
+    }
+
+    // 3. Obtener el asset actual
+    const assetRef = db.collection('assets').doc(data.assetId);
+    const assetDoc = await assetRef.get();
+
+    if (!assetDoc.exists) {
+      throw new HttpsError('not-found', 'El asset no existe');
+    }
+
+    const oldAsset = assetDoc.data();
+
+    // 4. Validar ownership via portfolioAccount
+    const account = await validateAccountOwnership(oldAsset.portfolioAccount, auth.uid);
+
+    // 5. Calcular valores antiguos y nuevos
+    const oldUnits = cleanDecimal(Number(oldAsset.units));
+    const oldUnitValue = cleanDecimal(Number(oldAsset.unitValue));
+    const oldCommission = cleanDecimal(Number(oldAsset.commission) || 0);
+    const oldTotalValue = cleanDecimal(oldUnits * oldUnitValue + oldCommission);
+
+    // Merge con los nuevos valores
+    const newUnits = data.updates.units !== undefined 
+      ? cleanDecimal(Number(data.updates.units)) 
+      : oldUnits;
+    const newUnitValue = data.updates.unitValue !== undefined 
+      ? cleanDecimal(Number(data.updates.unitValue)) 
+      : oldUnitValue;
+    const newCommission = data.updates.commission !== undefined 
+      ? cleanDecimal(Number(data.updates.commission)) 
+      : oldCommission;
+    const newTotalValue = cleanDecimal(newUnits * newUnitValue + newCommission);
+
+    // 6. Calcular diferencia de valor
+    const valueDifference = cleanDecimal(newTotalValue - oldTotalValue);
+    const currency = data.updates.currency || oldAsset.currency;
+
+    // 7. Verificar saldo suficiente si el nuevo valor es mayor
+    if (valueDifference > 0) {
+      const currentBalance = account.balances?.[currency] || 0;
+      if (currentBalance < valueDifference) {
+        throw new HttpsError(
+          'failed-precondition',
+          `Saldo insuficiente. Disponible: ${currentBalance.toFixed(2)} ${currency}, Requerido adicional: ${valueDifference.toFixed(2)} ${currency}`
+        );
+      }
+    }
+
+    // 8. Preparar los datos de actualización
+    const updateData = { ...data.updates };
+    
+    // Limpiar campos numéricos
+    if (updateData.units !== undefined) {
+      updateData.units = cleanDecimal(Number(updateData.units));
+    }
+    if (updateData.unitValue !== undefined) {
+      updateData.unitValue = cleanDecimal(Number(updateData.unitValue));
+    }
+    if (updateData.commission !== undefined) {
+      updateData.commission = cleanDecimal(Number(updateData.commission));
+    }
+    if (updateData.acquisitionDollarValue !== undefined) {
+      updateData.acquisitionDollarValue = cleanDecimal(Number(updateData.acquisitionDollarValue));
+    }
+
+    // 9. Ejecutar transacción atómica
+    const batch = db.batch();
+
+    // 9.1. Actualizar el asset
+    batch.update(assetRef, updateData);
+
+    // 9.2. Ajustar balance de la cuenta si hay diferencia
+    if (valueDifference !== 0) {
+      const newBalance = cleanDecimal((account.balances?.[currency] || 0) - valueDifference);
+      const accountRef = db.collection('portfolioAccounts').doc(oldAsset.portfolioAccount);
+      batch.update(accountRef, {
+        [`balances.${currency}`]: newBalance,
+      });
+    }
+
+    // 10. Commit
+    await batch.commit();
+
+    // 11. Invalidar cache de rendimientos
+    await invalidatePerformanceCache(auth.uid);
+
+    console.log(`[updateAsset] Éxito - assetId: ${data.assetId}, balanceAdjustment: ${valueDifference}`);
+
+    return {
+      success: true,
+      assetId: data.assetId,
+      balanceAdjustment: valueDifference,
+    };
+
+  } catch (error) {
+    console.error(`[updateAsset] Error - userId: ${auth?.uid}`, error);
+    
+    if (error instanceof HttpsError) {
+      throw error;
+    }
+    
+    throw new HttpsError('internal', `Error al actualizar el activo: ${error.message}`);
   }
 });
 
@@ -705,7 +935,94 @@ exports.addCashTransaction = onCall(callableConfig, async (request) => {
 });
 
 // ============================================================================
-// FUNCIÓN: deleteAssets
+// FUNCIÓN: deleteAsset (SINGULAR)
+// ============================================================================
+
+/**
+ * Elimina un asset individual y sus transacciones asociadas
+ * 
+ * @description
+ * Esta función reemplaza la lógica de deleteAsset() en useFirestore.ts.
+ * Ejecuta atómicamente:
+ * 1. Validar ownership del asset via portfolioAccount
+ * 2. Eliminar todas las transacciones asociadas al asset
+ * 3. Eliminar el documento del asset
+ * 
+ * @param {object} data
+ * @param {string} data.assetId - ID del asset a eliminar
+ * 
+ * @returns {Promise<object>} { success, deletedTransactionsCount }
+ */
+exports.deleteAsset = onCall(callableConfig, async (request) => {
+  const { auth, data } = request;
+
+  console.log(`[deleteAsset] Iniciando - userId: ${auth?.uid}, assetId: ${data?.assetId}`);
+
+  try {
+    // 1. Validar autenticación
+    validateAuth(auth);
+
+    // 2. Validar datos requeridos
+    if (!data.assetId) {
+      throw new HttpsError('invalid-argument', 'assetId es requerido');
+    }
+
+    // 3. Obtener el asset
+    const assetRef = db.collection('assets').doc(data.assetId);
+    const assetDoc = await assetRef.get();
+
+    if (!assetDoc.exists) {
+      throw new HttpsError('not-found', 'El asset no existe');
+    }
+
+    const assetData = assetDoc.data();
+
+    // 4. Validar ownership via portfolioAccount
+    await validateAccountOwnership(assetData.portfolioAccount, auth.uid);
+
+    // 5. Buscar y eliminar transacciones asociadas
+    const transactionsQuery = db.collection('transactions')
+      .where('assetId', '==', data.assetId);
+    
+    const transactionsSnapshot = await transactionsQuery.get();
+
+    const batch = db.batch();
+    let deletedTransactionsCount = 0;
+
+    transactionsSnapshot.forEach(txDoc => {
+      batch.delete(txDoc.ref);
+      deletedTransactionsCount++;
+    });
+
+    // 6. Eliminar el asset
+    batch.delete(assetRef);
+
+    // 7. Commit
+    await batch.commit();
+
+    // 8. Invalidar cache de rendimientos
+    await invalidatePerformanceCache(auth.uid);
+
+    console.log(`[deleteAsset] Éxito - assetId: ${data.assetId}, transacciones eliminadas: ${deletedTransactionsCount}`);
+
+    return {
+      success: true,
+      deletedTransactionsCount: deletedTransactionsCount,
+    };
+
+  } catch (error) {
+    console.error(`[deleteAsset] Error - userId: ${auth?.uid}`, error);
+    
+    if (error instanceof HttpsError) {
+      throw error;
+    }
+    
+    throw new HttpsError('internal', `Error al eliminar el activo: ${error.message}`);
+  }
+});
+
+// ============================================================================
+// FUNCIÓN: deleteAssets (PLURAL - por cuenta)
 // ============================================================================
 
 /**
