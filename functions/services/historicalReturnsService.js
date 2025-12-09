@@ -111,6 +111,8 @@ function calculateHistoricalReturns(docs, currency, ticker, assetType) {
   const totalValueDates = [];
   const totalValueValues = [];
   const percentChanges = [];
+  // FEAT-CHART-001: Agregar cambios ajustados para TWR en gráficos multi-cuenta
+  const adjustedPercentChanges = [];
 
   // Datos para rendimiento mensual
   const datesByMonth = {};
@@ -246,6 +248,8 @@ function calculateHistoricalReturns(docs, currency, ticker, assetType) {
           totalValueDates.push(data.date);
           totalValueValues.push(assetData.totalValue);
           percentChanges.push(assetData.dailyChangePercentage || 0);
+          // FEAT-CHART-001: Guardar cambios ajustados para TWR en gráficos
+          adjustedPercentChanges.push(assetData.adjustedDailyChangePercentage || 0);
         }
       }
     } else if (currencyData.adjustedDailyChangePercentage !== undefined) {
@@ -270,6 +274,8 @@ function calculateHistoricalReturns(docs, currency, ticker, assetType) {
         totalValueDates.push(data.date);
         totalValueValues.push(currencyData.totalValue);
         percentChanges.push(currencyData.dailyChangePercentage || 0);
+        // FEAT-CHART-001: Guardar cambios ajustados para TWR en gráficos
+        adjustedPercentChanges.push(currencyData.adjustedDailyChangePercentage || 0);
       }
     }
 
@@ -592,6 +598,8 @@ function calculateHistoricalReturns(docs, currency, ticker, assetType) {
       dates: totalValueDates,
       values: totalValueValues,
       percentChanges: percentChanges,
+      // FEAT-CHART-001: Cambios ajustados para TWR en gráficos multi-cuenta
+      adjustedPercentChanges: adjustedPercentChanges,
       overallPercentChange: overallPercentChange
     },
     performanceByYear,
