@@ -374,7 +374,46 @@ function calculateHoldingsAtDate(transactions, targetDate) {
 }
 
 /**
+ * Calcular P&L realizado del día específico (doneProfitAndLoss)
+ * 
+ * El doneProfitAndLoss es la suma de los valuePnL de las ventas del día.
+ * Esto representa las ganancias/pérdidas REALIZADAS por ventas.
+ * 
+ * @param {Array} transactions - Todas las transacciones
+ * @param {string} targetDate - Fecha objetivo
+ * @returns {Object} { total: number, byAsset: Map<assetKey, number> }
+ */
+function calculateDailyDonePnL(transactions, targetDate) {
+  const byAsset = new Map();
+  let total = 0;
+  
+  transactions
+    .filter(tx => tx.date === targetDate && tx.type === 'sell')
+    .forEach(tx => {
+      const pnl = tx.valuePnL || 0;
+      total += pnl;
+      
+      // Por asset (assetName_assetType)
+      const assetKey = `${tx.assetName}_${tx.assetType}`;
+      byAsset.set(assetKey, (byAsset.get(assetKey) || 0) + pnl);
+    });
+  
+  return { total, byAsset };
+}
+
+/**
  * Calcular cash flow del día específico
+ * 
+ * CONVENCIÓN DE SIGNOS PARA TWR:
+ * - Negativo: dinero que sale del bolsillo del inversor hacia el portfolio
+ *   (compras de activos)
+ * - Positivo: dinero que entra al bolsillo del inversor desde el portfolio
+ *   (ventas de activos)
+ * 
+ * NOTA: cash_income y cash_outcome NO se incluyen en el cashflow para TWR
+ * porque representan transferencias internas de efectivo dentro del portfolio,
+ * no inyecciones/retiros reales de capital. El efectivo ya está en el portfolio
+ * como parte del valor total (aunque no visible en los activos).
  */
 function calculateDailyCashFlow(transactions, targetDate) {
   return transactions
@@ -382,8 +421,27 @@ function calculateDailyCashFlow(transactions, targetDate) {
     .reduce((sum, tx) => {
       if (tx.type === 'buy') return sum - (tx.amount || 0) * (tx.price || 0);
       if (tx.type === 'sell') return sum + (tx.amount || 0) * (tx.price || 0);
-      if (tx.type === 'cash_income') return sum + (tx.amount || 0);
-      if (tx.type === 'cash_outcome') return sum - (tx.amount || 0);
+      // cash_income/cash_outcome NO se incluyen - son transferencias internas
+      return sum;
+    }, 0);
+}
+
+/**
+ * Calcular cashflow acumulado desde una fecha hasta otra (exclusive end)
+ * Incluye cashflows de días intermedios que no tienen documento
+ * 
+ * @param {Array} transactions - Todas las transacciones
+ * @param {string} startDateExclusive - Fecha inicio (exclusive)
+ * @param {string} endDateInclusive - Fecha fin (inclusive)
+ * @returns {number} Cashflow acumulado
+ */
+function calculateAccumulatedCashFlow(transactions, startDateExclusive, endDateInclusive) {
+  return transactions
+    .filter(tx => tx.date > startDateExclusive && tx.date <= endDateInclusive)
+    .reduce((sum, tx) => {
+      if (tx.type === 'buy') return sum - (tx.amount || 0) * (tx.price || 0);
+      if (tx.type === 'sell') return sum + (tx.amount || 0) * (tx.price || 0);
+      // cash_income/cash_outcome NO se incluyen - son transferencias internas
       return sum;
     }, 0);
 }
@@ -441,6 +499,16 @@ function getPriceForDate(symbolPrices, targetDate, allDates) {
  *   Formula: (endValue - startValue + cashFlow) / startValue * 100
  *   Donde cashFlow es NEGATIVO para compras (sale dinero) y POSITIVO para ventas (entra dinero)
  *   Al sumar el cashFlow, las compras se "cancelan" del rendimiento
+ * 
+ * @param {Map} holdings - Holdings del día
+ * @param {Map} pricesBySymbol - Precios por símbolo
+ * @param {string} targetDate - Fecha objetivo
+ * @param {Object} exchangeRates - Tasas de cambio por moneda
+ * @param {number} totalInvestmentUSD - Inversión total en USD
+ * @param {number} dailyCashFlowUSD - Cash flow del día en USD
+ * @param {Object} previousDayPerformance - Performance del día anterior
+ * @param {Map} previousDayHoldings - Holdings del día anterior
+ * @param {Object} dailyDonePnL - P&L realizado del día { total: number, byAsset: Map }
  */
 function calculateDayPerformance(
   holdings,
@@ -450,7 +518,8 @@ function calculateDayPerformance(
   totalInvestmentUSD,
   dailyCashFlowUSD,
   previousDayPerformance,
-  previousDayHoldings
+  previousDayHoldings,
+  dailyDonePnL = { total: 0, byAsset: new Map() }
 ) {
   const result = {};
   
@@ -461,12 +530,18 @@ function calculateDayPerformance(
     let totalValue = 0;
     const assetPerformance = {};
     
+    // Calcular doneProfitAndLoss para esta moneda
+    const dailyDonePnLForCurrency = dailyDonePnL.total * exchangeRate;
+    
     holdings.forEach((holding, assetKey) => {
       const symbolPrices = pricesBySymbol.get(holding.symbol);
       const price = getPriceForDate(symbolPrices, targetDate);
       const valueUSD = holding.units * price;
       const value = valueUSD * exchangeRate;
       const investment = holding.totalInvestment * exchangeRate;
+      
+      // doneProfitAndLoss por activo (del día)
+      const assetDonePnL = (dailyDonePnL.byAsset.get(assetKey) || 0) * exchangeRate;
       
       totalValue += value;
       
@@ -476,6 +551,7 @@ function calculateDayPerformance(
         totalInvestment: investment,
         totalCashFlow: 0,
         unrealizedProfitAndLoss: value - investment,
+        doneProfitAndLoss: assetDonePnL,
         totalROI: investment > 0 ? ((value - investment) / investment) * 100 : 0,
         dailyChangePercentage: 0,
         rawDailyChangePercentage: 0,
@@ -546,7 +622,7 @@ function calculateDayPerformance(
       totalValue,
       totalInvestment,
       totalCashFlow,
-      doneProfitAndLoss: 0,
+      doneProfitAndLoss: dailyDonePnLForCurrency,
       unrealizedProfitAndLoss: totalValue - totalInvestment,
       totalROI: totalInvestment > 0 ? ((totalValue - totalInvestment) / totalInvestment) * 100 : 0,
       dailyChangePercentage,
@@ -570,16 +646,18 @@ function calculateDayPerformance(
       const unitsDiff = perf.units - prevAssetUnits;
       const hadAssetCashFlow = Math.abs(unitsDiff) > 0.0001;
       
-      // Determinar si es nueva inversión en este activo
-      const isAssetNewInvestment = prevAssetValue === 0 && perf.totalValue > 0;
+      // PROTECCIÓN: Si el valor anterior es muy pequeño o cero, es nueva inversión
+      // Esto evita división por cero y valores astronómicos cuando un asset
+      // reaparece después de haber sido vendido completamente
+      const isAssetNewInvestment = prevAssetValue < 0.01 && perf.totalValue > 0;
       
       if (isAssetNewInvestment) {
-        // Nueva inversión: 0%
+        // Nueva inversión o reaparición después de venta: 0%
         perf.dailyChangePercentage = 0;
         perf.rawDailyChangePercentage = 0;
         perf.adjustedDailyChangePercentage = 0;
         perf.dailyReturn = 0;
-      } else if (prevAssetValue > 0) {
+      } else if (prevAssetValue >= 0.01) {
         // Calcular cambio bruto
         perf.rawDailyChangePercentage = ((perf.totalValue - prevAssetValue) / prevAssetValue) * 100;
         perf.dailyChangePercentage = perf.rawDailyChangePercentage;
@@ -592,6 +670,14 @@ function calculateDayPerformance(
         } else {
           // Sin cashflow: adjusted = raw
           perf.adjustedDailyChangePercentage = perf.rawDailyChangePercentage;
+        }
+        
+        // PROTECCIÓN: Limitar cambios extremos a ±50%
+        // Cambios mayores indican problemas de datos (gaps, precios incorrectos)
+        if (Math.abs(perf.adjustedDailyChangePercentage) > 50) {
+          perf.adjustedDailyChangePercentage = 0;
+          perf.rawDailyChangePercentage = 0;
+          perf.dailyChangePercentage = 0;
         }
         
         perf.dailyReturn = perf.adjustedDailyChangePercentage / 100;
@@ -756,6 +842,7 @@ async function main() {
         const allDaysSorted = [...expectedDays].sort();
         const currentIdx = allDaysSorted.indexOf(date);
         let previousDayPerformance = null;
+        let previousDayDate = null;
         
         // Buscar hacia atrás hasta encontrar un día con datos
         for (let i = currentIdx - 1; i >= 0; i--) {
@@ -763,16 +850,32 @@ async function main() {
           if (calculatedPerformance.has(prevDate)) {
             // Usar el performance que acabamos de calcular en este backfill
             previousDayPerformance = calculatedPerformance.get(prevDate);
+            previousDayDate = prevDate;
             break;
           } else if (existing.has(prevDate)) {
             // Usar el performance que ya existía en Firestore
             previousDayPerformance = existing.get(prevDate);
+            previousDayDate = prevDate;
             break;
           }
         }
         
         // Calcular holdings hasta esta fecha
-        const { holdings, totalInvestmentUSD, dailyCashFlow } = calculateHoldingsAtDate(transactions, date);
+        const { holdings, totalInvestmentUSD } = calculateHoldingsAtDate(transactions, date);
+        
+        // =====================================================================
+        // IMPORTANTE: Calcular cashflow ACUMULADO desde el día anterior
+        // Esto incluye cashflows de días intermedios sin documento
+        // =====================================================================
+        const accumulatedCashFlow = previousDayDate 
+          ? calculateAccumulatedCashFlow(transactions, previousDayDate, date)
+          : calculateDailyCashFlow(transactions, date); // Para el primer día
+        
+        // =====================================================================
+        // Calcular P&L realizado del día (doneProfitAndLoss)
+        // Suma de valuePnL de las ventas del día
+        // =====================================================================
+        const dailyDonePnL = calculateDailyDonePnL(transactions, date);
         
         // Obtener tipos de cambio para esta fecha
         const exchangeRates = exchangeRatesByDate.get(date) || { USD: 1 };
@@ -784,9 +887,10 @@ async function main() {
           date,
           exchangeRates,
           totalInvestmentUSD,
-          dailyCashFlow,
+          accumulatedCashFlow,
           previousDayPerformance,
-          null // previousDayHoldings - no necesario, usamos previousDayPerformance
+          null, // previousDayHoldings - no necesario, usamos previousDayPerformance
+          dailyDonePnL
         );
         
         // Guardar para usar como previousDayPerformance en el siguiente día
@@ -932,11 +1036,14 @@ async function main() {
                         totalInvestment: 0,
                         totalCashFlow: 0,
                         unrealizedProfitAndLoss: 0,
+                        doneProfitAndLoss: 0,
                         totalROI: 0,
                         dailyChangePercentage: 0,
                         rawDailyChangePercentage: 0,
                         adjustedDailyChangePercentage: 0,
                         dailyReturn: 0,
+                        monthlyReturn: 0,
+                        annualReturn: 0,
                       };
                     }
                     const combined = combinedAssetPerformance[assetKey];
@@ -945,6 +1052,7 @@ async function main() {
                     combined.totalInvestment += assetPerf.totalInvestment || 0;
                     combined.totalCashFlow += assetPerf.totalCashFlow || 0;
                     combined.unrealizedProfitAndLoss += assetPerf.unrealizedProfitAndLoss || 0;
+                    combined.doneProfitAndLoss += assetPerf.doneProfitAndLoss || 0;
                   });
                 }
               }
@@ -989,10 +1097,64 @@ async function main() {
               }
             }
             
-            // Recalcular ROI por activo
-            Object.values(combinedAssetPerformance).forEach(assetPerf => {
+            // Obtener assetPerformance del día anterior para calcular cambios por asset
+            let previousAssetPerformance = null;
+            for (let i = currentIdx - 1; i >= 0; i--) {
+              const prevDate = allDaysSorted[i];
+              if (calculatedOverall.has(prevDate)) {
+                previousAssetPerformance = calculatedOverall.get(prevDate)[currency]?.assetPerformance;
+                break;
+              } else if (existingOverall.has(prevDate)) {
+                previousAssetPerformance = existingOverall.get(prevDate)[currency]?.assetPerformance;
+                break;
+              }
+            }
+            
+            // Recalcular ROI y cambios diarios por activo
+            Object.entries(combinedAssetPerformance).forEach(([assetKey, assetPerf]) => {
+              // ROI
               if (assetPerf.totalInvestment > 0) {
                 assetPerf.totalROI = ((assetPerf.totalValue - assetPerf.totalInvestment) / assetPerf.totalInvestment) * 100;
+              }
+              
+              // Cambios diarios por asset
+              const prevAsset = previousAssetPerformance?.[assetKey];
+              const prevAssetValue = prevAsset?.totalValue || 0;
+              const prevAssetUnits = prevAsset?.units || 0;
+              
+              // Detectar si hubo cashflow en este activo
+              const unitsDiff = assetPerf.units - prevAssetUnits;
+              const hadAssetCashFlow = Math.abs(unitsDiff) > 0.0001;
+              
+              // PROTECCIÓN: Si el valor anterior es muy pequeño o cero, es nueva inversión
+              const isAssetNewInvestment = prevAssetValue < 0.01 && assetPerf.totalValue > 0;
+              
+              if (isAssetNewInvestment) {
+                assetPerf.dailyChangePercentage = 0;
+                assetPerf.rawDailyChangePercentage = 0;
+                assetPerf.adjustedDailyChangePercentage = 0;
+                assetPerf.dailyReturn = 0;
+              } else if (prevAssetValue >= 0.01) {
+                // Calcular cambio bruto
+                assetPerf.rawDailyChangePercentage = ((assetPerf.totalValue - prevAssetValue) / prevAssetValue) * 100;
+                assetPerf.dailyChangePercentage = assetPerf.rawDailyChangePercentage;
+                
+                // Calcular cambio ajustado
+                if (hadAssetCashFlow) {
+                  const assetCashFlow = -(assetPerf.totalInvestment - (prevAsset?.totalInvestment || 0));
+                  assetPerf.adjustedDailyChangePercentage = ((assetPerf.totalValue - prevAssetValue + assetCashFlow) / prevAssetValue) * 100;
+                } else {
+                  assetPerf.adjustedDailyChangePercentage = assetPerf.rawDailyChangePercentage;
+                }
+                
+                // PROTECCIÓN: Limitar cambios extremos a ±50%
+                if (Math.abs(assetPerf.adjustedDailyChangePercentage) > 50) {
+                  assetPerf.adjustedDailyChangePercentage = 0;
+                  assetPerf.rawDailyChangePercentage = 0;
+                  assetPerf.dailyChangePercentage = 0;
+                }
+                
+                assetPerf.dailyReturn = assetPerf.adjustedDailyChangePercentage / 100;
               }
             });
             
