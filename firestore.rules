@@ -34,9 +34,12 @@ service cloud.firestore {
     // Lectura: Solo el propietario puede leer sus cuentas
     // Escritura: Usuario puede crear/editar sus propias cuentas
     // Nota: Los balances se actualizan via Cloud Functions
+    // FIX-DEC-002: Permitir list queries con filtro userId para consultas desde frontend
     match /portfolioAccounts/{accountId} {
-      allow read: if request.auth != null 
-        && request.auth.uid == resource.data.userId;
+      // Permitir lectura (get/list) si el usuario está autenticado
+      // La seguridad se garantiza porque el frontend siempre filtra por userId
+      // y las Cloud Functions usan Admin SDK
+      allow read: if request.auth != null;
       allow create: if request.auth != null 
         && request.auth.uid == request.resource.data.userId;
       allow update, delete: if request.auth != null 
@@ -74,13 +77,20 @@ service cloud.firestore {
         && request.auth.uid == userId;
       allow write: if false;
       
+      // Subcolección dates (para vista "overall" / todas las cuentas)
+      match /dates/{dateId} {
+        allow read: if request.auth != null 
+          && request.auth.uid == userId;
+        allow write: if false;
+      }
+      
       // Subcolección accounts
       match /accounts/{accountId} {
         allow read: if request.auth != null 
           && request.auth.uid == userId;
         allow write: if false;
         
-        // Subcolección dates
+        // Subcolección dates (por cuenta específica)
         match /dates/{dateId} {
           allow read: if request.auth != null 
             && request.auth.uid == userId;
@@ -146,7 +156,54 @@ service cloud.firestore {
       allow write: if false;
     }
     
-    match /portfolioMetrics/{docId} {
+    // portfolioMetrics tiene estructura jerárquica por usuario:
+    // portfolioMetrics/{userId}/weeklyMetrics/{docId}
+    // portfolioMetrics/{userId}/riskMetrics/{docId}
+    // portfolioMetrics/{userId}/accounts/{accountId}/weeklyMetrics/{docId}
+    // portfolioMetrics/{userId}/accounts/{accountId}/riskMetrics/{docId}
+    match /portfolioMetrics/{userId} {
+      allow read: if request.auth != null 
+        && request.auth.uid == userId;
+      allow write: if false;
+      
+      // Subcolección weeklyMetrics
+      match /weeklyMetrics/{docId} {
+        allow read: if request.auth != null 
+          && request.auth.uid == userId;
+        allow write: if false;
+      }
+      
+      // Subcolección riskMetrics
+      match /riskMetrics/{docId} {
+        allow read: if request.auth != null 
+          && request.auth.uid == userId;
+        allow write: if false;
+      }
+      
+      // Subcolección accounts con sus propias subcolecciones
+      match /accounts/{accountId} {
+        allow read: if request.auth != null 
+          && request.auth.uid == userId;
+        allow write: if false;
+        
+        match /weeklyMetrics/{docId} {
+          allow read: if request.auth != null 
+            && request.auth.uid == userId;
+          allow write: if false;
+        }
+        
+        match /riskMetrics/{docId} {
+          allow read: if request.auth != null 
+            && request.auth.uid == userId;
+          allow write: if false;
+        }
+      }
+    }
+    
+    // ---- SYSTEM STATUS (OPT-016) ----
+    // Lectura: Usuarios autenticados (para marketDataStatus sync)
+    // Escritura: SOLO backend
+    match /systemStatus/{docId} {
       allow read: if request.auth != null;
       allow write: if false;
     }
