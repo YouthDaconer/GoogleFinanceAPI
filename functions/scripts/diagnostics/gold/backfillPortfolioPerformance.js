@@ -36,7 +36,7 @@ const admin = require('firebase-admin');
 const fetch = require('node-fetch');
 
 // Inicializar Firebase Admin
-const serviceAccount = require('../../key.json');
+const serviceAccount = require('../../../key.json');
 
 if (!admin.apps.length) {
   admin.initializeApp({
