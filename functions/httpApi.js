@@ -1206,4 +1206,155 @@ if (process.env.NODE_ENV === 'development') {
   });
 }*/
 
+// =============================================================================
+// ATTRIBUTION API - Portfolio Performance Attribution
+// =============================================================================
+
+const { 
+  getPortfolioAttribution, 
+  getTopContributors, 
+  checkAttributionAvailability 
+} = require('./services/attribution');
+
+/**
+ * GET /attribution
+ * 
+ * Obtiene la atribución completa del portafolio.
+ * Calcula la contribución de cada activo al rendimiento total.
+ * 
+ * Query params:
+ * - userId: (required) ID del usuario
+ * - period: Período de análisis ('YTD', '1M', '3M', '6M', '1Y', '2Y', 'ALL')
+ * - currency: Moneda para cálculos ('USD', 'COP', 'EUR', etc.)
+ * - accountIds: Comma-separated list de IDs de cuenta o 'overall'
+ * - benchmarkReturn: Retorno del benchmark para comparar
+ * - maxBars: Máximo de barras en waterfall (default: 8)
+ * - portfolioReturn: (optional) TWR pre-calculado del frontend para consistencia
+ */
+app.get("/attribution", async (req, res) => {
+  const { 
+    userId, 
+    period = 'YTD', 
+    currency = 'USD',
+    accountIds = 'overall',
+    benchmarkReturn = '0',
+    maxBars = '8',
+    portfolioReturn
+  } = req.query;
+  
+  try {
+    if (!userId) {
+      return res.status(400).json({
+        error: "Por favor, proporcione el parámetro userId"
+      });
+    }
+    
+    const result = await getPortfolioAttribution({
+      userId,
+      period,
+      currency,
+      accountIds: accountIds === 'overall' ? ['overall'] : accountIds.split(','),
+      options: {
+        benchmarkReturn: parseFloat(benchmarkReturn) || 0,
+        maxWaterfallBars: parseInt(maxBars) || 8,
+        includeMetadata: true,
+        portfolioReturn: portfolioReturn ? parseFloat(portfolioReturn) : undefined
+      }
+    });
+    
+    if (!result.success) {
+      return res.status(404).json({
+        error: result.error || 'No attribution data found'
+      });
+    }
+    
+    res.status(200).json(result);
+    
+  } catch (error) {
+    console.error('[/attribution] Error:', error);
+    res.status(500).json({
+      error: "Error calculando atribución: " + error.message
+    });
+  }
+});
+
+/**
+ * GET /attribution/top
+ * 
+ * Obtiene solo los top y bottom contributors.
+ * Versión ligera para carga rápida.
+ * 
+ * Query params:
+ * - userId: (required) ID del usuario
+ * - period: Período de análisis
+ * - currency: Moneda
+ * - topN: Número de contributors a retornar (default: 5)
+ */
+app.get("/attribution/top", async (req, res) => {
+  const { 
+    userId, 
+    period = 'YTD', 
+    currency = 'USD',
+    topN = '5'
+  } = req.query;
+  
+  try {
+    if (!userId) {
+      return res.status(400).json({
+        error: "Por favor, proporcione el parámetro userId"
+      });
+    }
+    
+    const result = await getTopContributors({
+      userId,
+      period,
+      currency,
+      topN: parseInt(topN) || 5
+    });
+    
+    if (!result.success) {
+      return res.status(404).json({
+        error: result.error || 'No attribution data found'
+      });
+    }
+    
+    res.status(200).json(result);
+    
+  } catch (error) {
+    console.error('[/attribution/top] Error:', error);
+    res.status(500).json({
+      error: "Error obteniendo top contributors: " + error.message
+    });
+  }
+});
+
+/**
+ * GET /attribution/check
+ * 
+ * Verifica si hay datos de atribución disponibles para un usuario.
+ * 
+ * Query params:
+ * - userId: (required) ID del usuario
+ */
+app.get("/attribution/check", async (req, res) => {
+  const { userId } = req.query;
+  
+  try {
+    if (!userId) {
+      return res.status(400).json({
+        error: "Por favor, proporcione el parámetro userId"
+      });
+    }
+    
+    const result = await checkAttributionAvailability(userId);
+    res.status(200).json(result);
+    
+  } catch (error) {
+    console.error('[/attribution/check] Error:', error);
+    res.status(500).json({
+      error: "Error verificando disponibilidad: " + error.message
+    });
+  }
+});
+
 module.exports = app; 
