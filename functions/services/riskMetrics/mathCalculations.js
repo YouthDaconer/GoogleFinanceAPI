@@ -247,10 +247,18 @@ function findMaxDrawdown(drawdowns) {
  * @param {Object} options - Opciones adicionales
  * @returns {Object} Métricas calculadas
  */
-function calculateAllMetrics(portfolioReturns, marketReturns, options = {}) {
+/**
+ * Calcula todas las métricas de riesgo
+ * @param {number[]} allPortfolioReturns - Todos los retornos diarios del portafolio (para Sharpe, Vol, etc.)
+ * @param {number[]} alignedPortfolioReturns - Retornos alineados con el mercado (para Beta, Correlación)
+ * @param {number[]} marketReturns - Retornos del mercado (alineados)
+ * @param {Object} options - Opciones (riskFreeRate)
+ * @returns {Object} Todas las métricas calculadas
+ */
+function calculateAllMetrics(allPortfolioReturns, alignedPortfolioReturns, marketReturns, options = {}) {
   const { riskFreeRate = DEFAULT_BENCHMARKS.RISK_FREE_RATE } = options;
   
-  if (!portfolioReturns || portfolioReturns.length === 0) {
+  if (!allPortfolioReturns || allPortfolioReturns.length === 0) {
     return {
       sharpeRatio: 0,
       sortinoRatio: 0,
@@ -261,23 +269,33 @@ function calculateAllMetrics(portfolioReturns, marketReturns, options = {}) {
     };
   }
   
-  const meanReturn = calculateMeanReturn(portfolioReturns);
-  const stdDev = calculateStdDev(portfolioReturns, meanReturn);
-  const downsideDev = calculateDownsideDeviation(portfolioReturns);
+  // Métricas del portafolio usando TODOS los retornos
+  const meanReturn = calculateMeanReturn(allPortfolioReturns);
+  const stdDev = calculateStdDev(allPortfolioReturns, meanReturn);
+  const downsideDev = calculateDownsideDeviation(allPortfolioReturns);
   
-  const annualizedRet = annualizeReturn(meanReturn);
+  // STORY-036 FIX: Calcular retorno anualizado usando retorno compuesto total
+  const totalReturn = allPortfolioReturns.reduce((acc, r) => acc * (1 + r), 1) - 1;
+  const tradingDays = allPortfolioReturns.length;
+  const annualizedRet = (Math.pow(1 + totalReturn, TRADING_DAYS_PER_YEAR / tradingDays) - 1) * 100;
+  
   const annualizedVol = annualizeVolatility(stdDev);
   const annualizedDownside = annualizeVolatility(downsideDev);
   
+  // Métricas comparativas usando retornos ALINEADOS
+  const beta = calculateBeta(alignedPortfolioReturns, marketReturns);
+  const correlation = calculateCorrelation(alignedPortfolioReturns, marketReturns);
+  
   return {
     meanDailyReturn: meanReturn,
+    totalReturn: totalReturn * 100,
     annualizedReturn: annualizedRet,
     volatility: annualizedVol,
     sharpeRatio: calculateSharpeRatio(annualizedRet, annualizedVol, riskFreeRate * 100),
     sortinoRatio: calculateSortinoRatio(annualizedRet, annualizedDownside, riskFreeRate * 100),
-    beta: calculateBeta(portfolioReturns, marketReturns),
-    valueAtRisk95: calculateVaR95(portfolioReturns),
-    correlation: calculateCorrelation(portfolioReturns, marketReturns)
+    beta,
+    valueAtRisk95: calculateVaR95(allPortfolioReturns),
+    correlation
   };
 }
 

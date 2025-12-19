@@ -168,15 +168,35 @@ async function calculateRiskMetrics(userId, options = {}) {
       };
     }
     
-    const marketReturns = marketData.map(d => d.dailyReturn);
+    // STORY-036 FIX: Separar cálculos del portafolio vs comparación con mercado
+    // Usar TODOS los retornos del portafolio para métricas propias (Sharpe, Sortino, Volatilidad)
+    // Usar solo datos ALINEADOS para comparación con mercado (Beta, Correlación)
+    
+    const allPortfolioReturns = portfolioData.dailyData.map(d => d.return);
+    
+    // Alinear para métricas comparativas (Beta, Correlación)
+    const portfolioByDate = new Map(portfolioData.dailyData.map(d => [d.date, d.return]));
+    const marketByDate = new Map(marketData.map(d => [d.date, d.dailyReturn]));
+    const commonDates = [...portfolioByDate.keys()].filter(date => marketByDate.has(date)).sort();
+    const alignedPortfolioReturns = commonDates.map(date => portfolioByDate.get(date));
+    const alignedMarketReturns = commonDates.map(date => marketByDate.get(date));
+    
+    console.log(`[riskMetricsService] Data: Portfolio ${allPortfolioReturns.length} days, Aligned with market: ${commonDates.length} days`);
     
     const metrics = calculateAllMetrics(
-      portfolioData.dailyReturns,
-      marketReturns,
+      allPortfolioReturns,         // Usar todos los retornos para métricas del portafolio
+      alignedPortfolioReturns,     // Retornos alineados para Beta/Correlación
+      alignedMarketReturns,        // Retornos del mercado alineados
       { riskFreeRate }
     );
     
-    const drawdownHistory = calculateDrawdownHistory(portfolioData.dailyData);
+    // Mapear dailyData al formato esperado por calculateDrawdownHistory
+    // dailyData tiene {date, return, value} pero la función espera {date, dailyReturn}
+    const drawdownInputData = portfolioData.dailyData.map(d => ({
+      date: d.date,
+      dailyReturn: d.return || 0
+    }));
+    const drawdownHistory = calculateDrawdownHistory(drawdownInputData);
     const maxDrawdown = findMaxDrawdown(drawdownHistory);
     
     const strategy = determineStrategy(accountIds);
@@ -213,7 +233,7 @@ async function calculateRiskMetrics(userId, options = {}) {
         startDate,
         endDate,
         dataPointsCount: dataPoints,
-        marketDataPoints: marketReturns.length,
+        marketDataPoints: alignedMarketReturns.length,
         dataQuality,
         aggregationStrategy: portfolioData.strategy,
         aggregationMethod: portfolioData.metadata.aggregationMethod,
