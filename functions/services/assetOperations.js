@@ -20,6 +20,9 @@ const { invalidatePerformanceCache } = require('./historicalReturnsService');
 // Importar getQuotes para crear currentPrices de nuevos tickers
 const { getQuotes } = require('./financeQuery');
 
+// Importar generador de logos
+const { generateLogoUrl } = require('../utils/logoGenerator');
+
 /**
  * Configuración común para Cloud Functions Callable
  */
@@ -153,14 +156,14 @@ const ensureCurrentPriceExists = async (symbol, assetType) => {
 
     // Lista de campos opcionales a incluir si están presentes
     const optionalFields = [
-      'logo', 'open', 'high', 'low',
+      'logo', 'website', 'open', 'high', 'low',
       'yearHigh', 'yearLow', 'volume', 'avgVolume',
       'marketCap', 'beta', 'pe', 'eps',
       'earningsDate', 'industry', 'sector', 'about', 'employees',
       'dividend', 'exDividend', 'yield', 'dividendDate',
       'threeMonthReturn', 'sixMonthReturn', 'ytdReturn',
       'threeYearReturn', 'yearReturn', 'fiveYearReturn',
-      'country', 'city'
+      'country', 'city', 'fullExchangeName', 'quoteType'
     ];
 
     optionalFields.forEach(field => {
@@ -169,8 +172,20 @@ const ensureCurrentPriceExists = async (symbol, assetType) => {
       }
     });
 
+    // Generar logo si no viene en la respuesta del API
+    if (!currentPriceData.logo) {
+      const generatedLogo = generateLogoUrl(symbol, { 
+        website: quote.website, 
+        assetType: assetType 
+      });
+      if (generatedLogo) {
+        currentPriceData.logo = generatedLogo;
+        console.log(`[ensureCurrentPriceExists] Logo generado para ${symbol}: ${generatedLogo}`);
+      }
+    }
+
     await priceRef.set(currentPriceData);
-    console.log(`[ensureCurrentPriceExists] ✅ Creado currentPrices/${symbol} con sector: ${quote.sector || 'N/A'}`);
+    console.log(`[ensureCurrentPriceExists] ✅ Creado currentPrices/${symbol} con sector: ${quote.sector || 'N/A'}, logo: ${currentPriceData.logo ? 'Sí' : 'No'}`);
     
     return true;
   } catch (error) {

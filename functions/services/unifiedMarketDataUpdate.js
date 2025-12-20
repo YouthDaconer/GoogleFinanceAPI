@@ -6,6 +6,9 @@ const { calculatePortfolioRisk } = require('./calculatePortfolioRisk');
 const { invalidatePerformanceCacheBatch } = require('./historicalReturnsService');
 const { DateTime } = require('luxon');
 
+// Importar generador de logos
+const { generateLogoUrl } = require('../utils/logoGenerator');
+
 const API_BASE_URL = 'https://dmn46d7xas3rvio6tugd2vzs2q0hxbmb.lambda-url.us-east-1.on.aws/v1';
 
 // Horarios estáticos para NYSE (en UTC)
@@ -183,6 +186,20 @@ async function updateCurrentPrices(db, assetQuotes) {
       if (docData.name) updatedData.name = docData.name;
       if (docData.isin) updatedData.isin = docData.isin;
       if (docData.type) updatedData.type = docData.type;
+      if (docData.logo) updatedData.logo = docData.logo;
+      if (docData.website) updatedData.website = docData.website;
+      
+      // Generar logo si no existe en el documento
+      if (!docData.logo) {
+        const generatedLogo = generateLogoUrl(symbol, { 
+          website: docData.website, 
+          assetType: docData.type || 'stock' 
+        });
+        if (generatedLogo) {
+          updatedData.logo = generatedLogo;
+          logDebug(`Logo generado para ${symbol}`);
+        }
+      }
       
       batch.update(doc.ref, updatedData);
       updatesCount++;
