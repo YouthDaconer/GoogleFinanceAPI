@@ -4,6 +4,8 @@ const admin = require('firebase-admin');
 const axios = require('axios');
 const { DateTime } = require('luxon');
 const functions = require('firebase-functions');
+const { getCircuit } = require('../utils/circuitBreaker');
+const { getCachedMarketStatus, cacheMarketStatus } = require('./cacheService');
 
 // Cargar variables de entorno desde el archivo .env en desarrollo
 if (process.env.NODE_ENV !== 'production') {
@@ -37,26 +39,33 @@ try {
 // Documento donde almacenaremos el estado del mercado
 const MARKET_DOC_ID = 'US';
 
+// Circuit breaker for Finnhub API - less critical, use lower threshold
+const finnhubCircuit = getCircuit('finnhub-market-status', {
+  failureThreshold: 3,
+  resetTimeout: 120000, // 2 minutes
+});
+
 /**
- * Consulta el estado del mercado desde Finnhub
+ * Consulta el estado del mercado desde Finnhub con circuit breaker
  */
 async function fetchMarketStatus() {
-  try {
-    console.log(`Consultando API Finnhub con token: ${FINNHUB_TOKEN.substring(0, 5)}...`);
-    const response = await axios.get(`https://finnhub.io/api/v1/stock/market-status?exchange=US&token=${FINNHUB_TOKEN}`);
-    return response.data;
-  } catch (error) {
-    console.error('Error al consultar estado del mercado:', error.message);
-    // Retornar un objeto con valores por defecto para evitar errores fatales
-    return {
-      exchange: 'US',
-      isOpen: false,
-      session: 'error',
-      holiday: null,
-      t: Math.floor(Date.now() / 1000),
-      timezone: 'America/New_York'
-    };
-  }
+  return finnhubCircuit.execute(
+    async () => {
+      console.log(`Consultando API Finnhub con token: ${FINNHUB_TOKEN.substring(0, 5)}...`);
+      const response = await axios.get(
+        `https://finnhub.io/api/v1/stock/market-status?exchange=US&token=${FINNHUB_TOKEN}`
+      );
+      
+      // Cache successful response for future fallback
+      await cacheMarketStatus(response.data);
+      
+      return response.data;
+    },
+    async () => {
+      console.log('Circuit breaker active - using cached market status');
+      return getCachedMarketStatus();
+    }
+  );
 }
 
 /**

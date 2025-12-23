@@ -268,3 +268,48 @@ exports.getIndexHistory = indexHistoryService.getIndexHistory;
  */
 exports.refreshIndexCache = indexHistoryService.refreshIndexCache;
 
+// ============================================================================
+// Health Check Endpoint - Circuit Breaker Status (SCALE-BE-003)
+// ============================================================================
+
+const { getAllCircuitStates, resetCircuit } = require('./utils/circuitBreaker');
+
+/**
+ * Health check endpoint that includes circuit breaker status
+ * GET /healthCheck - Returns system health and circuit states
+ * POST /healthCheck?reset=circuit-name - Resets a specific circuit
+ * 
+ * @see docs/stories/48.story.md (SCALE-BE-003)
+ */
+exports.healthCheck = onRequest({ cors: true }, async (req, res) => {
+  const circuitStates = getAllCircuitStates();
+  
+  const openCircuits = Object.entries(circuitStates)
+    .filter(([_, state]) => state.state === 'OPEN')
+    .map(([name]) => name);
+
+  const health = {
+    status: openCircuits.length > 0 ? 'degraded' : 'healthy',
+    timestamp: new Date().toISOString(),
+    version: '2.0.0',
+    circuits: circuitStates,
+  };
+
+  if (openCircuits.length > 0) {
+    health.warnings = [`Circuit breakers open: ${openCircuits.join(', ')}`];
+  }
+
+  // Allow manual circuit reset via POST request
+  if (req.method === 'POST' && req.query.reset) {
+    const circuitName = req.query.reset;
+    const wasReset = resetCircuit(circuitName);
+    
+    if (wasReset) {
+      health.message = `Circuit '${circuitName}' was reset`;
+    } else {
+      health.message = `Circuit '${circuitName}' not found`;
+    }
+  }
+
+  res.json(health);
+});
