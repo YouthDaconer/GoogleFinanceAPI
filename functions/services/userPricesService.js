@@ -14,6 +14,9 @@ const { onCall, HttpsError } = require("firebase-functions/v2/https");
 const admin = require('./firebaseAdmin');
 const db = admin.firestore();
 
+// Importar rate limiter (SCALE-BE-004)
+const { withRateLimit } = require('../utils/rateLimiter');
+
 /**
  * Configuración común para Cloud Functions Callable
  */
@@ -53,7 +56,7 @@ const validateAuth = (auth) => {
  * @param {object} request.auth - Información de autenticación
  * @returns {Promise<{prices: Array, symbols: Array, timestamp: number}>}
  */
-const getCurrentPricesForUser = onCall(callableConfig, async (request) => {
+const getCurrentPricesForUser = onCall(callableConfig, withRateLimit('getCurrentPricesForUser')(async (request) => {
   const { auth } = request;
   
   console.log(`[getCurrentPricesForUser] Iniciando - userId: ${auth?.uid}`);
@@ -142,7 +145,7 @@ const getCurrentPricesForUser = onCall(callableConfig, async (request) => {
       { originalError: error.message }
     );
   }
-});
+}));
 
 module.exports = {
   getCurrentPricesForUser

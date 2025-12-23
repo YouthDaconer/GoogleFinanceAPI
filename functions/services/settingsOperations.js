@@ -16,6 +16,9 @@ const { onCall, HttpsError } = require("firebase-functions/v2/https");
 const admin = require('./firebaseAdmin');
 const db = admin.firestore();
 
+// Importar rate limiter (SCALE-BE-004)
+const { withRateLimit } = require('../utils/rateLimiter');
+
 /**
  * Configuración común para Cloud Functions Callable
  */
@@ -56,7 +59,7 @@ const validateAuth = (auth) => {
  * @param {string} [data.flagCurrency] - URL de la bandera (opcional)
  * @returns {Promise<{success: boolean, currencyId: string}>}
  */
-exports.addCurrency = onCall(callableConfig, async (request) => {
+exports.addCurrency = onCall(callableConfig, withRateLimit('addCurrency')(async (request) => {
   const { auth, data } = request;
   validateAuth(auth);
 
@@ -110,7 +113,7 @@ exports.addCurrency = onCall(callableConfig, async (request) => {
     console.error('[addCurrency] Error:', error);
     throw new HttpsError('internal', 'Error al crear la moneda');
   }
-});
+}));
 
 /**
  * Actualiza una moneda existente
@@ -120,7 +123,7 @@ exports.addCurrency = onCall(callableConfig, async (request) => {
  * @param {object} data.updates - Campos a actualizar
  * @returns {Promise<{success: boolean}>}
  */
-exports.updateCurrency = onCall(callableConfig, async (request) => {
+exports.updateCurrency = onCall(callableConfig, withRateLimit('updateCurrency')(async (request) => {
   const { auth, data } = request;
   validateAuth(auth);
 
@@ -179,7 +182,7 @@ exports.updateCurrency = onCall(callableConfig, async (request) => {
     console.error('[updateCurrency] Error:', error);
     throw new HttpsError('internal', 'Error al actualizar la moneda');
   }
-});
+}));
 
 /**
  * Elimina una moneda del sistema
@@ -188,7 +191,7 @@ exports.updateCurrency = onCall(callableConfig, async (request) => {
  * @param {string} data.currencyId - ID de la moneda a eliminar
  * @returns {Promise<{success: boolean}>}
  */
-exports.deleteCurrency = onCall(callableConfig, async (request) => {
+exports.deleteCurrency = onCall(callableConfig, withRateLimit('deleteCurrency')(async (request) => {
   const { auth, data } = request;
   validateAuth(auth);
 
@@ -239,7 +242,7 @@ exports.deleteCurrency = onCall(callableConfig, async (request) => {
     console.error('[deleteCurrency] Error:', error);
     throw new HttpsError('internal', 'Error al eliminar la moneda');
   }
-});
+}));
 
 // ============================================================================
 // USER DATA OPERATIONS
@@ -252,7 +255,7 @@ exports.deleteCurrency = onCall(callableConfig, async (request) => {
  * @param {string} data.currencyCode - Código de la moneda a establecer como predeterminada
  * @returns {Promise<{success: boolean}>}
  */
-exports.updateDefaultCurrency = onCall(callableConfig, async (request) => {
+exports.updateDefaultCurrency = onCall(callableConfig, withRateLimit('updateDefaultCurrency')(async (request) => {
   const { auth, data } = request;
   validateAuth(auth);
 
@@ -291,7 +294,7 @@ exports.updateDefaultCurrency = onCall(callableConfig, async (request) => {
     console.error('[updateDefaultCurrency] Error:', error);
     throw new HttpsError('internal', 'Error al actualizar la moneda predeterminada');
   }
-});
+}));
 
 /**
  * Actualiza el país del usuario
@@ -300,7 +303,7 @@ exports.updateDefaultCurrency = onCall(callableConfig, async (request) => {
  * @param {string} data.countryCode - Código del país (ISO 3166-1 alpha-2)
  * @returns {Promise<{success: boolean}>}
  */
-exports.updateUserCountry = onCall(callableConfig, async (request) => {
+exports.updateUserCountry = onCall(callableConfig, withRateLimit('updateUserCountry')(async (request) => {
   const { auth, data } = request;
   validateAuth(auth);
 
@@ -326,7 +329,7 @@ exports.updateUserCountry = onCall(callableConfig, async (request) => {
     console.error('[updateUserCountry] Error:', error);
     throw new HttpsError('internal', 'Error al actualizar el país');
   }
-});
+}));
 
 /**
  * Actualiza el nombre para mostrar del usuario
@@ -335,7 +338,7 @@ exports.updateUserCountry = onCall(callableConfig, async (request) => {
  * @param {string} data.displayName - Nombre para mostrar
  * @returns {Promise<{success: boolean}>}
  */
-exports.updateUserDisplayName = onCall(callableConfig, async (request) => {
+exports.updateUserDisplayName = onCall(callableConfig, withRateLimit('updateUserDisplayName')(async (request) => {
   const { auth, data } = request;
   validateAuth(auth);
 
@@ -365,4 +368,4 @@ exports.updateUserDisplayName = onCall(callableConfig, async (request) => {
     console.error('[updateUserDisplayName] Error:', error);
     throw new HttpsError('internal', 'Error al actualizar el nombre');
   }
-});
+}));

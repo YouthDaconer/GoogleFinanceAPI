@@ -16,6 +16,9 @@
 const { onCall, HttpsError } = require("firebase-functions/v2/https");
 const { getFirestore, FieldValue } = require("firebase-admin/firestore");
 
+// Importar rate limiter (SCALE-BE-004)
+const { withRateLimit } = require('../utils/rateLimiter');
+
 const db = getFirestore();
 
 /**
@@ -40,7 +43,7 @@ const addPortfolioAccount = onCall(
     memory: "256MiB",
     timeoutSeconds: 30,
   },
-  async (request) => {
+  withRateLimit('addPortfolioAccount')(async (request) => {
     const userId = verifyAuth(request);
     const { name, description, isActive, taxDeductionPercentage, balances } = request.data;
 
@@ -79,7 +82,7 @@ const addPortfolioAccount = onCall(
       console.error("[addPortfolioAccount] Error:", error);
       throw new HttpsError("internal", `Error al crear la cuenta: ${error.message}`);
     }
-  }
+  })
 );
 
 /**
@@ -91,7 +94,7 @@ const updatePortfolioAccount = onCall(
     memory: "256MiB",
     timeoutSeconds: 30,
   },
-  async (request) => {
+  withRateLimit('updatePortfolioAccount')(async (request) => {
     const userId = verifyAuth(request);
     const { accountId, updates } = request.data;
 
@@ -143,7 +146,7 @@ const updatePortfolioAccount = onCall(
       console.error("[updatePortfolioAccount] Error:", error);
       throw new HttpsError("internal", `Error al actualizar la cuenta: ${error.message}`);
     }
-  }
+  })
 );
 
 /**
@@ -157,7 +160,7 @@ const deletePortfolioAccount = onCall(
     memory: "256MiB",
     timeoutSeconds: 60,
   },
-  async (request) => {
+  withRateLimit('deletePortfolioAccount')(async (request) => {
     const userId = verifyAuth(request);
     const { accountId } = request.data;
 
@@ -193,7 +196,7 @@ const deletePortfolioAccount = onCall(
       console.error("[deletePortfolioAccount] Error:", error);
       throw new HttpsError("internal", `Error al eliminar la cuenta: ${error.message}`);
     }
-  }
+  })
 );
 
 /**
@@ -205,7 +208,7 @@ const updatePortfolioAccountBalance = onCall(
     memory: "256MiB",
     timeoutSeconds: 30,
   },
-  async (request) => {
+  withRateLimit('updatePortfolioAccountBalance')(async (request) => {
     const userId = verifyAuth(request);
     const { accountId, currency, amount, operation } = request.data;
 
@@ -279,7 +282,7 @@ const updatePortfolioAccountBalance = onCall(
       console.error("[updatePortfolioAccountBalance] Error:", error);
       throw new HttpsError("internal", `Error al actualizar el balance: ${error.message}`);
     }
-  }
+  })
 );
 
 module.exports = {

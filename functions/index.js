@@ -269,6 +269,48 @@ exports.getIndexHistory = indexHistoryService.getIndexHistory;
 exports.refreshIndexCache = indexHistoryService.refreshIndexCache;
 
 // ============================================================================
+// Rate Limiting Cleanup (SCALE-BE-004)
+// ============================================================================
+
+const admin = require('./services/firebaseAdmin');
+const { RATE_LIMITS_COLLECTION } = require('./utils/rateLimiter');
+
+/**
+ * Limpia documentos de rate limits expirados de Firestore
+ * Se ejecuta cada hora para evitar acumulación de documentos obsoletos
+ * 
+ * @see docs/stories/49.story.md (SCALE-BE-004)
+ */
+exports.cleanupRateLimits = onSchedule(
+  {
+    schedule: '0 * * * *',
+    timeZone: 'America/New_York',
+    retryCount: 1,
+    memory: '256MiB',
+  },
+  async () => {
+    const db = admin.firestore();
+    const cutoff = Date.now() - (60 * 60 * 1000);
+    
+    const snapshot = await db.collection(RATE_LIMITS_COLLECTION)
+      .where('lastUpdated', '<', cutoff)
+      .limit(500)
+      .get();
+    
+    if (snapshot.empty) {
+      console.log('[cleanupRateLimits] No expired rate limit documents to clean');
+      return;
+    }
+    
+    const batch = db.batch();
+    snapshot.docs.forEach(doc => batch.delete(doc.ref));
+    await batch.commit();
+    
+    console.log(`[cleanupRateLimits] Cleaned ${snapshot.docs.length} expired rate limit docs`);
+  }
+);
+
+// ============================================================================
 // Health Check Endpoint - Circuit Breaker Status (SCALE-BE-003)
 // ============================================================================
 

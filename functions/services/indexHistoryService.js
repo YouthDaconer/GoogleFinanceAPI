@@ -13,6 +13,9 @@ const { onSchedule } = require("firebase-functions/v2/scheduler");
 const admin = require('./firebaseAdmin');
 const db = admin.firestore();
 
+// Importar rate limiter (SCALE-BE-004)
+const { withRateLimit } = require('../utils/rateLimiter');
+
 // ============================================================================
 // CONFIGURACIÓN
 // ============================================================================
@@ -48,7 +51,7 @@ const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 horas
  * @returns {boolean} returns.cacheHit - Si los datos vinieron del cache
  * @returns {number} returns.cacheTimestamp - Timestamp del cache
  */
-const getIndexHistory = onCall(callableConfig, async (request) => {
+const getIndexHistory = onCall(callableConfig, withRateLimit('getIndexHistory')(async (request) => {
   const { data } = request;
   const { code, range } = data || {};
 
@@ -120,7 +123,7 @@ const getIndexHistory = onCall(callableConfig, async (request) => {
     
     throw new HttpsError("internal", `Error al obtener datos del índice: ${error.message}`);
   }
-});
+}));
 
 // ============================================================================
 // FUNCIÓN AUXILIAR: calculateIndexData

@@ -29,6 +29,9 @@ const {
   calculateModifiedDietzReturn
 } = require('../utils/mwrCalculations');
 
+// Importar rate limiter (SCALE-BE-004)
+const { withRateLimit } = require('../utils/rateLimiter');
+
 const db = admin.firestore();
 
 /**
@@ -620,7 +623,7 @@ function calculateHistoricalReturns(docs, currency, ticker, assetType) {
  * @param {Object} request - Request con auth y data
  * @returns {Object} Rendimientos calculados o desde cache
  */
-const getHistoricalReturns = onCall(callableConfig, async (request) => {
+const getHistoricalReturns = onCall(callableConfig, withRateLimit('getHistoricalReturns')(async (request) => {
   const { auth, data } = request;
 
   // 1. Verificar autenticación
@@ -740,7 +743,7 @@ const getHistoricalReturns = onCall(callableConfig, async (request) => {
     lastCalculated: now.toISOString(),
     validUntil: validUntil.toISOString()
   };
-});
+}));
 
 /**
  * Invalida el cache de rendimientos para un usuario
@@ -878,7 +881,7 @@ async function invalidatePerformanceCacheBatch(userIds) {
  * 
  * @see docs/stories/24.story.md
  */
-const getMultiAccountHistoricalReturns = onCall(callableConfig, async (request) => {
+const getMultiAccountHistoricalReturns = onCall(callableConfig, withRateLimit('getMultiAccountHistoricalReturns')(async (request) => {
   const { auth, data } = request;
 
   // 1. Verificar autenticación
@@ -1249,7 +1252,7 @@ const getMultiAccountHistoricalReturns = onCall(callableConfig, async (request) 
     lastCalculated: now.toISOString(),
     validUntil: validUntil.toISOString()
   };
-});
+}));
 
 /**
  * Función interna para obtener rendimientos históricos (sin verificación de auth)

@@ -23,6 +23,9 @@ const { getQuotes } = require('./financeQuery');
 // Importar generador de logos
 const { generateLogoUrl } = require('../utils/logoGenerator');
 
+// Importar rate limiter (SCALE-BE-004)
+const { withRateLimit } = require('../utils/rateLimiter');
+
 /**
  * Configuración común para Cloud Functions Callable
  */
@@ -225,7 +228,7 @@ const ensureCurrentPriceExists = async (symbol, assetType) => {
  * 
  * @returns {Promise<object>} { success: true, assetId, transactionId }
  */
-exports.createAsset = onCall(callableConfig, async (request) => {
+exports.createAsset = onCall(callableConfig, withRateLimit('createAsset')(async (request) => {
   const { auth, data } = request;
   
   // Log de auditoría
@@ -333,7 +336,7 @@ exports.createAsset = onCall(callableConfig, async (request) => {
     
     throw new HttpsError('internal', `Error al crear el activo: ${error.message}`);
   }
-});
+}));
 
 // ============================================================================
 // FUNCIÓN: updateAsset
@@ -357,7 +360,7 @@ exports.createAsset = onCall(callableConfig, async (request) => {
  * 
  * @returns {Promise<object>} { success, assetId, balanceAdjustment }
  */
-exports.updateAsset = onCall(callableConfig, async (request) => {
+exports.updateAsset = onCall(callableConfig, withRateLimit('updateAsset')(async (request) => {
   const { auth, data } = request;
 
   console.log(`[updateAsset] Iniciando - userId: ${auth?.uid}, assetId: ${data?.assetId}`);
@@ -475,7 +478,7 @@ exports.updateAsset = onCall(callableConfig, async (request) => {
     
     throw new HttpsError('internal', `Error al actualizar el activo: ${error.message}`);
   }
-});
+}));
 
 // ============================================================================
 // FUNCIÓN: sellAsset
@@ -500,7 +503,7 @@ exports.updateAsset = onCall(callableConfig, async (request) => {
  * 
  * @returns {Promise<object>} { success, transactionId, realizedPnL, isFullSale }
  */
-exports.sellAsset = onCall(callableConfig, async (request) => {
+exports.sellAsset = onCall(callableConfig, withRateLimit('sellAsset')(async (request) => {
   const { auth, data } = request;
 
   console.log(`[sellAsset] Iniciando - userId: ${auth?.uid}, assetId: ${data?.assetId}`);
@@ -644,7 +647,7 @@ exports.sellAsset = onCall(callableConfig, async (request) => {
     
     throw new HttpsError('internal', `Error al vender el activo: ${error.message}`);
   }
-});
+}));
 
 // ============================================================================
 // FUNCIÓN: sellPartialAssetsFIFO
@@ -666,7 +669,7 @@ exports.sellAsset = onCall(callableConfig, async (request) => {
  * 
  * @returns {Promise<object>} { success, soldAssets[], totalPnL }
  */
-exports.sellPartialAssetsFIFO = onCall(callableConfig, async (request) => {
+exports.sellPartialAssetsFIFO = onCall(callableConfig, withRateLimit('sellPartialAssetsFIFO')(async (request) => {
   const { auth, data } = request;
 
   console.log(`[sellPartialAssetsFIFO] Iniciando - userId: ${auth?.uid}, ticker: ${data?.ticker}`);
@@ -833,7 +836,7 @@ exports.sellPartialAssetsFIFO = onCall(callableConfig, async (request) => {
     
     throw new HttpsError('internal', `Error al vender activos FIFO: ${error.message}`);
   }
-});
+}));
 
 // ============================================================================
 // FUNCIÓN: addCashTransaction
@@ -854,7 +857,7 @@ exports.sellPartialAssetsFIFO = onCall(callableConfig, async (request) => {
  * 
  * @returns {Promise<object>} { success, transactionId, newBalance }
  */
-exports.addCashTransaction = onCall(callableConfig, async (request) => {
+exports.addCashTransaction = onCall(callableConfig, withRateLimit('addCashTransaction')(async (request) => {
   const { auth, data } = request;
 
   console.log(`[addCashTransaction] Iniciando - userId: ${auth?.uid}, type: ${data?.type}`);
@@ -947,7 +950,7 @@ exports.addCashTransaction = onCall(callableConfig, async (request) => {
     
     throw new HttpsError('internal', `Error al registrar transacción de efectivo: ${error.message}`);
   }
-});
+}));
 
 // ============================================================================
 // FUNCIÓN: deleteAsset (SINGULAR)
@@ -968,7 +971,7 @@ exports.addCashTransaction = onCall(callableConfig, async (request) => {
  * 
  * @returns {Promise<object>} { success, deletedTransactionsCount }
  */
-exports.deleteAsset = onCall(callableConfig, async (request) => {
+exports.deleteAsset = onCall(callableConfig, withRateLimit('deleteAsset')(async (request) => {
   const { auth, data } = request;
 
   console.log(`[deleteAsset] Iniciando - userId: ${auth?.uid}, assetId: ${data?.assetId}`);
@@ -1034,7 +1037,7 @@ exports.deleteAsset = onCall(callableConfig, async (request) => {
     
     throw new HttpsError('internal', `Error al eliminar el activo: ${error.message}`);
   }
-});
+}));
 
 // ============================================================================
 // FUNCIÓN: deleteAssets (PLURAL - por cuenta)
@@ -1049,7 +1052,7 @@ exports.deleteAsset = onCall(callableConfig, async (request) => {
  * 
  * @returns {Promise<object>} { success, deletedCount }
  */
-exports.deleteAssets = onCall(callableConfig, async (request) => {
+exports.deleteAssets = onCall(callableConfig, withRateLimit('deleteAssets')(async (request) => {
   const { auth, data } = request;
 
   console.log(`[deleteAssets] Iniciando - userId: ${auth?.uid}, accountId: ${data?.accountId}`);
@@ -1118,7 +1121,7 @@ exports.deleteAssets = onCall(callableConfig, async (request) => {
     
     throw new HttpsError('internal', `Error al eliminar activos: ${error.message}`);
   }
-});
+}));
 
 // ============================================================================
 // FUNCIÓN: updateStockSector
@@ -1137,7 +1140,7 @@ exports.deleteAssets = onCall(callableConfig, async (request) => {
  * 
  * @returns {Promise<object>} { success, symbol, sector }
  */
-exports.updateStockSector = onCall(callableConfig, async (request) => {
+exports.updateStockSector = onCall(callableConfig, withRateLimit('updateStockSector')(async (request) => {
   const { auth, data } = request;
 
   console.log(`[updateStockSector] Iniciando - userId: ${auth?.uid}, symbol: ${data?.symbol}`);
@@ -1183,4 +1186,4 @@ exports.updateStockSector = onCall(callableConfig, async (request) => {
     
     throw new HttpsError('internal', `Error al actualizar sector: ${error.message}`);
   }
-});
+}));
