@@ -8,7 +8,10 @@
     "start": "npm run shell",
     "deploy": "firebase deploy --only functions",
     "logs": "firebase functions:log",
-    "dev": "nodemon ./functions/index.js"
+    "dev": "nodemon ./functions/index.js",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage"
   },
   "engines": {
     "node": "20"
@@ -36,9 +39,11 @@
     "yamljs": "^0.3.0"
   },
   "devDependencies": {
+    "@types/jest": "^30.0.0",
     "eslint": "^8.15.0",
     "eslint-config-google": "^0.14.0",
-    "firebase-functions-test": "^3.1.0"
+    "firebase-functions-test": "^3.1.0",
+    "jest": "^29.7.0"
   },
   "private": true,
   "license": "MIT"
