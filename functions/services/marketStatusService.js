@@ -3,14 +3,11 @@ const { onRequest } = require("firebase-functions/v2/https");
 const admin = require('firebase-admin');
 const axios = require('axios');
 const { DateTime } = require('luxon');
-const functions = require('firebase-functions');
 const { getCircuit } = require('../utils/circuitBreaker');
 const { getCachedMarketStatus, cacheMarketStatus } = require('./cacheService');
 
-// Cargar variables de entorno desde el archivo .env en desarrollo
-if (process.env.NODE_ENV !== 'production') {
-  require('dotenv').config();
-}
+// Cargar variables de entorno desde el archivo .env
+require('dotenv').config();
 
 // Asegurarse que admin esté inicializado
 try {
@@ -19,21 +16,11 @@ try {
   admin.initializeApp();
 }
 
-// Token de Finnhub desde variables de entorno o configuración de Firebase
-let FINNHUB_TOKEN;
-try {
-  FINNHUB_TOKEN = process.env.NODE_ENV !== 'production'
-    ? process.env.FINNHUB_TOKEN
-    : functions.config().finnhub?.token;
-  
-  if (!FINNHUB_TOKEN) {
-    console.error('No se ha configurado FINNHUB_TOKEN. Por favor configúralo con firebase functions:config:set finnhub.token="TU_TOKEN"');
-    // Usar un valor por defecto para evitar errores, aunque no funcionará correctamente
-    FINNHUB_TOKEN = 'token_no_configurado';
-  }
-} catch (error) {
-  console.error('Error al obtener FINNHUB_TOKEN:', error);
-  FINNHUB_TOKEN = 'token_con_error';
+// Token de Finnhub desde variables de entorno (Firebase Functions v2)
+const FINNHUB_TOKEN = process.env.FINNHUB_TOKEN;
+
+if (!FINNHUB_TOKEN) {
+  console.error('No se ha configurado FINNHUB_TOKEN. Por favor agrega FINNHUB_TOKEN al archivo .env');
 }
 
 // Documento donde almacenaremos el estado del mercado

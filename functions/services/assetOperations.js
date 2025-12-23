@@ -17,6 +17,9 @@ const db = admin.firestore();
 // Importar función de invalidación de cache de rendimientos (OPT-002)
 const { invalidatePerformanceCache } = require('./historicalReturnsService');
 
+// Importar función de invalidación de cache de distribución (SCALE-OPT-001)
+const { invalidateDistributionCache } = require('./portfolioDistributionService');
+
 // Importar getQuotes para crear currentPrices de nuevos tickers
 const { getQuotes } = require('./financeQuery');
 
@@ -319,6 +322,9 @@ exports.createAsset = onCall(callableConfig, withRateLimit('createAsset')(async 
     // 9. Invalidar cache de rendimientos (OPT-002)
     await invalidatePerformanceCache(auth.uid);
 
+    // 10. Invalidar cache de distribución (SCALE-OPT-001)
+    invalidateDistributionCache(auth.uid);
+
     console.log(`[createAsset] Éxito - assetId: ${assetRef.id}, transactionId: ${transactionRef.id}`);
 
     return {
@@ -460,6 +466,9 @@ exports.updateAsset = onCall(callableConfig, withRateLimit('updateAsset')(async 
 
     // 11. Invalidar cache de rendimientos
     await invalidatePerformanceCache(auth.uid);
+
+    // 12. Invalidar cache de distribución (SCALE-OPT-001)
+    invalidateDistributionCache(auth.uid);
 
     console.log(`[updateAsset] Éxito - assetId: ${data.assetId}, balanceAdjustment: ${valueDifference}`);
 
@@ -628,6 +637,9 @@ exports.sellAsset = onCall(callableConfig, withRateLimit('sellAsset')(async (req
 
     // 10. Invalidar cache de rendimientos (OPT-002)
     await invalidatePerformanceCache(auth.uid);
+
+    // 11. Invalidar cache de distribución (SCALE-OPT-001)
+    invalidateDistributionCache(auth.uid);
 
     console.log(`[sellAsset] Éxito - transactionId: ${transactionRef.id}, isFullSale: ${isFullSale}`);
 
@@ -817,6 +829,9 @@ exports.sellPartialAssetsFIFO = onCall(callableConfig, withRateLimit('sellPartia
 
     // 9. Invalidar cache de rendimientos (OPT-002)
     await invalidatePerformanceCache(auth.uid);
+
+    // 10. Invalidar cache de distribución (SCALE-OPT-001)
+    invalidateDistributionCache(auth.uid);
 
     console.log(`[sellPartialAssetsFIFO] Éxito - lotes vendidos: ${soldAssets.length}, totalPnL: ${totalPnL}`);
 
@@ -1020,6 +1035,9 @@ exports.deleteAsset = onCall(callableConfig, withRateLimit('deleteAsset')(async 
 
     // 8. Invalidar cache de rendimientos
     await invalidatePerformanceCache(auth.uid);
+
+    // 9. Invalidar cache de distribución (SCALE-OPT-001)
+    invalidateDistributionCache(auth.uid);
 
     console.log(`[deleteAsset] Éxito - assetId: ${data.assetId}, transacciones eliminadas: ${deletedTransactionsCount}`);
 

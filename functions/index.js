@@ -269,6 +269,86 @@ exports.getIndexHistory = indexHistoryService.getIndexHistory;
 exports.refreshIndexCache = indexHistoryService.refreshIndexCache;
 
 // ============================================================================
+// Cloud Functions Callable - Distribución de Portafolio (SCALE-OPT-001)
+// ============================================================================
+
+const { onCall, HttpsError } = require('firebase-functions/v2/https');
+const portfolioDistributionService = require('./services/portfolioDistributionService');
+const { withRateLimit } = require('./utils/rateLimiter');
+
+/**
+ * Obtiene distribución del portafolio (sectores, países, holdings)
+ * Migrado desde usePortfolioDistribution.ts y useCountriesDistribution.ts
+ * Reduce lecturas Firestore de ~200 a 1 (cache hit)
+ * 
+ * @see docs/stories/55.story.md (SCALE-OPT-001)
+ */
+exports.getPortfolioDistribution = onCall(
+  {
+    cors: true,
+    memory: '256MiB',
+    timeoutSeconds: 60,
+    minInstances: 0,
+    maxInstances: 10,
+  },
+  withRateLimit({ functionName: 'getPortfolioDistribution', limit: 60, windowMs: 60000 })(
+    async (request) => {
+      if (!request.auth) {
+        throw new HttpsError('unauthenticated', 'Autenticación requerida');
+      }
+
+      const { accountIds, accountId, currency, includeHoldings } = request.data || {};
+
+      try {
+        const result = await portfolioDistributionService.getPortfolioDistribution(
+          request.auth.uid,
+          { 
+            accountIds, 
+            accountId, 
+            currency: currency || 'USD', 
+            includeHoldings: includeHoldings ?? true 
+          }
+        );
+
+        return result;
+      } catch (error) {
+        console.error('[getPortfolioDistribution] Error:', error);
+        throw new HttpsError('internal', 'Error calculando distribución del portafolio');
+      }
+    }
+  )
+);
+
+/**
+ * Obtiene sectores disponibles en el sistema
+ * @see docs/stories/55.story.md (SCALE-OPT-001)
+ */
+exports.getAvailableSectors = onCall(
+  {
+    cors: true,
+    memory: '256MiB',
+    timeoutSeconds: 30,
+    minInstances: 0,
+    maxInstances: 5,
+  },
+  withRateLimit({ functionName: 'getAvailableSectors', limit: 30, windowMs: 60000 })(
+    async (request) => {
+      if (!request.auth) {
+        throw new HttpsError('unauthenticated', 'Autenticación requerida');
+      }
+
+      try {
+        const sectors = await portfolioDistributionService.getAvailableSectors();
+        return { sectors };
+      } catch (error) {
+        console.error('[getAvailableSectors] Error:', error);
+        throw new HttpsError('internal', 'Error obteniendo sectores disponibles');
+      }
+    }
+  )
+);
+
+// ============================================================================
 // Rate Limiting Cleanup (SCALE-BE-004)
 // ============================================================================
 
