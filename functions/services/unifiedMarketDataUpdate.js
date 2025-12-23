@@ -9,30 +9,44 @@ const { DateTime } = require('luxon');
 // Importar generador de logos
 const { generateLogoUrl } = require('../utils/logoGenerator');
 
+// Importar logger estructurado (SCALE-CORE-002)
+const { StructuredLogger } = require('../utils/logger');
+
 const API_BASE_URL = 'https://dmn46d7xas3rvio6tugd2vzs2q0hxbmb.lambda-url.us-east-1.on.aws/v1';
 
 // Horarios estáticos para NYSE (en UTC)
 const NYSE_OPEN_HOUR = 13.5;  // 9:30 AM EST
 const NYSE_CLOSE_HOUR = 20;   // 4:00 PM EST
 
-// 🚀 OPTIMIZACIÓN: Control de logging para reducir costos
-const LOG_LEVEL = process.env.LOG_LEVEL || 'INFO'; // 'DEBUG', 'INFO', 'WARN', 'ERROR'
-const ENABLE_DETAILED_LOGS = process.env.ENABLE_DETAILED_LOGS === 'true';
+// Logger global para este módulo (se inicializa en cada ejecución)
+let logger = null;
 
 function logDebug(...args) {
-  if (LOG_LEVEL === 'DEBUG') console.log(...args);
+  if (logger) {
+    logger.debug(args[0], args.length > 1 ? { details: args.slice(1) } : {});
+  }
 }
 
 function logInfo(...args) {
-  if (['DEBUG', 'INFO'].includes(LOG_LEVEL)) console.log(...args);
+  if (logger) {
+    logger.info(args[0], args.length > 1 ? { details: args.slice(1) } : {});
+  }
 }
 
 function logWarn(...args) {
-  if (['DEBUG', 'INFO', 'WARN'].includes(LOG_LEVEL)) console.warn(...args);
+  if (logger) {
+    logger.warn(args[0], args.length > 1 ? { details: args.slice(1) } : {});
+  }
 }
 
 function logError(...args) {
-  console.error(...args); // Siempre loguear errores
+  if (logger) {
+    const error = args.find(a => a instanceof Error);
+    const message = typeof args[0] === 'string' ? args[0] : 'Error';
+    logger.error(message, error, { details: args.filter(a => !(a instanceof Error) && a !== message) });
+  } else {
+    console.error(...args);
+  }
 }
 
 function isNYSEMarketOpen() {
@@ -763,18 +777,23 @@ exports.unifiedMarketDataUpdate = onSchedule({
   timeZone: 'America/New_York',
   retryCount: 3,
 }, async (event) => {
+  // Inicializar logger estructurado (SCALE-CORE-002)
+  logger = StructuredLogger.forScheduled('unifiedMarketDataUpdate');
+  
   if (!isNYSEMarketOpen()) {
-    logInfo('🔴 El mercado NYSE está cerrado. Omitiendo actualizaciones.');
+    logger.info('Market closed - skipping update', { marketStatus: 'closed' });
     return null;
   }
 
-  logInfo('🚀 Iniciando actualización unificada de datos de mercado...');
+  logger.info('Starting unified market data update', { marketStatus: 'open' });
   
   const db = admin.firestore();
   const startTime = Date.now();
+  const mainOp = logger.startOperation('fullUpdate');
   
       try {
     // Paso 1: Obtener códigos de monedas y símbolos de activos dinámicamente
+    const dataFetchOp = logger.startOperation('fetchInitialData');
     const [currenciesSnapshot, currentPricesSnapshot] = await Promise.all([
       db.collection('currencies').where('isActive', '==', true).get(),
       db.collection('currentPrices').get()
@@ -782,39 +801,44 @@ exports.unifiedMarketDataUpdate = onSchedule({
     
     const currencyCodes = currenciesSnapshot.docs.map(doc => doc.data().code);
     const assetSymbols = currentPricesSnapshot.docs.map(doc => doc.data().symbol);
+    dataFetchOp.success({ currencyCount: currencyCodes.length, assetCount: assetSymbols.length });
     
-    logInfo(`📊 Obteniendo datos para ${currencyCodes.length} monedas y ${assetSymbols.length} activos`);
+    logger.info('Fetching market data', { currencies: currencyCodes.length, assets: assetSymbols.length });
     
     // Paso 2: Obtener TODOS los datos de mercado en llamadas optimizadas
+    const marketDataOp = logger.startOperation('getAllMarketDataBatch');
     const marketData = await getAllMarketDataBatch(currencyCodes, assetSymbols);
+    marketDataOp.success({ currenciesReceived: Object.keys(marketData.currencies).length, assetsReceived: marketData.assets.size });
     
     // Paso 3: Actualizar tasas de cambio con datos ya obtenidos
+    const currencyOp = logger.startOperation('updateCurrencyRates');
     const currencyUpdates = await updateCurrencyRates(db, marketData.currencies);
+    currencyOp.success({ updated: currencyUpdates });
     
     // Paso 4: Actualizar precios actuales con datos ya obtenidos
+    const pricesOp = logger.startOperation('updateCurrentPrices');
     const priceUpdates = await updateCurrentPrices(db, marketData.assets);
+    pricesOp.success({ updated: priceUpdates });
     
     // Paso 5: Calcular rendimiento del portafolio
+    const perfOp = logger.startOperation('calculateDailyPortfolioPerformance');
     const portfolioResult = await calculateDailyPortfolioPerformance(db);
+    perfOp.success({ portfoliosCalculated: portfolioResult.count });
     
     // Paso 6: Calcular riesgo del portafolio (usando datos actualizados)
-    logDebug('🔄 Calculando riesgo del portafolio...');
+    const riskOp = logger.startOperation('calculatePortfolioRisk');
     await calculatePortfolioRisk();
-    logDebug('✅ Riesgo del portafolio calculado');
+    riskOp.success();
     
     // Paso 7: Invalidar cache de rendimientos históricos (OPT-010)
     let cacheInvalidationResult = { usersProcessed: 0, cachesDeleted: 0 };
     if (portfolioResult.userIds && portfolioResult.userIds.length > 0) {
       try {
-        const invalidationStart = Date.now();
+        const cacheOp = logger.startOperation('invalidatePerformanceCacheBatch');
         cacheInvalidationResult = await invalidatePerformanceCacheBatch(portfolioResult.userIds);
-        const invalidationTime = Date.now() - invalidationStart;
-        
-        if (invalidationTime > 500) {
-          logInfo(`⚠️ Invalidación de cache tomó ${invalidationTime}ms (>500ms)`);
-        }
+        cacheOp.success({ usersProcessed: cacheInvalidationResult.usersProcessed, cachesDeleted: cacheInvalidationResult.cachesDeleted });
       } catch (cacheError) {
-        logError('⚠️ Error invalidando cache (no crítico):', cacheError.message);
+        logger.warn('Cache invalidation failed (non-critical)', { error: cacheError.message });
       }
     }
     
@@ -822,8 +846,6 @@ exports.unifiedMarketDataUpdate = onSchedule({
     const executionTime = (endTime - startTime) / 1000;
     
     // Paso 8: Notificar al frontend que todo el pipeline completó (OPT-016)
-    // Este documento de señal se actualiza SOLO cuando todo el pipeline ha terminado exitosamente
-    // El frontend escucha este documento para saber cuándo re-fetch de rendimientos históricos
     try {
       await db.collection('systemStatus').doc('marketData').set({
         lastCompleteUpdate: admin.firestore.FieldValue.serverTimestamp(),
@@ -834,23 +856,21 @@ exports.unifiedMarketDataUpdate = onSchedule({
         marketOpen: true,
         lastUpdateDate: new Date().toISOString()
       }, { merge: true });
-      
-      logInfo('📡 Señal de actualización enviada a frontend (OPT-016)');
     } catch (signalError) {
-      logError('⚠️ Error enviando señal (no crítico):', signalError.message);
+      logger.warn('Frontend signal failed (non-critical)', { error: signalError.message });
     }
     
-    logInfo(`🎉 Actualización unificada completada en ${executionTime}s:`);
-    logInfo(`   - ${currencyUpdates} tasas de cambio actualizadas`);
-    logInfo(`   - ${priceUpdates} precios actualizados`);
-    logInfo(`   - ${portfolioResult.count} portafolios calculados`);
-    logInfo(`   - ✅ Riesgo de portafolios calculado`);
-    logInfo(`   - 🗑️ ${cacheInvalidationResult.cachesDeleted} caches invalidados de ${cacheInvalidationResult.usersProcessed} usuarios`);
-    logInfo(`   - 📡 Señal de sincronización enviada`);
+    mainOp.success({
+      currencyUpdates,
+      priceUpdates,
+      portfoliosCalculated: portfolioResult.count,
+      cachesInvalidated: cacheInvalidationResult.cachesDeleted,
+      executionTimeSec: executionTime
+    });
     
     return null;
   } catch (error) {
-    logError('❌ Error en actualización unificada:', error);
+    mainOp.failure(error);
     return null;
   }
 }); 

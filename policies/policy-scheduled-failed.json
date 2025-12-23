@@ -1,0 +1,29 @@
+{
+  "displayName": "Scheduled Job - unifiedMarketDataUpdate Failed",
+  "documentation": {
+    "content": "The unifiedMarketDataUpdate scheduled function has failed. Check Cloud Logging.",
+    "mimeType": "text/markdown"
+  },
+  "conditions": [
+    {
+      "displayName": "Function execution failed",
+      "conditionThreshold": {
+        "filter": "resource.type = \"cloud_function\" AND resource.labels.function_name = \"unifiedMarketDataUpdateV2\" AND metric.type = \"cloudfunctions.googleapis.com/function/execution_count\" AND metric.labels.status = \"error\"",
+        "comparison": "COMPARISON_GT",
+        "thresholdValue": 0,
+        "duration": "0s",
+        "aggregations": [
+          {
+            "alignmentPeriod": "60s",
+            "perSeriesAligner": "ALIGN_COUNT"
+          }
+        ]
+      }
+    }
+  ],
+  "combiner": "OR",
+  "enabled": true,
+  "notificationChannels": [
+    "projects/portafolio-inversiones/notificationChannels/17171909552384294197"
+  ]
+}
