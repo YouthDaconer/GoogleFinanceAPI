@@ -14,6 +14,9 @@ const { StructuredLogger } = require('../utils/logger');
 
 const API_BASE_URL = 'https://dmn46d7xas3rvio6tugd2vzs2q0hxbmb.lambda-url.us-east-1.on.aws/v1';
 
+// Flag para habilitar logs detallados (puede causar mucho ruido en producción)
+const ENABLE_DETAILED_LOGS = process.env.ENABLE_DETAILED_LOGS === 'true';
+
 // Horarios estáticos para NYSE (en UTC)
 const NYSE_OPEN_HOUR = 13.5;  // 9:30 AM EST
 const NYSE_CLOSE_HOUR = 20;   // 4:00 PM EST
