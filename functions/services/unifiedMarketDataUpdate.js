@@ -774,9 +774,13 @@ async function calculateDailyPortfolioPerformance(db) {
 
 /**
  * Función principal unificada que ejecuta todas las actualizaciones
+ * 
+ * COST-OPT-001: Frecuencia reducida de 2 a 5 minutos para optimizar costos
+ * - Ahorro estimado: ~60% en lecturas/escrituras de Firestore
+ * - Impacto UX: Precios actualizados cada 5 min en lugar de 2 min (aceptable)
  */
 exports.unifiedMarketDataUpdate = onSchedule({
-  schedule: '*/2 9-17 * * 1-5',
+  schedule: '*/5 9-17 * * 1-5',  // COST-OPT-001: Cada 5 minutos (antes: */2)
   timeZone: 'America/New_York',
   retryCount: 3,
 }, async (event) => {
