@@ -117,6 +117,16 @@ async function getPortfolioDistribution(userId, options = {}) {
       assets, prices, etfData, countryMappings, portfolioAccounts, userId, totalPortfolioValue
     );
 
+    // SCALE-OPT-001: Calcular activos sin ubicación geográfica
+    const nonGeographicData = calculateNonGeographicAssets(
+      assets, prices, etfData, countryMappings, portfolioAccounts, userId, totalPortfolioValue
+    );
+
+    // SCALE-OPT-001: Filtrar países con porcentaje muy pequeño (< 0.0001%)
+    // Estos países no se pueden representar significativamente en el mapa
+    const MIN_PERCENTAGE_THRESHOLD = 0.0001;
+    const filteredCountries = countries.filter(c => c.percentage >= MIN_PERCENTAGE_THRESHOLD);
+
     // 9. Construir respuesta
     const result = {
       sectors: sectors.map(s => ({
@@ -124,13 +134,19 @@ async function getPortfolioDistribution(userId, options = {}) {
         weight: s.weight,
         percentage: s.weight * 100
       })),
-      countries: countries.map(c => ({
+      countries: filteredCountries.map(c => ({
         id: c.id,
         name: c.name,
         value: c.value,
         percentage: c.percentage,
         assets: c.assets || []
       })),
+      // SCALE-OPT-001: Incluir activos sin ubicación geográfica
+      nonGeographicData: {
+        totalPercentage: nonGeographicData.totalPercentage,
+        assets: nonGeographicData.assets,
+        assetTypeDistribution: nonGeographicData.assetTypeDistribution
+      },
       holdings: options.includeHoldings ? holdings : undefined,
       totals: {
         portfolioValue: totalPortfolioValue,
@@ -728,6 +744,9 @@ function consolidateSources(sources) {
 
 /**
  * Calcula la distribución por países
+ * 
+ * SCALE-OPT-001: Usa codeNo (ISO 3166-1 numeric) para compatibilidad con TopoJSON
+ * El mapa mundial usa códigos numéricos de 3 dígitos (ej: "840" para USA)
  */
 function calculateCountryDistribution(assets, prices, etfData, countryMappings, portfolioAccounts, userId, totalValue) {
   const countryMap = {};
@@ -754,7 +773,8 @@ function calculateCountryDistribution(assets, prices, etfData, countryMappings, 
     if (countryName) {
       const country = countryMappings.get(countryName.toLowerCase());
       if (country) {
-        const countryId = country.code2 || country.id;
+        // SCALE-OPT-001: Usar codeNo para compatibilidad con TopoJSON del mapa mundial
+        const countryId = country.codeNo || country.id;
         
         if (!countryMap[countryId]) {
           countryMap[countryId] = {
@@ -768,12 +788,14 @@ function calculateCountryDistribution(assets, prices, etfData, countryMappings, 
 
         countryMap[countryId].value += value;
         countryMap[countryId].percentage += percentage;
+        // SCALE-OPT-001: Usar price.name para el nombre de la empresa, no asset.company (que es el broker)
         countryMap[countryId].assets.push({
           symbol: asset.name,
-          name: asset.company || asset.name,
+          name: price.name || asset.name,
           value,
           percentage,
-          assetType: asset.assetType
+          assetType: asset.assetType,
+          accountId: asset.portfolioAccount
         });
       }
     }
@@ -800,7 +822,8 @@ function calculateCountryDistribution(assets, prices, etfData, countryMappings, 
 
         const country = countryMappings.get(countryName.toLowerCase());
         if (country) {
-          const countryId = country.code2 || country.id;
+          // SCALE-OPT-001: Usar codeNo para compatibilidad con TopoJSON del mapa mundial
+          const countryId = country.codeNo || country.id;
           const contribution = (countryData.weight || 0) * etfWeight;
           const valueContribution = contribution * totalValue;
           const percentageContribution = contribution * 100;
@@ -817,13 +840,149 @@ function calculateCountryDistribution(assets, prices, etfData, countryMappings, 
 
           countryMap[countryId].value += valueContribution;
           countryMap[countryId].percentage += percentageContribution;
+          
+          // SCALE-OPT-001: Agregar ETF como asset contribuyente al país
+          // Evitar duplicados agrupando por símbolo y cuenta
+          const assetKey = `${etf.name}-${etf.portfolioAccount || 'default'}`;
+          const existingEtfAsset = countryMap[countryId].assets.find(a => 
+            a.symbol === etf.name && a.accountId === etf.portfolioAccount
+          );
+          if (existingEtfAsset) {
+            existingEtfAsset.value += valueContribution;
+            existingEtfAsset.percentage += percentageContribution;
+          } else {
+            countryMap[countryId].assets.push({
+              symbol: etf.name,
+              // SCALE-OPT-001: Usar price.name para el nombre, no company (que es broker)
+              name: price.name || etf.name,
+              value: valueContribution,
+              percentage: percentageContribution,
+              assetType: 'etf',
+              isFromHolding: true,
+              accountId: etf.portfolioAccount
+            });
+          }
         }
       }
     }
   }
 
-  return Object.values(countryMap)
-    .sort((a, b) => b.value - a.value);
+  // SCALE-OPT-001: Agrupar assets por símbolo dentro de cada país para evitar duplicados
+  // Esto consolida activos del mismo ticker que están en diferentes cuentas
+  const result = Object.values(countryMap).map(country => {
+    const assetsMap = {};
+    
+    country.assets.forEach(asset => {
+      const symbol = asset.symbol;
+      if (!assetsMap[symbol]) {
+        assetsMap[symbol] = {
+          symbol,
+          name: asset.name,
+          value: 0,
+          percentage: 0,
+          assetType: asset.assetType,
+          accountCount: 0
+        };
+      }
+      assetsMap[symbol].value += asset.value;
+      assetsMap[symbol].percentage += asset.percentage;
+      assetsMap[symbol].accountCount += 1;
+    });
+    
+    return {
+      ...country,
+      assets: Object.values(assetsMap).sort((a, b) => b.percentage - a.percentage)
+    };
+  });
+
+  return result.sort((a, b) => b.value - a.value);
+}
+
+/**
+ * Calcula activos sin ubicación geográfica (cryptos, bonos, etc.)
+ * SCALE-OPT-001: Agrupa activos por símbolo para evitar duplicados
+ */
+function calculateNonGeographicAssets(assets, prices, etfData, countryMappings, portfolioAccounts, userId, totalValue) {
+  // Mapa para agrupar por símbolo
+  const nonGeoAssetsMap = {};
+
+  // Filtrar assets relevantes
+  const relevantAssets = assets.filter(asset => {
+    if (!asset.isActive) return false;
+    if (!asset.portfolioAccount) return true;
+    const account = portfolioAccounts.find(acc => acc.id === asset.portfolioAccount);
+    return account && account.isActive && account.userId === userId;
+  });
+
+  relevantAssets.forEach(asset => {
+    const price = prices[asset.name];
+    if (!price || !price.price) return;
+
+    const value = asset.units * price.price;
+    const percentage = (value / totalValue) * 100;
+    
+    // Determinar si tiene ubicación geográfica
+    let hasGeoLocation = false;
+    
+    // 1. Verificar si tiene país directo
+    const countryName = price.country || asset.country;
+    if (countryName) {
+      const country = countryMappings.get(countryName.toLowerCase());
+      if (country) {
+        hasGeoLocation = true;
+      }
+    }
+    
+    // 2. Si es ETF, verificar si tiene datos de países
+    if (!hasGeoLocation && (asset.assetType === 'etf' || price.type === 'etf')) {
+      const normalized = asset.name.trim().toUpperCase();
+      const etfInfo = etfData.get(normalized);
+      if (etfInfo && etfInfo.countries && etfInfo.countries.length > 0) {
+        hasGeoLocation = true;
+      }
+    }
+    
+    // Si no tiene ubicación geográfica, agregarlo al mapa (agrupado por símbolo)
+    if (!hasGeoLocation) {
+      const symbol = asset.name;
+      if (!nonGeoAssetsMap[symbol]) {
+        nonGeoAssetsMap[symbol] = {
+          symbol,
+          name: price.name || asset.name,
+          value: 0,
+          percentage: 0,
+          assetType: asset.assetType || price.type || 'unknown',
+          isMultiCountry: false,
+          accountCount: 0 // Cuántas cuentas tienen este activo
+        };
+      }
+      nonGeoAssetsMap[symbol].value += value;
+      nonGeoAssetsMap[symbol].percentage += percentage;
+      nonGeoAssetsMap[symbol].accountCount += 1;
+    }
+  });
+
+  // Convertir mapa a array
+  const nonGeoAssets = Object.values(nonGeoAssetsMap);
+
+  // Calcular total y distribución por tipo
+  const totalPercentage = nonGeoAssets.reduce((sum, a) => sum + a.percentage, 0);
+  
+  const typeDistribution = {};
+  nonGeoAssets.forEach(asset => {
+    const type = asset.assetType || 'unknown';
+    if (!typeDistribution[type]) {
+      typeDistribution[type] = { type, percentage: 0, count: 0 };
+    }
+    typeDistribution[type].percentage += asset.percentage;
+    typeDistribution[type].count += 1;
+  });
+
+  return {
+    totalPercentage,
+    assets: nonGeoAssets.sort((a, b) => b.percentage - a.percentage),
+    assetTypeDistribution: Object.values(typeDistribution).sort((a, b) => b.percentage - a.percentage)
+  };
 }
 
 /**
