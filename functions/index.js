@@ -102,168 +102,202 @@ exports.weeklyProfitableWeeksCalculation = onSchedule({
 // ============================================================================
 // Cloud Functions Callable - Operaciones de Assets (REF-002)
 // ============================================================================
+// DEPRECATED: Estas funciones fueron consolidadas en portfolioOperations (SCALE-CF-001)
+// Mantenidas como comentario para referencia durante el período de transición
+// TODO: Eliminar después de 2 semanas de uso exitoso (2025-01-07)
 
-/**
+/*
  * Crea un nuevo asset con transacción de compra y actualización de balance atómicamente
  * @see docs/architecture/refactoring-analysis.md - Sección 1.1
+ * @deprecated Use portfolioOperations({ action: 'createAsset', payload: {...} })
  */
-exports.createAsset = assetOperations.createAsset;
+// exports.createAsset = assetOperations.createAsset;
 
-/**
+/*
  * Actualiza un asset existente con ajuste de balance
+ * @deprecated Use portfolioOperations({ action: 'updateAsset', payload: {...} })
  */
-exports.updateAsset = assetOperations.updateAsset;
+// exports.updateAsset = assetOperations.updateAsset;
 
-/**
+/*
  * Vende un asset existente (total o parcialmente)
  * @see docs/architecture/refactoring-analysis.md - Sección 1.2
+ * @deprecated Use portfolioOperations({ action: 'sellAsset', payload: {...} })
  */
-exports.sellAsset = assetOperations.sellAsset;
+// exports.sellAsset = assetOperations.sellAsset;
 
-/**
+/*
  * Vende unidades de múltiples lotes del mismo ticker usando FIFO
  * @see docs/architecture/refactoring-analysis.md - Sección 1.3
+ * @deprecated Use portfolioOperations({ action: 'sellPartialAssetsFIFO', payload: {...} })
  */
-exports.sellPartialAssetsFIFO = assetOperations.sellPartialAssetsFIFO;
+// exports.sellPartialAssetsFIFO = assetOperations.sellPartialAssetsFIFO;
 
-/**
+/*
  * Registra una transacción de efectivo (ingreso o egreso)
  * @see docs/architecture/refactoring-analysis.md - Sección 1.4
+ * @deprecated Use portfolioOperations({ action: 'addCashTransaction', payload: {...} })
  */
-exports.addCashTransaction = assetOperations.addCashTransaction;
+// exports.addCashTransaction = assetOperations.addCashTransaction;
 
-/**
+/*
  * Elimina un asset individual y sus transacciones asociadas
+ * @deprecated Use portfolioOperations({ action: 'deleteAsset', payload: {...} })
  */
-exports.deleteAsset = assetOperations.deleteAsset;
+// exports.deleteAsset = assetOperations.deleteAsset;
 
-/**
+/*
  * Elimina activos de una cuenta de portafolio (todos o por moneda)
+ * @deprecated Use portfolioOperations({ action: 'deleteAssets', payload: {...} })
  */
-exports.deleteAssets = assetOperations.deleteAssets;
+// exports.deleteAssets = assetOperations.deleteAssets;
 
-/**
+/*
  * Actualiza el sector de un stock en currentPrices (fallback manual)
+ * @deprecated Use portfolioOperations({ action: 'updateStockSector', payload: {...} })
  */
-exports.updateStockSector = assetOperations.updateStockSector;
+// exports.updateStockSector = assetOperations.updateStockSector;
 
 // ============================================================================
 // Cloud Functions Callable - Operaciones de Settings (REF-005)
 // ============================================================================
+// DEPRECATED: Estas funciones fueron consolidadas en settingsOperations (SCALE-CF-001)
+// TODO: Eliminar después de 2 semanas de uso exitoso (2025-01-07)
 
 // Cloud Functions para currencies y userData
 const settingsOperations = require('./services/settingsOperations');
 
-/**
+/*
  * Agrega una nueva moneda al sistema
  * @see docs/stories/27.story.md (REF-005)
+ * @deprecated Use settingsOperations({ action: 'addCurrency', payload: {...} })
  */
-exports.addCurrency = settingsOperations.addCurrency;
+// exports.addCurrency = settingsOperations.addCurrency;
 
-/**
+/*
  * Actualiza una moneda existente
  * @see docs/stories/27.story.md (REF-005)
+ * @deprecated Use settingsOperations({ action: 'updateCurrency', payload: {...} })
  */
-exports.updateCurrency = settingsOperations.updateCurrency;
+// exports.updateCurrency = settingsOperations.updateCurrency;
 
-/**
+/*
  * Elimina una moneda del sistema
  * @see docs/stories/27.story.md (REF-005)
+ * @deprecated Use settingsOperations({ action: 'deleteCurrency', payload: {...} })
  */
-exports.deleteCurrency = settingsOperations.deleteCurrency;
+// exports.deleteCurrency = settingsOperations.deleteCurrency;
 
-/**
+/*
  * Actualiza la moneda por defecto del usuario
  * @see docs/stories/27.story.md (REF-005)
+ * @deprecated Use settingsOperations({ action: 'updateDefaultCurrency', payload: {...} })
  */
-exports.updateDefaultCurrency = settingsOperations.updateDefaultCurrency;
+// exports.updateDefaultCurrency = settingsOperations.updateDefaultCurrency;
 
-/**
+/*
  * Actualiza el país del usuario
  * @see docs/stories/27.story.md (REF-005)
+ * @deprecated Use settingsOperations({ action: 'updateUserCountry', payload: {...} })
  */
-exports.updateUserCountry = settingsOperations.updateUserCountry;
+// exports.updateUserCountry = settingsOperations.updateUserCountry;
 
-/**
+/*
  * Actualiza el nombre para mostrar del usuario
  * @see docs/stories/27.story.md (REF-005)
+ * @deprecated Use settingsOperations({ action: 'updateUserDisplayName', payload: {...} })
  */
-exports.updateUserDisplayName = settingsOperations.updateUserDisplayName;
+// exports.updateUserDisplayName = settingsOperations.updateUserDisplayName;
 
 // ============================================================================
 // Cloud Functions Callable - Operaciones de Portfolio Accounts (REF-006)
 // ============================================================================
+// DEPRECATED: Estas funciones fueron consolidadas en accountOperations (SCALE-CF-001)
+// TODO: Eliminar después de 2 semanas de uso exitoso (2025-01-07)
 
 // Cloud Functions para portfolioAccounts
 const portfolioAccountOperations = require('./services/portfolioAccountOperations');
 
-/**
+/*
  * Crea una nueva cuenta de portafolio
  * @see docs/stories/27.story.md (REF-006)
+ * @deprecated Use accountOperations({ action: 'addPortfolioAccount', payload: {...} })
  */
-exports.addPortfolioAccount = portfolioAccountOperations.addPortfolioAccount;
+// exports.addPortfolioAccount = portfolioAccountOperations.addPortfolioAccount;
 
-/**
+/*
  * Actualiza una cuenta de portafolio existente
  * @see docs/stories/27.story.md (REF-006)
+ * @deprecated Use accountOperations({ action: 'updatePortfolioAccount', payload: {...} })
  */
-exports.updatePortfolioAccount = portfolioAccountOperations.updatePortfolioAccount;
+// exports.updatePortfolioAccount = portfolioAccountOperations.updatePortfolioAccount;
 
-/**
+/*
  * Elimina una cuenta de portafolio
  * @see docs/stories/27.story.md (REF-006)
+ * @deprecated Use accountOperations({ action: 'deletePortfolioAccount', payload: {...} })
  */
-exports.deletePortfolioAccount = portfolioAccountOperations.deletePortfolioAccount;
+// exports.deletePortfolioAccount = portfolioAccountOperations.deletePortfolioAccount;
 
-/**
+/*
  * Actualiza el balance de una moneda en una cuenta
  * @see docs/stories/27.story.md (REF-006)
+ * @deprecated Use accountOperations({ action: 'updatePortfolioAccountBalance', payload: {...} })
  */
-exports.updatePortfolioAccountBalance = portfolioAccountOperations.updatePortfolioAccountBalance;
+// exports.updatePortfolioAccountBalance = portfolioAccountOperations.updatePortfolioAccountBalance;
 
 // ============================================================================
 // Cloud Functions Callable - Optimización de Consultas (OPT-001)
 // ============================================================================
+// DEPRECATED: Estas funciones fueron consolidadas en queryOperations (SCALE-CF-001)
+// TODO: Eliminar después de 2 semanas de uso exitoso (2025-01-07)
 
-/**
+/*
  * Obtiene precios filtrados por símbolos que el usuario posee
  * Reduce lecturas de 56 (todos) a ~25 (solo del usuario)
  * @see docs/stories/6.story.md (OPT-001)
+ * @deprecated Use queryOperations({ action: 'getCurrentPricesForUser', payload: {...} })
  */
-exports.getCurrentPricesForUser = userPricesService.getCurrentPricesForUser;
+// exports.getCurrentPricesForUser = userPricesService.getCurrentPricesForUser;
 
 // ============================================================================
 // Cloud Functions Callable - Pre-cálculo de Rendimientos (OPT-002)
 // ============================================================================
 
-/**
+/*
  * Pre-calcula rendimientos históricos en el servidor con cache
  * Reduce lecturas de ~200 a 1 (cache hit) por montaje del Dashboard
  * @see docs/stories/7.story.md (OPT-002)
+ * @deprecated Use queryOperations({ action: 'getHistoricalReturns', payload: {...} })
  */
-exports.getHistoricalReturns = historicalReturnsService.getHistoricalReturns;
+// exports.getHistoricalReturns = historicalReturnsService.getHistoricalReturns;
 
-/**
+/*
  * FEAT-CHART-001: Pre-calcula rendimientos históricos de múltiples cuentas agregados
  * Permite visualizar rendimientos combinados de un subconjunto de cuentas
  * @see docs/stories/24.story.md (FEAT-CHART-001)
+ * @deprecated Use queryOperations({ action: 'getMultiAccountHistoricalReturns', payload: {...} })
  */
-exports.getMultiAccountHistoricalReturns = historicalReturnsService.getMultiAccountHistoricalReturns;
+// exports.getMultiAccountHistoricalReturns = historicalReturnsService.getMultiAccountHistoricalReturns;
 
 // ============================================================================
 // Cloud Functions - Pre-cálculo de Índices Históricos (OPT-009)
 // ============================================================================
+// NOTA: getIndexHistory está consolidada en queryOperations
+// Pero refreshIndexCache es scheduled y se mantiene
 
-/**
+/*
  * Obtiene datos históricos de índices de mercado con cache global
  * Reduce lecturas de ~1,300 a 1 (cache hit) por consulta
  * @see docs/stories/14.story.md (OPT-009)
+ * @deprecated Use queryOperations({ action: 'getIndexHistory', payload: {...} })
  */
-exports.getIndexHistory = indexHistoryService.getIndexHistory;
+// exports.getIndexHistory = indexHistoryService.getIndexHistory;
 
 /**
  * Refresca el cache de todos los índices históricos (scheduled)
  * Se ejecuta diariamente a las 00:30 UTC
+ * NOTA: Esta función scheduled NO está consolidada, se mantiene activa
  * @see docs/stories/14.story.md (OPT-009)
  */
 exports.refreshIndexCache = indexHistoryService.refreshIndexCache;
@@ -271,18 +305,22 @@ exports.refreshIndexCache = indexHistoryService.refreshIndexCache;
 // ============================================================================
 // Cloud Functions Callable - Distribución de Portafolio (SCALE-OPT-001)
 // ============================================================================
+// DEPRECATED: Estas funciones fueron consolidadas en queryOperations (SCALE-CF-001)
+// TODO: Eliminar después de 2 semanas de uso exitoso (2025-01-07)
 
 const { onCall, HttpsError } = require('firebase-functions/v2/https');
 const portfolioDistributionService = require('./services/portfolioDistributionService');
 const { withRateLimit } = require('./utils/rateLimiter');
 
-/**
+/*
  * Obtiene distribución del portafolio (sectores, países, holdings)
  * Migrado desde usePortfolioDistribution.ts y useCountriesDistribution.ts
  * Reduce lecturas Firestore de ~200 a 1 (cache hit)
  * 
  * @see docs/stories/55.story.md (SCALE-OPT-001)
+ * @deprecated Use queryOperations({ action: 'getPortfolioDistribution', payload: {...} })
  */
+/*
 exports.getPortfolioDistribution = onCall(
   {
     cors: true,
@@ -329,11 +367,14 @@ exports.getPortfolioDistribution = onCall(
     }
   )
 );
+*/
 
-/**
+/*
  * Obtiene sectores disponibles en el sistema
  * @see docs/stories/55.story.md (SCALE-OPT-001)
+ * @deprecated Use queryOperations({ action: 'getAvailableSectors', payload: {} })
  */
+/*
 exports.getAvailableSectors = onCall(
   {
     cors: true,
@@ -358,6 +399,7 @@ exports.getAvailableSectors = onCall(
     }
   )
 );
+*/
 
 // ============================================================================
 // Rate Limiting Cleanup (SCALE-BE-004)
@@ -446,3 +488,49 @@ exports.healthCheck = onRequest({ cors: true }, async (req, res) => {
 
   res.json(health);
 });
+
+// ============================================================================
+// SCALE-CF-001: Funciones Unificadas (Cloud Functions Consolidation)
+// ============================================================================
+
+/**
+ * Router unificado para operaciones de assets
+ * Consolida 8 funciones: createAsset, updateAsset, sellAsset, deleteAsset,
+ * deleteAssets, sellPartialAssetsFIFO, addCashTransaction, updateStockSector
+ * 
+ * @see docs/stories/56.story.md (SCALE-CF-001)
+ */
+const { portfolioOperations } = require('./services/unified/portfolioOperations');
+exports.portfolioOperations = portfolioOperations;
+
+/**
+ * Router unificado para operaciones de settings
+ * Consolida 6 funciones: addCurrency, updateCurrency, deleteCurrency,
+ * updateDefaultCurrency, updateUserCountry, updateUserDisplayName
+ * 
+ * @see docs/stories/56.story.md (SCALE-CF-001)
+ */
+const { settingsOperations: unifiedSettingsOps } = require('./services/unified/settingsOperations');
+exports.settingsOperations = unifiedSettingsOps;
+
+/**
+ * Router unificado para operaciones de cuentas
+ * Consolida 4 funciones: addPortfolioAccount, updatePortfolioAccount,
+ * deletePortfolioAccount, updatePortfolioAccountBalance
+ * 
+ * @see docs/stories/56.story.md (SCALE-CF-001)
+ */
+const { accountOperations } = require('./services/unified/accountOperations');
+exports.accountOperations = accountOperations;
+
+/**
+ * Router unificado para operaciones de consulta
+ * Consolida 6 funciones: getCurrentPricesForUser, getHistoricalReturns,
+ * getMultiAccountHistoricalReturns, getIndexHistory, getPortfolioDistribution, getAvailableSectors
+ * 
+ * NOTA: Usa 512MiB de memoria para soportar cálculos pesados
+ * 
+ * @see docs/stories/56.story.md (SCALE-CF-001)
+ */
+const { queryOperations } = require('./services/unified/queryOperations');
+exports.queryOperations = queryOperations;

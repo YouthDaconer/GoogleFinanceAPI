@@ -1373,5 +1373,8 @@ module.exports = {
   getMultiAccountHistoricalReturns,
   invalidatePerformanceCache,
   invalidatePerformanceCacheBatch,
-  calculateDynamicTTL
+  calculateDynamicTTL,
+  // SCALE-CF-001: Exportar funciones de cálculo para handlers unificados
+  calculateHistoricalReturns,
+  getHistoricalReturnsInternal,
 };
