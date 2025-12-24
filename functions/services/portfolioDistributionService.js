@@ -46,11 +46,32 @@ async function getPortfolioDistribution(userId, options = {}) {
   const startTime = Date.now();
   const cacheKey = buildCacheKey(userId, options);
   
-  // Verificar cache
+  // Verificar cache con validación de timestamp
   const cached = distributionCache.get(cacheKey);
-  if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
-    logger.info('Cache hit for distribution', { userId, cacheKey });
-    return { ...cached.data, fromCache: true };
+  if (cached) {
+    // Verificar si el cache no ha expirado por TTL
+    const ttlValid = Date.now() - cached.timestamp < CACHE_TTL;
+    
+    if (ttlValid) {
+      // Verificar si el portafolio fue modificado después del cache
+      const lastModified = await getPortfolioLastModified(userId);
+      
+      if (!lastModified || cached.timestamp > lastModified) {
+        logger.info('Cache hit for distribution', { 
+          userId, 
+          cacheKey,
+          cacheAge: Date.now() - cached.timestamp,
+          lastModified: lastModified ? new Date(lastModified).toISOString() : 'none'
+        });
+        return { ...cached.data, metadata: { ...cached.data.metadata, fromCache: true } };
+      } else {
+        logger.info('Cache invalidated by portfolioLastModified', { 
+          userId, 
+          cacheTimestamp: new Date(cached.timestamp).toISOString(),
+          lastModified: new Date(lastModified).toISOString()
+        });
+      }
+    }
   }
 
   try {
@@ -88,7 +109,7 @@ async function getPortfolioDistribution(userId, options = {}) {
     }
 
     // 8. Calcular distribuciones
-    const { holdings, sectors } = calculateSectorDistribution(
+    const { holdings, sectors, etfStats } = calculateSectorDistribution(
       assets, prices, etfData, sectorMappings, portfolioAccounts, userId, totalPortfolioValue
     );
 
@@ -120,7 +141,9 @@ async function getPortfolioDistribution(userId, options = {}) {
         assetCount: assets.length,
         accountCount: new Set(assets.map(a => a.portfolioAccount).filter(Boolean)).size,
         etfCount: etfSymbols.length,
-        etfDataLoaded: etfData.size
+        etfDataLoaded: etfData.size,
+        etfDecomposed: etfStats.decomposed,
+        etfNotDecomposed: etfStats.notDecomposed
       }
     };
 
@@ -152,6 +175,48 @@ function buildCacheKey(userId, options) {
   return `dist:${userId}:${accountPart}:${options.currency || 'USD'}`;
 }
 
+// Cache local de portfolioLastModified para evitar lecturas repetidas a Firestore
+const lastModifiedCache = new Map();
+const LAST_MODIFIED_CACHE_TTL = 30 * 1000; // 30 segundos
+
+/**
+ * Obtiene el timestamp de última modificación del portafolio
+ * @param {string} userId - ID del usuario
+ * @returns {Promise<number|null>} - Timestamp en milisegundos o null
+ */
+async function getPortfolioLastModified(userId) {
+  // Verificar cache local primero
+  const cached = lastModifiedCache.get(userId);
+  if (cached && Date.now() - cached.fetchedAt < LAST_MODIFIED_CACHE_TTL) {
+    return cached.timestamp;
+  }
+  
+  try {
+    const userDoc = await db.collection('users').doc(userId).get();
+    
+    if (!userDoc.exists) {
+      return null;
+    }
+    
+    const userData = userDoc.data();
+    const lastModified = userData.portfolioLastModified;
+    
+    // portfolioLastModified puede ser un Firestore Timestamp o undefined
+    let timestamp = null;
+    if (lastModified) {
+      timestamp = lastModified.toMillis ? lastModified.toMillis() : lastModified;
+    }
+    
+    // Guardar en cache local
+    lastModifiedCache.set(userId, { timestamp, fetchedAt: Date.now() });
+    
+    return timestamp;
+  } catch (error) {
+    logger.warn('Failed to get portfolioLastModified', { userId, error: error.message });
+    return null;
+  }
+}
+
 /**
  * Respuesta vacía para portafolios sin assets
  */
@@ -171,26 +236,64 @@ function buildEmptyResponse(currency) {
 
 /**
  * Obtiene assets activos del usuario
+ * 
+ * NOTA: Los assets NO tienen userId directo. Se relacionan con el usuario
+ * a través del campo portfolioAccount → portfolioAccounts.userId
  */
 async function getActiveAssets(userId, options) {
-  let query = db.collection('assets')
-    .where('userId', '==', userId)
-    .where('isActive', '==', true);
+  // Primero obtener las cuentas del usuario
+  const userAccounts = await getPortfolioAccounts(userId);
+  
+  if (!userAccounts.length) {
+    logger.info('No portfolio accounts found for user', { userId });
+    return [];
+  }
+  
+  const userAccountIds = userAccounts.map(a => a.id);
+  logger.info('User accounts found', { userId, accountCount: userAccountIds.length });
 
-  // Filtrar por cuenta específica si se proporciona
+  // Determinar qué cuentas filtrar
+  let targetAccountIds = userAccountIds;
+  
   if (options.accountId && options.accountId !== 'overall') {
     if (options.accountId === 'account_null') {
-      query = query.where('portfolioAccount', '==', null);
+      // Buscar assets sin cuenta asignada (raro, pero posible)
+      const snapshot = await db.collection('assets')
+        .where('portfolioAccount', '==', null)
+        .where('isActive', '==', true)
+        .get();
+      return snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+    }
+    // Filtrar por cuenta específica (validar que pertenece al usuario)
+    if (userAccountIds.includes(options.accountId)) {
+      targetAccountIds = [options.accountId];
     } else {
-      query = query.where('portfolioAccount', '==', options.accountId);
+      logger.warn('Account does not belong to user', { userId, accountId: options.accountId });
+      return [];
     }
   } else if (options.accountIds?.length) {
-    // Firestore permite máximo 10 valores en 'in'
-    query = query.where('portfolioAccount', 'in', options.accountIds.slice(0, 10));
+    // Filtrar por cuentas específicas (validar que pertenecen al usuario)
+    targetAccountIds = options.accountIds.filter(id => userAccountIds.includes(id));
+    if (!targetAccountIds.length) {
+      logger.warn('None of the requested accounts belong to user', { userId, requestedIds: options.accountIds });
+      return [];
+    }
   }
 
-  const snapshot = await query.get();
-  return snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+  // Firestore permite máximo 10 valores en 'in', hacemos batch si es necesario
+  const allAssets = [];
+  for (let i = 0; i < targetAccountIds.length; i += 10) {
+    const batch = targetAccountIds.slice(i, i + 10);
+    const snapshot = await db.collection('assets')
+      .where('portfolioAccount', 'in', batch)
+      .where('isActive', '==', true)
+      .get();
+    
+    allAssets.push(...snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
+  }
+
+  logger.info('Assets loaded', { userId, assetCount: allAssets.length });
+  return allAssets;
 }
 
 /**
@@ -230,62 +333,156 @@ async function getPortfolioAccounts(userId) {
 
 /**
  * Obtiene datos de ETFs en batch (con cache)
+ * Optimizado para evitar rate limiting (429) y llamadas duplicadas
  */
 async function batchGetETFData(symbols) {
   const etfData = new Map();
-  const symbolsToFetch = [];
+  const symbolsToFetch = new Set(); // Usar Set para deduplicar
+  const cacheHits = [];
 
-  // Verificar cache primero
+  // Verificar cache primero y deduplicar
   for (const symbol of symbols) {
     const normalized = symbol.trim().toUpperCase();
     const cached = etfDataCache.get(normalized);
     
     if (cached && Date.now() - cached.timestamp < ETF_CACHE_TTL) {
-      etfData.set(normalized, cached.data);
+      // Solo usar cache si tiene datos válidos (holdings)
+      if (cached.data && cached.data.holdings && cached.data.holdings.length > 0) {
+        etfData.set(normalized, cached.data);
+        cacheHits.push(normalized);
+      } else {
+        // Cache con datos inválidos, volver a buscar
+        symbolsToFetch.add(normalized);
+      }
     } else {
-      symbolsToFetch.push(normalized);
+      symbolsToFetch.add(normalized);
     }
   }
 
-  // Fetch símbolos que no están en cache
-  const fetchPromises = symbolsToFetch.map(async (symbol) => {
-    try {
-      const data = await fetchETFDataFromAPI(symbol);
-      if (data) {
-        etfDataCache.set(symbol, { data, timestamp: Date.now() });
-        etfData.set(symbol, data);
-      }
-    } catch (error) {
-      logger.warn('Failed to fetch ETF data', { symbol, error: error.message });
-    }
+  const uniqueSymbolsToFetch = Array.from(symbolsToFetch);
+  
+  logger.info('ETF batch fetch', { 
+    totalRequests: symbols.length,
+    uniqueSymbols: uniqueSymbolsToFetch.length,
+    cacheHits: cacheHits.length, 
+    toFetch: uniqueSymbolsToFetch
   });
 
-  await Promise.all(fetchPromises);
+  // Fetch con concurrencia limitada para evitar 429
+  const CONCURRENT_LIMIT = 3;
+  const results = await fetchWithConcurrencyLimit(
+    uniqueSymbolsToFetch,
+    fetchETFDataFromAPIWithRetry,
+    CONCURRENT_LIMIT
+  );
+
+  // Procesar resultados
+  for (const { symbol, data } of results) {
+    if (data && data.holdings && data.holdings.length > 0) {
+      etfDataCache.set(symbol, { data, timestamp: Date.now() });
+      etfData.set(symbol, data);
+    }
+  }
+  
+  logger.info('ETF data loaded', { total: etfData.size, symbols: Array.from(etfData.keys()) });
+  
   return etfData;
 }
 
 /**
+ * Ejecuta fetches con límite de concurrencia
+ */
+async function fetchWithConcurrencyLimit(symbols, fetchFn, limit) {
+  const results = [];
+  
+  for (let i = 0; i < symbols.length; i += limit) {
+    const batch = symbols.slice(i, i + limit);
+    const batchResults = await Promise.all(
+      batch.map(async (symbol) => ({
+        symbol,
+        data: await fetchFn(symbol)
+      }))
+    );
+    results.push(...batchResults);
+    
+    // Pequeña pausa entre batches para evitar rate limiting
+    if (i + limit < symbols.length) {
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+  }
+  
+  return results;
+}
+
+/**
+ * Obtiene datos de un ETF con retry automático para errores 429
+ */
+async function fetchETFDataFromAPIWithRetry(symbol, maxRetries = 3) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    const result = await fetchETFDataFromAPI(symbol);
+    
+    // Si obtuvimos datos o es un error definitivo (no 429), retornar
+    if (result !== 'RATE_LIMITED') {
+      return result;
+    }
+    
+    // Esperar antes de reintentar (backoff exponencial)
+    const delay = Math.min(1000 * Math.pow(2, attempt - 1), 5000);
+    logger.debug('ETF retry', { symbol, attempt, delay });
+    await new Promise(resolve => setTimeout(resolve, delay));
+  }
+  
+  logger.warn('ETF max retries exceeded', { symbol, maxRetries });
+  return null;
+}
+
+/**
  * Obtiene datos de un ETF desde la API externa
+ * Retorna 'RATE_LIMITED' si hay error 429 para permitir retry
  */
 async function fetchETFDataFromAPI(symbol) {
+  const url = `https://dmn46d7xas3rvio6tugd2vzs2q0hxbmb.lambda-url.us-east-1.on.aws/v1/etf/${symbol}/unified`;
+  
   try {
-    const response = await fetch(
-      `https://dmn46d7xas3rvio6tugd2vzs2q0hxbmb.lambda-url.us-east-1.on.aws/v1/etf/${symbol}/unified`,
-      { timeout: 10000 }
-    );
+    const response = await fetch(url, { 
+      timeout: 15000,
+      headers: {
+        'Accept': 'application/json',
+        'User-Agent': 'PortfolioDistributionService/1.0'
+      }
+    });
     
-    if (!response.ok || response.status === 204) {
+    if (response.status === 429) {
+      logger.debug('ETF API rate limited', { symbol });
+      return 'RATE_LIMITED';
+    }
+    
+    if (response.status === 204) {
+      logger.debug('ETF API 204 No Content', { symbol });
+      return null;
+    }
+    
+    if (!response.ok) {
+      logger.warn('ETF API error status', { symbol, status: response.status });
       return null;
     }
     
     const text = await response.text();
     if (!text || text.trim() === '') {
+      logger.debug('ETF API empty response', { symbol });
       return null;
     }
     
-    return JSON.parse(text);
+    const data = JSON.parse(text);
+    logger.debug('ETF API success', { 
+      symbol, 
+      holdingsCount: data.holdings?.length,
+      sectorsCount: data.sectors?.length 
+    });
+    
+    return data;
   } catch (error) {
-    logger.warn('ETF API error', { symbol, error: error.message });
+    logger.warn('ETF API fetch error', { symbol, error: error.message, url });
     return null;
   }
 }
@@ -386,6 +583,7 @@ function calculateTotalValue(assets, prices) {
 function calculateSectorDistribution(assets, prices, etfData, sectorMappings, portfolioAccounts, userId, totalValue) {
   const holdingsMap = {};
   const sectorsMap = {};
+  const etfStats = { decomposed: 0, notDecomposed: [] };
 
   // Filtrar assets relevantes
   const relevantAssets = assets.filter(asset => {
@@ -403,11 +601,14 @@ function calculateSectorDistribution(assets, prices, etfData, sectorMappings, po
     const value = asset.units * price.price;
     const weight = value / totalValue;
 
+    // BUGFIX: Usar price.name (nombre de la empresa) en lugar de asset.company (broker)
     holdingsMap[asset.name] = {
       symbol: asset.name,
-      description: asset.company || asset.name,
+      description: price.name || asset.name, // price.name contiene el nombre real (ej: "Apple Inc.")
       weight,
       asset_type: asset.assetType,
+      sector: price.sector,
+      assetClass: price.sector,
       sources: [{ symbol: asset.name, contribution: weight }]
     };
   });
@@ -426,9 +627,14 @@ function calculateSectorDistribution(assets, prices, etfData, sectorMappings, po
     const normalized = etf.name.trim().toUpperCase();
     const etfInfo = etfData.get(normalized);
 
-    if (etfInfo) {
+    if (etfInfo && etfInfo.holdings && etfInfo.holdings.length > 0) {
+      // BUGFIX: Eliminar el ETF del mapa de holdings ya que lo vamos a desglosar
+      // Solo mostramos los holdings subyacentes, no el ETF en sí
+      delete holdingsMap[etf.name];
+      etfStats.decomposed++;
+      
       // Procesar holdings del ETF
-      for (const holding of (etfInfo.holdings || [])) {
+      for (const holding of etfInfo.holdings) {
         if (!holding.symbol && !holding.isin) continue;
 
         const identifier = holding.symbol || holding.isin;
@@ -440,7 +646,7 @@ function calculateSectorDistribution(assets, prices, etfData, sectorMappings, po
             isin: holding.isin,
             description: holding.name,
             weight: 0,
-            asset_type: holding.asset_type,
+            asset_type: holding.asset_type || 'stock',
             sources: []
           };
         }
@@ -464,6 +670,9 @@ function calculateSectorDistribution(assets, prices, etfData, sectorMappings, po
         }
         sectorsMap[standardSector].weight += contribution;
       }
+    } else {
+      // Si no hay datos de ETF, el ETF permanece como holding directo
+      etfStats.notDecomposed.push(etf.name);
     }
   }
 
@@ -497,7 +706,7 @@ function calculateSectorDistribution(assets, prices, etfData, sectorMappings, po
   const sectors = Object.values(sectorsMap)
     .sort((a, b) => b.weight - a.weight);
 
-  return { holdings, sectors };
+  return { holdings, sectors, etfStats };
 }
 
 /**
@@ -619,9 +828,11 @@ function calculateCountryDistribution(assets, prices, etfData, countryMappings, 
 
 /**
  * Invalida el cache de distribución para un usuario
+ * Actualiza también portfolioLastModified en Firestore para invalidación entre instancias
  * @param {string} userId - ID del usuario
  */
 function invalidateDistributionCache(userId) {
+  // 1. Invalidar cache en memoria local
   const keysToDelete = [];
   
   for (const key of distributionCache.keys()) {
@@ -631,6 +842,15 @@ function invalidateDistributionCache(userId) {
   }
   
   keysToDelete.forEach(key => distributionCache.delete(key));
+  
+  // 2. Actualizar timestamp en Firestore (para invalidar entre instancias)
+  // Esto se hace de forma asíncrona sin esperar (fire-and-forget)
+  const admin = require('firebase-admin');
+  admin.firestore().collection('users').doc(userId).set({
+    portfolioLastModified: admin.firestore.FieldValue.serverTimestamp()
+  }, { merge: true }).catch(err => {
+    logger.warn('Failed to update portfolioLastModified', { userId, error: err.message });
+  });
   
   logger.info('Distribution cache invalidated', { 
     userId, 

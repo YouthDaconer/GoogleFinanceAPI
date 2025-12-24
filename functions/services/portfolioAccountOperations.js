@@ -19,6 +19,9 @@ const { getFirestore, FieldValue } = require("firebase-admin/firestore");
 // Importar rate limiter (SCALE-BE-004)
 const { withRateLimit } = require('../utils/rateLimiter');
 
+// Importar invalidación de cache de distribución
+const { invalidateDistributionCache } = require('./portfolioDistributionService');
+
 const db = getFirestore();
 
 /**
@@ -65,6 +68,9 @@ const addPortfolioAccount = onCall(
       };
 
       const docRef = await db.collection("portfolioAccounts").add(newAccount);
+
+      // Invalidar cache de distribución
+      invalidateDistributionCache(userId);
 
       console.log(`[addPortfolioAccount] Cuenta creada: ${docRef.id} para usuario ${userId}`);
 
@@ -134,6 +140,9 @@ const updatePortfolioAccount = onCall(
 
       await accountRef.update(sanitizedUpdates);
 
+      // Invalidar cache de distribución
+      invalidateDistributionCache(userId);
+
       console.log(`[updatePortfolioAccount] Cuenta actualizada: ${accountId}`);
 
       return {
@@ -183,6 +192,9 @@ const deletePortfolioAccount = onCall(
 
       // Eliminar la cuenta
       await accountRef.delete();
+
+      // Invalidar cache de distribución
+      invalidateDistributionCache(userId);
 
       console.log(`[deletePortfolioAccount] Cuenta eliminada: ${accountId}`);
 

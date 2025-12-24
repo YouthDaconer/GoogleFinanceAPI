@@ -293,11 +293,15 @@ exports.getPortfolioDistribution = onCall(
   },
   withRateLimit({ functionName: 'getPortfolioDistribution', limit: 60, windowMs: 60000 })(
     async (request) => {
+      console.log('[getPortfolioDistribution] Request received');
+      
       if (!request.auth) {
         throw new HttpsError('unauthenticated', 'Autenticación requerida');
       }
 
+      console.log('[getPortfolioDistribution] User:', request.auth.uid);
       const { accountIds, accountId, currency, includeHoldings } = request.data || {};
+      console.log('[getPortfolioDistribution] Options:', { accountIds, accountId, currency, includeHoldings });
 
       try {
         const result = await portfolioDistributionService.getPortfolioDistribution(
@@ -309,6 +313,13 @@ exports.getPortfolioDistribution = onCall(
             includeHoldings: includeHoldings ?? true 
           }
         );
+
+        console.log('[getPortfolioDistribution] Result:', {
+          sectorsCount: result.sectors?.length || 0,
+          holdingsCount: result.holdings?.length || 0,
+          countriesCount: result.countries?.length || 0,
+          fromCache: result.fromCache || false
+        });
 
         return result;
       } catch (error) {
