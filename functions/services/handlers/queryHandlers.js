@@ -175,13 +175,14 @@ async function getHistoricalReturns(context, payload) {
     }
 
     // 2. Obtener documentos de performance
-    let performanceQuery = db.collection(`userData/${userId}/performance`);
+    // BUGFIX: Usar la ruta correcta según la función legacy original
+    const basePath = accountId === "overall"
+      ? `portfolioPerformance/${userId}/dates`
+      : `portfolioPerformance/${userId}/accounts/${accountId}/dates`;
 
-    if (accountId && accountId !== "overall") {
-      performanceQuery = performanceQuery.where('accountId', '==', accountId);
-    }
-
-    const performanceSnapshot = await performanceQuery.get();
+    const performanceSnapshot = await db.collection(basePath)
+      .orderBy("date", "asc")
+      .get();
 
     if (performanceSnapshot.empty) {
       console.log(`[queryHandlers][getHistoricalReturns] Sin documentos de performance`);
@@ -241,13 +242,12 @@ async function getHistoricalReturns(context, payload) {
 /**
  * Obtiene rendimientos históricos multi-cuenta
  * 
- * NOTA: Esta función tiene lógica compleja de agregación que requiere
- * mantener la implementación del servicio original. Para casos comunes
- * (overall, una sola cuenta), delega a getHistoricalReturnsInternal.
+ * SCALE-CF-001: Implementación completa de agregación multi-cuenta
+ * Migrada desde historicalReturnsService.getMultiAccountHistoricalReturns
  * 
  * @param {Object} context - Contexto de ejecución
  * @param {Object} payload - Opciones de consulta
- * @returns {Promise<Object>} Rendimientos por cuenta
+ * @returns {Promise<Object>} Rendimientos agregados de múltiples cuentas
  */
 async function getMultiAccountHistoricalReturns(context, payload) {
   const { auth } = context;
@@ -314,20 +314,257 @@ async function getMultiAccountHistoricalReturns(context, payload) {
       });
     }
 
-    // Para multi-cuenta real, usar getHistoricalReturnsInternal con each account
-    // TODO: La lógica de agregación multi-cuenta es compleja y debería
-    // extraerse del servicio original en una fase futura
-    console.log(`[queryHandlers][getMultiAccountHistoricalReturns] Multi-cuenta, delegando al primer account`);
+    // ============================================================================
+    // MULTI-CUENTA REAL: Agregar datos de múltiples cuentas
+    // ============================================================================
     
-    // Por ahora, calculamos para la primera cuenta como fallback
-    // En producción, la Cloud Function legacy maneja esto correctamente
-    return await getHistoricalReturnsInternal(userId, {
-      currency,
-      accountId: accountIds[0],
-      ticker,
-      assetType,
-      forceRefresh
+    // Generar clave de cache
+    const sortedIds = [...accountIds].sort().join('_');
+    const cacheKey = `multi_${currency}_${sortedIds}${ticker ? `_${ticker}` : ''}${assetType ? `_${assetType}` : ''}`;
+
+    console.log(`[queryHandlers][getMultiAccountHistoricalReturns] Multi-cuenta, cache key: ${cacheKey}`);
+
+    // Verificar cache (si no forceRefresh)
+    if (!forceRefresh) {
+      try {
+        const cacheRef = db.doc(`userData/${userId}/performanceCache/${cacheKey}`);
+        const cacheDoc = await cacheRef.get();
+
+        if (cacheDoc.exists) {
+          const cache = cacheDoc.data();
+          const validUntil = new Date(cache.validUntil);
+
+          if (validUntil > new Date()) {
+            console.log(`[queryHandlers][getMultiAccountHistoricalReturns] Cache HIT`);
+            return {
+              ...cache.data,
+              cacheHit: true,
+              lastCalculated: cache.lastCalculated,
+              validUntil: cache.validUntil
+            };
+          }
+        }
+      } catch (cacheError) {
+        console.warn(`[queryHandlers][getMultiAccountHistoricalReturns] Error leyendo cache:`, cacheError.message);
+      }
+    }
+
+    console.log(`[queryHandlers][getMultiAccountHistoricalReturns] Cache MISS - Agregando ${accountIds.length} cuentas`);
+
+    // Leer datos de cada cuenta en paralelo
+    const accountDataPromises = accountIds.map(accountId => 
+      db.collection(`portfolioPerformance/${userId}/accounts/${accountId}/dates`)
+        .orderBy("date", "asc")
+        .get()
+    );
+    
+    const accountSnapshots = await Promise.all(accountDataPromises);
+
+    // Verificar si hay datos
+    const totalDocs = accountSnapshots.reduce((sum, snap) => sum.size + snap.size, 0);
+    if (totalDocs === 0) {
+      console.log(`[queryHandlers][getMultiAccountHistoricalReturns] Sin datos de performance`);
+      return {
+        returns: {
+          ytdReturn: 0, oneMonthReturn: 0, threeMonthReturn: 0, sixMonthReturn: 0,
+          oneYearReturn: 0, twoYearReturn: 0, fiveYearReturn: 0,
+          hasYtdData: false, hasOneMonthData: false, hasThreeMonthData: false,
+          hasSixMonthData: false, hasOneYearData: false, hasTwoYearData: false,
+          hasFiveYearData: false
+        },
+        validDocsCountByPeriod: {
+          ytd: 0, oneMonth: 0, threeMonths: 0, sixMonths: 0,
+          oneYear: 0, twoYears: 0, fiveYears: 0
+        },
+        totalValueData: {
+          dates: [], values: [], percentChanges: [], overallPercentChange: 0
+        },
+        performanceByYear: {},
+        availableYears: [],
+        startDate: "",
+        monthlyCompoundData: {},
+        cacheHit: false,
+        lastCalculated: new Date().toISOString()
+      };
+    }
+
+    // Agregar datos por fecha
+    const aggregatedByDate = new Map();
+
+    accountSnapshots.forEach(snapshot => {
+      snapshot.docs.forEach(doc => {
+        const data = doc.data();
+        const date = data.date;
+        
+        if (!aggregatedByDate.has(date)) {
+          aggregatedByDate.set(date, {
+            date,
+            currencies: {}
+          });
+        }
+        
+        const existing = aggregatedByDate.get(date);
+        
+        // Agregar métricas por moneda
+        Object.keys(data).forEach(key => {
+          if (key === 'date') return;
+          
+          const currencyCode = key;
+          const currencyData = data[currencyCode];
+          
+          if (!currencyData || typeof currencyData !== 'object') return;
+          
+          if (!existing.currencies[currencyCode]) {
+            existing.currencies[currencyCode] = {
+              totalInvestment: 0,
+              totalValue: 0,
+              totalCashFlow: 0,
+              unrealizedProfitAndLoss: 0,
+              doneProfitAndLoss: 0,
+              assetPerformance: {},
+              _accountContributions: []
+            };
+          }
+          
+          // Guardar contribución de esta cuenta para ponderar el cambio diario
+          existing.currencies[currencyCode]._accountContributions.push({
+            totalValue: currencyData.totalValue || 0,
+            adjustedDailyChangePercentage: currencyData.adjustedDailyChangePercentage || 0,
+            rawDailyChangePercentage: currencyData.rawDailyChangePercentage || currencyData.dailyChangePercentage || 0
+          });
+          
+          // Sumar métricas aditivas
+          existing.currencies[currencyCode].totalInvestment += currencyData.totalInvestment || 0;
+          existing.currencies[currencyCode].totalValue += currencyData.totalValue || 0;
+          existing.currencies[currencyCode].totalCashFlow += currencyData.totalCashFlow || 0;
+          existing.currencies[currencyCode].unrealizedProfitAndLoss += currencyData.unrealizedProfitAndLoss || 0;
+          existing.currencies[currencyCode].doneProfitAndLoss += currencyData.doneProfitAndLoss || 0;
+          
+          // Agregar assets para detalle
+          if (currencyData.assetPerformance) {
+            Object.entries(currencyData.assetPerformance).forEach(([assetKey, assetData]) => {
+              if (!existing.currencies[currencyCode].assetPerformance[assetKey]) {
+                existing.currencies[currencyCode].assetPerformance[assetKey] = {
+                  totalInvestment: 0,
+                  totalValue: 0,
+                  totalCashFlow: 0,
+                  units: 0,
+                  unrealizedProfitAndLoss: 0,
+                  doneProfitAndLoss: 0
+                };
+              }
+              
+              const existingAsset = existing.currencies[currencyCode].assetPerformance[assetKey];
+              existingAsset.totalInvestment += assetData.totalInvestment || 0;
+              existingAsset.totalValue += assetData.totalValue || 0;
+              existingAsset.totalCashFlow += assetData.totalCashFlow || 0;
+              existingAsset.units += assetData.units || 0;
+              existingAsset.unrealizedProfitAndLoss += assetData.unrealizedProfitAndLoss || 0;
+              existingAsset.doneProfitAndLoss += assetData.doneProfitAndLoss || 0;
+            });
+          }
+        });
+      });
     });
+
+    // Calcular rendimiento ponderado por valor para cada día
+    // Usar el VALOR PRE-CAMBIO para ponderar correctamente
+    const sortedDates = Array.from(aggregatedByDate.keys()).sort();
+    
+    sortedDates.forEach(date => {
+      const dateData = aggregatedByDate.get(date);
+      
+      Object.keys(dateData.currencies).forEach(currencyCode => {
+        const c = dateData.currencies[currencyCode];
+        
+        // ROI total
+        c.totalROI = c.totalInvestment > 0 
+          ? ((c.totalValue - c.totalInvestment) / c.totalInvestment) * 100 
+          : 0;
+        
+        // Calcular valor PRE-CAMBIO de cada cuenta para ponderar
+        const contributions = c._accountContributions || [];
+        
+        const contributionsWithPreValue = contributions.map(acc => {
+          const change = acc.adjustedDailyChangePercentage || 0;
+          const currentValue = acc.totalValue || 0;
+          const preChangeValue = change !== 0 ? currentValue / (1 + change / 100) : currentValue;
+          return { ...acc, preChangeValue };
+        });
+        
+        const totalWeight = contributionsWithPreValue.reduce((sum, acc) => sum + acc.preChangeValue, 0);
+        
+        if (totalWeight > 0 && contributionsWithPreValue.length > 0) {
+          const weightedAdjustedChange = contributionsWithPreValue.reduce((sum, acc) => {
+            const weight = acc.preChangeValue / totalWeight;
+            return sum + (acc.adjustedDailyChangePercentage || 0) * weight;
+          }, 0);
+          
+          const weightedRawChange = contributionsWithPreValue.reduce((sum, acc) => {
+            const weight = acc.preChangeValue / totalWeight;
+            return sum + (acc.rawDailyChangePercentage || 0) * weight;
+          }, 0);
+          
+          c.dailyChangePercentage = weightedRawChange;
+          c.rawDailyChangePercentage = weightedRawChange;
+          c.adjustedDailyChangePercentage = weightedAdjustedChange;
+        } else {
+          c.dailyChangePercentage = 0;
+          c.rawDailyChangePercentage = 0;
+          c.adjustedDailyChangePercentage = 0;
+        }
+        
+        delete c._accountContributions;
+        
+        // Calcular ROI para cada asset
+        Object.values(c.assetPerformance).forEach(assetData => {
+          assetData.totalROI = assetData.totalInvestment > 0
+            ? ((assetData.totalValue - assetData.totalInvestment) / assetData.totalInvestment) * 100
+            : 0;
+        });
+      });
+    });
+
+    // Convertir a formato de docs para usar calculateHistoricalReturns
+    const aggregatedDocs = sortedDates.map(date => {
+      const dateData = aggregatedByDate.get(date);
+      return {
+        data: () => ({
+          date: dateData.date,
+          ...dateData.currencies
+        })
+      };
+    });
+
+    console.log(`[queryHandlers][getMultiAccountHistoricalReturns] Procesando ${aggregatedDocs.length} fechas agregadas`);
+
+    // Usar función existente para calcular rendimientos
+    const result = calculateHistoricalReturns(aggregatedDocs, currency, ticker, assetType);
+
+    // Guardar en cache
+    const now = new Date();
+    const validUntil = calculateDynamicTTL();
+
+    const cacheData = {
+      data: result,
+      lastCalculated: now.toISOString(),
+      validUntil: validUntil.toISOString()
+    };
+
+    try {
+      const cacheRef = db.doc(`userData/${userId}/performanceCache/${cacheKey}`);
+      await cacheRef.set(cacheData);
+      console.log(`[queryHandlers][getMultiAccountHistoricalReturns] Cache guardado`);
+    } catch (cacheWriteError) {
+      console.error(`[queryHandlers][getMultiAccountHistoricalReturns] Error guardando cache:`, cacheWriteError.message);
+    }
+
+    return {
+      ...result,
+      cacheHit: false,
+      lastCalculated: now.toISOString(),
+      validUntil: validUntil.toISOString()
+    };
 
   } catch (error) {
     console.error(`[queryHandlers][getMultiAccountHistoricalReturns] Error:`, error);
