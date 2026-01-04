@@ -4,6 +4,9 @@
  * SCALE-CF-001: Consolida 6 Cloud Functions HTTP de consulta en un solo endpoint
  * con action router para reducir cold starts y costos.
  * 
+ * COST-OPT-001: Agregadas acciones getHistoricalReturnsOptimized y 
+ * getConsolidatedDataStatus para rendimientos con períodos consolidados.
+ * 
  * NOTA: Esta función usa 512MiB de memoria porque getHistoricalReturns y 
  * getMultiAccountHistoricalReturns lo requieren. Las otras funciones están
  * sobre-provisionadas pero se benefician de instancias calientes compartidas.
@@ -11,13 +14,16 @@
  * Acciones disponibles:
  * - getCurrentPricesForUser
  * - getHistoricalReturns
+ * - getHistoricalReturnsOptimized (COST-OPT-001: V2 con períodos consolidados)
  * - getMultiAccountHistoricalReturns
  * - getIndexHistory
  * - getPortfolioDistribution
  * - getAvailableSectors
+ * - getConsolidatedDataStatus (COST-OPT-001: Diagnóstico de datos)
  * 
  * @module unified/queryOperations
  * @see docs/stories/56.story.md
+ * @see docs/stories/62.story.md (COST-OPT-001)
  */
 
 const { onCall, HttpsError } = require("firebase-functions/v2/https");
@@ -55,6 +61,9 @@ const ACTION_HANDLERS = {
   getIndexHistory: queryHandlers.getIndexHistory,
   getPortfolioDistribution: queryHandlers.getPortfolioDistribution,
   getAvailableSectors: queryHandlers.getAvailableSectors,
+  // COST-OPT-001: Nuevas acciones para rendimientos optimizados (V2)
+  getHistoricalReturnsOptimized: queryHandlers.getHistoricalReturnsOptimized,
+  getConsolidatedDataStatus: queryHandlers.getConsolidatedDataStatus,
 };
 
 /**

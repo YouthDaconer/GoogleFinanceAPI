@@ -534,3 +534,19 @@ exports.accountOperations = accountOperations;
  */
 const { queryOperations } = require('./services/unified/queryOperations');
 exports.queryOperations = queryOperations;
+
+/**
+ * COST-OPT-002: Scheduled Functions para consolidación de períodos
+ * 
+ * - consolidateMonthlyPerformance: Día 1 de cada mes, 00:30 ET
+ * - consolidateYearlyPerformance: 1 de Enero, 01:00 ET
+ * 
+ * @see docs/stories/63.story.md (COST-OPT-002)
+ */
+const { 
+  consolidateMonthlyPerformance, 
+  consolidateYearlyPerformance 
+} = require('./services/periodConsolidationScheduled');
+
+exports.consolidateMonthlyPerformance = consolidateMonthlyPerformance;
+exports.consolidateYearlyPerformance = consolidateYearlyPerformance;

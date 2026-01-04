@@ -30,6 +30,12 @@ const {
 const { calculateIndexData } = require('../indexHistoryService');
 const { DateTime } = require('luxon');
 
+// COST-OPT-001: Importar servicio de rendimientos consolidados (V2)
+const { 
+  getHistoricalReturnsV2,
+  checkConsolidatedDataStatus 
+} = require('../consolidatedReturnsService');
+
 // Importar utilidades MWR para cálculos de multi-account
 const {
   calculateSimplePersonalReturn,
@@ -132,6 +138,9 @@ async function getCurrentPricesForUser(context, payload) {
 /**
  * Obtiene rendimientos históricos del portafolio
  * 
+ * COST-OPT-003: Ahora usa V2 (períodos consolidados) con fallback automático a V1
+ * si no hay datos consolidados. Esto reduce lecturas de ~300 a ~20 documentos.
+ * 
  * @param {Object} context - Contexto de ejecución
  * @param {Object} payload - Opciones de consulta
  * @returns {Promise<Object>} Rendimientos calculados
@@ -174,39 +183,18 @@ async function getHistoricalReturns(context, payload) {
       }
     }
 
-    // 2. Obtener documentos de performance
-    // BUGFIX: Usar la ruta correcta según la función legacy original
-    const basePath = accountId === "overall"
-      ? `portfolioPerformance/${userId}/dates`
-      : `portfolioPerformance/${userId}/accounts/${accountId}/dates`;
-
-    const performanceSnapshot = await db.collection(basePath)
-      .orderBy("date", "asc")
-      .get();
-
-    if (performanceSnapshot.empty) {
-      console.log(`[queryHandlers][getHistoricalReturns] Sin documentos de performance`);
-      return {
-        returns: {},
-        totalValueData: { dates: [], values: [], percentChanges: [], overallPercentChange: 0 },
-        performanceByYear: {},
-        availableYears: [],
-        startDate: "",
-        monthlyCompoundData: {},
-        cacheHit: false,
-        lastCalculated: new Date().toISOString()
-      };
-    }
-
-    // 3. Ejecutar cálculos
-    const result = calculateHistoricalReturns(
-      performanceSnapshot.docs,
+    // COST-OPT-003: Usar V2 (períodos consolidados) con fallback a V1
+    // Esto reduce lecturas de ~300+ documentos a ~20 documentos
+    const result = await getHistoricalReturnsV2(userId, {
       currency,
+      accountId,
       ticker,
-      assetType
-    );
+      assetType,
+      forceRefresh,
+      fallbackToV1: true  // Fallback automático si no hay datos consolidados
+    });
 
-    // 4. Guardar en cache
+    // 2. Guardar en cache
     const now = new Date();
     const validUntil = calculateDynamicTTL();
 
@@ -223,7 +211,8 @@ async function getHistoricalReturns(context, payload) {
       console.error(`[queryHandlers][getHistoricalReturns] Error guardando cache:`, cacheWriteError);
     }
 
-    console.log(`[queryHandlers][getHistoricalReturns] Éxito - calculado`);
+    const version = result._metadata?.version || 'v1';
+    console.log(`[queryHandlers][getHistoricalReturns] Éxito - version: ${version}`);
     
     return {
       ...result,
@@ -711,6 +700,126 @@ async function getAvailableSectors(context, payload) {
   }
 }
 
+/**
+ * Obtiene rendimientos históricos usando períodos consolidados (V2)
+ * 
+ * COST-OPT-001: Versión optimizada que reduce lecturas de Firestore
+ * de ~1,825 a ~40 documentos para consultas de 5 años.
+ * 
+ * @param {Object} context - Contexto de ejecución
+ * @param {Object} payload - Opciones de consulta
+ * @returns {Promise<Object>} Rendimientos calculados
+ */
+async function getHistoricalReturnsOptimized(context, payload) {
+  const { auth } = context;
+  const userId = auth.uid;
+  const { 
+    currency = "USD", 
+    accountId = "overall", 
+    ticker = null, 
+    assetType = null, 
+    forceRefresh = false,
+    fallbackToV1 = true
+  } = payload || {};
+
+  // Generar clave de cache
+  const cacheKey = `v2_${currency}_${accountId}${ticker ? `_${ticker}` : ''}${assetType ? `_${assetType}` : ''}`;
+  
+  console.log(`[queryHandlers][getHistoricalReturnsOptimized] userId: ${userId}, cacheKey: ${cacheKey}`);
+
+  try {
+    // 1. Verificar cache (si no forceRefresh)
+    if (!forceRefresh) {
+      const cacheRef = db.doc(`userData/${userId}/performanceCache/${cacheKey}`);
+      const cacheDoc = await cacheRef.get();
+
+      if (cacheDoc.exists) {
+        const cacheData = cacheDoc.data();
+        const validUntil = new Date(cacheData.validUntil);
+
+        if (validUntil > new Date()) {
+          console.log(`[queryHandlers][getHistoricalReturnsOptimized] Cache hit`);
+          return {
+            ...cacheData.data,
+            cacheHit: true,
+            lastCalculated: cacheData.lastCalculated,
+            validUntil: cacheData.validUntil
+          };
+        }
+      }
+    }
+
+    // 2. Ejecutar cálculos con V2 (períodos consolidados)
+    const result = await getHistoricalReturnsV2(userId, {
+      currency,
+      accountId,
+      ticker,
+      assetType,
+      forceRefresh,
+      fallbackToV1
+    });
+
+    // 3. Guardar en cache
+    const now = new Date();
+    const validUntil = calculateDynamicTTL();
+
+    const cacheData = {
+      data: result,
+      lastCalculated: now.toISOString(),
+      validUntil: validUntil.toISOString()
+    };
+
+    try {
+      const cacheRef = db.doc(`userData/${userId}/performanceCache/${cacheKey}`);
+      await cacheRef.set(cacheData);
+    } catch (cacheWriteError) {
+      console.error(`[queryHandlers][getHistoricalReturnsOptimized] Error guardando cache:`, cacheWriteError);
+    }
+
+    console.log(`[queryHandlers][getHistoricalReturnsOptimized] Éxito - version: ${result._metadata?.version || 'unknown'}`);
+    
+    return {
+      ...result,
+      cacheHit: false,
+      lastCalculated: now.toISOString(),
+      validUntil: validUntil.toISOString()
+    };
+
+  } catch (error) {
+    console.error(`[queryHandlers][getHistoricalReturnsOptimized] Error:`, error);
+    if (error instanceof HttpsError) throw error;
+    throw new HttpsError('internal', 'Error calculando rendimientos históricos optimizados');
+  }
+}
+
+/**
+ * Verifica el estado de datos consolidados de un usuario
+ * 
+ * COST-OPT-001: Útil para diagnóstico y determinar si usar V2.
+ * 
+ * @param {Object} context - Contexto de ejecución
+ * @param {Object} payload - Opciones de consulta
+ * @returns {Promise<Object>} Estado de datos consolidados
+ */
+async function getConsolidatedDataStatus(context, payload) {
+  const { auth } = context;
+  const userId = auth.uid;
+  const { accountId = "overall" } = payload || {};
+
+  console.log(`[queryHandlers][getConsolidatedDataStatus] userId: ${userId}, accountId: ${accountId}`);
+
+  try {
+    const status = await checkConsolidatedDataStatus(userId, accountId);
+    
+    console.log(`[queryHandlers][getConsolidatedDataStatus] Éxito - canUseV2: ${status.canUseV2}`);
+    
+    return status;
+  } catch (error) {
+    console.error(`[queryHandlers][getConsolidatedDataStatus] Error:`, error);
+    throw new HttpsError('internal', 'Error verificando estado de datos consolidados');
+  }
+}
+
 // ============================================================================
 // EXPORTS
 // ============================================================================
@@ -722,4 +831,7 @@ module.exports = {
   getIndexHistory,
   getPortfolioDistribution,
   getAvailableSectors,
+  // COST-OPT-001: Nuevos handlers para rendimientos optimizados
+  getHistoricalReturnsOptimized,
+  getConsolidatedDataStatus,
 };
