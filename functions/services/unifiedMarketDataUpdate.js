@@ -17,9 +17,11 @@ const API_BASE_URL = 'https://dmn46d7xas3rvio6tugd2vzs2q0hxbmb.lambda-url.us-eas
 // Flag para habilitar logs detallados (puede causar mucho ruido en producción)
 const ENABLE_DETAILED_LOGS = process.env.ENABLE_DETAILED_LOGS === 'true';
 
-// Horarios estáticos para NYSE (en UTC)
-const NYSE_OPEN_HOUR = 13.5;  // 9:30 AM EST
-const NYSE_CLOSE_HOUR = 20;   // 4:00 PM EST
+// Horarios de NYSE en hora local de Nueva York (no UTC)
+// Esto maneja automáticamente EST/EDT gracias a Luxon
+const NYSE_OPEN_HOUR = 9;
+const NYSE_OPEN_MINUTE = 30;
+const NYSE_CLOSE_HOUR = 16;  // 4:00 PM
 
 // Logger global para este módulo (se inicializa en cada ejecución)
 let logger = null;
@@ -52,10 +54,28 @@ function logError(...args) {
   }
 }
 
+/**
+ * Verifica si el mercado NYSE está abierto (fallback local).
+ * Usa Luxon para manejar correctamente EST/EDT automáticamente.
+ * NOTA: Este es un fallback - el código principal usa markets/US.isOpen de Finnhub.
+ */
 function isNYSEMarketOpen() {
-  const now = new Date();
-  const utcHour = now.getUTCHours() + now.getUTCMinutes() / 60;
-  return utcHour >= NYSE_OPEN_HOUR && utcHour < NYSE_CLOSE_HOUR;
+  const nyNow = DateTime.now().setZone('America/New_York');
+  const hour = nyNow.hour;
+  const minute = nyNow.minute;
+  const dayOfWeek = nyNow.weekday; // 1=Monday, 7=Sunday
+  
+  // Fin de semana: cerrado
+  if (dayOfWeek === 6 || dayOfWeek === 7) {
+    return false;
+  }
+  
+  // Convertir hora actual a minutos desde medianoche
+  const currentMinutes = hour * 60 + minute;
+  const openMinutes = NYSE_OPEN_HOUR * 60 + NYSE_OPEN_MINUTE; // 9:30 = 570
+  const closeMinutes = NYSE_CLOSE_HOUR * 60; // 16:00 = 960
+  
+  return currentMinutes >= openMinutes && currentMinutes < closeMinutes;
 }
 
 /**
@@ -772,6 +792,9 @@ async function calculateDailyPortfolioPerformance(db) {
   return { count: calculationsCount, userIds: Object.keys(userPortfolios) };
 }
 
+// Constante del intervalo de actualización (debe coincidir con el cron schedule)
+const REFRESH_INTERVAL_MINUTES = 5;
+
 /**
  * Función principal unificada que ejecuta todas las actualizaciones
  * 
@@ -780,22 +803,63 @@ async function calculateDailyPortfolioPerformance(db) {
  * - Impacto UX: Precios actualizados cada 5 min en lugar de 2 min (aceptable)
  */
 exports.unifiedMarketDataUpdate = onSchedule({
-  schedule: '*/5 9-17 * * 1-5',  // COST-OPT-001: Cada 5 minutos (antes: */2)
+  schedule: `*/${REFRESH_INTERVAL_MINUTES} 9-17 * * 1-5`,  // COST-OPT-001: Cada 5 minutos (antes: */2)
   timeZone: 'America/New_York',
   retryCount: 3,
 }, async (event) => {
   // Inicializar logger estructurado (SCALE-CORE-002)
   logger = StructuredLogger.forScheduled('unifiedMarketDataUpdate');
   
+  const db = admin.firestore();
+  
+  // OPT-SYNC-001: Verificar estado del mercado desde Firestore (incluye festivos)
+  // El documento markets/US es actualizado por marketStatusService que consulta Finnhub
+  try {
+    const marketDoc = await db.collection('markets').doc('US').get();
+    if (marketDoc.exists) {
+      const marketData = marketDoc.data();
+      
+      // Verificar si es festivo
+      if (marketData.holiday) {
+        logger.info('Market holiday - skipping update', { 
+          holiday: marketData.holiday,
+          marketStatus: 'holiday'
+        });
+        return null;
+      }
+      
+      // Verificar si el mercado está cerrado (usando dato de Finnhub)
+      if (marketData.isOpen === false) {
+        logger.info('Market closed (Finnhub) - skipping update', { 
+          session: marketData.session,
+          marketStatus: 'closed'
+        });
+        return null;
+      }
+    }
+  } catch (marketCheckError) {
+    // Si falla la consulta, continuar con la verificación local de horario
+    logger.warn('Failed to check market status from Firestore, using local check', {
+      error: marketCheckError.message
+    });
+  }
+  
+  // Fallback: verificación local de horario (por si la consulta a markets/US falla)
   if (!isNYSEMarketOpen()) {
-    logger.info('Market closed - skipping update', { marketStatus: 'closed' });
+    logger.info('Market closed (local check) - skipping update', { marketStatus: 'closed' });
     return null;
   }
 
   logger.info('Starting unified market data update', { marketStatus: 'open' });
   
-  const db = admin.firestore();
   const startTime = Date.now();
+  
+  // Calcular el minuto programado (el scheduler debería haber disparado en un múltiplo de REFRESH_INTERVAL_MINUTES)
+  // Esto nos da el momento exacto cuando SE PROGRAMÓ esta ejecución
+  const now = DateTime.now().setZone('America/New_York');
+  const scheduledMinute = Math.floor(now.minute / REFRESH_INTERVAL_MINUTES) * REFRESH_INTERVAL_MINUTES;
+  const scheduledAt = now.set({ minute: scheduledMinute, second: 0, millisecond: 0 });
+  const nextScheduledUpdate = scheduledAt.plus({ minutes: REFRESH_INTERVAL_MINUTES });
   const mainOp = logger.startOperation('fullUpdate');
   
       try {
@@ -853,15 +917,24 @@ exports.unifiedMarketDataUpdate = onSchedule({
     const executionTime = (endTime - startTime) / 1000;
     
     // Paso 8: Notificar al frontend que todo el pipeline completó (OPT-016)
+    // Incluimos metadata para sincronización precisa del countdown
     try {
       await db.collection('systemStatus').doc('marketData').set({
+        // Timestamps
         lastCompleteUpdate: admin.firestore.FieldValue.serverTimestamp(),
+        lastUpdateDate: new Date().toISOString(),
+        
+        // Metadata de sincronización para el frontend
+        refreshIntervalMinutes: REFRESH_INTERVAL_MINUTES,
+        scheduledAt: scheduledAt.toISO(),           // Cuando se programó esta ejecución
+        nextScheduledUpdate: nextScheduledUpdate.toISO(), // Próxima ejecución programada
+        
+        // Estadísticas del pipeline
         pricesUpdated: priceUpdates,
         performanceCalculated: portfolioResult.count,
         cachesInvalidated: cacheInvalidationResult.cachesDeleted,
         executionTimeMs: Math.round(executionTime * 1000),
-        marketOpen: true,
-        lastUpdateDate: new Date().toISOString()
+        marketOpen: true
       }, { merge: true });
     } catch (signalError) {
       logger.warn('Frontend signal failed (non-critical)', { error: signalError.message });
