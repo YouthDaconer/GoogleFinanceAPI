@@ -1068,10 +1068,12 @@ const getMultiAccountHistoricalReturns = onCall(callableConfig, withRateLimit('g
         
         // Guardar contribución de esta cuenta para ponderar el cambio diario
         // El adjustedDailyChangePercentage ya viene pre-calculado correctamente en Firestore
+        // FIX-MULTI-001: Agregar totalCashFlow para detectar cuentas nuevas (depósitos iniciales)
         existing.currencies[currencyCode]._accountContributions.push({
           totalValue: currencyData.totalValue || 0,
           adjustedDailyChangePercentage: currencyData.adjustedDailyChangePercentage || 0,
-          rawDailyChangePercentage: currencyData.rawDailyChangePercentage || currencyData.dailyChangePercentage || 0
+          rawDailyChangePercentage: currencyData.rawDailyChangePercentage || currencyData.dailyChangePercentage || 0,
+          totalCashFlow: currencyData.totalCashFlow || 0
         });
         
         // Sumar métricas aditivas
@@ -1135,40 +1137,90 @@ const getMultiAccountHistoricalReturns = onCall(callableConfig, withRateLimit('g
         ? ((c.totalValue - c.totalInvestment) / c.totalInvestment) * 100 
         : 0;
       
-      // FIX OPT-018: Calcular el valor PRE-CAMBIO de cada cuenta para ponderar correctamente
+      // FIX OPT-018 + FIX-MULTI-001: Calcular rendimiento diario usando fórmula directa
+      //
+      // Problema original: El promedio ponderado por valor pre-cambio no era consistente
+      // con el cálculo del overall cuando había cuentas nuevas (primer día con datos).
+      //
+      // Una cuenta nueva infla el denominador del promedio ponderado porque su
+      // preChangeValue = currValue (ya que change=0%), pero en realidad no existía ayer.
+      //
+      // Solución: Usar la fórmula directa del overall:
+      //   change = (currValue - prevValue + cashFlow) / prevValue × 100
+      //
+      // Donde prevValue = suma de valores pre-cambio de cuentas EXISTENTES
+      // (excluyendo cuentas nuevas identificadas por: change=0% && cashFlow<0 && value>0)
+      //
+      // Esta fórmula es matemáticamente equivalente al promedio ponderado para días
+      // normales, y correcta para días con cuentas nuevas.
+      
       const contributions = c._accountContributions || [];
       
-      // Calcular valor pre-cambio para cada cuenta
-      const contributionsWithPreValue = contributions.map(acc => {
-        const change = acc.adjustedDailyChangePercentage || 0;
-        const currentValue = acc.totalValue || 0;
-        // valor_pre_cambio = valor_actual / (1 + cambio/100)
-        const preChangeValue = change !== 0 ? currentValue / (1 + change / 100) : currentValue;
-        return {
-          ...acc,
-          preChangeValue
-        };
+      // Identificar cuentas existentes (no nuevas) para calcular prevValue
+      const existingAccountsData = contributions.filter(acc => {
+        const isNewAccount = 
+          acc.adjustedDailyChangePercentage === 0 && 
+          acc.totalCashFlow < 0 &&  // Depósito inicial
+          acc.totalValue > 0;
+        return !isNewAccount;
       });
       
-      // Usar valor pre-cambio para calcular los pesos
+      // Calcular valor pre-cambio para cuentas existentes
+      // FIX-MULTI-001: La fórmula correcta para calcular prevValue es:
+      //   prevValue = (currValue + cashFlow) / (1 + change/100)
+      // 
+      // Esto es porque el adjustedDailyChangePercentage se calcula como:
+      //   adjustedChange = (currValue - prevValue + cashFlow) / prevValue × 100
+      //
+      // Despejando:
+      //   prevValue × (1 + adjustedChange/100) = currValue + cashFlow
+      //   prevValue = (currValue + cashFlow) / (1 + adjustedChange/100)
+      //
+      // NOTA: cashFlow es negativo para depósitos, positivo para retiros
+      const contributionsWithPreValue = existingAccountsData.map(acc => {
+        const change = acc.adjustedDailyChangePercentage || 0;
+        const currentValue = acc.totalValue || 0;
+        const cashFlow = acc.totalCashFlow || 0;
+        
+        // FIX: Incluir cashFlow en el cálculo del prevValue
+        const preChangeValue = change !== 0 
+          ? (currentValue + cashFlow) / (1 + change / 100) 
+          : currentValue + cashFlow;  // Si change=0, prevValue = currValue + cashFlow
+        
+        return { ...acc, preChangeValue: Math.max(0, preChangeValue) };  // Evitar valores negativos
+      });
+      
+      // totalWeight = suma de valores pre-cambio de cuentas EXISTENTES (prevValue)
       const totalWeight = contributionsWithPreValue.reduce((sum, acc) => sum + acc.preChangeValue, 0);
       
+      // FIX-MULTI-001: Calcular usando la fórmula directa para consistencia con overall
+      // 
+      // La fórmula del overall es:
+      //   change = (currValue - prevValue + cashFlow) / prevValue × 100
+      //
+      // Para multi-cuenta, adaptamos esto como:
+      //   change = (currValue_total - prevValue_existentes + cashFlow_total) / prevValue_existentes × 100
+      //
+      // Donde:
+      //   - currValue_total = suma de valores de TODAS las cuentas (existentes + nuevas)
+      //   - prevValue_existentes = suma de valores pre-cambio de cuentas EXISTENTES (totalWeight)
+      //   - cashFlow_total = suma de cashflow de TODAS las cuentas
+      //
+      // Esto garantiza consistencia con el cálculo del overall en portfolioCalculations.js
+      
+      const totalCashFlow = contributions.reduce((sum, acc) => sum + (acc.totalCashFlow || 0), 0);
+      const totalCurrentValue = contributions.reduce((sum, acc) => sum + (acc.totalValue || 0), 0);
+      
       if (totalWeight > 0 && contributionsWithPreValue.length > 0) {
-        // Ponderar el adjustedDailyChangePercentage de cada cuenta por su valor PRE-CAMBIO
-        const weightedAdjustedChange = contributionsWithPreValue.reduce((sum, acc) => {
-          const weight = acc.preChangeValue / totalWeight;
-          return sum + (acc.adjustedDailyChangePercentage || 0) * weight;
-        }, 0);
+        // Fórmula directa: (currValue - prevValue + cashFlow) / prevValue × 100
+        const adjustedDailyChange = ((totalCurrentValue - totalWeight + totalCashFlow) / totalWeight) * 100;
         
-        // Ponderar el rawDailyChangePercentage de cada cuenta por su valor PRE-CAMBIO
-        const weightedRawChange = contributionsWithPreValue.reduce((sum, acc) => {
-          const weight = acc.preChangeValue / totalWeight;
-          return sum + (acc.rawDailyChangePercentage || 0) * weight;
-        }, 0);
+        // Para raw change, no incluimos el cashflow
+        const rawDailyChange = ((totalCurrentValue - totalWeight) / totalWeight) * 100;
         
-        c.dailyChangePercentage = weightedRawChange;
-        c.rawDailyChangePercentage = weightedRawChange;
-        c.adjustedDailyChangePercentage = weightedAdjustedChange;
+        c.dailyChangePercentage = rawDailyChange;
+        c.rawDailyChangePercentage = rawDailyChange;
+        c.adjustedDailyChangePercentage = adjustedDailyChange;
       } else {
         // Si no hay peso (primer día o sin datos), usar 0
         c.dailyChangePercentage = 0;
