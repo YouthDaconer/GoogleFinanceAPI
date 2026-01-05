@@ -330,16 +330,27 @@ function chainFactorsForPeriods(yearlyDocs, monthlyDocs, dailyDocs, currency, ti
   let lastValue = 0;
   let firstValue = 0;
   
+  // FIX-V2-001: Estructura para construir performanceByYear
+  // Recopila rendimientos mensuales para cada año
+  const monthlyReturns = {}; // { "2024": { "1": 0.5, "2": -0.3, ... } }
+  const yearlyReturns = {}; // { "2024": 5.2, "2025": 10.1 }
+  
   // Procesar años consolidados
   yearlyDocs.forEach(doc => {
     const data = doc.data ? doc.data() : doc;
     const periodStart = data.startDate;
     const periodEnd = data.endDate;
+    const periodKey = data.periodKey; // "2024"
     const currencyData = extractCurrencyOrAssetData(data, currency, ticker, assetType);
     
     if (!currencyData) return;
     
     processConsolidatedPeriod(periodFactors, periodBoundaries, currencyData, periodStart, periodEnd, data.docsCount || 1);
+    
+    // FIX-V2-001: Guardar rendimiento anual total
+    if (periodKey) {
+      yearlyReturns[periodKey] = currencyData.periodReturn || 0;
+    }
     
     // Agregar punto para gráfico (fin del año)
     if (currencyData.endTotalValue !== undefined) {
@@ -360,11 +371,24 @@ function chainFactorsForPeriods(yearlyDocs, monthlyDocs, dailyDocs, currency, ti
     const data = doc.data ? doc.data() : doc;
     const periodStart = data.startDate;
     const periodEnd = data.endDate;
+    const periodKey = data.periodKey; // "2024-12"
     const currencyData = extractCurrencyOrAssetData(data, currency, ticker, assetType);
     
     if (!currencyData) return;
     
     processConsolidatedPeriod(periodFactors, periodBoundaries, currencyData, periodStart, periodEnd, data.docsCount || 1);
+    
+    // FIX-V2-001: Recopilar rendimiento mensual para performanceByYear
+    if (periodKey) {
+      const [yearStr, monthStr] = periodKey.split('-');
+      const monthNum = parseInt(monthStr, 10).toString(); // "12" -> "12", "01" -> "1"
+      
+      if (!monthlyReturns[yearStr]) {
+        monthlyReturns[yearStr] = {};
+      }
+      // periodReturn es el rendimiento compuesto del mes
+      monthlyReturns[yearStr][monthNum] = currencyData.periodReturn || 0;
+    }
     
     // Agregar punto para gráfico (fin del mes)
     if (currencyData.endTotalValue !== undefined) {
@@ -381,6 +405,12 @@ function chainFactorsForPeriods(yearlyDocs, monthlyDocs, dailyDocs, currency, ti
   });
   
   // Procesar días del mes actual
+  // FIX-V2-001: Calcular rendimiento del mes actual en curso
+  let currentMonthFactor = 1;
+  const currentMonthKey = now.toFormat('yyyy-MM');
+  const currentYear = now.year.toString();
+  const currentMonth = now.month.toString();
+  
   dailyDocs.forEach(doc => {
     const data = doc.data ? doc.data() : doc;
     const date = data.date;
@@ -389,6 +419,10 @@ function chainFactorsForPeriods(yearlyDocs, monthlyDocs, dailyDocs, currency, ti
     if (!currencyData) return;
     
     processDailyDocument(periodFactors, periodBoundaries, currencyData, date);
+    
+    // FIX-V2-001: Acumular factor para mes actual
+    const dailyChange = currencyData.adjustedDailyChangePercentage || currencyData.dailyChangePercentage || 0;
+    currentMonthFactor *= (1 + dailyChange / 100);
     
     // Agregar punto para gráfico
     const value = ticker && assetType 
@@ -408,6 +442,14 @@ function chainFactorsForPeriods(yearlyDocs, monthlyDocs, dailyDocs, currency, ti
     }
   });
   
+  // FIX-V2-001: Agregar rendimiento del mes actual si hay datos
+  if (dailyDocs.length > 0) {
+    if (!monthlyReturns[currentYear]) {
+      monthlyReturns[currentYear] = {};
+    }
+    monthlyReturns[currentYear][currentMonth] = (currentMonthFactor - 1) * 100;
+  }
+  
   // Calcular rendimientos finales
   return buildReturnsResult(periodFactors, {
     totalValueDates,
@@ -416,7 +458,10 @@ function chainFactorsForPeriods(yearlyDocs, monthlyDocs, dailyDocs, currency, ti
     firstDate,
     firstValue,
     lastValue,
-    now
+    now,
+    // FIX-V2-001: Pasar datos para construir performanceByYear
+    monthlyReturns,
+    yearlyReturns
   });
 }
 
@@ -570,7 +615,18 @@ function processDailyDocument(periodFactors, boundaries, currencyData, date) {
  * @returns {Object} Resultado en formato compatible con V1
  */
 function buildReturnsResult(periodFactors, chartData) {
-  const { totalValueDates, totalValueValues, percentChanges, firstDate, firstValue, lastValue, now } = chartData;
+  const { 
+    totalValueDates, 
+    totalValueValues, 
+    percentChanges, 
+    firstDate, 
+    firstValue, 
+    lastValue, 
+    now,
+    // FIX-V2-001: Datos para performanceByYear
+    monthlyReturns = {},
+    yearlyReturns = {}
+  } = chartData;
   
   // Función auxiliar para calcular rendimiento
   const calculateReturn = (pf) => {
@@ -592,6 +648,61 @@ function buildReturnsResult(periodFactors, chartData) {
   const overallPercentChange = firstValue > 0 
     ? ((lastValue - firstValue) / firstValue) * 100 
     : 0;
+  
+  // FIX-V2-001: Construir performanceByYear desde monthlyReturns
+  const performanceByYear = {};
+  const yearsWithData = new Set();
+  
+  // Procesar años que tienen datos mensuales
+  Object.keys(monthlyReturns).forEach(year => {
+    performanceByYear[year] = {
+      months: {},
+      personalMonths: {},
+      total: 0,
+      personalTotal: 0
+    };
+    
+    // Inicializar todos los meses con 0
+    for (let i = 1; i <= 12; i++) {
+      performanceByYear[year].months[i.toString()] = 0;
+      performanceByYear[year].personalMonths[i.toString()] = 0;
+    }
+    
+    // Llenar con datos reales
+    let yearCompound = 1;
+    Object.keys(monthlyReturns[year]).forEach(month => {
+      const monthReturn = monthlyReturns[year][month];
+      performanceByYear[year].months[month] = monthReturn;
+      performanceByYear[year].personalMonths[month] = monthReturn; // Simplificación: usar mismo valor
+      yearCompound *= (1 + monthReturn / 100);
+      yearsWithData.add(year);
+    });
+    
+    // Calcular total del año como compuesto de meses
+    performanceByYear[year].total = (yearCompound - 1) * 100;
+    performanceByYear[year].personalTotal = performanceByYear[year].total;
+  });
+  
+  // Agregar años consolidados que no tenían meses detallados
+  Object.keys(yearlyReturns).forEach(year => {
+    if (!performanceByYear[year]) {
+      performanceByYear[year] = {
+        months: {},
+        personalMonths: {},
+        total: yearlyReturns[year],
+        personalTotal: yearlyReturns[year]
+      };
+      // Inicializar meses vacíos
+      for (let i = 1; i <= 12; i++) {
+        performanceByYear[year].months[i.toString()] = 0;
+        performanceByYear[year].personalMonths[i.toString()] = 0;
+      }
+      yearsWithData.add(year);
+    }
+  });
+  
+  // FIX-V2-001: Construir availableYears (ordenados descendentemente)
+  const availableYears = Array.from(yearsWithData).sort((a, b) => parseInt(b) - parseInt(a));
   
   return {
     returns: {
@@ -637,7 +748,12 @@ function buildReturnsResult(periodFactors, chartData) {
       percentChanges,
       overallPercentChange
     },
+    // FIX-V2-001: Agregar performanceByYear y availableYears para gráficos
+    performanceByYear,
+    availableYears,
     startDate: firstDate || '',
+    // monthlyCompoundData no disponible en V2, el frontend debe usar performanceByYear
+    monthlyCompoundData: {},
     // Flag para indicar que se usó V2
     consolidatedVersion: true
   };

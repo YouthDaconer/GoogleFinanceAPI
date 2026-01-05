@@ -144,7 +144,8 @@ function calculateHistoricalReturns(docs, currency, ticker, assetType) {
     const data = doc.data ? doc.data() : doc;
     const date = DateTime.fromISO(data.date);
     const year = date.year.toString();
-    const month = (date.month - 1).toString();
+    // FIX: Usar índice 1-based para meses (1=Ene, 12=Dic) para consistencia con V2
+    const month = date.month.toString();
 
     if (!datesByMonth[year]) {
       datesByMonth[year] = {};
@@ -312,7 +313,8 @@ function calculateHistoricalReturns(docs, currency, ticker, assetType) {
     if (hasData) {
       const date = DateTime.fromISO(data.date);
       const year = date.year.toString();
-      const month = (date.month - 1).toString();
+      // FIX: Usar índice 1-based para meses (1=Ene, 12=Dic) para consistencia con V2
+      const month = date.month.toString();
 
       const isLastDayOfMonth = lastDaysByMonth[year]?.[month] === data.date;
 
@@ -391,8 +393,8 @@ function calculateHistoricalReturns(docs, currency, ticker, assetType) {
     let compoundTotal = 1;
     let personalCompoundTotal = 1;
 
-    // Inicializar meses con 0
-    for (let i = 0; i < 12; i++) {
+    // Inicializar meses con 0 (1-based: 1=Ene, 12=Dic)
+    for (let i = 1; i <= 12; i++) {
       performanceByYear[year].months[i.toString()] = 0;
       performanceByYear[year].personalMonths[i.toString()] = 0;
     }
@@ -479,9 +481,10 @@ function calculateHistoricalReturns(docs, currency, ticker, assetType) {
 
   if (yearsWithData.length > 0) {
     const firstValidYear = yearsWithData[yearsWithData.length - 1];
-    let firstValidMonth = "11";
+    // FIX: Usar índice 1-based (1=Ene, 12=Dic)
+    let firstValidMonth = "12";
 
-    for (let month = 0; month < 12; month++) {
+    for (let month = 1; month <= 12; month++) {
       if (performanceByYear[firstValidYear].months[month.toString()] !== 0) {
         firstValidMonth = month.toString();
         break;
@@ -490,7 +493,7 @@ function calculateHistoricalReturns(docs, currency, ticker, assetType) {
 
     const firstDate = DateTime.fromObject({
       year: parseInt(firstValidYear),
-      month: parseInt(firstValidMonth) + 1,
+      month: parseInt(firstValidMonth), // Ya es 1-based, no necesita +1
       day: 1
     });
 
