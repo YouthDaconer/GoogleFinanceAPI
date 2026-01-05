@@ -10,7 +10,15 @@ const { scheduledUpdatePrices } = require('./services/updateCurrentPrices');
 
 const processDividendPayments = require('./services/processDividendPayments');
 const marketStatusService = require('./services/marketStatusService');
-const { saveAllIndicesAndSectorsHistoryData } = require("./services/saveAllIndicesAndSectorsHistoryData");
+
+// COST-OPT-004: Funciones optimizadas para datos de mercado (reemplazan saveAllIndicesAndSectorsHistoryData)
+const { 
+  saveIndicesHistoryData, 
+  saveSectorsSnapshot 
+} = require("./services/marketDataScheduled");
+
+// DEPRECATED: Función legacy - mantener comentada para referencia
+// const { saveAllIndicesAndSectorsHistoryData } = require("./services/saveAllIndicesAndSectorsHistoryData");
 
 // Calcular semanalmente el porcentaje de semanas rentables
 const { onSchedule } = require("firebase-functions/v2/scheduler");
@@ -76,8 +84,40 @@ exports.unifiedMarketDataUpdateV2 = unifiedMarketDataUpdate;
 // Función específica para actualizaciones completas de datos (ISINs y metadatos)
 exports.scheduledUpdatePricesV2 = scheduledUpdatePrices;
 
-// Exportar las demás funciones
-exports.saveAllIndicesAndSectorsHistoryDataV2 = saveAllIndicesAndSectorsHistoryData;
+// ============================================================================
+// COST-OPT-004: Funciones Optimizadas para Datos de Mercado
+// ============================================================================
+
+/**
+ * Guarda datos históricos de índices de mercado (S&P 500, NASDAQ, etc.)
+ * 
+ * ANTES: Cada 10 min (48 ejecuciones/día) - saveAllIndicesAndSectorsHistoryData
+ * AHORA: 2x/día (9:35 AM y 4:35 PM ET)
+ * 
+ * Ahorro: 96% menos ejecuciones
+ * 
+ * @see docs/architecture/firebase-cost-analysis-detailed.md
+ */
+exports.saveIndicesHistoryData = saveIndicesHistoryData;
+
+/**
+ * Guarda snapshot histórico de rendimiento sectorial al cierre del mercado
+ * 
+ * ANTES: Cada 10 min (48 ejecuciones/día) - saveAllIndicesAndSectorsHistoryData
+ * AHORA: 1x/día (4:35 PM ET, solo cierre)
+ * 
+ * NOTA: El frontend ahora usa API Lambda directa (0 reads Firestore).
+ * Esta función solo mantiene histórico para análisis futuro.
+ * 
+ * Ahorro: 98% menos ejecuciones
+ * 
+ * @see docs/architecture/firebase-cost-analysis-detailed.md
+ */
+exports.saveSectorsSnapshot = saveSectorsSnapshot;
+
+// DEPRECATED: Función legacy reemplazada por saveIndicesHistoryData + saveSectorsSnapshot
+// exports.saveAllIndicesAndSectorsHistoryDataV2 = saveAllIndicesAndSectorsHistoryData;
+
 exports.processDividendPaymentsV2 = processDividendPayments.processDividendPayments;
 exports.scheduledMarketStatusUpdateV2 = marketStatusService.scheduledMarketStatusUpdate;
 exports.scheduledMarketStatusUpdateAdditionalV2 = marketStatusService.scheduledMarketStatusUpdateAdditional;
