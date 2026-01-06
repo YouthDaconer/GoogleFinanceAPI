@@ -23,6 +23,9 @@ const NYSE_OPEN_HOUR = 9;
 const NYSE_OPEN_MINUTE = 30;
 const NYSE_CLOSE_HOUR = 16;  // 4:00 PM
 
+// Ventana de gracia después del cierre para capturar precios finales (en minutos)
+const CLOSING_GRACE_WINDOW_MINUTES = 5;
+
 // Logger global para este módulo (se inicializa en cada ejecución)
 let logger = null;
 
@@ -76,6 +79,43 @@ function isNYSEMarketOpen() {
   const closeMinutes = NYSE_CLOSE_HOUR * 60; // 16:00 = 960
   
   return currentMinutes >= openMinutes && currentMinutes < closeMinutes;
+}
+
+/**
+ * Verifica si estamos en la "ventana de cierre" del mercado.
+ * Esta ventana permite una última actualización justo después del cierre
+ * para capturar los precios finales del día.
+ * 
+ * @param {number} closeHour - Hora de cierre del mercado (ej: 16 para 4:00 PM)
+ * @returns {{ inWindow: boolean, reason: string }} - Si estamos en la ventana y por qué
+ */
+function isInClosingWindow(closeHour = NYSE_CLOSE_HOUR) {
+  const nyNow = DateTime.now().setZone('America/New_York');
+  const hour = nyNow.hour;
+  const minute = nyNow.minute;
+  const dayOfWeek = nyNow.weekday;
+  
+  // Fin de semana: no hay ventana de cierre
+  if (dayOfWeek === 6 || dayOfWeek === 7) {
+    return { inWindow: false, reason: 'weekend' };
+  }
+  
+  const currentMinutes = hour * 60 + minute;
+  const closeMinutes = closeHour * 60;
+  const graceEndMinutes = closeMinutes + CLOSING_GRACE_WINDOW_MINUTES;
+  
+  // Estamos en la ventana si:
+  // - Es exactamente la hora de cierre (16:00), O
+  // - Estamos dentro de los primeros N minutos después del cierre
+  if (currentMinutes >= closeMinutes && currentMinutes <= graceEndMinutes) {
+    return { 
+      inWindow: true, 
+      reason: `closing-window (${closeHour}:00 + ${CLOSING_GRACE_WINDOW_MINUTES}min grace)`,
+      minutesAfterClose: currentMinutes - closeMinutes
+    };
+  }
+  
+  return { inWindow: false, reason: 'outside-window' };
 }
 
 /**
@@ -812,6 +852,11 @@ exports.unifiedMarketDataUpdate = onSchedule({
   
   const db = admin.firestore();
   
+  // Verificar si estamos en la ventana de cierre del mercado
+  // Esto permite una última actualización para capturar precios de cierre
+  const closingWindowCheck = isInClosingWindow(NYSE_CLOSE_HOUR);
+  const isInClosingGrace = closingWindowCheck.inWindow;
+  
   // OPT-SYNC-001: Verificar estado del mercado desde Firestore (incluye festivos)
   // El documento markets/US es actualizado por marketStatusService que consulta Finnhub
   try {
@@ -819,7 +864,7 @@ exports.unifiedMarketDataUpdate = onSchedule({
     if (marketDoc.exists) {
       const marketData = marketDoc.data();
       
-      // Verificar si es festivo
+      // Verificar si es festivo (siempre respetar festivos)
       if (marketData.holiday) {
         logger.info('Market holiday - skipping update', { 
           holiday: marketData.holiday,
@@ -830,11 +875,23 @@ exports.unifiedMarketDataUpdate = onSchedule({
       
       // Verificar si el mercado está cerrado (usando dato de Finnhub)
       if (marketData.isOpen === false) {
-        logger.info('Market closed (Finnhub) - skipping update', { 
-          session: marketData.session,
-          marketStatus: 'closed'
-        });
-        return null;
+        // MEJORA: Si estamos en la ventana de cierre, ejecutar una última actualización
+        // para capturar los precios de cierre del día
+        if (isInClosingGrace) {
+          logger.info('Market just closed - executing final update to capture closing prices', { 
+            session: marketData.session,
+            marketStatus: 'closing-grace',
+            closingWindow: closingWindowCheck,
+            graceMinutes: CLOSING_GRACE_WINDOW_MINUTES
+          });
+          // Continuar con la ejecución (no return)
+        } else {
+          logger.info('Market closed (Finnhub) - skipping update', { 
+            session: marketData.session,
+            marketStatus: 'closed'
+          });
+          return null;
+        }
       }
     }
   } catch (marketCheckError) {
@@ -845,7 +902,8 @@ exports.unifiedMarketDataUpdate = onSchedule({
   }
   
   // Fallback: verificación local de horario (por si la consulta a markets/US falla)
-  if (!isNYSEMarketOpen()) {
+  // También considerar la ventana de cierre
+  if (!isNYSEMarketOpen() && !isInClosingGrace) {
     logger.info('Market closed (local check) - skipping update', { marketStatus: 'closed' });
     return null;
   }
