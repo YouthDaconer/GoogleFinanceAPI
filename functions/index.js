@@ -17,6 +17,12 @@ const {
   saveSectorsSnapshot 
 } = require("./services/marketDataScheduled");
 
+// RBAC-001: Auth Triggers para asignar Custom Claims a nuevos usuarios
+// NOTA: beforeUserCreated (Blocking Functions) requiere GCIP habilitado
+// Para proyectos con Firebase Auth estándar, los claims se asignan manualmente
+// via scripts/set-admin-claims.js o los usuarios sin claims son tratados como 'user'
+// const { onUserCreate } = require('./triggers/authTriggers');
+
 // DEPRECATED: Función legacy - mantener comentada para referencia
 // const { saveAllIndicesAndSectorsHistoryData } = require("./services/saveAllIndicesAndSectorsHistoryData");
 
@@ -590,3 +596,19 @@ const {
 
 exports.consolidateMonthlyPerformance = consolidateMonthlyPerformance;
 exports.consolidateYearlyPerformance = consolidateYearlyPerformance;
+
+// ============================================================================
+// RBAC-001: Auth Triggers para Sistema de Roles
+// ============================================================================
+
+/**
+ * NOTA: beforeUserCreated (Blocking Functions) requiere Google Cloud Identity 
+ * Platform (GCIP) habilitado, no disponible en Firebase Auth estándar.
+ * 
+ * Alternativa implementada:
+ * - Admin: Claims configurados manualmente via scripts/set-admin-claims.js
+ * - Usuarios: Sin claims = tratados como 'user' por defecto en authorization.js
+ * 
+ * @see docs/architecture/role-based-access-control-design.md
+ */
+// exports.onUserCreate = onUserCreate;

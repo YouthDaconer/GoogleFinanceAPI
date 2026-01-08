@@ -4,30 +4,39 @@
  * SCALE-CF-001: Handlers extraídos de settingsOperations.js para consolidación
  * de Cloud Functions HTTP.
  * 
+ * RBAC-001: Operaciones de currency requieren rol de administrador.
+ * 
  * @module handlers/settingsHandlers
  * @see docs/stories/56.story.md
+ * @see docs/architecture/role-based-access-control-design.md
  */
 
 const { HttpsError } = require("firebase-functions/v2/https");
 const admin = require('../firebaseAdmin');
+const { requireAdmin } = require('../../utils/authorization');
 const db = admin.firestore();
 
 // ============================================================================
-// CURRENCY HANDLERS
+// CURRENCY HANDLERS - 🔒 SOLO ADMIN
 // ============================================================================
 
 /**
  * Agrega una nueva moneda al sistema
+ * 
+ * 🔒 RBAC: Requiere rol de administrador
  * 
  * @param {Object} context - Contexto de ejecución
  * @param {Object} payload - Datos de la moneda
  * @returns {Promise<{success: boolean, currencyId: string}>}
  */
 async function addCurrency(context, payload) {
+  // 🔒 RBAC-001: Verificar rol de admin
+  requireAdmin(context);
+  
   const { auth } = context;
   const { code, name, symbol, exchangeRate, isActive, flagCurrency } = payload;
 
-  console.log(`[settingsHandlers][addCurrency] userId: ${auth.uid}, code: ${code}`);
+  console.log(`[settingsHandlers][addCurrency] Admin userId: ${auth.uid}, code: ${code}`);
 
   // Validaciones
   if (!code || typeof code !== 'string' || code.length < 2 || code.length > 5) {
@@ -82,15 +91,20 @@ async function addCurrency(context, payload) {
 /**
  * Actualiza una moneda existente
  * 
+ * 🔒 RBAC: Requiere rol de administrador
+ * 
  * @param {Object} context - Contexto de ejecución
  * @param {Object} payload - Datos de actualización
  * @returns {Promise<{success: boolean}>}
  */
 async function updateCurrency(context, payload) {
+  // 🔒 RBAC-001: Verificar rol de admin
+  requireAdmin(context);
+  
   const { auth } = context;
   const { currencyId, updates } = payload;
 
-  console.log(`[settingsHandlers][updateCurrency] userId: ${auth.uid}, currencyId: ${currencyId}`);
+  console.log(`[settingsHandlers][updateCurrency] Admin userId: ${auth.uid}, currencyId: ${currencyId}`);
 
   if (!currencyId || typeof currencyId !== 'string') {
     throw new HttpsError('invalid-argument', 'El ID de la moneda es requerido');
@@ -150,15 +164,20 @@ async function updateCurrency(context, payload) {
 /**
  * Elimina una moneda del sistema
  * 
+ * 🔒 RBAC: Requiere rol de administrador
+ * 
  * @param {Object} context - Contexto de ejecución
  * @param {Object} payload - Datos de la operación
  * @returns {Promise<{success: boolean}>}
  */
 async function deleteCurrency(context, payload) {
+  // 🔒 RBAC-001: Verificar rol de admin
+  requireAdmin(context);
+  
   const { auth } = context;
   const { currencyId } = payload;
 
-  console.log(`[settingsHandlers][deleteCurrency] userId: ${auth.uid}, currencyId: ${currencyId}`);
+  console.log(`[settingsHandlers][deleteCurrency] Admin userId: ${auth.uid}, currencyId: ${currencyId}`);
 
   if (!currencyId || typeof currencyId !== 'string') {
     throw new HttpsError('invalid-argument', 'El ID de la moneda es requerido');
@@ -208,7 +227,7 @@ async function deleteCurrency(context, payload) {
 }
 
 // ============================================================================
-// USER DATA HANDLERS
+// USER DATA HANDLERS - ✅ TODOS LOS USUARIOS (propio)
 // ============================================================================
 
 /**

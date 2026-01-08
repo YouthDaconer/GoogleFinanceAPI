@@ -32,6 +32,11 @@ let countriesCache = null;
 let countriesCacheTimestamp = 0;
 const COUNTRIES_CACHE_TTL = 60 * 60 * 1000; // 1 hora
 
+// Cache para tasas de cambio de monedas
+let currencyRatesCache = null;
+let currencyRatesCacheTimestamp = 0;
+const CURRENCY_RATES_CACHE_TTL = 15 * 60 * 1000; // 15 minutos
+
 /**
  * Obtiene la distribución del portafolio (sectores, países, holdings)
  * @param {string} userId - ID del usuario
@@ -95,31 +100,34 @@ async function getPortfolioDistribution(userId, options = {}) {
       .map(a => a.name);
     const etfData = await batchGetETFData(etfSymbols);
 
-    // 5. Obtener mapeo de sectores
+    // 5. Obtener tasas de cambio de monedas (FIX-CURRENCY-001)
+    const currencyRates = await getCurrencyRates();
+
+    // 6. Obtener mapeo de sectores
     const sectorMappings = await getSectorMappings();
 
-    // 6. Obtener mapeo de países
+    // 7. Obtener mapeo de países
     const countryMappings = await getCountryMappings();
 
-    // 7. Calcular valor total del portafolio
-    const totalPortfolioValue = calculateTotalValue(assets, prices);
+    // 8. Calcular valor total del portafolio (FIX-CURRENCY-001: convertir a USD)
+    const totalPortfolioValue = calculateTotalValue(assets, prices, currencyRates);
     
     if (totalPortfolioValue === 0) {
       return buildEmptyResponse(options.currency);
     }
 
-    // 8. Calcular distribuciones
+    // 9. Calcular distribuciones (FIX-CURRENCY-001: pasar currencyRates)
     const { holdings, sectors, etfStats } = calculateSectorDistribution(
-      assets, prices, etfData, sectorMappings, portfolioAccounts, userId, totalPortfolioValue
+      assets, prices, etfData, sectorMappings, portfolioAccounts, userId, totalPortfolioValue, currencyRates
     );
 
     const countries = calculateCountryDistribution(
-      assets, prices, etfData, countryMappings, portfolioAccounts, userId, totalPortfolioValue
+      assets, prices, etfData, countryMappings, portfolioAccounts, userId, totalPortfolioValue, currencyRates
     );
 
     // SCALE-OPT-001: Calcular activos sin ubicación geográfica
     const nonGeographicData = calculateNonGeographicAssets(
-      assets, prices, etfData, countryMappings, portfolioAccounts, userId, totalPortfolioValue
+      assets, prices, etfData, countryMappings, portfolioAccounts, userId, totalPortfolioValue, currencyRates
     );
 
     // SCALE-OPT-001: Filtrar países con porcentaje muy pequeño (< 0.0001%)
@@ -581,13 +589,77 @@ async function getCountryMappings() {
 }
 
 /**
- * Calcula el valor total del portafolio
+ * Obtiene las tasas de cambio de monedas activas (con cache)
+ * FIX-CURRENCY-001: Necesario para convertir activos en monedas locales a USD
  */
-function calculateTotalValue(assets, prices) {
+async function getCurrencyRates() {
+  if (currencyRatesCache && Date.now() - currencyRatesCacheTimestamp < CURRENCY_RATES_CACHE_TTL) {
+    return currencyRatesCache;
+  }
+
+  const snapshot = await db.collection('currencies')
+    .where('isActive', '==', true)
+    .get();
+  
+  const rates = new Map();
+  
+  // USD siempre tiene tasa 1
+  rates.set('USD', 1);
+  
+  snapshot.docs.forEach(doc => {
+    const data = doc.data();
+    if (data.code && data.exchangeRate) {
+      // exchangeRate = cuántas unidades de moneda local por 1 USD
+      // Ej: COP = 3707.47 significa 1 USD = 3707.47 COP
+      rates.set(data.code, data.exchangeRate);
+    }
+  });
+
+  currencyRatesCache = rates;
+  currencyRatesCacheTimestamp = Date.now();
+  
+  logger.info('Currency rates loaded', { count: rates.size, currencies: Array.from(rates.keys()) });
+  
+  return rates;
+}
+
+/**
+ * Convierte un valor de una moneda a USD
+ * FIX-CURRENCY-001
+ * @param {number} value - Valor en moneda local
+ * @param {string} currency - Código de moneda (ej: 'COP', 'EUR', 'USD')
+ * @param {Map} currencyRates - Mapa de tasas de cambio
+ * @returns {number} Valor en USD
+ */
+function convertToUSD(value, currency, currencyRates) {
+  if (!currency || currency === 'USD') {
+    return value;
+  }
+  
+  const rate = currencyRates.get(currency);
+  if (!rate || rate === 0) {
+    // Si no hay tasa de cambio, loguear advertencia y retornar el valor sin conversión
+    logger.warn('No exchange rate found for currency', { currency, value });
+    return value;
+  }
+  
+  // rate = unidades de moneda local por 1 USD
+  // Para convertir de moneda local a USD: value / rate
+  return value / rate;
+}
+
+/**
+ * Calcula el valor total del portafolio en USD
+ * FIX-CURRENCY-001: Convierte todos los valores a USD antes de sumar
+ */
+function calculateTotalValue(assets, prices, currencyRates) {
   return assets.reduce((total, asset) => {
     const price = prices[asset.name];
     if (price && price.price) {
-      return total + (asset.units * price.price);
+      const valueInLocalCurrency = asset.units * price.price;
+      const currency = price.currency || 'USD';
+      const valueInUSD = convertToUSD(valueInLocalCurrency, currency, currencyRates);
+      return total + valueInUSD;
     }
     return total;
   }, 0);
@@ -595,8 +667,9 @@ function calculateTotalValue(assets, prices) {
 
 /**
  * Calcula la distribución por sectores
+ * FIX-CURRENCY-001: Usa currencyRates para convertir valores a USD
  */
-function calculateSectorDistribution(assets, prices, etfData, sectorMappings, portfolioAccounts, userId, totalValue) {
+function calculateSectorDistribution(assets, prices, etfData, sectorMappings, portfolioAccounts, userId, totalValue, currencyRates) {
   const holdingsMap = {};
   const sectorsMap = {};
   const etfStats = { decomposed: 0, notDecomposed: [] };
@@ -614,8 +687,11 @@ function calculateSectorDistribution(assets, prices, etfData, sectorMappings, po
     const price = prices[asset.name];
     if (!price || !price.price) return;
 
-    const value = asset.units * price.price;
-    const weight = value / totalValue;
+    // FIX-CURRENCY-001: Convertir a USD antes de calcular peso
+    const valueInLocalCurrency = asset.units * price.price;
+    const currency = price.currency || 'USD';
+    const valueInUSD = convertToUSD(valueInLocalCurrency, currency, currencyRates);
+    const weight = valueInUSD / totalValue;
 
     // BUGFIX: Usar price.name (nombre de la empresa) en lugar de asset.company (broker)
     holdingsMap[asset.name] = {
@@ -638,8 +714,11 @@ function calculateSectorDistribution(assets, prices, etfData, sectorMappings, po
     const price = prices[etf.name];
     if (!price || !price.price) continue;
 
-    const assetValue = etf.units * price.price;
-    const etfWeight = assetValue / totalValue;
+    // FIX-CURRENCY-001: Convertir a USD
+    const valueInLocalCurrency = etf.units * price.price;
+    const currency = price.currency || 'USD';
+    const assetValueUSD = convertToUSD(valueInLocalCurrency, currency, currencyRates);
+    const etfWeight = assetValueUSD / totalValue;
     const normalized = etf.name.trim().toUpperCase();
     const etfInfo = etfData.get(normalized);
 
@@ -701,8 +780,11 @@ function calculateSectorDistribution(assets, prices, etfData, sectorMappings, po
     const price = prices[stock.name];
     if (!price || !price.price || !price.sector) continue;
 
-    const assetValue = stock.units * price.price;
-    const stockWeight = assetValue / totalValue;
+    // FIX-CURRENCY-001: Convertir a USD
+    const valueInLocalCurrency = stock.units * price.price;
+    const currency = price.currency || 'USD';
+    const assetValueUSD = convertToUSD(valueInLocalCurrency, currency, currencyRates);
+    const stockWeight = assetValueUSD / totalValue;
     const standardSector = sectorMappings[price.sector] || price.sector;
 
     if (!sectorsMap[standardSector]) {
@@ -747,8 +829,9 @@ function consolidateSources(sources) {
  * 
  * SCALE-OPT-001: Usa codeNo (ISO 3166-1 numeric) para compatibilidad con TopoJSON
  * El mapa mundial usa códigos numéricos de 3 dígitos (ej: "840" para USA)
+ * FIX-CURRENCY-001: Usa currencyRates para convertir valores a USD
  */
-function calculateCountryDistribution(assets, prices, etfData, countryMappings, portfolioAccounts, userId, totalValue) {
+function calculateCountryDistribution(assets, prices, etfData, countryMappings, portfolioAccounts, userId, totalValue, currencyRates) {
   const countryMap = {};
 
   // Filtrar assets relevantes
@@ -764,8 +847,11 @@ function calculateCountryDistribution(assets, prices, etfData, countryMappings, 
     const price = prices[asset.name];
     if (!price || !price.price) return;
 
-    const value = asset.units * price.price;
-    const percentage = (value / totalValue) * 100;
+    // FIX-CURRENCY-001: Convertir a USD
+    const valueInLocalCurrency = asset.units * price.price;
+    const currency = price.currency || 'USD';
+    const valueInUSD = convertToUSD(valueInLocalCurrency, currency, currencyRates);
+    const percentage = (valueInUSD / totalValue) * 100;
 
     // Obtener país del precio o del asset
     let countryName = price.country || asset.country;
@@ -786,13 +872,14 @@ function calculateCountryDistribution(assets, prices, etfData, countryMappings, 
           };
         }
 
-        countryMap[countryId].value += value;
+        // FIX-CURRENCY-001: Usar valueInUSD en lugar de value
+        countryMap[countryId].value += valueInUSD;
         countryMap[countryId].percentage += percentage;
         // SCALE-OPT-001: Usar price.name para el nombre de la empresa, no asset.company (que es el broker)
         countryMap[countryId].assets.push({
           symbol: asset.name,
           name: price.name || asset.name,
-          value,
+          value: valueInUSD,
           percentage,
           assetType: asset.assetType,
           accountId: asset.portfolioAccount
@@ -810,8 +897,11 @@ function calculateCountryDistribution(assets, prices, etfData, countryMappings, 
     const price = prices[etf.name];
     if (!price || !price.price) continue;
 
-    const assetValue = etf.units * price.price;
-    const etfWeight = assetValue / totalValue;
+    // FIX-CURRENCY-001: Convertir ETF a USD
+    const valueInLocalCurrency = etf.units * price.price;
+    const currency = price.currency || 'USD';
+    const assetValueUSD = convertToUSD(valueInLocalCurrency, currency, currencyRates);
+    const etfWeight = assetValueUSD / totalValue;
     const normalized = etf.name.trim().toUpperCase();
     const etfInfo = etfData.get(normalized);
 
@@ -901,8 +991,9 @@ function calculateCountryDistribution(assets, prices, etfData, countryMappings, 
 /**
  * Calcula activos sin ubicación geográfica (cryptos, bonos, etc.)
  * SCALE-OPT-001: Agrupa activos por símbolo para evitar duplicados
+ * FIX-CURRENCY-001: Usa currencyRates para convertir valores a USD
  */
-function calculateNonGeographicAssets(assets, prices, etfData, countryMappings, portfolioAccounts, userId, totalValue) {
+function calculateNonGeographicAssets(assets, prices, etfData, countryMappings, portfolioAccounts, userId, totalValue, currencyRates) {
   // Mapa para agrupar por símbolo
   const nonGeoAssetsMap = {};
 
@@ -918,8 +1009,11 @@ function calculateNonGeographicAssets(assets, prices, etfData, countryMappings, 
     const price = prices[asset.name];
     if (!price || !price.price) return;
 
-    const value = asset.units * price.price;
-    const percentage = (value / totalValue) * 100;
+    // FIX-CURRENCY-001: Convertir a USD
+    const valueInLocalCurrency = asset.units * price.price;
+    const currency = price.currency || 'USD';
+    const valueInUSD = convertToUSD(valueInLocalCurrency, currency, currencyRates);
+    const percentage = (valueInUSD / totalValue) * 100;
     
     // Determinar si tiene ubicación geográfica
     let hasGeoLocation = false;
@@ -956,7 +1050,7 @@ function calculateNonGeographicAssets(assets, prices, etfData, countryMappings, 
           accountCount: 0 // Cuántas cuentas tienen este activo
         };
       }
-      nonGeoAssetsMap[symbol].value += value;
+      nonGeoAssetsMap[symbol].value += valueInUSD;
       nonGeoAssetsMap[symbol].percentage += percentage;
       nonGeoAssetsMap[symbol].accountCount += 1;
     }

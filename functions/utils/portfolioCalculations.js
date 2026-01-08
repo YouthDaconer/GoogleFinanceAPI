@@ -190,12 +190,16 @@ const calculateAccountPerformance = (assets, currentPrices, currencies, totalVal
       const groupDividendsList = [];
 
       for (const asset of groupAssets) {
-        const currentPrice = currentPrices.find(cp => cp.symbol === asset.name)?.price || 0;
-        const assetValueUSD = currentPrice * asset.units;
+        const priceData = currentPrices.find(cp => cp.symbol === asset.name);
+        const currentPrice = priceData?.price || 0;
+        // FIX-CURRENCY-001: Obtener la moneda del precio actual (puede ser COP, EUR, etc.)
+        const priceCurrency = priceData?.currency || 'USD';
+        const assetValueInPriceCurrency = currentPrice * asset.units;
 
         const initialInvestmentUSD = asset.unitValue * asset.units;
         const assetInvestment = convertCurrency(initialInvestmentUSD, 'USD', currency.code, currencies, asset.defaultCurrencyForAdquisitionDollar, asset.acquisitionDollarValue);
-        const assetValue = convertCurrency(assetValueUSD, 'USD', currency.code, currencies);
+        // FIX-CURRENCY-001: Convertir desde la moneda real del precio, no asumir USD
+        const assetValue = convertCurrency(assetValueInPriceCurrency, priceCurrency, currency.code, currencies);
 
         groupInvestment += assetInvestment;
         groupValue += assetValue;
@@ -330,14 +334,18 @@ const calculateAccountPerformance = (assets, currentPrices, currencies, totalVal
       if (Math.abs(unitsDifference) > 0.00000001 && groupTransactions.length === 0 && previousGroupUnits > 0) {
         // Obtener precio actual del asset del grupo
         const groupAssetName = groupKey.split('_')[0]; // Ej: "BTC-USD" de "BTC-USD_crypto"
-        const currentAssetPrice = currentPrices.find(cp => cp.symbol === groupAssetName)?.price || 0;
+        const priceDataForGroup = currentPrices.find(cp => cp.symbol === groupAssetName);
+        const currentAssetPrice = priceDataForGroup?.price || 0;
+        // FIX-CURRENCY-001: Obtener la moneda real del precio
+        const assetPriceCurrency = priceDataForGroup?.currency || 'USD';
         
         if (currentAssetPrice > 0) {
           // Calcular cashflow implícito:
           // - unitsDifference > 0 = compra = cashflow negativo
           // - unitsDifference < 0 = venta = cashflow positivo
-          const implicitCashFlowUSD = -unitsDifference * currentAssetPrice;
-          const implicitCashFlowConverted = convertCurrency(implicitCashFlowUSD, 'USD', currency.code, currencies);
+          // FIX-CURRENCY-001: Usar la moneda real del precio
+          const implicitCashFlowInPriceCurrency = -unitsDifference * currentAssetPrice;
+          const implicitCashFlowConverted = convertCurrency(implicitCashFlowInPriceCurrency, assetPriceCurrency, currency.code, currencies);
           
           effectiveGroupTransactions.push({
             amount: implicitCashFlowConverted
