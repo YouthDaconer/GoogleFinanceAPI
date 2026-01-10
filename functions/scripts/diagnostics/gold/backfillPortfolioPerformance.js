@@ -96,12 +96,14 @@ function parseArgs() {
     accountId: null, // null = todas las cuentas
     startDate: CONFIG.DEFAULT_START_DATE,
     endDate: CONFIG.DEFAULT_END_DATE,
+    overwrite: false, // Si true, sobrescribe documentos existentes
   };
 
   args.forEach(arg => {
     if (arg === '--dry-run') options.mode = 'dry-run';
     else if (arg === '--fix') options.mode = 'fix';
     else if (arg === '--analyze') options.mode = 'analyze';
+    else if (arg === '--overwrite') options.overwrite = true;
     else if (arg.startsWith('--user=')) options.userId = arg.split('=')[1];
     else if (arg.startsWith('--account=')) options.accountId = arg.split('=')[1];
     else if (arg.startsWith('--start=')) options.startDate = arg.split('=')[1];
@@ -307,9 +309,10 @@ async function getUserAccounts(userId) {
  * Calcular holdings (posiciones) hasta una fecha específica
  * @param {Array} transactions - Todas las transacciones de la cuenta
  * @param {string} targetDate - Fecha límite (inclusive)
+ * @param {Object} exchangeRates - Tipos de cambio para convertir a USD (ej: { COP: 3750, EUR: 0.85 })
  * @returns {Object} { holdings: Map<assetKey, {units, totalInvestment, assetType}>, totalCashFlow }
  */
-function calculateHoldingsAtDate(transactions, targetDate) {
+function calculateHoldingsAtDate(transactions, targetDate, exchangeRates = {}) {
   const holdings = new Map();
   let totalInvestmentUSD = 0;
   let totalCashFlowUSD = 0;
@@ -320,6 +323,16 @@ function calculateHoldingsAtDate(transactions, targetDate) {
   relevantTx.forEach(tx => {
     const assetKey = tx.assetName ? `${tx.assetName}_${tx.assetType || 'stock'}` : null;
     
+    // Determinar el factor de conversión a USD
+    // Si la transacción está en una moneda diferente a USD, convertir
+    const txCurrency = tx.currency || 'USD';
+    let conversionRate = 1;
+    if (txCurrency !== 'USD' && exchangeRates[txCurrency]) {
+      // exchangeRates[COP] = 3750 significa 1 USD = 3750 COP
+      // Para convertir COP a USD: valor_COP / exchangeRates[COP]
+      conversionRate = 1 / exchangeRates[txCurrency];
+    }
+    
     // Procesar según tipo de transacción
     switch (tx.type) {
       case 'buy':
@@ -328,12 +341,20 @@ function calculateHoldingsAtDate(transactions, targetDate) {
             units: 0, 
             totalInvestment: 0, 
             assetType: tx.assetType || 'stock',
-            symbol: tx.assetName 
+            symbol: tx.assetName,
+            currency: txCurrency // Guardar la moneda del activo para conversión de precios
           };
           current.units += tx.amount || 0;
-          current.totalInvestment += (tx.amount || 0) * (tx.price || 0);
+          // Convertir la inversión a USD
+          const investmentInTxCurrency = (tx.amount || 0) * (tx.price || 0);
+          const investmentInUSD = investmentInTxCurrency * conversionRate;
+          current.totalInvestment += investmentInUSD;
+          // Mantener la moneda original del activo (la primera compra define la moneda)
+          if (!current.currency) {
+            current.currency = txCurrency;
+          }
           holdings.set(assetKey, current);
-          totalInvestmentUSD += (tx.amount || 0) * (tx.price || 0);
+          totalInvestmentUSD += investmentInUSD;
         }
         break;
         
@@ -342,6 +363,7 @@ function calculateHoldingsAtDate(transactions, targetDate) {
           const current = holdings.get(assetKey);
           if (current) {
             // Reducir unidades
+            // Nota: avgCost ya está en USD porque se convirtió al comprar
             const soldUnits = tx.amount || 0;
             const avgCost = current.units > 0 ? current.totalInvestment / current.units : 0;
             current.units -= soldUnits;
@@ -360,14 +382,15 @@ function calculateHoldingsAtDate(transactions, targetDate) {
         
       case 'cash_income':
         // Ingreso de efectivo - solo afecta cashflow, NO inversión
-        // El scheduler no suma cash_income al totalInvestment
-        totalCashFlowUSD += tx.amount || 0;
+        // Convertir a USD si está en otra moneda
+        totalCashFlowUSD += (tx.amount || 0) * conversionRate;
         // NO sumar a totalInvestmentUSD
         break;
         
       case 'cash_outcome':
         // Retiro de efectivo - solo afecta cashflow, NO inversión
-        totalCashFlowUSD -= tx.amount || 0;
+        // Convertir a USD si está en otra moneda
+        totalCashFlowUSD -= (tx.amount || 0) * conversionRate;
         // NO restar de totalInvestmentUSD
         break;
         
@@ -546,8 +569,19 @@ function calculateDayPerformance(
     
     holdings.forEach((holding, assetKey) => {
       const symbolPrices = pricesBySymbol.get(holding.symbol);
-      const price = getPriceForDate(symbolPrices, targetDate);
-      const valueUSD = holding.units * price;
+      const priceInAssetCurrency = getPriceForDate(symbolPrices, targetDate);
+      
+      // IMPORTANTE: Convertir el precio a USD si el activo cotiza en otra moneda
+      // El precio viene en la moneda del activo (holding.currency), necesitamos convertir a USD
+      let priceInUSD = priceInAssetCurrency;
+      const assetCurrency = holding.currency || 'USD';
+      if (assetCurrency !== 'USD' && exchangeRates[assetCurrency]) {
+        // exchangeRates[COP] = 3750 significa 1 USD = 3750 COP
+        // Para convertir COP a USD: precio_COP / exchangeRates[COP]
+        priceInUSD = priceInAssetCurrency / exchangeRates[assetCurrency];
+      }
+      
+      const valueUSD = holding.units * priceInUSD;
       const value = valueUSD * exchangeRate;
       const investment = holding.totalInvestment * exchangeRate;
       
@@ -764,11 +798,11 @@ async function main() {
   
   log('SUCCESS', 'Precios históricos obtenidos');
   
-  // 5. Obtener tipos de cambio históricos para cada día faltante
+  // 5. Obtener tipos de cambio históricos para cada día a procesar
   log('PROGRESS', 'Obteniendo tipos de cambio históricos...');
   const exchangeRatesByDate = new Map();
   
-  // Obtener solo para días que vamos a procesar
+  // Obtener para todos los días que vamos a procesar
   for (const account of targetAccounts) {
     const existing = await getExistingPerformance(
       options.userId, 
@@ -777,9 +811,12 @@ async function main() {
       options.endDate
     );
     
-    const missingDays = expectedDays.filter(d => !existing.has(d));
+    // Con --overwrite, procesar todos los días; sin él, solo los faltantes
+    const daysToProcess = options.overwrite 
+      ? expectedDays 
+      : expectedDays.filter(d => !existing.has(d));
     
-    for (const date of missingDays) {
+    for (const date of daysToProcess) {
       if (!exchangeRatesByDate.has(date)) {
         const rates = { USD: 1 };
         const dateObj = new Date(date + 'T12:00:00Z');
@@ -818,11 +855,19 @@ async function main() {
       options.endDate
     );
     
-    const missingDays = expectedDays.filter(d => !existing.has(d));
-    log('INFO', `  Días existentes: ${existing.size}, Días faltantes: ${missingDays.length}`);
+    // Si --overwrite está activo, procesar todos los días; de lo contrario solo los faltantes
+    const missingDays = options.overwrite 
+      ? expectedDays 
+      : expectedDays.filter(d => !existing.has(d));
+    
+    if (options.overwrite) {
+      log('INFO', `  [OVERWRITE] Procesando ${missingDays.length} días (sobrescribiendo existentes)`);
+    } else {
+      log('INFO', `  Días existentes: ${existing.size}, Días faltantes: ${missingDays.length}`);
+    }
     
     if (missingDays.length === 0) {
-      log('SUCCESS', '  No hay días faltantes para esta cuenta');
+      log('SUCCESS', '  No hay días para procesar en esta cuenta');
       continue;
     }
     
@@ -871,8 +916,11 @@ async function main() {
           }
         }
         
-        // Calcular holdings hasta esta fecha
-        const { holdings, totalInvestmentUSD } = calculateHoldingsAtDate(transactions, date);
+        // Obtener tipos de cambio para esta fecha (necesario para convertir transacciones a USD)
+        const exchangeRates = exchangeRatesByDate.get(date) || { USD: 1 };
+        
+        // Calcular holdings hasta esta fecha (pasando exchangeRates para conversión de moneda)
+        const { holdings, totalInvestmentUSD } = calculateHoldingsAtDate(transactions, date, exchangeRates);
         
         // =====================================================================
         // IMPORTANTE: Calcular cashflow ACUMULADO desde el día anterior
@@ -887,9 +935,6 @@ async function main() {
         // Suma de valuePnL de las ventas del día
         // =====================================================================
         const dailyDonePnL = calculateDailyDonePnL(transactions, date);
-        
-        // Obtener tipos de cambio para esta fecha
-        const exchangeRates = exchangeRatesByDate.get(date) || { USD: 1 };
         
         // Calcular performance
         const performance = calculateDayPerformance(
@@ -1004,9 +1049,16 @@ async function main() {
       // Obtener días existentes en OVERALL
       const existingOverall = await getExistingPerformance(options.userId, null, options.startDate, options.endDate);
       
-      // Identificar días faltantes en OVERALL
-      const missingOverallDays = [...allAccountDates].filter(d => !existingOverall.has(d)).sort();
-      log('INFO', `  Días faltantes en OVERALL: ${missingOverallDays.length}`);
+      // Si --overwrite está activo, procesar todos los días; de lo contrario solo los faltantes
+      const missingOverallDays = options.overwrite
+        ? [...allAccountDates].sort()
+        : [...allAccountDates].filter(d => !existingOverall.has(d)).sort();
+      
+      if (options.overwrite) {
+        log('INFO', `  [OVERWRITE] Procesando ${missingOverallDays.length} días OVERALL (sobrescribiendo existentes)`);
+      } else {
+        log('INFO', `  Días faltantes en OVERALL: ${missingOverallDays.length}`);
+      }
       
       if (missingOverallDays.length > 0) {
         const overallDocuments = [];
