@@ -1,4 +1,29 @@
+/**
+ * Finance Query Service with Circuit Breaker
+ * 
+ * Client for the finance-query AWS Lambda API.
+ * Now protected by circuit breaker pattern for resilience.
+ * 
+ * @see SCALE-BE-003 - Circuit Breaker para APIs Externas
+ */
+
+const { getCircuit } = require('../utils/circuitBreaker');
+const { getCachedPrices, getCachedCurrencyRates } = require('./cacheService');
+const { StructuredLogger } = require('../utils/logger');
+
 const API_BASE_URL = 'https://dmn46d7xas3rvio6tugd2vzs2q0hxbmb.lambda-url.us-east-1.on.aws/v1';
+const logger = new StructuredLogger('financeQuery');
+
+// Circuit breakers per endpoint type
+const quotesCircuit = getCircuit('finance-query-quotes', {
+  failureThreshold: 5,
+  resetTimeout: 60000,
+});
+
+const generalCircuit = getCircuit('finance-query-general', {
+  failureThreshold: 5,
+  resetTimeout: 60000,
+});
 
 let data = null;
 let loading = false;
@@ -23,11 +48,10 @@ const fetchData = async (endpoint, maxRetries = 3, delay = 1000) => {
       console.warn(`Intento ${attempts} fallido: ${error}`);
 
       if (attempts < maxRetries) {
-        // Esperar antes de reintentar
         await new Promise(resolve => setTimeout(resolve, delay));
       } else {
         console.error('Todos los intentos fallaron');
-        return null;
+        throw new Error(`API call failed after ${maxRetries} attempts: ${error}`);
       }
     } finally {
       loading = false;
@@ -35,17 +59,88 @@ const fetchData = async (endpoint, maxRetries = 3, delay = 1000) => {
   }
 };
 
-const getIndices = () => fetchData('/indices');
-const getActives = () => fetchData('/actives');
-const getGainers = () => fetchData('/gainers');
-const getLosers = () => fetchData('/losers');
-const getNews = () => fetchData('/news');
-const getNewsFromSymbol = (symbol) => fetchData(`/news?symbol=${symbol}`);
-const getQuotes = (symbols) => fetchData(`/quotes?symbols=${symbols}`);
-const getSimpleQuotes = (symbols) => fetchData(`/simple-quotes/?symbols=${symbols}`);
+// === QUOTES WITH CIRCUIT BREAKER (AC2, AC4) ===
+
+const getQuotesWithFallback = async (symbols) => {
+  const symbolsArray = typeof symbols === 'string' ? symbols.split(',') : symbols;
+  
+  return quotesCircuit.execute(
+    async () => {
+      const result = await fetchData(`/quotes?symbols=${symbols}`);
+      if (!result) {
+        throw new Error('No data returned from quotes API');
+      }
+      return result;
+    },
+    async () => {
+      logger.warn('Using cached prices due to circuit breaker', {
+        symbolCount: symbolsArray.length,
+      });
+      return getCachedPrices(symbolsArray);
+    }
+  );
+};
+
+// === SIMPLE QUOTES WITH CIRCUIT BREAKER ===
+
+const getSimpleQuotesWithFallback = async (symbols) => {
+  const symbolsArray = typeof symbols === 'string' ? symbols.split(',') : symbols;
+  
+  return quotesCircuit.execute(
+    async () => {
+      const result = await fetchData(`/simple-quotes/?symbols=${symbols}`);
+      if (!result) {
+        throw new Error('No data returned from simple-quotes API');
+      }
+      return result;
+    },
+    async () => {
+      logger.warn('Using cached prices for simple quotes', {
+        symbolCount: symbolsArray.length,
+      });
+      return getCachedPrices(symbolsArray);
+    }
+  );
+};
+
+// === GENERAL ENDPOINTS (less critical, graceful degradation) ===
+
+const getWithGracefulDegradation = async (endpoint, fallbackValue = []) => {
+  return generalCircuit.execute(
+    async () => {
+      const result = await fetchData(endpoint);
+      if (!result) {
+        throw new Error(`No data returned from ${endpoint}`);
+      }
+      return result;
+    },
+    async () => {
+      logger.warn('Returning fallback due to circuit breaker', {
+        endpoint,
+        fallbackType: Array.isArray(fallbackValue) ? 'empty array' : typeof fallbackValue,
+      });
+      return fallbackValue;
+    }
+  );
+};
+
+// === EXPORTED FUNCTIONS ===
+
+const getIndices = () => getWithGracefulDegradation('/indices', []);
+const getActives = () => getWithGracefulDegradation('/actives', []);
+const getGainers = () => getWithGracefulDegradation('/gainers', []);
+const getLosers = () => getWithGracefulDegradation('/losers', []);
+const getNews = () => getWithGracefulDegradation('/news', []);
+const getNewsFromSymbol = (symbol) => getWithGracefulDegradation(`/news?symbol=${symbol}`, []);
+const getSectors = () => getWithGracefulDegradation('/sectors', []);
+const search = (query) => getWithGracefulDegradation(`/search?query=${query}`, []);
+
+// Quotes use dedicated circuit with cache fallback
+const getQuotes = (symbols) => getQuotesWithFallback(symbols);
+const getSimpleQuotes = (symbols) => getSimpleQuotesWithFallback(symbols);
+
+// These don't have fallback - they throw on circuit open
 const getSimilarStocks = (symbol) => fetchData(`/similar-stocks/?symbol=${symbol}`);
-const getSectors = () => fetchData('/sectors');
-const search = (query) => fetchData(`/search?query=${query}`);
 const getHistorical = (symbol, time, interval) => fetchData(`/historical/?symbol=${symbol}&time=${time}&interval=${interval}`);
 const getIndicators = (func, symbol) => fetchData(`/indicators/?function=${func}&symbol=${symbol}`);
 const getAnalysis = (symbol, time, interval) => fetchData(`/analysis/?symbol=${symbol}&time=${time}&interval=${interval}`);
@@ -67,5 +162,10 @@ module.exports = {
   getData: () => data,
   isLoading: () => loading,
   getError: () => error,
-  getNewsFromSymbol
-}; 
+  getNewsFromSymbol,
+  // Export for testing
+  _getCircuitStates: () => ({
+    quotes: quotesCircuit.getState(),
+    general: generalCircuit.getState(),
+  }),
+};

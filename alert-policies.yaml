@@ -1,0 +1,114 @@
+# Cloud Monitoring Alerts Configuration
+# SCALE-CORE-002 - Observabilidad End-to-End
+# 
+# Uso: gcloud alpha monitoring policies create --policy-from-file=alert-policies.yaml
+# Referencia: https://cloud.google.com/monitoring/alerts/policies-in-json
+
+# ============================================================================
+# INSTRUCCIONES DE CONFIGURACIÓN
+# ============================================================================
+# 
+# 1. Configurar canal de notificación (email):
+#    gcloud alpha monitoring channels create --display-name="Portfolio Alerts Email" \
+#      --type=email --channel-labels=email_address=tu-email@example.com
+#
+# 2. Obtener el ID del canal:
+#    gcloud alpha monitoring channels list
+#
+# 3. Reemplazar NOTIFICATION_CHANNEL_ID en las políticas abajo
+#
+# 4. Crear las políticas:
+#    gcloud alpha monitoring policies create --policy-from-file=policy-error-rate.json
+#
+# ============================================================================
+
+---
+# Política 1: High Error Rate
+# Archivo: policy-error-rate.json
+# Condición: Más de 5 errores por minuto en Cloud Functions
+
+displayName: "Cloud Functions - High Error Rate"
+documentation:
+  content: "Error rate is above 5 errors per minute. Check Cloud Logging for details."
+  mimeType: "text/markdown"
+conditions:
+  - displayName: "Error rate > 5/min"
+    conditionThreshold:
+      filter: >
+        resource.type="cloud_function"
+        AND severity="ERROR"
+      comparison: COMPARISON_GT
+      thresholdValue: 5
+      duration: "60s"
+      aggregations:
+        - alignmentPeriod: "60s"
+          perSeriesAligner: ALIGN_RATE
+combiner: OR
+enabled: true
+# notificationChannels:
+#   - projects/portafolio-inversiones/notificationChannels/NOTIFICATION_CHANNEL_ID
+
+---
+# Política 2: Scheduled Job Failed
+# Archivo: policy-scheduled-failed.json
+
+displayName: "Scheduled Job - unifiedMarketDataUpdate Failed"
+documentation:
+  content: "The unifiedMarketDataUpdate scheduled function has failed. Check Cloud Logging."
+  mimeType: "text/markdown"
+conditions:
+  - displayName: "Function execution failed"
+    conditionThreshold:
+      filter: >
+        resource.type="cloud_function"
+        AND resource.labels.function_name="unifiedMarketDataUpdateV2"
+        AND severity="ERROR"
+      comparison: COMPARISON_GT
+      thresholdValue: 0
+      duration: "0s"
+combiner: OR
+enabled: true
+
+---
+# Política 3: High Latency
+# Archivo: policy-high-latency.json
+
+displayName: "Cloud Functions - High Latency (>10s)"
+documentation:
+  content: "P95 latency is above 10 seconds for critical functions."
+  mimeType: "text/markdown"
+conditions:
+  - displayName: "P95 latency > 10s"
+    conditionThreshold:
+      filter: >
+        resource.type="cloud_function"
+        AND resource.labels.function_name=one_of("getHistoricalReturns", "createAsset", "sellAsset", "getCurrentPricesForUser")
+        AND metric.type="cloudfunctions.googleapis.com/function/execution_times"
+      comparison: COMPARISON_GT
+      thresholdValue: 10000
+      duration: "300s"
+      aggregations:
+        - alignmentPeriod: "60s"
+          perSeriesAligner: ALIGN_PERCENTILE_95
+combiner: OR
+enabled: true
+
+---
+# Política 4: Function Timeout Warning
+# Archivo: policy-timeout.json
+
+displayName: "Cloud Functions - Near Timeout (>50s)"
+documentation:
+  content: "Function execution time is approaching the 60s timeout limit."
+  mimeType: "text/markdown"
+conditions:
+  - displayName: "Execution time > 50s"
+    conditionThreshold:
+      filter: >
+        resource.type="cloud_function"
+        AND metric.type="cloudfunctions.googleapis.com/function/execution_times"
+      comparison: COMPARISON_GT
+      thresholdValue: 50000
+      duration: "0s"
+combiner: OR
+enabled: true

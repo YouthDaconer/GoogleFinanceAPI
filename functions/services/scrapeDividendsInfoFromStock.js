@@ -1,98 +1,127 @@
 const axios = require("axios");
-const cheerio = require("cheerio");
 const { DateTime } = require("luxon");
 const admin = require("firebase-admin");
 
+// API Lambda para datos de mercado (fallback)
+const LAMBDA_API_BASE_URL = 'https://dmn46d7xas3rvio6tugd2vzs2q0hxbmb.lambda-url.us-east-1.on.aws/v1';
+
+// FastAPI con StockEvents scraper (fuente primaria - datos más actualizados)
+const FASTAPI_BASE_URL = 'https://dmn46d7xas3rvio6tugd2vzs2q0hxbmb.lambda-url.us-east-1.on.aws/v1';
+
 /**
- * Obtiene información de dividendos para un símbolo específico desde StockEvents
+ * Obtiene información de dividendos para un símbolo desde StockEvents via FastAPI
+ * Esta es la fuente primaria - datos más actualizados
  * @param {string} symbol - El símbolo del ETF o acción
  * @returns {object} Objeto con la información de dividendos o null si no hay datos
  */
-async function scrapeDividendInfo(symbol) {
+async function getDividendInfoFromStockEvents(symbol) {
   try {
-    const url = `https://stockevents.app/en/stock/${symbol}/dividends`;
-    console.log(`Consultando información de dividendos para ${symbol} en ${url}`);
+    const url = `${FASTAPI_BASE_URL}/dividends?symbols=${encodeURIComponent(symbol)}`;
+    console.log(`[StockEvents] Consultando dividendos para ${symbol}`);
     
-    const { data } = await axios.get(url, {
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-      }
-    });
+    const { data } = await axios.get(url, { timeout: 15000 });
     
-    const $ = cheerio.load(data);
-    
-    // Buscar utilizando el texto dentro de dt y luego obteniendo el dd correspondiente
-    const yieldText = $('dt:contains("Dividend Yield")').closest('div').find('dd').text().trim();
-    const dividendText = $('dt:contains("Dividend amount")').closest('div').find('dd').text().trim();
-    const exDividendText = $('dt:contains("Last ex-date")').closest('div').find('dd').text().trim();
-    const dividendDateText = $('dt:contains("Last pay date")').closest('div').find('dd').text().trim();
-    
-    // Si no hay datos de dividendos, retornar null
-    if (!yieldText && !dividendText && !exDividendText && !dividendDateText) {
-      console.log(`No se encontró información de dividendos para ${symbol}`);
+    if (!data || !data.dividendDate) {
+      console.log(`[StockEvents] No hay datos de dividendos para ${symbol}`);
       return null;
     }
     
-    // Procesar yield (quitar el símbolo % y convertir a número)
-    const yield = yieldText ? parseFloat(yieldText.replace('%', '')) : null;
-    
-    // Procesar dividend (quitar el símbolo $ y convertir a número)
-    const dividend = dividendText ? parseFloat(dividendText.replace('$', '')) : null;
-    
-    // Formatear fechas
-    let exDividend = null;
-    let dividendDate = null;
-    
-    if (exDividendText) {
-      try {
-        const datePattern = /(\w{3})\s+(\d{1,2}),\s+(\d{4})/;
-        const exMatch = exDividendText.match(datePattern);
-        
-        if (exMatch) {
-          const month = exMatch[1];
-          const day = exMatch[2];
-          const year = exMatch[3];
-          
-          const dateStr = `${month} ${day}, ${year}`;
-          exDividend = DateTime.fromFormat(dateStr, 'LLL d, yyyy', { locale: 'en' }).toFormat('MMM d, yyyy');
-        }
-      } catch (error) {
-        console.error(`Error al procesar la fecha ex-dividendo para ${symbol}:`, error);
-      }
-    }
-    
-    if (dividendDateText) {
-      try {
-        const datePattern = /(\w{3})\s+(\d{1,2}),\s+(\d{4})/;
-        const payMatch = dividendDateText.match(datePattern);
-        
-        if (payMatch) {
-          const month = payMatch[1];
-          const day = payMatch[2];
-          const year = payMatch[3];
-          
-          const dateStr = `${month} ${day}, ${year}`;
-          dividendDate = DateTime.fromFormat(dateStr, 'LLL d, yyyy', { locale: 'en' }).toFormat('MMM d, yyyy');
-        }
-      } catch (error) {
-        console.error(`Error al procesar la fecha de pago para ${symbol}:`, error);
-      }
-    }
+    // La API devuelve:
+    // - dividendYield: porcentaje (número)
+    // - dividend: valor del dividendo
+    // - lastDividend: valor del último dividendo por acción
+    // - exDividend: fecha ex-dividend (ej: "Dec 05, 2025")
+    // - dividendDate: fecha de pago (ej: "Jan 06, 2026")
     
     return {
-      yield: yield,
-      dividend: dividend * 4,
-      exDividend: exDividend,
-      dividendDate: dividendDate
+      yield: data.dividendYield || null,
+      dividend: data.dividend || null,
+      lastDividend: data.lastDividend || null,
+      exDividend: data.exDividend || null,
+      dividendDate: data.dividendDate || null,
+      source: 'stockevents'
     };
   } catch (error) {
-    console.error(`Error al obtener información de dividendos para ${symbol}:`, error.message);
+    console.error(`[StockEvents] Error obteniendo dividendos para ${symbol}:`, error.message);
     return null;
   }
 }
 
 /**
- * Actualiza la información de dividendos para todos los ETFs en la colección currentPrices
+ * Obtiene información de dividendos para un símbolo desde nuestra API Lambda
+ * Esta es la fuente de fallback
+ * @param {string} symbol - El símbolo del ETF o acción
+ * @returns {object} Objeto con la información de dividendos o null si no hay datos
+ */
+async function getDividendInfoFromLambda(symbol) {
+  try {
+    const url = `${LAMBDA_API_BASE_URL}/quotes?symbols=${encodeURIComponent(symbol)}`;
+    console.log(`[Lambda API] Consultando dividendos para ${symbol}`);
+    
+    const { data: responseData } = await axios.get(url, { timeout: 10000 });
+    
+    // La API siempre devuelve un array, incluso para un solo símbolo
+    const data = Array.isArray(responseData) ? responseData[0] : responseData;
+    
+    if (!data || !data.dividendDate) {
+      console.log(`[Lambda API] No hay datos de dividendos para ${symbol}`);
+      return null;
+    }
+    
+    // La API devuelve:
+    // - dividend: valor anual del dividendo (string)
+    // - yield: porcentaje (ej: "4.07%")
+    // - exDividend: fecha ex-dividend (ej: "Dec 05, 2025")
+    // - dividendDate: fecha de pago (ej: "Jan 06, 2026")
+    // - lastDividend: valor del último dividendo por acción (string)
+    
+    const yieldValue = data.yield ? parseFloat(data.yield.replace('%', '')) : null;
+    const dividendValue = data.dividend ? parseFloat(data.dividend) : null;
+    const lastDividendValue = data.lastDividend ? parseFloat(data.lastDividend) : null;
+    
+    return {
+      yield: yieldValue,
+      dividend: dividendValue,
+      lastDividend: lastDividendValue,
+      exDividend: data.exDividend || null,
+      dividendDate: data.dividendDate || null,
+      source: 'lambda'
+    };
+  } catch (error) {
+    console.error(`[Lambda API] Error obteniendo dividendos para ${symbol}:`, error.message);
+    return null;
+  }
+}
+
+/**
+ * Obtiene información de dividendos para un símbolo
+ * Intenta StockEvents primero (datos más actualizados), luego Lambda como fallback
+ * @param {string} symbol - El símbolo del ETF o acción
+ * @returns {object} Objeto con la información de dividendos o null si no hay datos
+ */
+async function getDividendInfo(symbol) {
+  // Primero intentar StockEvents (datos más frescos)
+  let result = await getDividendInfoFromStockEvents(symbol);
+  
+  // Si falla, usar Lambda como fallback
+  if (!result) {
+    console.log(`[DividendService] StockEvents falló, usando Lambda como fallback para ${symbol}`);
+    result = await getDividendInfoFromLambda(symbol);
+  }
+  
+  return result;
+}
+
+/**
+ * @deprecated Usar getDividendInfo en lugar de este método
+ */
+async function scrapeDividendInfo(symbol) {
+  return getDividendInfo(symbol);
+}
+
+/**
+ * Actualiza la información de dividendos para todos los ETFs y acciones en la colección currentPrices
+ * Usa StockEvents via FastAPI como fuente primaria, con Lambda como fallback
  */
 async function scrapeDividendsInfoFromStockEvents() {
   const db = admin.firestore();
@@ -108,76 +137,148 @@ async function scrapeDividendsInfoFromStockEvents() {
       return;
     }
     
-    if (snapshot.docs.length === 0) {
-      console.log('Todos los activos ya tienen información de dividendos');
-      return;
-    }
-    
     console.log(`Actualizando información de dividendos para ${snapshot.docs.length} activos (ETFs y acciones)`);
     
-    // Control de flujo para evitar bloqueos
+    // Crear mapa de símbolos a referencias de documentos
+    const symbols = snapshot.docs.map(doc => doc.data().symbol);
+    const symbolToDocRef = new Map();
+    snapshot.docs.forEach(doc => {
+      symbolToDocRef.set(doc.data().symbol, doc.ref);
+    });
+    
+    // Primero intentar obtener datos via StockEvents (endpoint FastAPI /dividends/batch)
+    // Si falla, usar Lambda API como fallback
     let batch = db.batch();
     let updatesCount = 0;
-    let errorsCount = 0;
-    let waitTime = 3000; // Comenzar con 3 segundos para ser conservadores
-    const MAX_BATCH_SIZE = 20;
-    const MAX_ASSETS_PER_RUN = 50; // Reducir a 50 para ser más conservadores
+    let noDataCount = 0;
+    let stockEventsCount = 0;
+    let lambdaFallbackCount = 0;
+    const MAX_BATCH_SIZE = 400; // Firestore limit is 500
     
-    // Procesar solo un subconjunto de activos por ejecución
-    const assetsToProcess = snapshot.docs.slice(0, MAX_ASSETS_PER_RUN);
-    
-    for (const doc of assetsToProcess) {
-      const data = doc.data();
-      const symbol = data.symbol;
+    // Intentar StockEvents batch primero (más actualizado)
+    let stockEventsResults = [];
+    try {
+      const symbolsParam = symbols.join(',');
+      const url = `${FASTAPI_BASE_URL}/dividends/batch?symbols=${encodeURIComponent(symbolsParam)}`;
+      console.log(`[StockEvents] Intentando batch request para ${symbols.length} símbolos`);
       
-      try {
-        console.log(`Procesando ${symbol} (${data.type})...`);
-        // Esperar entre solicitudes para prevenir bloqueos
-        await new Promise(resolve => setTimeout(resolve, waitTime));
+      const { data: batchResponse } = await axios.get(url, { timeout: 60000 });
+      
+      if (batchResponse && batchResponse.success) {
+        stockEventsResults = batchResponse.success;
+        console.log(`[StockEvents] Batch exitoso: ${stockEventsResults.length} símbolos con datos`);
+      }
+    } catch (error) {
+      console.log(`[StockEvents] Batch falló, usando Lambda como fallback:`, error.message);
+    }
+    
+    // Crear set de símbolos que obtuvimos de StockEvents
+    const stockEventsSymbols = new Set(stockEventsResults.map(r => r.symbol));
+    
+    // Procesar resultados de StockEvents
+    for (const quote of stockEventsResults) {
+      if (!quote || !quote.symbol) continue;
+      
+      const docRef = symbolToDocRef.get(quote.symbol);
+      if (!docRef) continue;
+      
+      if (quote.dividendDate || quote.exDividend || quote.dividend) {
+        const updateData = {
+          lastDividendUpdate: admin.firestore.FieldValue.serverTimestamp(),
+          dividendSource: 'stockevents'
+        };
         
-        const dividendInfo = await scrapeDividendInfo(symbol);
+        if (quote.dividendYield !== null && !isNaN(quote.dividendYield)) updateData.yield = quote.dividendYield;
+        if (quote.dividend) updateData.dividend = quote.dividend;
+        if (quote.lastDividend) updateData.lastDividend = quote.lastDividend;
+        if (quote.exDividend) updateData.exDividend = quote.exDividend;
+        if (quote.dividendDate) updateData.dividendDate = quote.dividendDate;
         
-        if (dividendInfo) {
-          batch.update(doc.ref, {
-            yield: dividendInfo.yield,
-            dividend: dividendInfo.dividend,
-            exDividend: dividendInfo.exDividend,
-            dividendDate: dividendInfo.dividendDate,
-            lastDividendUpdate: admin.firestore.FieldValue.serverTimestamp()
-          });
-          
-          console.log(`Actualizada información de dividendos para ${symbol} (${data.type})`);
-          updatesCount++;
-          
-          // Commit batch cada cierto número de actualizaciones
-          if (updatesCount % MAX_BATCH_SIZE === 0) {
-            await batch.commit();
-            console.log(`Lote de ${MAX_BATCH_SIZE} actualizaciones guardado`);
-            batch = db.batch();
-            
-            // Pausa adicional entre lotes
-            await new Promise(resolve => setTimeout(resolve, 2000));
-          }
-        } else {
-          console.log(`No se encontró información de dividendos para ${symbol} (${data.type})`);
+        batch.update(docRef, updateData);
+        updatesCount++;
+        stockEventsCount++;
+        
+        if (updatesCount % MAX_BATCH_SIZE === 0) {
+          await batch.commit();
+          console.log(`Lote de ${MAX_BATCH_SIZE} actualizaciones guardado`);
+          batch = db.batch();
         }
-      } catch (error) {
-        console.error(`Error procesando ${symbol}:`, error);
-        errorsCount++;
+      } else {
+        noDataCount++;
+      }
+    }
+    
+    // Para símbolos que no obtuvimos de StockEvents, usar Lambda API
+    const missingSymbols = symbols.filter(s => !stockEventsSymbols.has(s));
+    
+    if (missingSymbols.length > 0) {
+      console.log(`[Lambda API] Procesando ${missingSymbols.length} símbolos faltantes`);
+      
+      // Procesar en chunks de 50 para Lambda
+      const CHUNK_SIZE = 50;
+      
+      for (let i = 0; i < missingSymbols.length; i += CHUNK_SIZE) {
+        const chunk = missingSymbols.slice(i, i + CHUNK_SIZE);
+        const symbolsParam = chunk.join(',');
+        
+        try {
+          const url = `${LAMBDA_API_BASE_URL}/quotes?symbols=${encodeURIComponent(symbolsParam)}`;
+          const { data: apiResponse } = await axios.get(url, { timeout: 30000 });
+          
+          const quotes = Array.isArray(apiResponse) ? apiResponse : [apiResponse];
+          
+          for (const quote of quotes) {
+            if (!quote || !quote.symbol) continue;
+            
+            const docRef = symbolToDocRef.get(quote.symbol);
+            if (!docRef) continue;
+            
+            if (quote.dividendDate || quote.exDividend || quote.dividend) {
+              const yieldValue = quote.yield ? parseFloat(quote.yield.replace('%', '')) : null;
+              
+              const updateData = {
+                lastDividendUpdate: admin.firestore.FieldValue.serverTimestamp(),
+                dividendSource: 'lambda'
+              };
+              
+              if (yieldValue !== null && !isNaN(yieldValue)) updateData.yield = yieldValue;
+              if (quote.dividend) updateData.dividend = quote.dividend;
+              if (quote.lastDividend) updateData.lastDividend = quote.lastDividend;
+              if (quote.exDividend) updateData.exDividend = quote.exDividend;
+              if (quote.dividendDate) updateData.dividendDate = quote.dividendDate;
+              
+              batch.update(docRef, updateData);
+              updatesCount++;
+              lambdaFallbackCount++;
+              
+              if (updatesCount % MAX_BATCH_SIZE === 0) {
+                await batch.commit();
+                console.log(`Lote de ${MAX_BATCH_SIZE} actualizaciones guardado`);
+                batch = db.batch();
+              }
+            } else {
+              noDataCount++;
+            }
+          }
+          
+          // Pequeña pausa entre chunks
+          if (i + CHUNK_SIZE < missingSymbols.length) {
+            await new Promise(resolve => setTimeout(resolve, 500));
+          }
+          
+        } catch (error) {
+          console.error(`Error procesando chunk Lambda:`, error.message);
+        }
       }
     }
     
     // Guardar actualizaciones pendientes
     if (updatesCount % MAX_BATCH_SIZE !== 0 && updatesCount > 0) {
       await batch.commit();
-      console.log(`Lote final de ${updatesCount % MAX_BATCH_SIZE} actualizaciones guardado`);
+      console.log(`Lote final guardado`);
     }
     
-    console.log(`Proceso completado: ${updatesCount} activos actualizados, ${errorsCount} errores`);
-    
-    if (snapshot.docs.length > MAX_ASSETS_PER_RUN) {
-      console.log(`Atención: Quedan ${snapshot.docs.length - MAX_ASSETS_PER_RUN} activos pendientes por actualizar.`);
-    }
+    console.log(`Proceso completado: ${updatesCount} activos actualizados (${stockEventsCount} de StockEvents, ${lambdaFallbackCount} de Lambda), ${noDataCount} sin datos de dividendos`);
     
   } catch (error) {
     console.error('Error al actualizar información de dividendos:', error);
@@ -186,5 +287,8 @@ async function scrapeDividendsInfoFromStockEvents() {
 
 module.exports = {
   scrapeDividendInfo,
+  getDividendInfo,
+  getDividendInfoFromLambda,
+  getDividendInfoFromStockEvents,
   scrapeDividendsInfoFromStockEvents
 };

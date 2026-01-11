@@ -1206,4 +1206,583 @@ if (process.env.NODE_ENV === 'development') {
   });
 }*/
 
+// =============================================================================
+// ATTRIBUTION API - Portfolio Performance Attribution
+// =============================================================================
+
+const { 
+  getPortfolioAttribution, 
+  getTopContributors, 
+  checkAttributionAvailability 
+} = require('./services/attribution');
+
+/**
+ * GET /attribution
+ * 
+ * Obtiene la atribución completa del portafolio.
+ * Calcula la contribución de cada activo al rendimiento total.
+ * 
+ * Query params:
+ * - userId: (required) ID del usuario
+ * - period: Período de análisis ('YTD', '1M', '3M', '6M', '1Y', '2Y', 'ALL')
+ * - currency: Moneda para cálculos ('USD', 'COP', 'EUR', etc.)
+ * - accountIds: Comma-separated list de IDs de cuenta o 'overall'
+ * - benchmarkReturn: Retorno del benchmark para comparar
+ * - maxBars: Máximo de barras en waterfall (default: 8)
+ * - portfolioReturn: (optional) TWR pre-calculado del frontend para consistencia
+ */
+app.get("/attribution", async (req, res) => {
+  const { 
+    userId, 
+    period = 'YTD', 
+    currency = 'USD',
+    accountIds = 'overall',
+    benchmarkReturn = '0',
+    maxBars = '8',
+    portfolioReturn
+  } = req.query;
+  
+  try {
+    if (!userId) {
+      return res.status(400).json({
+        error: "Por favor, proporcione el parámetro userId"
+      });
+    }
+    
+    const result = await getPortfolioAttribution({
+      userId,
+      period,
+      currency,
+      accountIds: accountIds === 'overall' ? ['overall'] : accountIds.split(','),
+      options: {
+        benchmarkReturn: parseFloat(benchmarkReturn) || 0,
+        maxWaterfallBars: parseInt(maxBars) || 8,
+        includeMetadata: true,
+        portfolioReturn: portfolioReturn ? parseFloat(portfolioReturn) : undefined
+      }
+    });
+    
+    if (!result.success) {
+      return res.status(404).json({
+        error: result.error || 'No attribution data found'
+      });
+    }
+    
+    res.status(200).json(result);
+    
+  } catch (error) {
+    console.error('[/attribution] Error:', error);
+    res.status(500).json({
+      error: "Error calculando atribución: " + error.message
+    });
+  }
+});
+
+/**
+ * GET /attribution/top
+ * 
+ * Obtiene solo los top y bottom contributors.
+ * Versión ligera para carga rápida.
+ * 
+ * Query params:
+ * - userId: (required) ID del usuario
+ * - period: Período de análisis
+ * - currency: Moneda
+ * - topN: Número de contributors a retornar (default: 5)
+ */
+app.get("/attribution/top", async (req, res) => {
+  const { 
+    userId, 
+    period = 'YTD', 
+    currency = 'USD',
+    topN = '5'
+  } = req.query;
+  
+  try {
+    if (!userId) {
+      return res.status(400).json({
+        error: "Por favor, proporcione el parámetro userId"
+      });
+    }
+    
+    const result = await getTopContributors({
+      userId,
+      period,
+      currency,
+      topN: parseInt(topN) || 5
+    });
+    
+    if (!result.success) {
+      return res.status(404).json({
+        error: result.error || 'No attribution data found'
+      });
+    }
+    
+    res.status(200).json(result);
+    
+  } catch (error) {
+    console.error('[/attribution/top] Error:', error);
+    res.status(500).json({
+      error: "Error obteniendo top contributors: " + error.message
+    });
+  }
+});
+
+/**
+ * GET /attribution/check
+ * 
+ * Verifica si hay datos de atribución disponibles para un usuario.
+ * 
+ * Query params:
+ * - userId: (required) ID del usuario
+ */
+app.get("/attribution/check", async (req, res) => {
+  const { userId } = req.query;
+  
+  try {
+    if (!userId) {
+      return res.status(400).json({
+        error: "Por favor, proporcione el parámetro userId"
+      });
+    }
+    
+    const result = await checkAttributionAvailability(userId);
+    res.status(200).json(result);
+    
+  } catch (error) {
+    console.error('[/attribution/check] Error:', error);
+    res.status(500).json({
+      error: "Error verificando disponibilidad: " + error.message
+    });
+  }
+});
+
+// ============================================================================
+// RISK METRICS ENDPOINTS (STORY-036)
+// ============================================================================
+
+const { calculateRiskMetrics } = require('./services/riskMetrics');
+
+/**
+ * @swagger
+ * /risk-metrics:
+ *   get:
+ *     summary: Calcula métricas de riesgo del portafolio
+ *     description: |
+ *       Endpoint para obtener métricas de riesgo (Sharpe, Sortino, Beta, etc.)
+ *       con soporte para múltiples cuentas y agregación value-weighted.
+ *     tags: [Risk Metrics]
+ *     parameters:
+ *       - name: userId
+ *         in: query
+ *         required: true
+ *         description: ID del usuario
+ *         schema:
+ *           type: string
+ *       - name: period
+ *         in: query
+ *         required: false
+ *         description: Período de análisis (1M, 3M, 6M, YTD, 1Y, 2Y, ALL)
+ *         schema:
+ *           type: string
+ *           default: YTD
+ *       - name: currency
+ *         in: query
+ *         required: false
+ *         description: Moneda para cálculos
+ *         schema:
+ *           type: string
+ *           default: USD
+ *       - name: accountIds
+ *         in: query
+ *         required: false
+ *         description: IDs de cuentas separados por coma (vacío = overall)
+ *         schema:
+ *           type: string
+ *       - name: requestId
+ *         in: query
+ *         required: false
+ *         description: ID único de request para debugging race conditions
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: Métricas calculadas exitosamente
+ *       400:
+ *         description: Parámetros faltantes o inválidos
+ *       500:
+ *         description: Error interno
+ */
+app.get("/risk-metrics", async (req, res) => {
+  const { 
+    userId, 
+    period = 'YTD', 
+    currency = 'USD', 
+    accountIds = '',
+    requestId = `req_${Date.now()}`
+  } = req.query;
+  
+  console.log(`[/risk-metrics] Request: ${requestId}`, {
+    userId,
+    period,
+    currency,
+    accountIds
+  });
+  
+  try {
+    if (!userId) {
+      return res.status(400).json({
+        success: false,
+        error: "MISSING_PARAM",
+        message: "Por favor, proporcione el parámetro userId"
+      });
+    }
+    
+    const validPeriods = ['1M', '3M', '6M', 'YTD', '1Y', '2Y', 'ALL'];
+    if (!validPeriods.includes(period)) {
+      return res.status(400).json({
+        success: false,
+        error: "INVALID_PERIOD",
+        message: `Período inválido. Valores válidos: ${validPeriods.join(', ')}`
+      });
+    }
+    
+    const parsedAccountIds = accountIds
+      ? accountIds.split(',').map(id => id.trim()).filter(Boolean)
+      : [];
+    
+    const result = await calculateRiskMetrics(userId, {
+      period,
+      currency,
+      accountIds: parsedAccountIds,
+      requestId
+    });
+    
+    console.log(`[/risk-metrics] Response: ${requestId}`, {
+      success: result.success,
+      durationMs: result.metadata?.durationMs
+    });
+    
+    // BUGFIX: INSUFFICIENT_DATA no es un error 404, es una respuesta válida con success=false
+    // El frontend debe manejar este caso para mostrar un mensaje apropiado al usuario
+    // En vez de devolver 404 (que causa error en fetch), devolvemos 200 con success=false
+    if (!result.success) {
+      // Solo usar 500 para errores reales de servidor
+      const statusCode = result.error === 'INSUFFICIENT_DATA' ? 200 : 500;
+      return res.status(statusCode).json(result);
+    }
+    
+    res.status(200).json(result);
+    
+  } catch (error) {
+    console.error(`[/risk-metrics] Error: ${requestId}`, error);
+    res.status(500).json({
+      success: false,
+      error: "SERVER_ERROR",
+      message: "Error calculando métricas de riesgo: " + error.message,
+      requestId
+    });
+  }
+});
+
+// ============================================================================
+// CLOSED POSITIONS ENDPOINTS (STORY-036)
+// ============================================================================
+
+const { getClosedPositions } = require('./services/closedPositions');
+
+/**
+ * @swagger
+ * /closed-positions:
+ *   get:
+ *     summary: Obtiene posiciones cerradas (trades vendidos)
+ *     description: |
+ *       Endpoint para obtener historial de posiciones cerradas con métricas,
+ *       filtros, ordenamiento y paginación. Soporta múltiples cuentas.
+ *     tags: [Closed Positions]
+ *     parameters:
+ *       - name: userId
+ *         in: query
+ *         required: true
+ *         description: ID del usuario
+ *       - name: accountIds
+ *         in: query
+ *         required: false
+ *         description: IDs de cuentas separados por coma (vacío = todas)
+ *       - name: startDate
+ *         in: query
+ *         required: false
+ *         description: Fecha inicio filtro (YYYY-MM-DD)
+ *       - name: endDate
+ *         in: query
+ *         required: false
+ *         description: Fecha fin filtro (YYYY-MM-DD)
+ *       - name: tickers
+ *         in: query
+ *         required: false
+ *         description: Tickers a filtrar separados por coma
+ *       - name: currency
+ *         in: query
+ *         required: false
+ *         description: Moneda para valores (default USD)
+ *       - name: page
+ *         in: query
+ *         required: false
+ *         description: Página (1-indexed, default 1)
+ *       - name: pageSize
+ *         in: query
+ *         required: false
+ *         description: Tamaño de página (default 50, max 200)
+ *       - name: sortBy
+ *         in: query
+ *         required: false
+ *         description: Campo de ordenamiento (sellDate, realizedPnL, ticker)
+ *       - name: sortOrder
+ *         in: query
+ *         required: false
+ *         description: Orden (asc, desc)
+ *       - name: requestId
+ *         in: query
+ *         required: false
+ *         description: ID único de request para debugging
+ *     responses:
+ *       200:
+ *         description: Posiciones obtenidas exitosamente
+ *       400:
+ *         description: Parámetros faltantes o inválidos
+ *       500:
+ *         description: Error interno
+ */
+app.get("/closed-positions", async (req, res) => {
+  const { 
+    userId, 
+    accountIds = '',
+    startDate,
+    endDate,
+    tickers = '',
+    currency = 'USD',
+    page = '1',
+    pageSize = '50',
+    sortBy = 'sellDate',
+    sortOrder = 'desc',
+    requestId = `req_${Date.now()}`
+  } = req.query;
+  
+  console.log(`[/closed-positions] Request: ${requestId}`, {
+    userId,
+    accountIds,
+    page,
+    pageSize
+  });
+  
+  try {
+    if (!userId) {
+      return res.status(400).json({
+        success: false,
+        error: "MISSING_PARAM",
+        message: "Por favor, proporcione el parámetro userId"
+      });
+    }
+    
+    const parsedAccountIds = accountIds
+      ? accountIds.split(',').map(id => id.trim()).filter(Boolean)
+      : [];
+    
+    const parsedTickers = tickers
+      ? tickers.split(',').map(t => t.trim()).filter(Boolean)
+      : [];
+    
+    const validSortFields = ['sellDate', 'buyDate', 'realizedPnL', 'realizedPnLPercent', 'ticker', 'holdingPeriodDays'];
+    const safeSortBy = validSortFields.includes(sortBy) ? sortBy : 'sellDate';
+    const safeSortOrder = ['asc', 'desc'].includes(sortOrder) ? sortOrder : 'desc';
+    
+    const result = await getClosedPositions(userId, {
+      accountIds: parsedAccountIds,
+      startDate,
+      endDate,
+      tickers: parsedTickers,
+      currency,
+      page: parseInt(page) || 1,
+      pageSize: parseInt(pageSize) || 50,
+      sortBy: safeSortBy,
+      sortOrder: safeSortOrder,
+      requestId
+    });
+    
+    console.log(`[/closed-positions] Response: ${requestId}`, {
+      success: result.success,
+      positions: result.positions?.length || 0,
+      durationMs: result.metadata?.durationMs
+    });
+    
+    if (!result.success) {
+      const statusCode = result.error === 'NO_ACCOUNTS' ? 404 : 500;
+      return res.status(statusCode).json(result);
+    }
+    
+    res.status(200).json(result);
+    
+  } catch (error) {
+    console.error(`[/closed-positions] Error: ${requestId}`, error);
+    res.status(500).json({
+      success: false,
+      error: "SERVER_ERROR",
+      message: "Error obteniendo posiciones cerradas: " + error.message,
+      requestId
+    });
+  }
+});
+
+// ============================================================================
+// BATCH NEWS ENDPOINT (STORY-036)
+// ============================================================================
+
+/**
+ * @swagger
+ * /news/batch:
+ *   get:
+ *     summary: Obtiene noticias para múltiples símbolos en una sola llamada
+ *     description: |
+ *       Endpoint batch para obtener noticias de hasta 10 símbolos en paralelo.
+ *       Reduce N+1 queries del frontend al consolidar múltiples llamadas.
+ *     tags: [News]
+ *     parameters:
+ *       - name: symbols
+ *         in: query
+ *         required: true
+ *         description: Símbolos separados por coma (max 10)
+ *         schema:
+ *           type: string
+ *           example: AAPL,MSFT,GOOGL
+ *       - name: limit
+ *         in: query
+ *         required: false
+ *         description: Máximo de noticias por símbolo (default 5)
+ *         schema:
+ *           type: number
+ *       - name: requestId
+ *         in: query
+ *         required: false
+ *         description: ID único de request para debugging
+ *     responses:
+ *       200:
+ *         description: Noticias obtenidas exitosamente
+ *       400:
+ *         description: Parámetros faltantes o inválidos
+ *       500:
+ *         description: Error interno
+ */
+app.get("/news/batch", async (req, res) => {
+  const { 
+    symbols = '',
+    limit = '5',
+    requestId = `req_${Date.now()}`
+  } = req.query;
+  
+  const startTime = Date.now();
+  
+  console.log(`[/news/batch] Request: ${requestId}`, { symbols, limit });
+  
+  try {
+    if (!symbols || symbols.trim() === '') {
+      return res.status(400).json({
+        success: false,
+        error: "MISSING_PARAM",
+        message: "Por favor, proporcione el parámetro symbols"
+      });
+    }
+    
+    const symbolList = symbols.split(',')
+      .map(s => s.trim().toUpperCase())
+      .filter(Boolean)
+      .slice(0, 10); // Max 10 símbolos
+    
+    if (symbolList.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: "INVALID_SYMBOLS",
+        message: "No se proporcionaron símbolos válidos"
+      });
+    }
+    
+    const limitNum = Math.min(Math.max(1, parseInt(limit) || 5), 20);
+    
+    // Fetch noticias en paralelo
+    const newsPromises = symbolList.map(async (symbol) => {
+      try {
+        const news = await getNewsFromSymbol(symbol);
+        return {
+          symbol,
+          success: true,
+          news: Array.isArray(news) ? news.slice(0, limitNum) : []
+        };
+      } catch (error) {
+        console.warn(`[/news/batch] Error fetching news for ${symbol}:`, error.message);
+        return {
+          symbol,
+          success: false,
+          news: [],
+          error: error.message
+        };
+      }
+    });
+    
+    const results = await Promise.all(newsPromises);
+    
+    // Organizar por símbolo
+    const newsBySymbol = {};
+    results.forEach(r => {
+      newsBySymbol[r.symbol] = {
+        success: r.success,
+        news: r.news,
+        count: r.news.length
+      };
+    });
+    
+    // Consolidar todas las noticias ordenadas por fecha
+    const allNews = results
+      .filter(r => r.success)
+      .flatMap(r => r.news.map(n => ({ ...n, symbol: r.symbol })))
+      .sort((a, b) => {
+        const dateA = new Date(a.pubDate || a.date || 0);
+        const dateB = new Date(b.pubDate || b.date || 0);
+        return dateB.getTime() - dateA.getTime();
+      })
+      .slice(0, 50); // Max 50 noticias consolidadas
+    
+    const successCount = results.filter(r => r.success).length;
+    
+    const result = {
+      success: true,
+      newsBySymbol,
+      consolidated: allNews,
+      metadata: {
+        requestId,
+        symbolsRequested: symbolList.length,
+        symbolsSuccessful: successCount,
+        totalNews: allNews.length,
+        durationMs: Date.now() - startTime
+      }
+    };
+    
+    console.log(`[/news/batch] Response: ${requestId}`, {
+      symbols: symbolList.length,
+      successful: successCount,
+      totalNews: allNews.length,
+      durationMs: result.metadata.durationMs
+    });
+    
+    res.status(200).json(result);
+    
+  } catch (error) {
+    console.error(`[/news/batch] Error: ${requestId}`, error);
+    res.status(500).json({
+      success: false,
+      error: "SERVER_ERROR",
+      message: "Error obteniendo noticias: " + error.message,
+      requestId
+    });
+  }
+});
+
 module.exports = app; 

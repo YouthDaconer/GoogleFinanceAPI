@@ -190,12 +190,16 @@ const calculateAccountPerformance = (assets, currentPrices, currencies, totalVal
       const groupDividendsList = [];
 
       for (const asset of groupAssets) {
-        const currentPrice = currentPrices.find(cp => cp.symbol === asset.name)?.price || 0;
-        const assetValueUSD = currentPrice * asset.units;
+        const priceData = currentPrices.find(cp => cp.symbol === asset.name);
+        const currentPrice = priceData?.price || 0;
+        // FIX-CURRENCY-001: Obtener la moneda del precio actual (puede ser COP, EUR, etc.)
+        const priceCurrency = priceData?.currency || 'USD';
+        const assetValueInPriceCurrency = currentPrice * asset.units;
 
         const initialInvestmentUSD = asset.unitValue * asset.units;
         const assetInvestment = convertCurrency(initialInvestmentUSD, 'USD', currency.code, currencies, asset.defaultCurrencyForAdquisitionDollar, asset.acquisitionDollarValue);
-        const assetValue = convertCurrency(assetValueUSD, 'USD', currency.code, currencies);
+        // FIX-CURRENCY-001: Convertir desde la moneda real del precio, no asumir USD
+        const assetValue = convertCurrency(assetValueInPriceCurrency, priceCurrency, currency.code, currencies);
 
         groupInvestment += assetInvestment;
         groupValue += assetValue;
@@ -281,7 +285,7 @@ const calculateAccountPerformance = (assets, currentPrices, currencies, totalVal
 
       totalInvestment += groupInvestment;
       totalValue += groupValue;
-      totalCashFlow += groupCashFlow;
+      // NOTA: totalCashFlow se suma después del fix de cashflow implícito (más abajo)
       totalDividends += groupDividends;
 
       const groupROI = (groupValue - groupInvestment) / groupInvestment;
@@ -319,12 +323,45 @@ const calculateAccountPerformance = (assets, currentPrices, currencies, totalVal
       
       const groupDailyChangePercentage = calculateDailyChangePercentage(groupValue, previousGroupData?.totalValue || 0);
 
+      // ========================================================================
+      // FIX: Detectar cashflow implícito por diferencia de unidades
+      // Cuando hay diferencia de unidades pero no hay transacciones del día,
+      // significa que la compra/venta se hizo fuera del horario del job
+      // ========================================================================
+      let effectiveGroupTransactions = [...groupTransactions];
+      const unitsDifference = groupUnits - previousGroupUnits;
+      
+      if (Math.abs(unitsDifference) > 0.00000001 && groupTransactions.length === 0 && previousGroupUnits > 0) {
+        // Obtener precio actual del asset del grupo
+        const groupAssetName = groupKey.split('_')[0]; // Ej: "BTC-USD" de "BTC-USD_crypto"
+        const priceDataForGroup = currentPrices.find(cp => cp.symbol === groupAssetName);
+        const currentAssetPrice = priceDataForGroup?.price || 0;
+        // FIX-CURRENCY-001: Obtener la moneda real del precio
+        const assetPriceCurrency = priceDataForGroup?.currency || 'USD';
+        
+        if (currentAssetPrice > 0) {
+          // Calcular cashflow implícito:
+          // - unitsDifference > 0 = compra = cashflow negativo
+          // - unitsDifference < 0 = venta = cashflow positivo
+          // FIX-CURRENCY-001: Usar la moneda real del precio
+          const implicitCashFlowInPriceCurrency = -unitsDifference * currentAssetPrice;
+          const implicitCashFlowConverted = convertCurrency(implicitCashFlowInPriceCurrency, assetPriceCurrency, currency.code, currencies);
+          
+          effectiveGroupTransactions.push({
+            amount: implicitCashFlowConverted
+          });
+          
+          // Actualizar groupCashFlow también para que se guarde correctamente
+          groupCashFlow += implicitCashFlowConverted;
+        }
+      }
+
       // Calcular adjusted daily change percentage usando las transacciones acumuladas y dividendos
       // Pasar isNewInvestment para resetear el cálculo cuando es una nueva inversión
       const groupAdjustedDailyChangePercentage = calculatePureReturnWithoutCashflows(
         previousGroupData?.totalValue || 0,
         groupValue,
-        groupTransactions,
+        effectiveGroupTransactions,
         groupDividendsList,
         isNewInvestment
       );
@@ -334,6 +371,10 @@ const calculateAccountPerformance = (assets, currentPrices, currencies, totalVal
         previousGroupData?.totalValue || 0,
         groupValue
       );
+
+      // Sumar el cashflow del grupo DESPUÉS del fix de cashflow implícito
+      // para que totalCashFlow incluya también los cashflows detectados por diferencia de unidades
+      totalCashFlow += groupCashFlow;
 
       assetPerformance[groupKey] = {
         totalInvestment: groupInvestment,
@@ -363,15 +404,18 @@ const calculateAccountPerformance = (assets, currentPrices, currencies, totalVal
     const { totalROI, dailyReturn, monthlyReturn, annualReturn } = calculateTotalROIAndReturns(totalInvestment, totalValue, maxDaysInvested);
     const dailyChangePercentage = calculateDailyChangePercentage(totalValue, totalValueYesterday[currency.code]?.totalValue || 0);
     
-    // Calcular adjusted daily change percentage para toda la cartera usando el método Modified Dietz
-    // Pasar isPortfolioNewInvestment para resetear el cálculo cuando el portafolio es nuevo
-    const adjustedDailyChangePercentage = calculatePureReturnWithoutCashflows(
-      totalValueYesterday[currency.code]?.totalValue || 0,
-      totalValue,
-      convertedTransactions,
-      convertedDividends,
-      isPortfolioNewInvestment
-    );
+    // Calcular adjusted daily change percentage para toda la cartera
+    // Usamos totalCashFlow (que ya incluye cashflows implícitos detectados por diferencia de unidades)
+    // en lugar de convertedTransactions para asegurar consistencia
+    const previousTotalValue = totalValueYesterday[currency.code]?.totalValue || 0;
+    let adjustedDailyChangePercentage = 0;
+    
+    if (isPortfolioNewInvestment) {
+      adjustedDailyChangePercentage = 0;
+    } else if (previousTotalValue > 0) {
+      // Fórmula: (endValue - startValue + cashFlow + dividends) / startValue * 100
+      adjustedDailyChangePercentage = ((totalValue - previousTotalValue + totalCashFlow + totalDividends) / previousTotalValue) * 100;
+    }
     
     // Añadir un nuevo campo para el cambio porcentual sin flujos de caja para toda la cartera
     const rawDailyChangePercentage = calculateRawDailyChange(

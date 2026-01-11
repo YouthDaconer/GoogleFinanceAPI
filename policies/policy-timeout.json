@@ -1,0 +1,29 @@
+{
+  "displayName": "Cloud Functions - Near Timeout (>50s)",
+  "documentation": {
+    "content": "Function execution time is approaching the 60s timeout limit.",
+    "mimeType": "text/markdown"
+  },
+  "conditions": [
+    {
+      "displayName": "Execution time > 50s",
+      "conditionThreshold": {
+        "filter": "resource.type=\"cloud_function\" AND metric.type=\"cloudfunctions.googleapis.com/function/execution_times\"",
+        "comparison": "COMPARISON_GT",
+        "thresholdValue": 50000,
+        "duration": "0s",
+        "aggregations": [
+          {
+            "alignmentPeriod": "60s",
+            "perSeriesAligner": "ALIGN_PERCENTILE_99"
+          }
+        ]
+      }
+    }
+  ],
+  "combiner": "OR",
+  "enabled": true,
+  "notificationChannels": [
+    "projects/portafolio-inversiones/notificationChannels/17171909552384294197"
+  ]
+}

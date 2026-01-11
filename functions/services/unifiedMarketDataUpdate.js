@@ -3,38 +3,119 @@ const admin = require('firebase-admin');
 const axios = require('axios');
 const { calculateAccountPerformance, convertCurrency } = require('../utils/portfolioCalculations');
 const { calculatePortfolioRisk } = require('./calculatePortfolioRisk');
+const { invalidatePerformanceCacheBatch } = require('./historicalReturnsService');
 const { DateTime } = require('luxon');
+
+// Importar generador de logos
+const { generateLogoUrl } = require('../utils/logoGenerator');
+
+// Importar logger estructurado (SCALE-CORE-002)
+const { StructuredLogger } = require('../utils/logger');
 
 const API_BASE_URL = 'https://dmn46d7xas3rvio6tugd2vzs2q0hxbmb.lambda-url.us-east-1.on.aws/v1';
 
-// Horarios estáticos para NYSE (en UTC)
-const NYSE_OPEN_HOUR = 13.5;  // 9:30 AM EST
-const NYSE_CLOSE_HOUR = 20;   // 4:00 PM EST
-
-// 🚀 OPTIMIZACIÓN: Control de logging para reducir costos
-const LOG_LEVEL = process.env.LOG_LEVEL || 'INFO'; // 'DEBUG', 'INFO', 'WARN', 'ERROR'
+// Flag para habilitar logs detallados (puede causar mucho ruido en producción)
 const ENABLE_DETAILED_LOGS = process.env.ENABLE_DETAILED_LOGS === 'true';
 
+// Horarios de NYSE en hora local de Nueva York (no UTC)
+// Esto maneja automáticamente EST/EDT gracias a Luxon
+const NYSE_OPEN_HOUR = 9;
+const NYSE_OPEN_MINUTE = 30;
+const NYSE_CLOSE_HOUR = 16;  // 4:00 PM
+
+// Ventana de gracia después del cierre para capturar precios finales (en minutos)
+const CLOSING_GRACE_WINDOW_MINUTES = 5;
+
+// Logger global para este módulo (se inicializa en cada ejecución)
+let logger = null;
+
 function logDebug(...args) {
-  if (LOG_LEVEL === 'DEBUG') console.log(...args);
+  if (logger) {
+    logger.debug(args[0], args.length > 1 ? { details: args.slice(1) } : {});
+  }
 }
 
 function logInfo(...args) {
-  if (['DEBUG', 'INFO'].includes(LOG_LEVEL)) console.log(...args);
+  if (logger) {
+    logger.info(args[0], args.length > 1 ? { details: args.slice(1) } : {});
+  }
 }
 
 function logWarn(...args) {
-  if (['DEBUG', 'INFO', 'WARN'].includes(LOG_LEVEL)) console.warn(...args);
+  if (logger) {
+    logger.warn(args[0], args.length > 1 ? { details: args.slice(1) } : {});
+  }
 }
 
 function logError(...args) {
-  console.error(...args); // Siempre loguear errores
+  if (logger) {
+    const error = args.find(a => a instanceof Error);
+    const message = typeof args[0] === 'string' ? args[0] : 'Error';
+    logger.error(message, error, { details: args.filter(a => !(a instanceof Error) && a !== message) });
+  } else {
+    console.error(...args);
+  }
 }
 
+/**
+ * Verifica si el mercado NYSE está abierto (fallback local).
+ * Usa Luxon para manejar correctamente EST/EDT automáticamente.
+ * NOTA: Este es un fallback - el código principal usa markets/US.isOpen de Finnhub.
+ */
 function isNYSEMarketOpen() {
-  const now = new Date();
-  const utcHour = now.getUTCHours() + now.getUTCMinutes() / 60;
-  return utcHour >= NYSE_OPEN_HOUR && utcHour < NYSE_CLOSE_HOUR;
+  const nyNow = DateTime.now().setZone('America/New_York');
+  const hour = nyNow.hour;
+  const minute = nyNow.minute;
+  const dayOfWeek = nyNow.weekday; // 1=Monday, 7=Sunday
+  
+  // Fin de semana: cerrado
+  if (dayOfWeek === 6 || dayOfWeek === 7) {
+    return false;
+  }
+  
+  // Convertir hora actual a minutos desde medianoche
+  const currentMinutes = hour * 60 + minute;
+  const openMinutes = NYSE_OPEN_HOUR * 60 + NYSE_OPEN_MINUTE; // 9:30 = 570
+  const closeMinutes = NYSE_CLOSE_HOUR * 60; // 16:00 = 960
+  
+  return currentMinutes >= openMinutes && currentMinutes < closeMinutes;
+}
+
+/**
+ * Verifica si estamos en la "ventana de cierre" del mercado.
+ * Esta ventana permite una última actualización justo después del cierre
+ * para capturar los precios finales del día.
+ * 
+ * @param {number} closeHour - Hora de cierre del mercado (ej: 16 para 4:00 PM)
+ * @returns {{ inWindow: boolean, reason: string }} - Si estamos en la ventana y por qué
+ */
+function isInClosingWindow(closeHour = NYSE_CLOSE_HOUR) {
+  const nyNow = DateTime.now().setZone('America/New_York');
+  const hour = nyNow.hour;
+  const minute = nyNow.minute;
+  const dayOfWeek = nyNow.weekday;
+  
+  // Fin de semana: no hay ventana de cierre
+  if (dayOfWeek === 6 || dayOfWeek === 7) {
+    return { inWindow: false, reason: 'weekend' };
+  }
+  
+  const currentMinutes = hour * 60 + minute;
+  const closeMinutes = closeHour * 60;
+  const graceEndMinutes = closeMinutes + CLOSING_GRACE_WINDOW_MINUTES;
+  
+  // Estamos en la ventana si:
+  // - Es exactamente la hora de cierre (16:00), O
+  // - Estamos dentro de los primeros N minutos después del cierre
+  if (currentMinutes >= closeMinutes && currentMinutes <= graceEndMinutes) {
+    return { 
+      inWindow: true, 
+      reason: `closing-window (${closeHour}:00 + ${CLOSING_GRACE_WINDOW_MINUTES}min grace)`,
+      minutesAfterClose: currentMinutes - closeMinutes
+    };
+  }
+  
+  return { inWindow: false, reason: 'outside-window' };
 }
 
 /**
@@ -182,6 +263,20 @@ async function updateCurrentPrices(db, assetQuotes) {
       if (docData.name) updatedData.name = docData.name;
       if (docData.isin) updatedData.isin = docData.isin;
       if (docData.type) updatedData.type = docData.type;
+      if (docData.logo) updatedData.logo = docData.logo;
+      if (docData.website) updatedData.website = docData.website;
+      
+      // Generar logo si no existe en el documento
+      if (!docData.logo) {
+        const generatedLogo = generateLogoUrl(symbol, { 
+          website: docData.website, 
+          assetType: docData.type || 'stock' 
+        });
+        if (generatedLogo) {
+          updatedData.logo = generatedLogo;
+          logDebug(`Logo generado para ${symbol}`);
+        }
+      }
       
       batch.update(doc.ref, updatedData);
       updatesCount++;
@@ -734,29 +829,100 @@ async function calculateDailyPortfolioPerformance(db) {
   }
 
   logInfo(`✅ Rendimiento calculado para ${calculationsCount} usuarios (${totalBatchesCommitted} batches)`);
-  return calculationsCount;
+  return { count: calculationsCount, userIds: Object.keys(userPortfolios) };
 }
+
+// Constante del intervalo de actualización (debe coincidir con el cron schedule)
+const REFRESH_INTERVAL_MINUTES = 5;
 
 /**
  * Función principal unificada que ejecuta todas las actualizaciones
+ * 
+ * COST-OPT-001: Frecuencia reducida de 2 a 5 minutos para optimizar costos
+ * - Ahorro estimado: ~60% en lecturas/escrituras de Firestore
+ * - Impacto UX: Precios actualizados cada 5 min en lugar de 2 min (aceptable)
  */
 exports.unifiedMarketDataUpdate = onSchedule({
-  schedule: '*/2 9-17 * * 1-5',
+  schedule: `*/${REFRESH_INTERVAL_MINUTES} 9-17 * * 1-5`,  // COST-OPT-001: Cada 5 minutos (antes: */2)
   timeZone: 'America/New_York',
   retryCount: 3,
 }, async (event) => {
-  if (!isNYSEMarketOpen()) {
-    logInfo('🔴 El mercado NYSE está cerrado. Omitiendo actualizaciones.');
+  // Inicializar logger estructurado (SCALE-CORE-002)
+  logger = StructuredLogger.forScheduled('unifiedMarketDataUpdate');
+  
+  const db = admin.firestore();
+  
+  // Verificar si estamos en la ventana de cierre del mercado
+  // Esto permite una última actualización para capturar precios de cierre
+  const closingWindowCheck = isInClosingWindow(NYSE_CLOSE_HOUR);
+  const isInClosingGrace = closingWindowCheck.inWindow;
+  
+  // OPT-SYNC-001: Verificar estado del mercado desde Firestore (incluye festivos)
+  // El documento markets/US es actualizado por marketStatusService que consulta Finnhub
+  try {
+    const marketDoc = await db.collection('markets').doc('US').get();
+    if (marketDoc.exists) {
+      const marketData = marketDoc.data();
+      
+      // Verificar si es festivo (siempre respetar festivos)
+      if (marketData.holiday) {
+        logger.info('Market holiday - skipping update', { 
+          holiday: marketData.holiday,
+          marketStatus: 'holiday'
+        });
+        return null;
+      }
+      
+      // Verificar si el mercado está cerrado (usando dato de Finnhub)
+      if (marketData.isOpen === false) {
+        // MEJORA: Si estamos en la ventana de cierre, ejecutar una última actualización
+        // para capturar los precios de cierre del día
+        if (isInClosingGrace) {
+          logger.info('Market just closed - executing final update to capture closing prices', { 
+            session: marketData.session,
+            marketStatus: 'closing-grace',
+            closingWindow: closingWindowCheck,
+            graceMinutes: CLOSING_GRACE_WINDOW_MINUTES
+          });
+          // Continuar con la ejecución (no return)
+        } else {
+          logger.info('Market closed (Finnhub) - skipping update', { 
+            session: marketData.session,
+            marketStatus: 'closed'
+          });
+          return null;
+        }
+      }
+    }
+  } catch (marketCheckError) {
+    // Si falla la consulta, continuar con la verificación local de horario
+    logger.warn('Failed to check market status from Firestore, using local check', {
+      error: marketCheckError.message
+    });
+  }
+  
+  // Fallback: verificación local de horario (por si la consulta a markets/US falla)
+  // También considerar la ventana de cierre
+  if (!isNYSEMarketOpen() && !isInClosingGrace) {
+    logger.info('Market closed (local check) - skipping update', { marketStatus: 'closed' });
     return null;
   }
 
-  logInfo('🚀 Iniciando actualización unificada de datos de mercado...');
+  logger.info('Starting unified market data update', { marketStatus: 'open' });
   
-  const db = admin.firestore();
   const startTime = Date.now();
+  
+  // Calcular el minuto programado (el scheduler debería haber disparado en un múltiplo de REFRESH_INTERVAL_MINUTES)
+  // Esto nos da el momento exacto cuando SE PROGRAMÓ esta ejecución
+  const now = DateTime.now().setZone('America/New_York');
+  const scheduledMinute = Math.floor(now.minute / REFRESH_INTERVAL_MINUTES) * REFRESH_INTERVAL_MINUTES;
+  const scheduledAt = now.set({ minute: scheduledMinute, second: 0, millisecond: 0 });
+  const nextScheduledUpdate = scheduledAt.plus({ minutes: REFRESH_INTERVAL_MINUTES });
+  const mainOp = logger.startOperation('fullUpdate');
   
       try {
     // Paso 1: Obtener códigos de monedas y símbolos de activos dinámicamente
+    const dataFetchOp = logger.startOperation('fetchInitialData');
     const [currenciesSnapshot, currentPricesSnapshot] = await Promise.all([
       db.collection('currencies').where('isActive', '==', true).get(),
       db.collection('currentPrices').get()
@@ -764,38 +930,85 @@ exports.unifiedMarketDataUpdate = onSchedule({
     
     const currencyCodes = currenciesSnapshot.docs.map(doc => doc.data().code);
     const assetSymbols = currentPricesSnapshot.docs.map(doc => doc.data().symbol);
+    dataFetchOp.success({ currencyCount: currencyCodes.length, assetCount: assetSymbols.length });
     
-    logInfo(`📊 Obteniendo datos para ${currencyCodes.length} monedas y ${assetSymbols.length} activos`);
+    logger.info('Fetching market data', { currencies: currencyCodes.length, assets: assetSymbols.length });
     
     // Paso 2: Obtener TODOS los datos de mercado en llamadas optimizadas
+    const marketDataOp = logger.startOperation('getAllMarketDataBatch');
     const marketData = await getAllMarketDataBatch(currencyCodes, assetSymbols);
+    marketDataOp.success({ currenciesReceived: Object.keys(marketData.currencies).length, assetsReceived: marketData.assets.size });
     
     // Paso 3: Actualizar tasas de cambio con datos ya obtenidos
+    const currencyOp = logger.startOperation('updateCurrencyRates');
     const currencyUpdates = await updateCurrencyRates(db, marketData.currencies);
+    currencyOp.success({ updated: currencyUpdates });
     
     // Paso 4: Actualizar precios actuales con datos ya obtenidos
+    const pricesOp = logger.startOperation('updateCurrentPrices');
     const priceUpdates = await updateCurrentPrices(db, marketData.assets);
+    pricesOp.success({ updated: priceUpdates });
     
     // Paso 5: Calcular rendimiento del portafolio
-    const portfolioCalculations = await calculateDailyPortfolioPerformance(db);
+    const perfOp = logger.startOperation('calculateDailyPortfolioPerformance');
+    const portfolioResult = await calculateDailyPortfolioPerformance(db);
+    perfOp.success({ portfoliosCalculated: portfolioResult.count });
     
     // Paso 6: Calcular riesgo del portafolio (usando datos actualizados)
-    logDebug('🔄 Calculando riesgo del portafolio...');
+    const riskOp = logger.startOperation('calculatePortfolioRisk');
     await calculatePortfolioRisk();
-    logDebug('✅ Riesgo del portafolio calculado');
+    riskOp.success();
+    
+    // Paso 7: Invalidar cache de rendimientos históricos (OPT-010)
+    let cacheInvalidationResult = { usersProcessed: 0, cachesDeleted: 0 };
+    if (portfolioResult.userIds && portfolioResult.userIds.length > 0) {
+      try {
+        const cacheOp = logger.startOperation('invalidatePerformanceCacheBatch');
+        cacheInvalidationResult = await invalidatePerformanceCacheBatch(portfolioResult.userIds);
+        cacheOp.success({ usersProcessed: cacheInvalidationResult.usersProcessed, cachesDeleted: cacheInvalidationResult.cachesDeleted });
+      } catch (cacheError) {
+        logger.warn('Cache invalidation failed (non-critical)', { error: cacheError.message });
+      }
+    }
     
     const endTime = Date.now();
     const executionTime = (endTime - startTime) / 1000;
     
-    logInfo(`🎉 Actualización unificada completada en ${executionTime}s:`);
-    logInfo(`   - ${currencyUpdates} tasas de cambio actualizadas`);
-    logInfo(`   - ${priceUpdates} precios actualizados`);
-    logInfo(`   - ${portfolioCalculations} portafolios calculados`);
-    logInfo(`   - ✅ Riesgo de portafolios calculado`);
+    // Paso 8: Notificar al frontend que todo el pipeline completó (OPT-016)
+    // Incluimos metadata para sincronización precisa del countdown
+    try {
+      await db.collection('systemStatus').doc('marketData').set({
+        // Timestamps
+        lastCompleteUpdate: admin.firestore.FieldValue.serverTimestamp(),
+        lastUpdateDate: new Date().toISOString(),
+        
+        // Metadata de sincronización para el frontend
+        refreshIntervalMinutes: REFRESH_INTERVAL_MINUTES,
+        scheduledAt: scheduledAt.toISO(),           // Cuando se programó esta ejecución
+        nextScheduledUpdate: nextScheduledUpdate.toISO(), // Próxima ejecución programada
+        
+        // Estadísticas del pipeline
+        pricesUpdated: priceUpdates,
+        performanceCalculated: portfolioResult.count,
+        cachesInvalidated: cacheInvalidationResult.cachesDeleted,
+        executionTimeMs: Math.round(executionTime * 1000),
+        marketOpen: true
+      }, { merge: true });
+    } catch (signalError) {
+      logger.warn('Frontend signal failed (non-critical)', { error: signalError.message });
+    }
+    
+    mainOp.success({
+      currencyUpdates,
+      priceUpdates,
+      portfoliosCalculated: portfolioResult.count,
+      cachesInvalidated: cacheInvalidationResult.cachesDeleted,
+      executionTimeSec: executionTime
+    });
     
     return null;
   } catch (error) {
-    logError('❌ Error en actualización unificada:', error);
+    mainOp.failure(error);
     return null;
   }
 }); 

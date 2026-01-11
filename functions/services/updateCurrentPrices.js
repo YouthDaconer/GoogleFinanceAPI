@@ -3,6 +3,9 @@ const admin = require('firebase-admin');
 const { getQuotes } = require('./financeQuery');
 const axios = require('axios'); // Asegúrate de tener esta dependencia instalada
 
+// Importar generador de logos
+const { generateLogoUrl } = require('../utils/logoGenerator');
+
 const API_BASE_URL = 'https://dmn46d7xas3rvio6tugd2vzs2q0hxbmb.lambda-url.us-east-1.on.aws/v1';
 
 // Función para obtener el ISIN de una acción
@@ -105,7 +108,7 @@ async function updateCurrentPrices() {
 
             // Lista de campos adicionales a agregar si están en quoteData
             const optionalKeys = [
-              'logo', 'open', 'high', 'low',
+              'logo', 'website', 'open', 'high', 'low',
               'yearHigh', 'yearLow', 'volume', 'avgVolume',
               'marketCap', 'beta', 'pe', 'eps',
               'earningsDate', 'industry', 'sector', 'about', 'employees', 
@@ -120,6 +123,18 @@ async function updateCurrentPrices() {
                 updatedData[key] = quoteData[key];
               }
             });
+
+            // Generar logo si no viene en la respuesta del API y no existe en el documento
+            if (!updatedData.logo && !docData.logo) {
+              const generatedLogo = generateLogoUrl(symbol, { 
+                website: quoteData.website || docData.website, 
+                assetType: type 
+              });
+              if (generatedLogo) {
+                updatedData.logo = generatedLogo;
+                console.log(`Logo generado para ${symbol}: ${generatedLogo}`);
+              }
+            }
 
             batch.update(doc.ref, updatedData);
             updatesCount++;
