@@ -1463,8 +1463,12 @@ app.get("/risk-metrics", async (req, res) => {
       durationMs: result.metadata?.durationMs
     });
     
+    // BUGFIX: INSUFFICIENT_DATA no es un error 404, es una respuesta válida con success=false
+    // El frontend debe manejar este caso para mostrar un mensaje apropiado al usuario
+    // En vez de devolver 404 (que causa error en fetch), devolvemos 200 con success=false
     if (!result.success) {
-      const statusCode = result.error === 'INSUFFICIENT_DATA' ? 404 : 500;
+      // Solo usar 500 para errores reales de servidor
+      const statusCode = result.error === 'INSUFFICIENT_DATA' ? 200 : 500;
       return res.status(statusCode).json(result);
     }
     
