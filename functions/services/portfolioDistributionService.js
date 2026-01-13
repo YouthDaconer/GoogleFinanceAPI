@@ -683,6 +683,7 @@ function calculateSectorDistribution(assets, prices, etfData, sectorMappings, po
   });
 
   // Procesar holdings directos
+  // FIX-MULTI-ACCOUNT-001: Acumular en lugar de sobrescribir cuando hay múltiples assets con el mismo ticker
   relevantAssets.forEach(asset => {
     const price = prices[asset.name];
     if (!price || !price.price) return;
@@ -693,16 +694,33 @@ function calculateSectorDistribution(assets, prices, etfData, sectorMappings, po
     const valueInUSD = convertToUSD(valueInLocalCurrency, currency, currencyRates);
     const weight = valueInUSD / totalValue;
 
-    // BUGFIX: Usar price.name (nombre de la empresa) en lugar de asset.company (broker)
-    holdingsMap[asset.name] = {
-      symbol: asset.name,
-      description: price.name || asset.name, // price.name contiene el nombre real (ej: "Apple Inc.")
-      weight,
-      asset_type: asset.assetType,
-      sector: price.sector,
-      assetClass: price.sector,
-      sources: [{ symbol: asset.name, contribution: weight }]
-    };
+    // FIX-MULTI-ACCOUNT-001: Si el holding ya existe (mismo ticker en otra cuenta), acumular
+    if (holdingsMap[asset.name]) {
+      // Acumular peso
+      holdingsMap[asset.name].weight += weight;
+      // Buscar si ya existe una fuente directa para este símbolo
+      const existingDirectSource = holdingsMap[asset.name].sources.find(
+        src => src.symbol === asset.name
+      );
+      if (existingDirectSource) {
+        // Sumar a la contribución directa existente
+        existingDirectSource.contribution += weight;
+      } else {
+        // Agregar nueva fuente directa
+        holdingsMap[asset.name].sources.push({ symbol: asset.name, contribution: weight });
+      }
+    } else {
+      // BUGFIX: Usar price.name (nombre de la empresa) en lugar de asset.company (broker)
+      holdingsMap[asset.name] = {
+        symbol: asset.name,
+        description: price.name || asset.name, // price.name contiene el nombre real (ej: "Apple Inc.")
+        weight,
+        asset_type: asset.assetType,
+        sector: price.sector,
+        assetClass: price.sector,
+        sources: [{ symbol: asset.name, contribution: weight }]
+      };
+    }
   });
 
   // Procesar ETFs
@@ -737,7 +755,9 @@ function calculateSectorDistribution(assets, prices, etfData, sectorMappings, po
 
         if (!holdingsMap[identifier]) {
           holdingsMap[identifier] = {
-            symbol: holding.symbol || '',
+            // FIX-MULTI-ACCOUNT-001: Usar identifier como symbol para consistencia
+            // Esto asegura que el frontend pueda identificar inversiones directas correctamente
+            symbol: identifier,
             isin: holding.isin,
             description: holding.name,
             weight: 0,
