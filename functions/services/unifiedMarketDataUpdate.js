@@ -12,6 +12,25 @@ const { generateLogoUrl } = require('../utils/logoGenerator');
 // Importar logger estructurado (SCALE-CORE-002)
 const { StructuredLogger } = require('../utils/logger');
 
+/**
+ * @deprecated OPT-DEMAND-302: Esta función está DEPRECADA desde 2026-01-15.
+ * 
+ * Los precios ahora se obtienen On-Demand desde el frontend via API Lambda.
+ * Los snapshots EOD los maneja dailyEODSnapshot (2x/día).
+ * Los cálculos de portfolio los maneja scheduledPortfolioCalculations (2x/día).
+ * 
+ * Esta función se mantiene temporalmente deshabilitada para posible rollback.
+ * Se eliminará completamente después de 2 semanas de estabilidad.
+ * 
+ * Reducción de costos lograda:
+ * - Invocaciones: 96/día → 4/día (EOD + Portfolio) = -96%
+ * - Writes Firestore: 6,720/día → 140/día = -98%
+ * 
+ * @see docs/stories/85.story.md (OPT-DEMAND-302)
+ * @see services/dailyEODSnapshot.js (nuevo - snapshots de precios)
+ * @see services/scheduledPortfolioCalculations.js (nuevo - cálculos de portfolio)
+ */
+
 const API_BASE_URL = 'https://dmn46d7xas3rvio6tugd2vzs2q0hxbmb.lambda-url.us-east-1.on.aws/v1';
 
 // Flag para habilitar logs detallados (puede causar mucho ruido en producción)
@@ -833,20 +852,45 @@ async function calculateDailyPortfolioPerformance(db) {
 }
 
 // Constante del intervalo de actualización (debe coincidir con el cron schedule)
+// @deprecated OPT-DEMAND-302: Schedule reducido drásticamente
 const REFRESH_INTERVAL_MINUTES = 5;
 
 /**
- * Función principal unificada que ejecuta todas las actualizaciones
+ * @deprecated OPT-DEMAND-302: Esta función está DEPRECADA.
  * 
- * COST-OPT-001: Frecuencia reducida de 2 a 5 minutos para optimizar costos
- * - Ahorro estimado: ~60% en lecturas/escrituras de Firestore
- * - Impacto UX: Precios actualizados cada 5 min en lugar de 2 min (aceptable)
+ * ANTES: Se ejecutaba cada 5 minutos (96 veces/día)
+ * AHORA: Schedule deshabilitado - reemplazada por:
+ *   - dailyEODSnapshot (precios/currencies - 2x/día)
+ *   - scheduledPortfolioCalculations (cálculos - 2x/día)
+ * 
+ * La función se mantiene con un schedule nunca-ejecuta para:
+ * 1. Mantener el código disponible para rollback de emergencia
+ * 2. Permitir reactivación manual si es necesario
+ * 
+ * Para ROLLBACK de emergencia:
+ * 1. Cambiar schedule a: `* /${REFRESH_INTERVAL_MINUTES} 9-17 * * 1-5`
+ * 2. Desplegar con: firebase deploy --only functions:unifiedMarketDataUpdateV2
+ * 
+ * @see docs/stories/85.story.md (OPT-DEMAND-302)
  */
 exports.unifiedMarketDataUpdate = onSchedule({
-  schedule: `*/${REFRESH_INTERVAL_MINUTES} 9-17 * * 1-5`,  // COST-OPT-001: Cada 5 minutos (antes: */2)
+  // DEPRECATED: Schedule original comentado para rollback
+  // schedule: `*/${REFRESH_INTERVAL_MINUTES} 9-17 * * 1-5`,  // Cada 5 min 9AM-5PM L-V
+  
+  // Schedule deshabilitado: 1 de enero a las 0:00 (nunca en práctica)
+  schedule: '0 0 1 1 *',
   timeZone: 'America/New_York',
-  retryCount: 3,
+  retryCount: 0, // Sin reintentos ya que está deprecada
+  labels: {
+    status: 'deprecated',
+    deprecated: '2026-01-15',
+    replaced: 'eod-snapshot-portfolio-calcs'
+  }
 }, async (event) => {
+  // Log de advertencia si se ejecuta accidentalmente
+  console.warn('⚠️ DEPRECATED: unifiedMarketDataUpdate ejecutada pero está deprecada');
+  console.warn('Esta función será eliminada. Use dailyEODSnapshot + scheduledPortfolioCalculations');
+  
   // Inicializar logger estructurado (SCALE-CORE-002)
   logger = StructuredLogger.forScheduled('unifiedMarketDataUpdate');
   

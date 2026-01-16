@@ -20,10 +20,12 @@
  * - getPortfolioDistribution
  * - getAvailableSectors
  * - getConsolidatedDataStatus (COST-OPT-001: Diagnóstico de datos)
- * 
+ * - getPerformanceOnDemand (OPT-DEMAND-102: Rendimiento con precios live)
+ *
  * @module unified/queryOperations
  * @see docs/stories/56.story.md
  * @see docs/stories/62.story.md (COST-OPT-001)
+ * @see docs/stories/74.story.md (OPT-DEMAND-102)
  */
 
 const { onCall, HttpsError } = require("firebase-functions/v2/https");
@@ -32,6 +34,7 @@ const { getRateLimitConfig } = require('../../config/rateLimits');
 
 // Importar handlers individuales
 const queryHandlers = require('../handlers/queryHandlers');
+const { getPerformanceOnDemand } = require('../handlers/performanceOnDemandHandler');
 
 // ============================================================================
 // CONFIGURACIÓN
@@ -64,6 +67,8 @@ const ACTION_HANDLERS = {
   // COST-OPT-001: Nuevas acciones para rendimientos optimizados (V2)
   getHistoricalReturnsOptimized: queryHandlers.getHistoricalReturnsOptimized,
   getConsolidatedDataStatus: queryHandlers.getConsolidatedDataStatus,
+  // OPT-DEMAND-102: Rendimiento on-demand con precios en vivo del API Lambda
+  getPerformanceOnDemand: getPerformanceOnDemand,
 };
 
 /**
