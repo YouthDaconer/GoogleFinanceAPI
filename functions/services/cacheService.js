@@ -29,31 +29,14 @@ const logger = new StructuredLogger('CacheService');
 const etfMemoryCache = new Map();
 const ETF_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
 
-/**
- * @deprecated OPT-DEMAND-CLEANUP (2026-01-17): Esta función está DEPRECADA.
- * 
- * RAZÓN: El frontend tiene polling implementado que obtiene datos frescos
- * del API Lambda. Cachear precios de Firestore que pueden tener días de
- * antigüedad es peor que mostrar un error con opción de retry.
- * 
- * Los precios de acciones son muy volátiles (pueden moverse 5-20% en un día).
- * Mostrar datos obsoletos puede llevar a decisiones financieras incorrectas.
- * 
- * COMPORTAMIENTO: Retorna array vacío siempre. Los llamadores deben
- * manejar esto como "sin fallback disponible".
- * 
- * @param {string[]} symbols - Símbolos a buscar (ignorado)
- * @returns {Promise<Array>} Array vacío siempre
- */
-async function getCachedPrices(symbols) {
-  logger.warn('getCachedPrices() is DEPRECATED - returning empty array', {
-    symbolCount: symbols?.length || 0,
-    reason: 'OPT-DEMAND-CLEANUP: Frontend polling handles fresh data from API Lambda'
-  });
-  
-  // Retornar vacío - el Circuit Breaker debe manejar esto como "sin fallback"
-  return [];
-}
+// ============================================================================
+// OPT-DEMAND-CLEANUP (2026-01-17): Funciones de cache de precios ELIMINADAS
+// ============================================================================
+// getCachedPrices() y getCachedCurrencyRates() fueron eliminadas porque:
+// - El frontend usa polling al API Lambda para datos frescos
+// - Cachear precios obsoletos de Firestore es peor que mostrar error + retry
+// - Las tasas de cambio vienen del API Lambda junto con los precios
+// ============================================================================
 
 async function getCachedMarketStatus() {
   const MARKET_DOC_ID = 'US';
@@ -106,32 +89,6 @@ async function cacheMarketStatus(marketData) {
   }
 }
 
-/**
- * @deprecated OPT-DEMAND-CLEANUP (2026-01-17): Esta función está DEPRECADA.
- * 
- * RAZÓN: Las tasas de cambio ahora vienen incluidas en la respuesta del
- * API Lambda (/market-quotes retorna currencyRates). El frontend tiene
- * polling que obtiene datos frescos regularmente.
- * 
- * Cachear tasas de cambio obsoletas de Firestore es innecesario y
- * potencialmente peligroso para cálculos financieros.
- * 
- * COMPORTAMIENTO: Retorna objeto vacío siempre. Los llamadores deben
- * manejar esto como "sin fallback disponible".
- * 
- * @param {string[]} currencyCodes - Códigos de moneda (ignorado)
- * @returns {Promise<Object>} Objeto vacío siempre
- */
-async function getCachedCurrencyRates(currencyCodes) {
-  logger.warn('getCachedCurrencyRates() is DEPRECATED - returning empty object', {
-    codesCount: currencyCodes?.length || 0,
-    reason: 'OPT-DEMAND-CLEANUP: Currency rates come from API Lambda with prices'
-  });
-  
-  // Retornar vacío - el Circuit Breaker debe manejar esto como "sin fallback"
-  return {};
-}
-
 function getCachedEtfData(ticker) {
   const cached = etfMemoryCache.get(ticker);
   
@@ -166,10 +123,8 @@ function getEtfCacheStats() {
 }
 
 module.exports = {
-  getCachedPrices,
   getCachedMarketStatus,
   cacheMarketStatus,
-  getCachedCurrencyRates,
   getCachedEtfData,
   cacheEtfData,
   clearEtfCache,

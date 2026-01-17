@@ -2,11 +2,8 @@ require('dotenv').config();
 const { onRequest } = require("firebase-functions/v2/https");
 const httpApp = require('./httpApi');
 
-// Nueva función unificada que combina updateCurrencyRates, updateCurrentPrices y calculateDailyPortfolioPerformance
+// Función unificada EOD que calcula performance y riesgo del portafolio
 const { unifiedMarketDataUpdate } = require('./services/unifiedMarketDataUpdate');
-
-// Función para actualizaciones completas de datos de activos (mantener para ISINs y optionalKeys)
-const { scheduledUpdatePrices } = require('./services/updateCurrentPrices');
 
 const processDividendPayments = require('./services/processDividendPayments');
 const marketStatusService = require('./services/marketStatusService');
@@ -98,9 +95,6 @@ exports.app = onRequest(etfProcessingOpts, httpApp);
  * Se eliminará después de 2 semanas de estabilidad.
  */
 exports.unifiedMarketDataUpdateV2 = unifiedMarketDataUpdate;
-
-// Función específica para actualizaciones completas de datos (ISINs y metadatos)
-exports.scheduledUpdatePricesV2 = scheduledUpdatePrices;
 
 // ============================================================================
 // COST-OPT-004: Funciones Optimizadas para Datos de Mercado
@@ -646,53 +640,11 @@ const { getMarketDataToken } = require('./services/marketDataTokenService');
 exports.getMarketDataToken = getMarketDataToken;
 
 // ============================================================================
-// OPT-DEMAND-301: Daily EOD Snapshot
+// OPT-DEMAND-CLEANUP: Funciones EOD Consolidadas
 // ============================================================================
-
-/**
- * Captura snapshots EOD (End Of Day) de precios y currencies 2 veces al día.
- * Reemplaza las 96 ejecuciones diarias de unifiedMarketDataUpdate con solo 2,
- * reduciendo costos de Firestore en ~98%.
- * 
- * Schedule:
- * - Pre-Market: 8:30 AM ET (datos cierre día anterior)
- * - Post-Market: 5:00 PM ET (datos EOD día actual)
- * 
- * @see docs/stories/84.story.md (OPT-DEMAND-301)
- * @see docs/architecture/on-demand-pricing-architecture.md
- */
-const { 
-  dailyEODSnapshotPreMarket, 
-  dailyEODSnapshotPostMarket,
-  dailyEODSnapshotManual 
-} = require('./services/dailyEODSnapshot');
-
-exports.dailyEODSnapshotPreMarket = dailyEODSnapshotPreMarket;
-exports.dailyEODSnapshotPostMarket = dailyEODSnapshotPostMarket;
-exports.dailyEODSnapshotManual = dailyEODSnapshotManual;
-
-// ============================================================================
-// OPT-DEMAND-302: Scheduled Portfolio Calculations
-// ============================================================================
-
-/**
- * Cálculos de rendimiento y riesgo del portafolio 2 veces al día.
- * Reemplaza los cálculos de unifiedMarketDataUpdate con una función ligera.
- * 
- * Schedule: 10:30 AM y 5:30 PM ET (después de los EOD snapshots)
- * 
- * Tareas:
- * - Calcular rendimiento del portafolio (portfolioPerformance)
- * - Calcular riesgo del portafolio
- * - Invalidar cache de rendimientos históricos
- * 
- * @see docs/stories/85.story.md (OPT-DEMAND-302)
- * @see docs/architecture/on-demand-pricing-architecture.md
- */
-const { 
-  scheduledPortfolioCalculations,
-  scheduledPortfolioCalculationsManual 
-} = require('./services/scheduledPortfolioCalculations');
-
-exports.scheduledPortfolioCalculations = scheduledPortfolioCalculations;
-exports.scheduledPortfolioCalculationsManual = scheduledPortfolioCalculationsManual;
+// NOTA: Las funciones dailyEODSnapshot y scheduledPortfolioCalculations fueron
+// eliminadas (2026-01-17). La funcionalidad está consolidada en:
+// - unifiedMarketDataUpdate: Ejecuta 1x/día a las 17:05 ET
+// - queryOperations: Para cálculos on-demand
+//
+// @see docs/architecture/OPT-DEMAND-CLEANUP-firestore-fallback-removal.md

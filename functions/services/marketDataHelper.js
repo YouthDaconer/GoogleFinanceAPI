@@ -1,12 +1,17 @@
 /**
  * Market Data Helper Service
  * 
- * OPT-DEMAND-CLEANUP: Servicio centralizado para obtener precios y tasas de cambio
- * desde el API Lambda, eliminando la dependencia de Firestore.
+ * OPT-DEMAND-CLEANUP: Servicio centralizado para obtener precios y tasas de cambio.
+ * 
+ * IMPORTANTE - Arquitectura de Currencies:
+ * - La colección `currencies` de Firestore es la FUENTE DE VERDAD para:
+ *   - Cuáles currencies están activas (isActive: true)
+ *   - Metadata: nombre, símbolo, bandera, etc.
+ * - Las TASAS DE CAMBIO se obtienen del API Lambda (datos frescos)
  * 
  * Este servicio es usado por:
  * - calculateDailyPortfolioPerformance.js
- * - scheduledPortfolioCalculations.js
+ * - unifiedMarketDataUpdate.js
  * - calculatePortfolioRisk.js
  * - processDividendPayments.js
  * 
@@ -14,24 +19,24 @@
  * @module services/marketDataHelper
  */
 
+const admin = require('firebase-admin');
 const { getQuotes } = require('./financeQuery');
 const { StructuredLogger } = require('../utils/logger');
+const axios = require('axios');
 
 const logger = new StructuredLogger('marketDataHelper');
+
+// API Lambda URL para tasas de cambio
+const API_BASE_URL = 'https://dmn46d7xas3rvio6tugd2vzs2q0hxbmb.lambda-url.us-east-1.on.aws/v1';
 
 // Cache en memoria para tasas de cambio (evita llamadas repetidas en la misma ejecución)
 let currencyRatesCache = null;
 let currencyRatesCacheTimestamp = 0;
 const CURRENCY_RATES_CACHE_TTL = 5 * 60 * 1000; // 5 minutos
 
-/**
- * Códigos de moneda que el API Lambda soporta para tasas de cambio
- * Estas son las monedas más comunes usadas en el portafolio
- */
-const SUPPORTED_CURRENCY_CODES = [
-  'USD', 'EUR', 'GBP', 'COP', 'MXN', 'BRL', 'ARS', 'CLP', 'PEN',
-  'JPY', 'CHF', 'CAD', 'AUD', 'CNY', 'INR', 'KRW'
-];
+// NOTA: SUPPORTED_CURRENCY_CODES fue ELIMINADA
+// Las currencies activas ahora se leen de Firestore (isActive: true)
+// Esto permite al usuario configurar sus propias currencies sin cambios de código
 
 /**
  * Obtiene precios actuales desde el API Lambda
@@ -123,12 +128,21 @@ function normalizeQuote(quote) {
 }
 
 /**
- * Obtiene tasas de cambio desde el API Lambda
+ * Obtiene currencies activas con tasas de cambio frescas del API Lambda
  * 
- * El API /quotes retorna currencyRates como parte de la respuesta.
- * Esta función hace una llamada mínima para obtener solo las tasas.
+ * FLUJO:
+ * 1. Lee currencies con isActive: true de Firestore (configuración del usuario)
+ * 2. Obtiene tasas de cambio del API Lambda para esas currencies
+ * 3. Combina metadata de Firestore + tasas del API Lambda
  * 
- * @returns {Promise<Object[]>} Array de objetos Currency con code y exchangeRate
+ * La colección `currencies` de Firestore es la FUENTE DE VERDAD para:
+ * - Cuáles currencies usar (isActive)
+ * - Metadata: id, code, name, symbol, flagCurrency
+ * 
+ * El API Lambda es la fuente para:
+ * - Tasas de cambio actualizadas (exchangeRate)
+ * 
+ * @returns {Promise<Object[]>} Array de objetos Currency con metadata + exchangeRate fresco
  */
 async function getCurrencyRatesFromApi() {
   // Verificar cache
@@ -141,61 +155,137 @@ async function getCurrencyRatesFromApi() {
   }
 
   try {
-    logger.info('Fetching currency rates from API Lambda');
-
-    // El API /quotes retorna currencyRates cuando se consultan símbolos
-    // Usamos un símbolo común como "SPY" para obtener las tasas
-    const symbolsString = 'SPY';
-    const apiResponse = await getQuotes(symbolsString);
+    const db = admin.firestore();
     
-    // Extraer currencyRates de la respuesta
-    let currencyRates = {};
+    // =========================================================================
+    // PASO 1: Leer currencies activas de Firestore (fuente de verdad para config)
+    // =========================================================================
+    logger.info('Fetching active currencies from Firestore');
     
-    if (apiResponse && apiResponse.currencyRates) {
-      currencyRates = apiResponse.currencyRates;
-    } else if (apiResponse && Array.isArray(apiResponse) && apiResponse[0]?.currencyRates) {
-      currencyRates = apiResponse[0].currencyRates;
-    }
-
-    // Convertir a formato Currency[]
-    const currencies = Object.entries(currencyRates).map(([code, rate]) => ({
-      id: code,
-      code: code,
-      exchangeRate: parseFloat(rate) || 1,
-      isActive: true,
-      // Metadata estática (se puede extender)
-      name: getCurrencyName(code),
-      symbol: getCurrencySymbol(code),
-    }));
-
-    // Si el API no retorna tasas, agregar al menos USD
-    if (currencies.length === 0) {
-      logger.warn('No currency rates from API, using defaults');
-      currencies.push({
+    const currenciesSnapshot = await db.collection('currencies')
+      .where('isActive', '==', true)
+      .get();
+    
+    if (currenciesSnapshot.empty) {
+      logger.warn('No active currencies found in Firestore, using USD default');
+      const defaultCurrency = [{
         id: 'USD',
         code: 'USD',
         exchangeRate: 1,
         isActive: true,
         name: 'US Dollar',
         symbol: '$',
-      });
+        flagCurrency: 'https://flagcdn.com/us.svg',
+      }];
+      currencyRatesCache = defaultCurrency;
+      currencyRatesCacheTimestamp = Date.now();
+      return defaultCurrency;
     }
+    
+    // Extraer datos de Firestore
+    const activeCurrencies = currenciesSnapshot.docs.map(doc => ({
+      id: doc.id,
+      ...doc.data()
+    }));
+    
+    const currencyCodes = activeCurrencies.map(c => c.code).filter(Boolean);
+    
+    logger.info('Active currencies from Firestore', {
+      count: activeCurrencies.length,
+      codes: currencyCodes
+    });
+    
+    // =========================================================================
+    // PASO 2: Obtener tasas de cambio del API Lambda
+    // =========================================================================
+    logger.info('Fetching exchange rates from API Lambda', {
+      currencies: currencyCodes
+    });
+    
+    // Construir símbolos de currency para el API (formato: COP=X, EUR=X, etc.)
+    // Excluir USD ya que siempre es 1
+    const currencySymbols = currencyCodes
+      .filter(code => code !== 'USD')
+      .map(code => `${code}=X`);
+    
+    let apiRates = {};
+    
+    if (currencySymbols.length > 0) {
+      try {
+        const symbolsParam = currencySymbols.join(',');
+        const url = `${API_BASE_URL}/market-quotes?symbols=${symbolsParam}`;
+        
+        const { data } = await axios.get(url, { timeout: 15000 });
+        
+        // Extraer tasas de la respuesta
+        if (Array.isArray(data)) {
+          data.forEach(item => {
+            if (item.symbol && item.regularMarketPrice) {
+              // Convertir COP=X a COP
+              const currencyCode = item.symbol.replace('=X', '');
+              apiRates[currencyCode] = parseFloat(item.regularMarketPrice) || 1;
+            }
+          });
+        }
+        
+        logger.info('Exchange rates received from API', {
+          requested: currencySymbols.length,
+          received: Object.keys(apiRates).length,
+          rates: apiRates
+        });
+        
+      } catch (apiError) {
+        logger.warn('Failed to fetch rates from API Lambda, using Firestore rates as fallback', {
+          error: apiError.message
+        });
+        // Continuar con las tasas de Firestore
+      }
+    }
+    
+    // USD siempre es 1
+    apiRates['USD'] = 1;
+    
+    // =========================================================================
+    // PASO 3: Combinar metadata de Firestore + tasas del API Lambda
+    // =========================================================================
+    const currencies = activeCurrencies.map(currency => {
+      const freshRate = apiRates[currency.code];
+      const hasApiRate = freshRate !== undefined && freshRate !== null;
+      
+      return {
+        id: currency.id,
+        code: currency.code,
+        name: currency.name,
+        symbol: currency.symbol,
+        flagCurrency: currency.flagCurrency,
+        isActive: true,
+        // Usar tasa del API si está disponible, sino usar la de Firestore
+        exchangeRate: hasApiRate ? freshRate : (currency.exchangeRate || 1),
+        // Metadata adicional para debugging
+        rateSource: hasApiRate ? 'api-lambda' : 'firestore-fallback',
+        lastUpdated: new Date().toISOString(),
+      };
+    });
 
     // Guardar en cache
     currencyRatesCache = currencies;
     currencyRatesCacheTimestamp = Date.now();
 
-    logger.info('Currency rates fetched successfully', {
+    logger.info('Currency rates ready', {
       count: currencies.length,
       codes: currencies.map(c => c.code),
-      source: 'api-lambda'
+      sources: currencies.reduce((acc, c) => {
+        acc[c.rateSource] = (acc[c.rateSource] || 0) + 1;
+        return acc;
+      }, {})
     });
 
     return currencies;
 
   } catch (error) {
-    logger.error('Error fetching currency rates from API Lambda', {
-      error: error.message
+    logger.error('Error fetching currency rates', {
+      error: error.message,
+      stack: error.stack
     });
     
     // Retornar default mínimo para no bloquear cálculos
@@ -206,65 +296,16 @@ async function getCurrencyRatesFromApi() {
       isActive: true,
       name: 'US Dollar',
       symbol: '$',
+      flagCurrency: 'https://flagcdn.com/us.svg',
+      rateSource: 'default-fallback',
     }];
   }
 }
 
-/**
- * Obtiene el nombre de una moneda por su código
- * 
- * @param {string} code - Código ISO de la moneda
- * @returns {string} Nombre de la moneda
- */
-function getCurrencyName(code) {
-  const names = {
-    USD: 'US Dollar',
-    EUR: 'Euro',
-    GBP: 'British Pound',
-    COP: 'Colombian Peso',
-    MXN: 'Mexican Peso',
-    BRL: 'Brazilian Real',
-    ARS: 'Argentine Peso',
-    CLP: 'Chilean Peso',
-    PEN: 'Peruvian Sol',
-    JPY: 'Japanese Yen',
-    CHF: 'Swiss Franc',
-    CAD: 'Canadian Dollar',
-    AUD: 'Australian Dollar',
-    CNY: 'Chinese Yuan',
-    INR: 'Indian Rupee',
-    KRW: 'South Korean Won',
-  };
-  return names[code] || code;
-}
-
-/**
- * Obtiene el símbolo de una moneda por su código
- * 
- * @param {string} code - Código ISO de la moneda
- * @returns {string} Símbolo de la moneda
- */
-function getCurrencySymbol(code) {
-  const symbols = {
-    USD: '$',
-    EUR: '€',
-    GBP: '£',
-    COP: '$',
-    MXN: '$',
-    BRL: 'R$',
-    ARS: '$',
-    CLP: '$',
-    PEN: 'S/',
-    JPY: '¥',
-    CHF: 'Fr',
-    CAD: 'C$',
-    AUD: 'A$',
-    CNY: '¥',
-    INR: '₹',
-    KRW: '₩',
-  };
-  return symbols[code] || code;
-}
+// ============================================================================
+// Funciones getCurrencyName y getCurrencySymbol ELIMINADAS
+// La metadata de currencies ahora viene de Firestore (nombre, símbolo, bandera)
+// ============================================================================
 
 /**
  * Invalida el cache de tasas de cambio
@@ -280,5 +321,4 @@ module.exports = {
   getCurrencyRatesFromApi,
   normalizeQuote,
   invalidateCurrencyRatesCache,
-  SUPPORTED_CURRENCY_CODES,
 };
