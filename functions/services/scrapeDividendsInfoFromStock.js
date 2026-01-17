@@ -1,3 +1,15 @@
+/**
+ * Scraper de Información de Dividendos
+ * 
+ * OPT-DEMAND-CLEANUP: Refactorizado para:
+ * - Leer símbolos de `assets` en lugar de `currentPrices`
+ * - NO escribir a Firestore (retornar datos en memoria)
+ * - Los datos de dividendos vienen del API Lambda directamente
+ * 
+ * @module scrapeDividendsInfoFromStock
+ * @see docs/architecture/OPT-DEMAND-CLEANUP-phase4-closure-subplan.md
+ */
+
 const axios = require("axios");
 const { DateTime } = require("luxon");
 const admin = require("firebase-admin");
@@ -120,40 +132,52 @@ async function scrapeDividendInfo(symbol) {
 }
 
 /**
- * Actualiza la información de dividendos para todos los ETFs y acciones en la colección currentPrices
- * Usa StockEvents via FastAPI como fuente primaria, con Lambda como fallback
+ * OPT-DEMAND-CLEANUP: Obtiene información de dividendos para activos del usuario.
+ * 
+ * CAMBIOS:
+ * - Lee símbolos de `assets` en lugar de `currentPrices`
+ * - NO escribe a Firestore (retorna datos en memoria)
+ * - Los datos son usados por `processDividendPayments`
+ * 
+ * @returns {Promise<Map<string, object>>} Mapa de símbolo a datos de dividendos
  */
 async function scrapeDividendsInfoFromStockEvents() {
   const db = admin.firestore();
+  const dividendDataMap = new Map();
   
   try {
-    // Hacer una única consulta eficiente para obtener todos los ETFs y acciones
-    const snapshot = await db.collection('currentPrices')
-      .where('type', 'in', ['etf', 'stock'])
+    // OPT-DEMAND-CLEANUP: Leer símbolos de assets activos (no de currentPrices)
+    const assetsSnapshot = await db.collection('assets')
+      .where('isActive', '==', true)
       .get();
     
-    if (snapshot.empty) {
-      console.log('No se encontraron ETFs o acciones en la colección currentPrices');
-      return;
+    if (assetsSnapshot.empty) {
+      console.log('[scrapeDividendsInfoFromStockEvents] No se encontraron assets activos');
+      return dividendDataMap;
     }
     
-    console.log(`Actualizando información de dividendos para ${snapshot.docs.length} activos (ETFs y acciones)`);
-    
-    // Crear mapa de símbolos a referencias de documentos
-    const symbols = snapshot.docs.map(doc => doc.data().symbol);
-    const symbolToDocRef = new Map();
-    snapshot.docs.forEach(doc => {
-      symbolToDocRef.set(doc.data().symbol, doc.ref);
+    // Extraer símbolos únicos de ETFs y stocks
+    const symbolsSet = new Set();
+    assetsSnapshot.docs.forEach(doc => {
+      const data = doc.data();
+      const assetType = data.assetType?.toLowerCase();
+      if ((assetType === 'etf' || assetType === 'stock') && data.name) {
+        symbolsSet.add(data.name);
+      }
     });
     
-    // Primero intentar obtener datos via StockEvents (endpoint FastAPI /dividends/batch)
-    // Si falla, usar Lambda API como fallback
-    let batch = db.batch();
-    let updatesCount = 0;
-    let noDataCount = 0;
+    const symbols = Array.from(symbolsSet);
+    
+    if (symbols.length === 0) {
+      console.log('[scrapeDividendsInfoFromStockEvents] No hay ETFs o acciones activos');
+      return dividendDataMap;
+    }
+    
+    console.log(`[scrapeDividendsInfoFromStockEvents] Consultando dividendos para ${symbols.length} símbolos únicos`);
+    
     let stockEventsCount = 0;
     let lambdaFallbackCount = 0;
-    const MAX_BATCH_SIZE = 400; // Firestore limit is 500
+    let noDataCount = 0;
     
     // Intentar StockEvents batch primero (más actualizado)
     let stockEventsResults = [];
@@ -175,34 +199,20 @@ async function scrapeDividendsInfoFromStockEvents() {
     // Crear set de símbolos que obtuvimos de StockEvents
     const stockEventsSymbols = new Set(stockEventsResults.map(r => r.symbol));
     
-    // Procesar resultados de StockEvents
+    // Procesar resultados de StockEvents (guardar en memoria, no en Firestore)
     for (const quote of stockEventsResults) {
       if (!quote || !quote.symbol) continue;
       
-      const docRef = symbolToDocRef.get(quote.symbol);
-      if (!docRef) continue;
-      
       if (quote.dividendDate || quote.exDividend || quote.dividend) {
-        const updateData = {
-          lastDividendUpdate: admin.firestore.FieldValue.serverTimestamp(),
-          dividendSource: 'stockevents'
-        };
-        
-        if (quote.dividendYield !== null && !isNaN(quote.dividendYield)) updateData.yield = quote.dividendYield;
-        if (quote.dividend) updateData.dividend = quote.dividend;
-        if (quote.lastDividend) updateData.lastDividend = quote.lastDividend;
-        if (quote.exDividend) updateData.exDividend = quote.exDividend;
-        if (quote.dividendDate) updateData.dividendDate = quote.dividendDate;
-        
-        batch.update(docRef, updateData);
-        updatesCount++;
+        dividendDataMap.set(quote.symbol, {
+          yield: quote.dividendYield || null,
+          dividend: quote.dividend || null,
+          lastDividend: quote.lastDividend || null,
+          exDividend: quote.exDividend || null,
+          dividendDate: quote.dividendDate || null,
+          source: 'stockevents'
+        });
         stockEventsCount++;
-        
-        if (updatesCount % MAX_BATCH_SIZE === 0) {
-          await batch.commit();
-          console.log(`Lote de ${MAX_BATCH_SIZE} actualizaciones guardado`);
-          batch = db.batch();
-        }
       } else {
         noDataCount++;
       }
@@ -230,32 +240,18 @@ async function scrapeDividendsInfoFromStockEvents() {
           for (const quote of quotes) {
             if (!quote || !quote.symbol) continue;
             
-            const docRef = symbolToDocRef.get(quote.symbol);
-            if (!docRef) continue;
-            
             if (quote.dividendDate || quote.exDividend || quote.dividend) {
-              const yieldValue = quote.yield ? parseFloat(quote.yield.replace('%', '')) : null;
+              const yieldValue = quote.yield ? parseFloat(String(quote.yield).replace('%', '')) : null;
               
-              const updateData = {
-                lastDividendUpdate: admin.firestore.FieldValue.serverTimestamp(),
-                dividendSource: 'lambda'
-              };
-              
-              if (yieldValue !== null && !isNaN(yieldValue)) updateData.yield = yieldValue;
-              if (quote.dividend) updateData.dividend = quote.dividend;
-              if (quote.lastDividend) updateData.lastDividend = quote.lastDividend;
-              if (quote.exDividend) updateData.exDividend = quote.exDividend;
-              if (quote.dividendDate) updateData.dividendDate = quote.dividendDate;
-              
-              batch.update(docRef, updateData);
-              updatesCount++;
+              dividendDataMap.set(quote.symbol, {
+                yield: yieldValue,
+                dividend: quote.dividend || null,
+                lastDividend: quote.lastDividend || null,
+                exDividend: quote.exDividend || null,
+                dividendDate: quote.dividendDate || null,
+                source: 'lambda'
+              });
               lambdaFallbackCount++;
-              
-              if (updatesCount % MAX_BATCH_SIZE === 0) {
-                await batch.commit();
-                console.log(`Lote de ${MAX_BATCH_SIZE} actualizaciones guardado`);
-                batch = db.batch();
-              }
             } else {
               noDataCount++;
             }
@@ -272,16 +268,13 @@ async function scrapeDividendsInfoFromStockEvents() {
       }
     }
     
-    // Guardar actualizaciones pendientes
-    if (updatesCount % MAX_BATCH_SIZE !== 0 && updatesCount > 0) {
-      await batch.commit();
-      console.log(`Lote final guardado`);
-    }
+    console.log(`[scrapeDividendsInfoFromStockEvents] Completado: ${dividendDataMap.size} símbolos con datos (${stockEventsCount} StockEvents, ${lambdaFallbackCount} Lambda), ${noDataCount} sin datos`);
     
-    console.log(`Proceso completado: ${updatesCount} activos actualizados (${stockEventsCount} de StockEvents, ${lambdaFallbackCount} de Lambda), ${noDataCount} sin datos de dividendos`);
+    return dividendDataMap;
     
   } catch (error) {
-    console.error('Error al actualizar información de dividendos:', error);
+    console.error('[scrapeDividendsInfoFromStockEvents] Error:', error);
+    return dividendDataMap;
   }
 }
 

@@ -8,8 +8,12 @@
  * - indexHistoryService.js
  * - index.js (inline: getPortfolioDistribution, getAvailableSectors)
  * 
+ * OPT-DEMAND-CLEANUP: getCurrentPricesForUser migrado para usar API Lambda
+ * en lugar de Firestore collection('currentPrices').
+ * 
  * @module handlers/queryHandlers
  * @see docs/stories/56.story.md
+ * @see docs/architecture/OPT-DEMAND-CLEANUP-firestore-fallback-removal.md
  */
 
 const { HttpsError } = require("firebase-functions/v2/https");
@@ -42,6 +46,9 @@ const {
   calculateModifiedDietzReturn
 } = require('../../utils/mwrCalculations');
 
+// OPT-DEMAND-CLEANUP: Importar helper para obtener precios del API Lambda
+const { getPricesFromApi } = require('../marketDataHelper');
+
 // ============================================================================
 // CONSTANTES
 // ============================================================================
@@ -56,9 +63,12 @@ const INDEX_CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 horas
 /**
  * Obtiene precios actuales filtrados por los símbolos que el usuario posee
  * 
+ * OPT-DEMAND-CLEANUP: Migrado para usar API Lambda en lugar de Firestore.
+ * Ya NO lee de collection('currentPrices').
+ * 
  * @param {Object} context - Contexto de ejecución
  * @param {Object} payload - Opciones de consulta (vacío para este handler)
- * @returns {Promise<{prices: Array, symbols: Array, timestamp: number}>}
+ * @returns {Promise<{prices: Array, symbols: Array, timestamp: number, source: string}>}
  */
 async function getCurrentPricesForUser(context, payload) {
   const { auth } = context;
@@ -75,7 +85,7 @@ async function getCurrentPricesForUser(context, payload) {
     
     if (accountsSnapshot.empty) {
       console.log(`[queryHandlers][getCurrentPricesForUser] Usuario sin cuentas activas`);
-      return { prices: [], symbols: [], timestamp: Date.now() };
+      return { prices: [], symbols: [], timestamp: Date.now(), source: 'none' };
     }
     
     const accountIds = accountsSnapshot.docs.map(doc => doc.id);
@@ -103,30 +113,28 @@ async function getCurrentPricesForUser(context, payload) {
     
     if (symbols.length === 0) {
       console.log(`[queryHandlers][getCurrentPricesForUser] Usuario sin assets activos`);
-      return { prices: [], symbols: [], timestamp: Date.now() };
+      return { prices: [], symbols: [], timestamp: Date.now(), source: 'none' };
     }
     
-    // 3. Obtener precios en batches
-    const prices = [];
+    // OPT-DEMAND-CLEANUP: Obtener precios del API Lambda en lugar de Firestore
+    console.log(`[queryHandlers][getCurrentPricesForUser] Consultando API Lambda para ${symbols.length} símbolos`);
     
-    for (let i = 0; i < symbols.length; i += 10) {
-      const batchSymbols = symbols.slice(i, i + 10);
-      
-      const pricesSnapshot = await db.collection('currentPrices')
-        .where('symbol', 'in', batchSymbols)
-        .get();
-      
-      pricesSnapshot.docs.forEach(doc => {
-        prices.push({ id: doc.id, ...doc.data() });
-      });
-    }
+    const pricesFromApi = await getPricesFromApi(symbols);
     
-    console.log(`[queryHandlers][getCurrentPricesForUser] Éxito - ${prices.length} precios`);
+    // Formatear respuesta para mantener compatibilidad con el frontend
+    const prices = pricesFromApi.map(price => ({
+      id: price.symbol,
+      symbol: price.symbol,
+      ...price
+    }));
+    
+    console.log(`[queryHandlers][getCurrentPricesForUser] Éxito - ${prices.length} precios desde API Lambda`);
     
     return {
       prices,
       symbols,
       timestamp: Date.now(),
+      source: 'api-lambda'  // OPT-DEMAND-CLEANUP: Indicar fuente de datos
     };
 
   } catch (error) {

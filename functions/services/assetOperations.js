@@ -109,17 +109,29 @@ const validateSufficientFunds = (account, currency, requiredAmount) => {
 };
 
 /**
- * Crea o actualiza el documento currentPrices para un ticker
+ * @deprecated OPT-DEMAND-CLEANUP: Esta función ya NO debe usarse
  * 
- * @description
- * Verifica si existe el documento currentPrices/{symbol}. Si no existe,
- * consulta el API para obtener la quote completa (incluido sector) y lo crea.
+ * La colección currentPrices está siendo deprecada. Los precios ahora
+ * vienen exclusivamente del API Lambda on-demand.
+ * 
+ * Esta función se mantiene temporalmente para evitar errores pero
+ * ya no realiza ninguna operación.
+ * 
+ * @see docs/architecture/OPT-DEMAND-CLEANUP-firestore-fallback-removal.md
  * 
  * @param {string} symbol - Símbolo del ticker (ej: "NFLX")
  * @param {string} assetType - Tipo de activo ("stock", "etf", etc.)
- * @returns {Promise<boolean>} true si se creó/actualizó, false si ya existía
+ * @returns {Promise<boolean>} Siempre retorna false (no-op)
  */
 const ensureCurrentPriceExists = async (symbol, assetType) => {
+  // OPT-DEMAND-CLEANUP: Función deprecada, no realiza ninguna operación
+  console.log(`[ensureCurrentPriceExists] DEPRECADO - ${symbol} no se escribe a currentPrices (on-demand puro)`);
+  return false;
+};
+
+// OPT-DEMAND-CLEANUP: Código legacy comentado para referencia durante transición
+/*
+const ensureCurrentPriceExists_LEGACY = async (symbol, assetType) => {
   const priceRef = db.collection('currentPrices').doc(symbol);
   const priceDoc = await priceRef.get();
 
@@ -200,6 +212,7 @@ const ensureCurrentPriceExists = async (symbol, assetType) => {
     return false;
   }
 };
+*/
 
 // ============================================================================
 // FUNCIÓN: createAsset
@@ -1146,19 +1159,36 @@ exports.deleteAssets = onCall(callableConfig, withRateLimit('deleteAssets')(asyn
 // ============================================================================
 
 /**
- * Actualiza el sector de un stock en currentPrices (fallback manual)
+ * @deprecated OPT-DEMAND-CLEANUP: Esta función ya NO debe usarse
  * 
- * @description
- * Permite a los usuarios asignar manualmente el sector a stocks que no fueron
- * detectados automáticamente por el scraping de GoogleFinanceAPI.
+ * La colección currentPrices está siendo deprecada. Los sectores ahora
+ * vienen exclusivamente del API Lambda on-demand.
+ * 
+ * Esta función se mantiene por compatibilidad pero retorna error.
+ * 
+ * @see docs/architecture/OPT-DEMAND-CLEANUP-firestore-fallback-removal.md
  * 
  * @param {object} data
  * @param {string} data.symbol - Símbolo del stock (ej: "AAPL")
  * @param {string} data.sector - Sector a asignar
  * 
- * @returns {Promise<object>} { success, symbol, sector }
+ * @returns {Promise<object>} Error indicando deprecación
  */
 exports.updateStockSector = onCall(callableConfig, withRateLimit('updateStockSector')(async (request) => {
+  const { auth } = request;
+  
+  // OPT-DEMAND-CLEANUP: Función deprecada
+  console.warn(`[updateStockSector] DEPRECADO - Los sectores vienen del API Lambda. userId: ${auth?.uid}`);
+  
+  throw new HttpsError(
+    'failed-precondition',
+    'Esta función está deprecada. Los sectores ahora se obtienen automáticamente del API.'
+  );
+}));
+
+// OPT-DEMAND-CLEANUP: Código legacy comentado para referencia
+/*
+exports.updateStockSector_LEGACY = onCall(callableConfig, withRateLimit('updateStockSector')(async (request) => {
   const { auth, data } = request;
 
   console.log(`[updateStockSector] Iniciando - userId: ${auth?.uid}, symbol: ${data?.symbol}`);
@@ -1205,3 +1235,4 @@ exports.updateStockSector = onCall(callableConfig, withRateLimit('updateStockSec
     throw new HttpsError('internal', `Error al actualizar sector: ${error.message}`);
   }
 }));
+*/

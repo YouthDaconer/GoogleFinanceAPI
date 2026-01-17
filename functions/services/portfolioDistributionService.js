@@ -455,27 +455,16 @@ async function batchGetPrices(symbols) {
     });
     
   } catch (error) {
-    logger.error('Error fetching prices from API Lambda, falling back to Firestore', { 
+    // OPT-DEMAND-CLEANUP: NO hay fallback a Firestore
+    // Si el API falla, re-lanzar el error para que el caller lo maneje
+    // Ver: docs/architecture/OPT-DEMAND-CLEANUP-firestore-fallback-removal.md
+    logger.error('Error fetching prices from API Lambda - NO FALLBACK', { 
       error: error.message,
       symbolCount: symbols.length
     });
     
-    // Fallback a Firestore si el API falla
-    for (let i = 0; i < symbols.length; i += 10) {
-      const batch = symbols.slice(i, i + 10);
-      const snapshot = await db.collection('currentPrices')
-        .where('__name__', 'in', batch)
-        .get();
-      
-      snapshot.docs.forEach(doc => {
-        prices[doc.id] = { symbol: doc.id, ...doc.data() };
-      });
-    }
-    
-    logger.info('Prices fetched from Firestore fallback', { 
-      received: Object.keys(prices).length,
-      source: 'firestore-fallback'
-    });
+    // Re-throw para que el servicio que llama pueda manejar el error
+    throw new Error(`Failed to fetch prices from API: ${error.message}`);
   }
   
   return prices;

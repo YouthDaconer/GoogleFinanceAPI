@@ -2,6 +2,8 @@ const { onSchedule } = require("firebase-functions/v2/scheduler");
 const admin = require('firebase-admin');
 const { DateTime } = require('luxon');
 const { scrapeDividendsInfoFromStockEvents } = require('./scrapeDividendsInfoFromStock');
+// OPT-DEMAND-CLEANUP: Importar helper para obtener precios y currencies del API Lambda
+const { getPricesFromApi, getCurrencyRatesFromApi } = require('./marketDataHelper');
 
 exports.processDividendPayments = onSchedule({
   schedule: '0 7,18 * * *',  // Ejecutar a las 7:00 AM y 6:00 PM todos los días
@@ -20,13 +22,27 @@ exports.processDividendPayments = onSchedule({
     await scrapeDividendsInfoFromStockEvents();
     console.log('Actualización de información de dividendos completada');
 
-    // Obtener los precios actuales
-    const currentPricesSnapshot = await db.collection('currentPrices').get();
-    const currentPrices = currentPricesSnapshot.docs.map(doc => ({
-      id: doc.id,
-      symbol: doc.id.split(':')[0],
-      ...doc.data()
+    // Obtener todos los activos activos primero para saber qué símbolos consultar
+    const assetsSnapshot = await db.collection('assets').where('isActive', '==', true).get();
+    const assets = assetsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+    
+    // Extraer símbolos únicos
+    const symbols = [...new Set(assets.map(a => a.name).filter(Boolean))];
+    
+    // OPT-DEMAND-CLEANUP: Obtener precios (incluye datos de dividendos) y currencies del API Lambda
+    const [currentPricesArray, currencies] = await Promise.all([
+      getPricesFromApi(symbols),
+      getCurrencyRatesFromApi()
+    ]);
+    
+    // Convertir a formato compatible con el código existente
+    const currentPrices = currentPricesArray.map(price => ({
+      id: price.symbol,
+      symbol: price.symbol,
+      ...price
     }));
+    
+    console.log(`[OPT-DEMAND-CLEANUP] Precios obtenidos del API: ${currentPrices.length}, Currencies: ${currencies.length}`);
 
     // Filtrar activos con fecha de dividendo hoy y que tengan la información de dividendo necesaria
     const todaysDividends = currentPrices.filter(price => {
@@ -52,17 +68,10 @@ exports.processDividendPayments = onSchedule({
 
     console.log(`Encontrados ${todaysDividends.length} activos con dividendos para hoy`);
 
-    // Obtener todos los activos activos
-    const assetsSnapshot = await db.collection('assets').where('isActive', '==', true).get();
-    const assets = assetsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-
-    // Obtener todas las cuentas de cartera activas
+    // OPT-DEMAND-CLEANUP: Assets y currencies ya fueron obtenidos arriba
+    // Solo obtener cuentas de cartera
     const portfolioAccountsSnapshot = await db.collection('portfolioAccounts').where('isActive', '==', true).get();
     const portfolioAccounts = portfolioAccountsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-
-    // Obtener las monedas activas para la conversión
-    const currenciesSnapshot = await db.collection('currencies').where('isActive', '==', true).get();
-    const currencies = currenciesSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
 
     // Obtener las transacciones de dividendos de hoy para evitar duplicados
     const todaysDividendTransactionsSnapshot = await db.collection('transactions')

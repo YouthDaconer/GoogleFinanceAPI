@@ -7,12 +7,17 @@
  * MEJORADO: Ahora incluye P&L realizada de ventas en el período para
  * cálculos de atribución más precisos.
  * 
+ * OPT-DEMAND-CLEANUP: enrichWithCurrentPrices ahora usa API Lambda en lugar de Firestore
+ * 
  * @module services/attribution/contributionCalculator
  * @see docs/architecture/portfolio-attribution-coherence-analysis.md
+ * @see docs/architecture/OPT-DEMAND-CLEANUP-firestore-fallback-removal.md
  */
 
 const admin = require('../firebaseAdmin');
 const db = admin.firestore();
+// OPT-DEMAND-CLEANUP: Importar getQuotes para obtener datos de mercado
+const { getQuotes } = require('../financeQuery');
 
 /**
  * Obtiene datos de portfolioPerformance para una fecha
@@ -525,29 +530,53 @@ async function calculateContributions(userId, period, currency = 'USD', accountI
 }
 
 /**
- * Enriquece las atribuciones con datos de currentPrices
+ * OPT-DEMAND-CLEANUP: Enriquece las atribuciones con datos del API Lambda
+ * 
+ * Migrado desde Firestore (colección currentPrices) para cumplir con 
+ * arquitectura on-demand pura.
+ * 
  * @param {Array} attributions - Array de atribuciones
  * @returns {Promise<Array>} Atribuciones enriquecidas
  */
 async function enrichWithCurrentPrices(attributions) {
   const tickers = [...new Set(attributions.map(a => a.ticker))];
   
-  // Obtener precios en batches
+  if (tickers.length === 0) {
+    return attributions;
+  }
+  
+  // OPT-DEMAND-CLEANUP: Usar API Lambda en lugar de Firestore
   const pricesMap = new Map();
-  for (let i = 0; i < tickers.length; i += 30) {
-    const batch = tickers.slice(i, i + 30);
-    const snapshot = await db.collection('currentPrices')
-      .where('symbol', 'in', batch)
-      .get();
+  
+  try {
+    const symbolsString = tickers.join(',');
+    const quotes = await getQuotes(symbolsString);
     
-    for (const doc of snapshot.docs) {
-      const data = doc.data();
-      pricesMap.set(data.symbol, {
-        name: data.name || data.symbol,
-        sector: data.sector || 'Unknown',
-        logo: data.logo || null
-      });
+    if (quotes && Array.isArray(quotes)) {
+      for (const quote of quotes) {
+        if (quote && quote.symbol) {
+          pricesMap.set(quote.symbol, {
+            name: quote.name || quote.shortName || quote.symbol,
+            sector: quote.sector || 'Unknown',
+            logo: quote.logo || null
+          });
+        }
+      }
+    } else if (quotes && typeof quotes === 'object') {
+      // Formato objeto { AAPL: {...}, MSFT: {...} }
+      for (const [symbol, quote] of Object.entries(quotes)) {
+        if (quote) {
+          pricesMap.set(symbol, {
+            name: quote.name || quote.shortName || symbol,
+            sector: quote.sector || 'Unknown',
+            logo: quote.logo || null
+          });
+        }
+      }
     }
+  } catch (error) {
+    console.warn('[enrichWithCurrentPrices] Error fetching from API, continuing without enrichment:', error.message);
+    // No lanzar error, continuar sin enriquecer
   }
   
   // Enriquecer atribuciones

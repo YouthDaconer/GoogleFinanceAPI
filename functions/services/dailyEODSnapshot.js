@@ -1,15 +1,20 @@
 /**
  * Daily EOD Snapshot - Captura de precios End-Of-Day
  * 
- * Esta Cloud Function reemplaza las 96 ejecuciones diarias de unifiedMarketDataUpdate
- * con solo 2 ejecuciones al día, reduciendo costos en ~98%.
+ * @deprecated OPT-DEMAND-CLEANUP: Esta función está DEPRECADA desde 2026-01-16.
  * 
- * Schedule:
- * - Pre-Market: 8:30 AM ET (datos cierre día anterior)
- * - Post-Market: 5:00 PM ET (datos EOD día actual)
+ * La funcionalidad de cálculos EOD ahora está consolidada en:
+ * - unifiedMarketDataUpdate (ejecuta 1x/día a las 17:05 ET)
+ * 
+ * RAZÓN: Esta función escribía a `currentPrices` y `currencies` en Firestore,
+ * lo cual es innecesario ya que ahora los datos vienen del API Lambda on-demand.
+ * 
+ * Esta función se mantiene temporalmente deshabilitada para posible rollback.
+ * Se eliminará completamente después de 2 semanas de estabilidad.
  * 
  * @module services/dailyEODSnapshot
  * @see docs/stories/84.story.md (OPT-DEMAND-301)
+ * @see docs/architecture/OPT-DEMAND-CLEANUP-phase4-closure-subplan.md
  */
 
 const { onSchedule } = require("firebase-functions/v2/scheduler");
@@ -389,57 +394,58 @@ async function executeEODSnapshot(db, type) {
 // ============================================================================
 
 /**
- * Daily EOD Snapshot - Pre-Market (8:30 AM ET)
+ * @deprecated OPT-DEMAND-CLEANUP: DEPRECADA - Ver unifiedMarketDataUpdate
  * 
- * Captura precios de cierre del día anterior para tener datos frescos
- * antes de que abra el mercado.
+ * Daily EOD Snapshot - Pre-Market (8:30 AM ET)
+ * Schedule deshabilitado para evitar ejecución accidental.
  */
 const dailyEODSnapshotPreMarket = onSchedule(
   {
-    schedule: '30 8 * * 1-5', // 8:30 AM ET
+    // DEPRECATED: Schedule original comentado
+    // schedule: '30 8 * * 1-5', // 8:30 AM ET
+    schedule: '0 0 1 1 *',  // Nunca ejecutar (1 de enero a medianoche)
     timeZone: 'America/New_York',
     memory: '512MiB',
-    timeoutSeconds: 540, // 9 minutos
-    retryCount: 2,
+    timeoutSeconds: 540,
+    retryCount: 0,
     labels: {
-      deployment: 'eod-snapshot',
-      type: 'pre-market'
+      status: 'deprecated',
+      deprecated: '2026-01-16',
+      replacedby: 'unified-market-data-update'
     }
   },
   async (event) => {
-    logger = new StructuredLogger('dailyEODSnapshot', { type: 'pre-market' });
-    logger.info('Starting pre-market EOD snapshot');
-    
-    const db = admin.firestore();
-    await executeEODSnapshot(db, 'pre-market');
+    console.warn('⚠️ DEPRECATED: dailyEODSnapshotPreMarket ejecutada pero está deprecada');
+    console.warn('La funcionalidad EOD ahora está en unifiedMarketDataUpdate (17:05 ET)');
+    return null;
   }
 );
 
 /**
- * Daily EOD Snapshot - Post-Market (5:00 PM ET)
+ * @deprecated OPT-DEMAND-CLEANUP: DEPRECADA - Ver unifiedMarketDataUpdate
  * 
- * Captura precios EOD del día actual para:
- * - Fallback de la noche
- * - Cálculos de rendimiento overnight
+ * Daily EOD Snapshot - Post-Market (5:00 PM ET)
+ * Schedule deshabilitado para evitar ejecución accidental.
  */
 const dailyEODSnapshotPostMarket = onSchedule(
   {
-    schedule: '0 17 * * 1-5', // 5:00 PM ET
+    // DEPRECATED: Schedule original comentado
+    // schedule: '0 17 * * 1-5', // 5:00 PM ET
+    schedule: '0 0 1 1 *',  // Nunca ejecutar (1 de enero a medianoche)
     timeZone: 'America/New_York',
     memory: '512MiB',
-    timeoutSeconds: 540, // 9 minutos
-    retryCount: 2,
+    timeoutSeconds: 540,
+    retryCount: 0,
     labels: {
-      deployment: 'eod-snapshot',
-      type: 'post-market'
+      status: 'deprecated',
+      deprecated: '2026-01-16',
+      replacedby: 'unified-market-data-update'
     }
   },
   async (event) => {
-    logger = new StructuredLogger('dailyEODSnapshot', { type: 'post-market' });
-    logger.info('Starting post-market EOD snapshot');
-    
-    const db = admin.firestore();
-    await executeEODSnapshot(db, 'post-market');
+    console.warn('⚠️ DEPRECATED: dailyEODSnapshotPostMarket ejecutada pero está deprecada');
+    console.warn('La funcionalidad EOD ahora está en unifiedMarketDataUpdate (17:05 ET)');
+    return null;
   }
 );
 

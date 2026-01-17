@@ -87,12 +87,26 @@ const validateSufficientFunds = (account, currency, requiredAmount) => {
 };
 
 /**
- * Crea o actualiza el documento currentPrices para un ticker
+ * @deprecated OPT-DEMAND-CLEANUP: Esta función ya NO debe usarse
+ * 
+ * La colección currentPrices está siendo deprecada. Los precios ahora
+ * vienen exclusivamente del API Lambda on-demand.
+ * 
+ * @see docs/architecture/OPT-DEMAND-CLEANUP-firestore-fallback-removal.md
+ * 
  * @param {string} symbol - Símbolo del ticker
  * @param {string} assetType - Tipo de activo
- * @returns {Promise<boolean>} true si se creó/actualizó
+ * @returns {Promise<boolean>} Siempre retorna false (no-op)
  */
 const ensureCurrentPriceExists = async (symbol, assetType) => {
+  // OPT-DEMAND-CLEANUP: Función deprecada, no realiza ninguna operación
+  console.log(`[ensureCurrentPriceExists] DEPRECADO - ${symbol} no se escribe a currentPrices (on-demand puro)`);
+  return false;
+};
+
+// OPT-DEMAND-CLEANUP: Código legacy comentado para referencia durante transición
+/*
+const ensureCurrentPriceExists_LEGACY = async (symbol, assetType) => {
   const priceRef = db.collection('currentPrices').doc(symbol);
   const priceDoc = await priceRef.get();
 
@@ -167,6 +181,7 @@ const ensureCurrentPriceExists = async (symbol, assetType) => {
     return false;
   }
 };
+*/
 
 // ============================================================================
 // HANDLERS
@@ -957,13 +972,32 @@ async function deleteAssets(context, payload) {
 }
 
 /**
- * Actualiza el sector de un stock en currentPrices
+ * @deprecated OPT-DEMAND-CLEANUP: Esta función ya NO debe usarse
+ * 
+ * La colección currentPrices está siendo deprecada. Los sectores ahora
+ * vienen exclusivamente del API Lambda on-demand.
+ * 
+ * @see docs/architecture/OPT-DEMAND-CLEANUP-firestore-fallback-removal.md
  * 
  * @param {Object} context - Contexto de ejecución
  * @param {Object} payload - Datos de actualización
- * @returns {Promise<{success: boolean, symbol: string, sector: string}>}
+ * @returns {Promise<never>} Siempre lanza error
  */
 async function updateStockSector(context, payload) {
+  const { auth } = context;
+  
+  // OPT-DEMAND-CLEANUP: Función deprecada
+  console.warn(`[assetHandlers][updateStockSector] DEPRECADO - Los sectores vienen del API Lambda. userId: ${auth.uid}`);
+  
+  throw new HttpsError(
+    'failed-precondition',
+    'Esta función está deprecada. Los sectores ahora se obtienen automáticamente del API.'
+  );
+}
+
+// OPT-DEMAND-CLEANUP: Código legacy comentado para referencia
+/*
+async function updateStockSector_LEGACY(context, payload) {
   const { auth } = context;
   const data = payload;
 
@@ -1008,6 +1042,7 @@ async function updateStockSector(context, payload) {
     throw new HttpsError('internal', `Error al actualizar sector: ${error.message}`);
   }
 }
+*/
 
 // ============================================================================
 // EXPORTS

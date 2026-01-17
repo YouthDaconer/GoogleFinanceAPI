@@ -12,23 +12,29 @@ const { generateLogoUrl } = require('../utils/logoGenerator');
 // Importar logger estructurado (SCALE-CORE-002)
 const { StructuredLogger } = require('../utils/logger');
 
+// OPT-DEMAND-CLEANUP: Importar helper para obtener precios y currencies del API Lambda
+const { getPricesFromApi, getCurrencyRatesFromApi } = require('./marketDataHelper');
+
 /**
- * @deprecated OPT-DEMAND-302: Esta función está DEPRECADA desde 2026-01-15.
+ * End-of-Day Portfolio Update
  * 
- * Los precios ahora se obtienen On-Demand desde el frontend via API Lambda.
- * Los snapshots EOD los maneja dailyEODSnapshot (2x/día).
- * Los cálculos de portfolio los maneja scheduledPortfolioCalculations (2x/día).
+ * OPT-DEMAND-CLEANUP: Refactorizada como el único punto de cálculos EOD.
  * 
- * Esta función se mantiene temporalmente deshabilitada para posible rollback.
- * Se eliminará completamente después de 2 semanas de estabilidad.
+ * CAMBIOS desde 2026-01-16:
+ * - Se ejecuta 1x/día a las 17:05 ET (5 min después del cierre)
+ * - Lee símbolos de `assets` (no de `currentPrices`)
+ * - Obtiene precios del API Lambda (no de Firestore)
+ * - NO escribe a `currentPrices` ni `currencies`
+ * - Calcula performance del portafolio
+ * - Calcula riesgo del portafolio
+ * - Invalida cache de performance
  * 
- * Reducción de costos lograda:
- * - Invocaciones: 96/día → 4/día (EOD + Portfolio) = -96%
- * - Writes Firestore: 6,720/día → 140/día = -98%
+ * Reemplaza las funciones redundantes:
+ * - dailyEODSnapshot (deprecada)
+ * - scheduledPortfolioCalculations (deprecada)
  * 
+ * @see docs/architecture/OPT-DEMAND-CLEANUP-phase4-closure-subplan.md
  * @see docs/stories/85.story.md (OPT-DEMAND-302)
- * @see services/dailyEODSnapshot.js (nuevo - snapshots de precios)
- * @see services/scheduledPortfolioCalculations.js (nuevo - cálculos de portfolio)
  */
 
 const API_BASE_URL = 'https://dmn46d7xas3rvio6tugd2vzs2q0hxbmb.lambda-url.us-east-1.on.aws/v1';
@@ -194,128 +200,21 @@ async function getAllMarketDataBatch(currencyCodes, assetSymbols) {
   }
 }
 
-/**
- * Actualiza las tasas de cambio de monedas usando datos ya obtenidos
- */
-async function updateCurrencyRates(db, currencyRates) {
-  logDebug('🔄 Actualizando tasas de cambio...');
-  
-  const currenciesRef = db.collection('currencies');
-  const snapshot = await currenciesRef.where('isActive', '==', true).get();
-  const batch = db.batch();
-  let updatesCount = 0;
-  let invalidCount = 0;
-
-  const activeCurrencies = snapshot.docs.map(doc => ({
-    code: doc.data().code,
-    ref: doc.ref,
-    data: doc.data()
-  }));
-  
-  activeCurrencies.forEach(currency => {
-    const { code, ref, data } = currency;
-    const newRate = currencyRates[code];
-    
-    if (newRate && !isNaN(newRate) && newRate > 0) {
-      const updatedData = {
-        code: code,
-        name: data.name,
-        symbol: data.symbol,
-        exchangeRate: newRate,
-        lastUpdated: admin.firestore.FieldValue.serverTimestamp()
-      };
-
-      batch.update(ref, updatedData);
-      updatesCount++;
-      
-      // 🚀 OPTIMIZACIÓN: Solo log detallado si está habilitado
-      if (ENABLE_DETAILED_LOGS) {
-        logDebug(`Actualizada tasa de cambio para USD:${code} a ${newRate}`);
-      }
-    } else {
-      invalidCount++;
-      logWarn(`Valor inválido para USD:${code}: ${newRate}`);
-    }
-  });
-
-  if (updatesCount > 0) {
-    await batch.commit();
-    logInfo(`✅ ${updatesCount} tasas de cambio actualizadas${invalidCount > 0 ? ` (${invalidCount} inválidas)` : ''}`);
-  }
-  
-  return updatesCount;
-}
-
-/**
- * Actualiza los precios actuales de los activos usando datos ya obtenidos
- */
-async function updateCurrentPrices(db, assetQuotes) {
-  logDebug('🔄 Actualizando precios actuales...');
-  
-  const currentPricesRef = db.collection('currentPrices');
-  const snapshot = await currentPricesRef.get();
-  const batch = db.batch();
-  let updatesCount = 0;
-  let failedUpdates = 0;
-
-  snapshot.docs.forEach(doc => {
-    const docData = doc.data();
-    const symbol = docData.symbol;
-    const quote = assetQuotes.get(symbol);
-    
-    if (quote && quote.regularMarketPrice) {
-      const updatedData = {
-        symbol: symbol,
-        price: quote.regularMarketPrice,
-        lastUpdated: Date.now(),
-        change: quote.regularMarketChange,
-        percentChange: quote.regularMarketChangePercent,
-        previousClose: quote.regularMarketPreviousClose,
-        currency: quote.currency,
-        marketState: quote.marketState,
-        quoteType: quote.quoteType,
-        exchange: quote.exchange,
-        fullExchangeName: quote.fullExchangeName
-      };
-      
-      // Mantener campos existentes
-      if (docData.name) updatedData.name = docData.name;
-      if (docData.isin) updatedData.isin = docData.isin;
-      if (docData.type) updatedData.type = docData.type;
-      if (docData.logo) updatedData.logo = docData.logo;
-      if (docData.website) updatedData.website = docData.website;
-      
-      // Generar logo si no existe en el documento
-      if (!docData.logo) {
-        const generatedLogo = generateLogoUrl(symbol, { 
-          website: docData.website, 
-          assetType: docData.type || 'stock' 
-        });
-        if (generatedLogo) {
-          updatedData.logo = generatedLogo;
-          logDebug(`Logo generado para ${symbol}`);
-        }
-      }
-      
-      batch.update(doc.ref, updatedData);
-      updatesCount++;
-      
-      // 🚀 OPTIMIZACIÓN: Solo log detallado si está habilitado
-      if (ENABLE_DETAILED_LOGS) {
-        logDebug(`Actualizado precio para ${symbol}: ${quote.regularMarketPrice} ${quote.currency}`);
-      }
-    } else {
-      failedUpdates++;
-    }
-  });
-
-  if (updatesCount > 0) {
-    await batch.commit();
-    logInfo(`✅ ${updatesCount} precios actualizados${failedUpdates > 0 ? ` (${failedUpdates} fallidos)` : ''}`);
-  }
-  
-  return updatesCount;
-}
+// ============================================================================
+// OPT-DEMAND-CLEANUP: Funciones eliminadas (2026-01-17)
+// ============================================================================
+// Las siguientes funciones fueron ELIMINADAS porque ya no se usan:
+//
+// - updateCurrencyRates(db, currencyRates)
+//   Razón: Las tasas de cambio ahora vienen del API Lambda on-demand.
+//   No se escriben a Firestore.
+//
+// - updateCurrentPrices(db, assetQuotes)
+//   Razón: Los precios ahora vienen del API Lambda on-demand.
+//   No se escriben a Firestore.
+//
+// Ver: docs/architecture/OPT-DEMAND-CLEANUP-firestore-fallback-removal.md
+// ============================================================================
 
 /**
  * 🚀 OPTIMIZACIÓN: Sistema de caché para datos históricos
@@ -444,10 +343,17 @@ class PerformanceDataCache {
 }
 
 /**
- * 🚀 OPTIMIZACIÓN: Calcula el rendimiento diario del portafolio con caché
+ * OPT-DEMAND-CLEANUP: Calcula el rendimiento diario del portafolio.
+ * 
+ * Modificada para recibir precios y currencies como parámetros
+ * en lugar de leer de Firestore.
+ * 
+ * @param {FirebaseFirestore.Firestore} db - Instancia de Firestore
+ * @param {Array} currentPrices - Precios actuales del API Lambda
+ * @param {Array} currencies - Tasas de cambio del API Lambda
  */
-async function calculateDailyPortfolioPerformance(db) {
-  logInfo('🔄 Calculando rendimiento diario del portafolio (OPTIMIZADO)...');
+async function calculateDailyPortfolioPerformance(db, currentPrices, currencies) {
+  logInfo('🔄 Calculando rendimiento diario del portafolio (API Lambda)...');
   
   const now = DateTime.now().setZone('America/New_York');
   const formattedDate = now.toISODate();
@@ -455,19 +361,15 @@ async function calculateDailyPortfolioPerformance(db) {
   
   logDebug(`📅 Fecha de cálculo (NY): ${formattedDate}`);
   
-  // ✨ OPTIMIZACIÓN: Todas las consultas iniciales en paralelo
+  // OPT-DEMAND-CLEANUP: Solo consultar datos que NO vienen del API
   const [
     transactionsSnapshot,
     activeAssetsSnapshot,
-    currenciesSnapshot,
-    portfolioAccountsSnapshot,
-    currentPricesSnapshot
+    portfolioAccountsSnapshot
   ] = await Promise.all([
     db.collection('transactions').where('date', '==', formattedDate).get(),
     db.collection('assets').where('isActive', '==', true).get(),
-    db.collection('currencies').where('isActive', '==', true).get(),
-    db.collection('portfolioAccounts').where('isActive', '==', true).get(),
-    db.collection('currentPrices').get()
+    db.collection('portfolioAccounts').where('isActive', '==', true).get()
   ]);
   
   const todaysTransactions = transactionsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
@@ -476,11 +378,10 @@ async function calculateDailyPortfolioPerformance(db) {
   
   // 🚀 OPTIMIZACIÓN: Log consolidado de transacciones
   logInfo(`📊 Transacciones para ${formattedDate}: ${todaysTransactions.length} total (${sellTransactions.length} ventas)`);
+  logInfo(`📊 Datos de mercado: ${currentPrices.length} precios, ${currencies.length} currencies (fuente: API Lambda)`);
   
   const activeAssets = activeAssetsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-  const currencies = currenciesSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
   const portfolioAccounts = portfolioAccountsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-  const currentPrices = currentPricesSnapshot.docs.map(doc => ({ symbol: doc.id.split(':')[0], ...doc.data() }));
   
   // Obtener activos inactivos involucrados en ventas
   let inactiveAssets = [];
@@ -851,159 +752,90 @@ async function calculateDailyPortfolioPerformance(db) {
   return { count: calculationsCount, userIds: Object.keys(userPortfolios) };
 }
 
-// Constante del intervalo de actualización (debe coincidir con el cron schedule)
-// @deprecated OPT-DEMAND-302: Schedule reducido drásticamente
-const REFRESH_INTERVAL_MINUTES = 5;
-
 /**
- * @deprecated OPT-DEMAND-302: Esta función está DEPRECADA.
+ * End-of-Day Portfolio Update
  * 
- * ANTES: Se ejecutaba cada 5 minutos (96 veces/día)
- * AHORA: Schedule deshabilitado - reemplazada por:
- *   - dailyEODSnapshot (precios/currencies - 2x/día)
- *   - scheduledPortfolioCalculations (cálculos - 2x/día)
+ * OPT-DEMAND-CLEANUP: Función consolidada que ejecuta 1x/día al cierre del mercado.
  * 
- * La función se mantiene con un schedule nunca-ejecuta para:
- * 1. Mantener el código disponible para rollback de emergencia
- * 2. Permitir reactivación manual si es necesario
+ * Schedule: 17:05 ET (5 minutos después del cierre de NYSE)
  * 
- * Para ROLLBACK de emergencia:
- * 1. Cambiar schedule a: `* /${REFRESH_INTERVAL_MINUTES} 9-17 * * 1-5`
- * 2. Desplegar con: firebase deploy --only functions:unifiedMarketDataUpdateV2
+ * Flujo:
+ * 1. Obtener símbolos únicos de assets activos
+ * 2. Consultar precios del API Lambda
+ * 3. Consultar currencies del API Lambda
+ * 4. Calcular performance del portafolio (EOD)
+ * 5. Calcular riesgo del portafolio
+ * 6. Invalidar cache de performance
  * 
- * @see docs/stories/85.story.md (OPT-DEMAND-302)
+ * @see docs/architecture/OPT-DEMAND-CLEANUP-phase4-closure-subplan.md
  */
 exports.unifiedMarketDataUpdate = onSchedule({
-  // DEPRECATED: Schedule original comentado para rollback
-  // schedule: `*/${REFRESH_INTERVAL_MINUTES} 9-17 * * 1-5`,  // Cada 5 min 9AM-5PM L-V
-  
-  // Schedule deshabilitado: 1 de enero a las 0:00 (nunca en práctica)
-  schedule: '0 0 1 1 *',
+  // OPT-DEMAND-CLEANUP: Ejecutar 1x/día a las 17:05 ET (5 min después del cierre)
+  schedule: '5 17 * * 1-5',  // 17:05 L-V
   timeZone: 'America/New_York',
-  retryCount: 0, // Sin reintentos ya que está deprecada
+  memory: '512MiB',
+  timeoutSeconds: 540,  // 9 minutos
+  retryCount: 2,
   labels: {
-    status: 'deprecated',
-    deprecated: '2026-01-15',
-    replaced: 'eod-snapshot-portfolio-calcs'
+    status: 'active',
+    purpose: 'eod-portfolio-calculations',
+    updated: '2026-01-16'
   }
 }, async (event) => {
-  // Log de advertencia si se ejecuta accidentalmente
-  console.warn('⚠️ DEPRECATED: unifiedMarketDataUpdate ejecutada pero está deprecada');
-  console.warn('Esta función será eliminada. Use dailyEODSnapshot + scheduledPortfolioCalculations');
-  
   // Inicializar logger estructurado (SCALE-CORE-002)
-  logger = StructuredLogger.forScheduled('unifiedMarketDataUpdate');
+  logger = StructuredLogger.forScheduled('endOfDayPortfolioUpdate');
   
   const db = admin.firestore();
-  
-  // Verificar si estamos en la ventana de cierre del mercado
-  // Esto permite una última actualización para capturar precios de cierre
-  const closingWindowCheck = isInClosingWindow(NYSE_CLOSE_HOUR);
-  const isInClosingGrace = closingWindowCheck.inWindow;
-  
-  // OPT-SYNC-001: Verificar estado del mercado desde Firestore (incluye festivos)
-  // El documento markets/US es actualizado por marketStatusService que consulta Finnhub
-  try {
-    const marketDoc = await db.collection('markets').doc('US').get();
-    if (marketDoc.exists) {
-      const marketData = marketDoc.data();
-      
-      // Verificar si es festivo (siempre respetar festivos)
-      if (marketData.holiday) {
-        logger.info('Market holiday - skipping update', { 
-          holiday: marketData.holiday,
-          marketStatus: 'holiday'
-        });
-        return null;
-      }
-      
-      // Verificar si el mercado está cerrado (usando dato de Finnhub)
-      if (marketData.isOpen === false) {
-        // MEJORA: Si estamos en la ventana de cierre, ejecutar una última actualización
-        // para capturar los precios de cierre del día
-        if (isInClosingGrace) {
-          logger.info('Market just closed - executing final update to capture closing prices', { 
-            session: marketData.session,
-            marketStatus: 'closing-grace',
-            closingWindow: closingWindowCheck,
-            graceMinutes: CLOSING_GRACE_WINDOW_MINUTES
-          });
-          // Continuar con la ejecución (no return)
-        } else {
-          logger.info('Market closed (Finnhub) - skipping update', { 
-            session: marketData.session,
-            marketStatus: 'closed'
-          });
-          return null;
-        }
-      }
-    }
-  } catch (marketCheckError) {
-    // Si falla la consulta, continuar con la verificación local de horario
-    logger.warn('Failed to check market status from Firestore, using local check', {
-      error: marketCheckError.message
-    });
-  }
-  
-  // Fallback: verificación local de horario (por si la consulta a markets/US falla)
-  // También considerar la ventana de cierre
-  if (!isNYSEMarketOpen() && !isInClosingGrace) {
-    logger.info('Market closed (local check) - skipping update', { marketStatus: 'closed' });
-    return null;
-  }
-
-  logger.info('Starting unified market data update', { marketStatus: 'open' });
-  
   const startTime = Date.now();
   
-  // Calcular el minuto programado (el scheduler debería haber disparado en un múltiplo de REFRESH_INTERVAL_MINUTES)
-  // Esto nos da el momento exacto cuando SE PROGRAMÓ esta ejecución
-  const now = DateTime.now().setZone('America/New_York');
-  const scheduledMinute = Math.floor(now.minute / REFRESH_INTERVAL_MINUTES) * REFRESH_INTERVAL_MINUTES;
-  const scheduledAt = now.set({ minute: scheduledMinute, second: 0, millisecond: 0 });
-  const nextScheduledUpdate = scheduledAt.plus({ minutes: REFRESH_INTERVAL_MINUTES });
-  const mainOp = logger.startOperation('fullUpdate');
+  logger.info('🚀 Starting End-of-Day Portfolio Update', {
+    trigger: 'scheduled',
+    time: DateTime.now().setZone('America/New_York').toISO()
+  });
+
+  const mainOp = logger.startOperation('eodPortfolioUpdate');
   
-      try {
-    // Paso 1: Obtener códigos de monedas y símbolos de activos dinámicamente
-    const dataFetchOp = logger.startOperation('fetchInitialData');
-    const [currenciesSnapshot, currentPricesSnapshot] = await Promise.all([
-      db.collection('currencies').where('isActive', '==', true).get(),
-      db.collection('currentPrices').get()
+  try {
+    // Paso 1: Obtener símbolos únicos de assets activos
+    const assetsOp = logger.startOperation('fetchAssetSymbols');
+    const assetsSnapshot = await db.collection('assets').where('isActive', '==', true).get();
+    const symbols = [...new Set(assetsSnapshot.docs.map(d => d.data().name).filter(Boolean))];
+    assetsOp.success({ assetCount: assetsSnapshot.size, uniqueSymbols: symbols.length });
+    
+    logger.info('📊 Assets fetched', { assets: assetsSnapshot.size, symbols: symbols.length });
+    
+    // Paso 2: Obtener precios y currencies del API Lambda
+    const marketDataOp = logger.startOperation('fetchMarketData');
+    const [currentPrices, currencies] = await Promise.all([
+      getPricesFromApi(symbols),
+      getCurrencyRatesFromApi()
     ]);
+    marketDataOp.success({ pricesReceived: currentPrices.length, currenciesReceived: currencies.length });
     
-    const currencyCodes = currenciesSnapshot.docs.map(doc => doc.data().code);
-    const assetSymbols = currentPricesSnapshot.docs.map(doc => doc.data().symbol);
-    dataFetchOp.success({ currencyCount: currencyCodes.length, assetCount: assetSymbols.length });
+    logger.info('💹 Market data fetched from API Lambda', {
+      prices: currentPrices.length,
+      currencies: currencies.length,
+      source: 'api-lambda'
+    });
     
-    logger.info('Fetching market data', { currencies: currencyCodes.length, assets: assetSymbols.length });
-    
-    // Paso 2: Obtener TODOS los datos de mercado en llamadas optimizadas
-    const marketDataOp = logger.startOperation('getAllMarketDataBatch');
-    const marketData = await getAllMarketDataBatch(currencyCodes, assetSymbols);
-    marketDataOp.success({ currenciesReceived: Object.keys(marketData.currencies).length, assetsReceived: marketData.assets.size });
-    
-    // Paso 3: Actualizar tasas de cambio con datos ya obtenidos
-    const currencyOp = logger.startOperation('updateCurrencyRates');
-    const currencyUpdates = await updateCurrencyRates(db, marketData.currencies);
-    currencyOp.success({ updated: currencyUpdates });
-    
-    // Paso 4: Actualizar precios actuales con datos ya obtenidos
-    const pricesOp = logger.startOperation('updateCurrentPrices');
-    const priceUpdates = await updateCurrentPrices(db, marketData.assets);
-    pricesOp.success({ updated: priceUpdates });
-    
-    // Paso 5: Calcular rendimiento del portafolio
+    // Paso 3: Calcular performance del portafolio
     const perfOp = logger.startOperation('calculateDailyPortfolioPerformance');
-    const portfolioResult = await calculateDailyPortfolioPerformance(db);
+    const portfolioResult = await calculateDailyPortfolioPerformance(db, currentPrices, currencies);
     perfOp.success({ portfoliosCalculated: portfolioResult.count });
     
-    // Paso 6: Calcular riesgo del portafolio (usando datos actualizados)
+    logger.info('📈 Portfolio performance calculated', {
+      users: portfolioResult.count,
+      userIds: portfolioResult.userIds?.length || 0
+    });
+    
+    // Paso 4: Calcular riesgo del portafolio
     const riskOp = logger.startOperation('calculatePortfolioRisk');
     await calculatePortfolioRisk();
     riskOp.success();
     
-    // Paso 7: Invalidar cache de rendimientos históricos (OPT-010)
+    logger.info('⚠️ Portfolio risk calculated');
+    
+    // Paso 5: Invalidar cache de performance
     let cacheInvalidationResult = { usersProcessed: 0, cachesDeleted: 0 };
     if (portfolioResult.userIds && portfolioResult.userIds.length > 0) {
       try {
@@ -1015,44 +847,40 @@ exports.unifiedMarketDataUpdate = onSchedule({
       }
     }
     
-    const endTime = Date.now();
-    const executionTime = (endTime - startTime) / 1000;
+    const executionTime = (Date.now() - startTime) / 1000;
     
-    // Paso 8: Notificar al frontend que todo el pipeline completó (OPT-016)
-    // Incluimos metadata para sincronización precisa del countdown
+    // Paso 6: Actualizar systemStatus
     try {
       await db.collection('systemStatus').doc('marketData').set({
-        // Timestamps
         lastCompleteUpdate: admin.firestore.FieldValue.serverTimestamp(),
-        lastUpdateDate: new Date().toISOString(),
-        
-        // Metadata de sincronización para el frontend
-        refreshIntervalMinutes: REFRESH_INTERVAL_MINUTES,
-        scheduledAt: scheduledAt.toISO(),           // Cuando se programó esta ejecución
-        nextScheduledUpdate: nextScheduledUpdate.toISO(), // Próxima ejecución programada
-        
-        // Estadísticas del pipeline
-        pricesUpdated: priceUpdates,
+        lastUpdateDate: new Date().toISO(),
+        source: 'api-lambda',  // OPT-DEMAND-CLEANUP: Indicar fuente de datos
         performanceCalculated: portfolioResult.count,
         cachesInvalidated: cacheInvalidationResult.cachesDeleted,
         executionTimeMs: Math.round(executionTime * 1000),
-        marketOpen: true
+        marketOpen: false  // EOD = mercado cerrado
       }, { merge: true });
     } catch (signalError) {
-      logger.warn('Frontend signal failed (non-critical)', { error: signalError.message });
+      logger.warn('SystemStatus update failed (non-critical)', { error: signalError.message });
     }
     
     mainOp.success({
-      currencyUpdates,
-      priceUpdates,
       portfoliosCalculated: portfolioResult.count,
       cachesInvalidated: cacheInvalidationResult.cachesDeleted,
-      executionTimeSec: executionTime
+      executionTimeSec: executionTime,
+      source: 'api-lambda'
+    });
+    
+    logger.info('✅ End-of-Day Portfolio Update completed', {
+      executionTime: `${executionTime.toFixed(2)}s`,
+      portfolios: portfolioResult.count
     });
     
     return null;
+    
   } catch (error) {
     mainOp.failure(error);
-    return null;
+    logger.error('❌ End-of-Day Portfolio Update failed', error);
+    throw error;
   }
-}); 
+});

@@ -1,5 +1,7 @@
 const admin = require('firebase-admin');
 const { DateTime } = require('luxon');
+// OPT-DEMAND-CLEANUP: Importar helper para obtener precios y currencies del API Lambda
+const { getPricesFromApi, getCurrencyRatesFromApi } = require('./marketDataHelper');
 
 // 🚀 OPTIMIZACIÓN: Control de logging para reducir costos
 const LOG_LEVEL = process.env.LOG_LEVEL || 'INFO'; // 'DEBUG', 'INFO', 'WARN', 'ERROR'
@@ -23,6 +25,10 @@ function logError(...args) {
 
 /**
  * Calcula el riesgo del portafolio basado en el beta de los activos
+ * 
+ * OPT-DEMAND-CLEANUP: Migrado para usar API Lambda en lugar de Firestore
+ * para obtener precios y tasas de cambio.
+ * 
  * @returns {Promise<null>}
  */
 async function calculatePortfolioRisk() {
@@ -34,26 +40,29 @@ async function calculatePortfolioRisk() {
     const portfolioPerformanceSnapshot = await db.collection('portfolioPerformance').get();
     const userIds = portfolioPerformanceSnapshot.docs.map(doc => doc.id);
     
-    // Obtener todas las cotizaciones actuales con betas
-    const currentPricesSnapshot = await db.collection('currentPrices').get();
-    const currentPrices = {};
+    // OPT-DEMAND-CLEANUP: Primero obtener todos los assets para saber qué símbolos necesitamos
+    const allAssetsSnapshot = await db.collection('assets').where('isActive', '==', true).get();
+    const allAssetsData = allAssetsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
     
-    // Crear mapa de símbolos a betas
-    currentPricesSnapshot.docs.forEach(doc => {
-      const data = doc.data();
-      // Usar 1 como beta por defecto si no está definido (neutral)
-      currentPrices[data.symbol] = {
-        beta: data.beta !== undefined ? data.beta : 1.0,
-        price: data.price || 0
+    // Extraer símbolos únicos
+    const symbols = [...new Set(allAssetsData.map(a => a.name).filter(Boolean))];
+    
+    // OPT-DEMAND-CLEANUP: Obtener precios (con betas) y currencies del API Lambda
+    const [pricesArray, currencies] = await Promise.all([
+      getPricesFromApi(symbols),
+      getCurrencyRatesFromApi()
+    ]);
+    
+    // Convertir array a mapa para acceso rápido
+    const currentPrices = {};
+    pricesArray.forEach(quote => {
+      currentPrices[quote.symbol] = {
+        beta: quote.beta !== undefined ? quote.beta : 1.0,
+        price: quote.price || 0
       };
     });
     
-    // Obtener monedas activas para conversiones
-    const currenciesSnapshot = await db.collection('currencies').where('isActive', '==', true).get();
-    const currencies = currenciesSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-    
-    // 🚀 OPTIMIZACIÓN: Log consolidado inicial
-    logInfo(`📊 Iniciando cálculo de riesgo para ${userIds.length} usuarios`);
+    logInfo(`📊 Iniciando cálculo de riesgo - ${userIds.length} usuarios, ${symbols.length} símbolos del API Lambda`);
     
     let processedUsers = 0;
     let usersWithData = 0;

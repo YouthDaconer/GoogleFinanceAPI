@@ -1,18 +1,22 @@
 /**
  * Cloud Function Callable para obtener precios filtrados por usuario
  * 
- * Esta función optimiza las lecturas de Firestore al retornar solo
- * los precios de los símbolos que el usuario posee en sus portfolioAccounts.
+ * OPT-DEMAND-CLEANUP: Migrado para usar API Lambda en lugar de Firestore.
  * 
- * Reducción esperada: de 56 lecturas (todos los símbolos) a ~25 (símbolos del usuario)
+ * Esta función optimiza las lecturas retornando solo los precios de los
+ * símbolos que el usuario posee en sus portfolioAccounts.
  * 
  * @module userPricesService
  * @see docs/stories/6.story.md (OPT-001)
+ * @see docs/architecture/OPT-DEMAND-CLEANUP-phase4-closure-subplan.md
  */
 
 const { onCall, HttpsError } = require("firebase-functions/v2/https");
 const admin = require('./firebaseAdmin');
 const db = admin.firestore();
+
+// OPT-DEMAND-CLEANUP: Importar helper para obtener precios del API Lambda
+const { getPricesFromApi } = require('./marketDataHelper');
 
 // Importar rate limiter (SCALE-BE-004)
 const { withRateLimit } = require('../utils/rateLimiter');
@@ -109,27 +113,25 @@ const getCurrentPricesForUser = onCall(callableConfig, withRateLimit('getCurrent
     
     console.log(`[getCurrentPricesForUser] Símbolos únicos: ${symbols.length}`);
     
-    // 4. Batch get de precios (más eficiente que query con 'in')
-    const priceRefs = symbols.map(symbol => 
-      db.collection('currentPrices').doc(symbol)
-    );
+    // OPT-DEMAND-CLEANUP: Obtener precios del API Lambda en lugar de Firestore
+    console.log(`[getCurrentPricesForUser] Consultando API Lambda para ${symbols.length} símbolos`);
     
-    const priceDocs = await db.getAll(...priceRefs);
+    const prices = await getPricesFromApi(symbols);
     
-    const prices = priceDocs
-      .filter(doc => doc.exists)
-      .map(doc => ({
-        id: doc.id,
-        symbol: doc.id,
-        ...doc.data()
-      }));
+    // Formatear respuesta para mantener compatibilidad con el frontend
+    const formattedPrices = prices.map(price => ({
+      id: price.symbol,
+      symbol: price.symbol,
+      ...price
+    }));
     
-    console.log(`[getCurrentPricesForUser] Éxito - precios: ${prices.length}, símbolos: ${symbols.length}`);
+    console.log(`[getCurrentPricesForUser] Éxito - precios: ${formattedPrices.length}, símbolos: ${symbols.length}, fuente: API Lambda`);
     
     return {
-      prices,
+      prices: formattedPrices,
       symbols,
-      timestamp: Date.now()
+      timestamp: Date.now(),
+      source: 'api-lambda'  // OPT-DEMAND-CLEANUP: Indicar fuente de datos
     };
     
   } catch (error) {

@@ -2,6 +2,8 @@ const { onSchedule } = require("firebase-functions/v2/scheduler");
 const admin = require('firebase-admin');
 const { calculateAccountPerformance, convertCurrency } = require('../utils/portfolioCalculations');
 const { DateTime } = require('luxon');
+// OPT-DEMAND-CLEANUP: Importar helper para obtener precios y currencies del API Lambda
+const { getPricesFromApi, getCurrencyRatesFromApi } = require('./marketDataHelper');
 
 exports.calcDailyPortfolioPerf = onSchedule({
   schedule: '*/3 9-17 * * 1-5',
@@ -54,16 +56,19 @@ exports.calcDailyPortfolioPerf = onSchedule({
     // Ahora tenemos activeAssets y inactiveAssets, que es el equivalente a allAssets filtrado
     const allAssets = [...activeAssets, ...inactiveAssets];
     
-    // Consultar el resto de datos necesarios
-    const [currentPricesSnapshot, currenciesSnapshot, portfolioAccountsSnapshot] = await Promise.all([
-      db.collection('currentPrices').get(),
-      db.collection('currencies').where('isActive', '==', true).get(),
+    // Extraer símbolos únicos de los assets
+    const symbols = [...new Set(allAssets.map(a => a.name).filter(Boolean))];
+    
+    // OPT-DEMAND-CLEANUP: Obtener precios y currencies del API Lambda (no de Firestore)
+    const [currentPrices, currencies, portfolioAccountsSnapshot] = await Promise.all([
+      getPricesFromApi(symbols),
+      getCurrencyRatesFromApi(),
       db.collection('portfolioAccounts').where('isActive', '==', true).get()
     ]);
     
-    const currentPrices = currentPricesSnapshot.docs.map(doc => ({ symbol: doc.id.split(':')[0], ...doc.data() }));
-    const currencies = currenciesSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
     const portfolioAccounts = portfolioAccountsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+    
+    console.log(`[OPT-DEMAND-CLEANUP] Precios obtenidos del API: ${currentPrices.length}, Currencies: ${currencies.length}`);
     
     // Obtener todas las transacciones de compra para los activos vendidos hoy
     const assetIdsWithSells = new Set(assetIdsInSellTransactions);
