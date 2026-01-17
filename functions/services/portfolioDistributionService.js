@@ -4,13 +4,18 @@
  * Servicio para calcular distribución del portafolio (sectores, países, holdings).
  * Migrado desde usePortfolioDistribution.ts y useCountriesDistribution.ts del frontend.
  * 
+ * OPT-DEMAND-SECTOR: Migrado para usar API Lambda on-demand en lugar de colección currentPrices
+ * 
  * @see SCALE-OPT-001 - Migración de Cálculos Frontend → Backend (SOLID)
+ * @see docs/architecture/on-demand-pricing-architecture.md
  */
 
 const admin = require('./firebaseAdmin');
 const db = admin.firestore();
 const { StructuredLogger } = require('../utils/logger');
 const fetch = require('node-fetch');
+// OPT-DEMAND-SECTOR: Importar servicio de financeQuery para precios on-demand
+const { getQuotes } = require('./financeQuery');
 
 const logger = new StructuredLogger('PortfolioDistributionService');
 
@@ -36,6 +41,48 @@ const COUNTRIES_CACHE_TTL = 60 * 60 * 1000; // 1 hora
 let currencyRatesCache = null;
 let currencyRatesCacheTimestamp = 0;
 const CURRENCY_RATES_CACHE_TTL = 15 * 60 * 1000; // 15 minutos
+
+/**
+ * Sanitiza valores numéricos para evitar NaN/Infinity que no se pueden serializar a JSON
+ * @param {any} value - Valor a sanitizar
+ * @param {number} defaultValue - Valor por defecto si es inválido
+ * @returns {number} Valor sanitizado
+ */
+function sanitizeNumber(value, defaultValue = 0) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return defaultValue;
+  }
+  return value;
+}
+
+/**
+ * Sanitiza recursivamente un objeto para eliminar valores NaN/Infinity
+ * @param {any} obj - Objeto a sanitizar
+ * @returns {any} Objeto sanitizado
+ */
+function sanitizeForJSON(obj) {
+  if (obj === null || obj === undefined) {
+    return obj;
+  }
+  
+  if (typeof obj === 'number') {
+    return sanitizeNumber(obj, 0);
+  }
+  
+  if (Array.isArray(obj)) {
+    return obj.map(item => sanitizeForJSON(item));
+  }
+  
+  if (typeof obj === 'object') {
+    const sanitized = {};
+    for (const [key, value] of Object.entries(obj)) {
+      sanitized[key] = sanitizeForJSON(value);
+    }
+    return sanitized;
+  }
+  
+  return obj;
+}
 
 /**
  * Obtiene la distribución del portafolio (sectores, países, holdings)
@@ -68,7 +115,9 @@ async function getPortfolioDistribution(userId, options = {}) {
           cacheAge: Date.now() - cached.timestamp,
           lastModified: lastModified ? new Date(lastModified).toISOString() : 'none'
         });
-        return { ...cached.data, metadata: { ...cached.data.metadata, fromCache: true } };
+        // Sanitizar datos del cache para evitar NaN/Infinity
+        const sanitizedData = sanitizeForJSON(cached.data);
+        return { ...sanitizedData, metadata: { ...sanitizedData.metadata, fromCache: true } };
       } else {
         logger.info('Cache invalidated by portfolioLastModified', { 
           userId, 
@@ -182,7 +231,8 @@ async function getPortfolioDistribution(userId, options = {}) {
       countriesCount: countries.length
     });
 
-    return result;
+    // Sanitizar resultado para evitar NaN/Infinity que rompen JSON serialization
+    return sanitizeForJSON(result);
   } catch (error) {
     logger.error('Error calculating distribution', { userId, error: error.message });
     throw error;
@@ -321,22 +371,110 @@ async function getActiveAssets(userId, options) {
 }
 
 /**
- * Obtiene precios actuales en batch
+ * OPT-DEMAND-SECTOR: Obtiene precios actuales desde API Lambda on-demand
+ * 
+ * Migrado desde Firestore (colección currentPrices) para cumplir con arquitectura on-demand.
+ * Usa getQuotesWithFallback que tiene circuit breaker y fallback a cache.
+ * 
+ * @param {string[]} symbols - Lista de símbolos a consultar
+ * @returns {Promise<Object>} Mapa de symbol -> precio/datos
  */
 async function batchGetPrices(symbols) {
   if (!symbols.length) return {};
   
   const prices = {};
   
-  // Firestore limita 'in' a 10 valores, hacemos batch
-  for (let i = 0; i < symbols.length; i += 10) {
-    const batch = symbols.slice(i, i + 10);
-    const snapshot = await db.collection('currentPrices')
-      .where('__name__', 'in', batch)
-      .get();
+  try {
+    // Llamar al API Lambda con todos los símbolos de una vez
+    const symbolsString = symbols.join(',');
+    logger.info('Fetching prices from API Lambda', { 
+      symbolCount: symbols.length,
+      source: 'on-demand'
+    });
     
-    snapshot.docs.forEach(doc => {
-      prices[doc.id] = { symbol: doc.id, ...doc.data() };
+    const apiResponse = await getQuotes(symbolsString);
+    
+    // El API retorna un objeto con los símbolos como keys
+    if (apiResponse && typeof apiResponse === 'object') {
+      // Puede venir como { AAPL: {...}, MSFT: {...} } o como array
+      if (Array.isArray(apiResponse)) {
+        // Formato array
+        apiResponse.forEach(quote => {
+          if (quote && quote.symbol) {
+            // OPT-DEMAND-SECTOR: Convertir precio de string a número
+            const priceValue = parseFloat(quote.price) || parseFloat(quote.regularMarketPrice) || 0;
+            prices[quote.symbol] = {
+              symbol: quote.symbol,
+              price: priceValue,
+              name: quote.name || quote.shortName,
+              sector: quote.sector,
+              industry: quote.industry,
+              type: quote.type || quote.quoteType,
+              logo: quote.logo,
+              currency: quote.currency,
+              country: quote.country,
+              exchange: quote.exchange,
+              // Campos adicionales para compatibilidad
+              regularMarketPrice: priceValue,
+              regularMarketChange: parseFloat(quote.change) || parseFloat(quote.regularMarketChange) || 0,
+              regularMarketChangePercent: parseFloat(String(quote.changePercent || quote.regularMarketChangePercent || '0').replace('%', '')) || 0,
+            };
+          }
+        });
+      } else {
+        // Formato objeto { AAPL: {...}, MSFT: {...} }
+        Object.entries(apiResponse).forEach(([symbol, quote]) => {
+          if (quote && symbol) {
+            // OPT-DEMAND-SECTOR: Convertir precio de string a número
+            const priceValue = parseFloat(quote.price) || parseFloat(quote.regularMarketPrice) || 0;
+            prices[symbol] = {
+              symbol,
+              price: priceValue,
+              name: quote.name || quote.shortName,
+              sector: quote.sector,
+              industry: quote.industry,
+              type: quote.type || quote.quoteType,
+              logo: quote.logo,
+              currency: quote.currency,
+              country: quote.country,
+              exchange: quote.exchange,
+              // Campos adicionales para compatibilidad
+              regularMarketPrice: priceValue,
+              regularMarketChange: parseFloat(quote.change) || parseFloat(quote.regularMarketChange) || 0,
+              regularMarketChangePercent: parseFloat(String(quote.changePercent || quote.regularMarketChangePercent || '0').replace('%', '')) || 0,
+            };
+          }
+        });
+      }
+    }
+    
+    logger.info('Prices fetched successfully', { 
+      requested: symbols.length,
+      received: Object.keys(prices).length,
+      source: 'api-lambda'
+    });
+    
+  } catch (error) {
+    logger.error('Error fetching prices from API Lambda, falling back to Firestore', { 
+      error: error.message,
+      symbolCount: symbols.length
+    });
+    
+    // Fallback a Firestore si el API falla
+    for (let i = 0; i < symbols.length; i += 10) {
+      const batch = symbols.slice(i, i + 10);
+      const snapshot = await db.collection('currentPrices')
+        .where('__name__', 'in', batch)
+        .get();
+      
+      snapshot.docs.forEach(doc => {
+        prices[doc.id] = { symbol: doc.id, ...doc.data() };
+      });
+    }
+    
+    logger.info('Prices fetched from Firestore fallback', { 
+      received: Object.keys(prices).length,
+      source: 'firestore-fallback'
     });
   }
   

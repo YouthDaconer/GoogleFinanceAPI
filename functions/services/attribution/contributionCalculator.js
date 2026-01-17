@@ -168,21 +168,47 @@ async function calculateContributions(userId, period, currency = 'USD', accountI
   if (!useOverall && accountIds.length > 0) {
     allowedAssetKeys = new Set();
     
-    // Obtener activos de cada cuenta seleccionada
-    for (const accId of accountIds) {
-      const accData = await getLatestPerformanceData(userId, accId);
-      if (accData) {
-        const accCurrencyData = accData[currency] || accData.USD || {};
-        const accAssets = Object.keys(accCurrencyData.assetPerformance || {});
-        accAssets.forEach(key => allowedAssetKeys.add(key));
+    // FIX: Obtener activos directamente de la colección 'assets' que tiene el campo portfolioAccount
+    // Los assets no tienen userId directamente, pero podemos filtrar por portfolioAccount
+    try {
+      // Consultar activos de cada cuenta seleccionada
+      for (const accId of accountIds) {
+        console.log(`[Attribution] Buscando activos para cuenta: ${accId}`);
+        const assetsSnapshot = await db.collection('assets')
+          .where('portfolioAccount', '==', accId)
+          .where('isActive', '==', true)
+          .get();
+        
+        console.log(`[Attribution] Encontrados ${assetsSnapshot.size} activos en cuenta ${accId}`);
+        
+        assetsSnapshot.docs.forEach(doc => {
+          const asset = doc.data();
+          // Construir la key del mismo formato que assetPerformance: {ticker}_{type}
+          const assetKey = `${asset.name}_${asset.assetType || 'stock'}`;
+          allowedAssetKeys.add(assetKey);
+          console.log(`[Attribution] Asset permitido: ${assetKey} (${asset.name}, tipo: ${asset.assetType})`);
+        });
       }
+      
+      console.log(`[Attribution] Filtrando activos para ${accountIds.length} cuentas: ${allowedAssetKeys.size} activos permitidos`);
+      console.log(`[Attribution] AllowedAssetKeys: ${Array.from(allowedAssetKeys).join(', ')}`);
+    } catch (error) {
+      console.error(`[Attribution] Error obteniendo activos: ${error.message}`);
+      // Fallback: intentar obtener de portfolioPerformance como antes
+      for (const accId of accountIds) {
+        const accData = await getLatestPerformanceData(userId, accId);
+        if (accData) {
+          const accCurrencyData = accData[currency] || accData.USD || {};
+          const accAssets = Object.keys(accCurrencyData.assetPerformance || {});
+          accAssets.forEach(key => allowedAssetKeys.add(key));
+        }
+      }
+      console.log(`[Attribution] Fallback: ${allowedAssetKeys.size} activos de portfolioPerformance`);
     }
-    
-    console.log(`[Attribution] Filtrando activos para ${accountIds.length} cuentas: ${allowedAssetKeys.size} activos permitidos`);
   }
   
   console.log(`[Attribution] Usando datos de cuenta: ${accountId} (input: ${accountIds.join(',')})`);
-  
+  console.log(`[Attribution] allowedAssetKeys es null? ${allowedAssetKeys === null}, size: ${allowedAssetKeys?.size || 0}`);  
   // 1. Obtener documento más reciente (valores actuales)
   const latestData = await getLatestPerformanceData(userId, accountId);
   if (!latestData) {
@@ -258,87 +284,147 @@ async function calculateContributions(userId, period, currency = 'USD', accountI
   }
   console.log(`[Attribution] Total P&L realizada en período: $${totalRealizedPnL.toFixed(2)}`);
   
+  // =========================================================================
   // 5. Calcular contribuciones para cada activo activo
+  // 
+  // MÉTODO: Brinson Attribution simplificado
+  // Contribución = (cambioValorActivo + P&L realizada) / valorInicialPortafolio × 100
+  // 
+  // Este método mide directamente cuánto contribuyó cada activo al rendimiento
+  // total del portafolio, sin necesidad de obtener retornos de mercado.
+  // =========================================================================
+  
   const attributions = [];
   const processedAssetKeys = new Set();
+  let skippedCount = 0;
+  let includedCount = 0;
+  
+  console.log(`[Attribution] Procesando ${Object.keys(assetPerformance).length} activos de assetPerformance`);
+  console.log(`[Attribution] Usando datos de inicio del período: ${startData?.id || periodStartStr}`);
+  console.log(`[Attribution] Valor inicial del portafolio: $${startTotalValue.toFixed(2)}`);
   
   for (const [assetKey, assetData] of Object.entries(assetPerformance)) {
     // FILTRO: Si hay cuentas específicas, solo incluir activos de esas cuentas
     if (allowedAssetKeys && !allowedAssetKeys.has(assetKey)) {
+      skippedCount++;
       continue; // Saltar activos que no pertenecen a las cuentas seleccionadas
     }
     
+    includedCount++;
     const parts = assetKey.split('_');
     const ticker = parts[0];
     const type = parts[1] || 'stock';
     
-    const assetValue = assetData.totalValue || 0;
+    const assetValueEnd = assetData.totalValue || 0;
     const assetInvestment = assetData.totalInvestment || 0;
-    const assetROI = assetData.totalROI || 0;
+    const assetTotalROI = assetData.totalROI || 0; // ROI total desde compra (para referencia)
     
-    // Calcular peso actual
-    const weight = totalPortfolioValue > 0 ? assetValue / totalPortfolioValue : 0;
+    // =========================================================================
+    // MÉTODO BRINSON SIMPLIFICADO (sin dependencia de currentPrices)
+    // 
+    // Contribución al rendimiento = cambioValor / valorInicialPortafolio × 100
+    // 
+    // Este método es correcto tanto para assets sin cambios como con compras/ventas
+    // porque mide directamente cuánto contribuyó al rendimiento del portafolio.
+    // =========================================================================
+    const startAssetData = startAssetPerformance[assetKey];
+    const assetValueStart = startAssetData?.totalValue || 0;
+    const unitsStart = startAssetData?.units || 0;
+    const unitsEnd = assetData.units || 0;
     
-    // CONTRIBUCIÓN = peso × ROI del activo
-    let contribution = weight * assetROI;
+    // Cambio de valor en el período (incluye apreciación + nuevas inversiones)
+    const periodValueChange = assetValueEnd - assetValueStart;
     
-    // P&L no realizada
-    const unrealizedPnL = assetData.unrealizedProfitAndLoss || 0;
-    
-    // NUEVO: Agregar P&L realizada de ventas parciales en el período
+    // P&L realizada de ventas parciales en el período
     const sellData = sellsByAsset[assetKey];
     const realizedPnLInPeriod = sellData?.totalRealizedPnL || 0;
     const totalSoldAmount = sellData?.totalSold || 0;
     
-    // Si hubo ventas parciales, ajustar la contribución
-    if (realizedPnLInPeriod !== 0) {
-      // La contribución de la venta es la P&L realizada como % del valor inicial del portafolio
-      const realizedContribution = startTotalValue > 0 
-        ? (realizedPnLInPeriod / startTotalValue) * 100 
-        : 0;
-      contribution += realizedContribution;
-      console.log(`[Attribution] ${ticker}: Agregando contribución realizada: ${realizedContribution.toFixed(2)}pp ($${realizedPnLInPeriod.toFixed(2)})`);
+    // Cambio total = cambio de valor no realizado + P&L realizada
+    const totalChange = periodValueChange + realizedPnLInPeriod;
+    
+    // CONTRIBUCIÓN = cambioTotal / valorInicialPortafolio × 100
+    // Esto mide directamente cuánto contribuyó este activo al rendimiento del portafolio
+    const contribution = startTotalValue > 0 
+      ? (totalChange / startTotalValue) * 100 
+      : 0;
+    
+    // =========================================================================
+    // CALCULAR RETORNO DEL PERÍODO (para mostrar, NO para contribución)
+    // 
+    // El retorno del período es el cambio de PRECIO del activo, no el cambio de valor.
+    // Esto es consistente con lo que muestra la página del activo (Rendimiento YTD).
+    // 
+    // Para assets con cambio de unidades (compras/ventas), calculamos el retorno
+    // basado en el precio: (precioFinal - precioInicial) / precioInicial × 100
+    // =========================================================================
+    let periodReturn = 0;
+    const hasUnitChange = Math.abs(unitsEnd - unitsStart) > 0.0001;
+    
+    if (assetValueStart > 0 && unitsStart > 0) {
+      if (hasUnitChange && unitsEnd > 0) {
+        // Asset con cambio de unidades: calcular retorno del PRECIO
+        // Esto da el retorno real del activo sin verse afectado por nuevas compras
+        const priceStart = assetValueStart / unitsStart;
+        const priceEnd = assetValueEnd / unitsEnd;
+        periodReturn = ((priceEnd - priceStart) / priceStart) * 100;
+      } else {
+        // Asset sin cambio de unidades: cambio de valor = cambio de precio
+        periodReturn = ((assetValueEnd - assetValueStart) / assetValueStart) * 100;
+      }
+    } else if (assetValueEnd > 0 && assetInvestment > 0) {
+      // Asset nuevo en el período: usar el ROI desde la compra
+      periodReturn = assetTotalROI;
     }
     
-    const contributionAbsolute = unrealizedPnL + realizedPnLInPeriod;
-    const valueChange = assetValue - assetInvestment + realizedPnLInPeriod;
+    // Calcular peso actual (usando peso al final del período)
+    const weight = totalPortfolioValue > 0 ? assetValueEnd / totalPortfolioValue : 0;
     
-    // Calcular ROI ajustado para activos con ventas parciales
-    // ROI = (P&L Total) / (Inversión actual + Costo de lo vendido)
-    // Costo de lo vendido = totalSold - realizedPnL
-    let displayROI = assetROI;
+    console.log(`[Attribution] ${ticker}: startVal=$${assetValueStart.toFixed(2)}, endVal=$${assetValueEnd.toFixed(2)}, units=${unitsStart.toFixed(4)}->${unitsEnd.toFixed(4)}${hasUnitChange ? ' (cambio)' : ''}, periodReturn=${periodReturn.toFixed(2)}%, weight=${(weight*100).toFixed(2)}%, contribution=${contribution.toFixed(4)}pp`);
+    
+    // P&L no realizada
+    const unrealizedPnL = assetData.unrealizedProfitAndLoss || 0;
+    
+    // ROI para mostrar: usar el retorno del período calculado
+    let displayROI = periodReturn;
     if (realizedPnLInPeriod !== 0 && totalSoldAmount > 0) {
+      // Ajustar ROI si hubo ventas parciales para incluir P&L realizada
       const costOfSold = totalSoldAmount - realizedPnLInPeriod;
       const totalInvestmentIncludingSold = assetInvestment + costOfSold;
       const totalPnL = unrealizedPnL + realizedPnLInPeriod;
       displayROI = totalInvestmentIncludingSold > 0 
         ? (totalPnL / totalInvestmentIncludingSold) * 100 
-        : assetROI;
+        : periodReturn;
     }
     
     attributions.push({
       assetKey,
       ticker,
-      name: ticker,
+      name: ticker, // Se puede enriquecer después desde frontend con currentPrices on-demand
       sector: 'Unknown',
+      logo: null,
       type: type.toLowerCase(),
       status: 'active',
       weightStart: weight,
       weightEnd: weight,
       weightAverage: weight,
-      returnPercent: displayROI, // ROI ajustado que incluye ganancias realizadas
+      returnPercent: displayROI, // Retorno del período (basado en precio si hubo cambio de unidades)
       contribution,
-      contributionAbsolute,
-      valueStart: assetInvestment,
-      valueEnd: assetValue,
-      valueChange,
+      contributionAbsolute: totalChange,
+      valueStart: assetValueStart, // Valor al inicio del período
+      valueEnd: assetValueEnd,     // Valor al final del período
+      valueChange: totalChange,
+      hasUnitChange,               // Flag: hubo compras/ventas durante el período
       hasPartialSales: realizedPnLInPeriod !== 0,
       partialSalesPnL: realizedPnLInPeriod !== 0 ? realizedPnLInPeriod : undefined,
       partialSalesCount: sellData?.transactions?.length,
       _source: {
-        totalValue: assetValue,
+        totalValue: assetValueEnd,
         totalInvestment: assetInvestment,
-        totalROI: assetROI,
+        totalROI: assetTotalROI, // ROI total desde compra (para referencia)
+        periodReturn: periodReturn, // Retorno del período (basado en precio)
+        unitsStart,
+        unitsEnd,
         unrealizedPnL,
         realizedPnLInPeriod
       }
@@ -397,6 +483,9 @@ async function calculateContributions(userId, period, currency = 'USD', accountI
   
   // 7. Ordenar por contribución descendente
   attributions.sort((a, b) => b.contribution - a.contribution);
+  
+  console.log(`[Attribution] Resumen: ${includedCount} activos incluidos, ${skippedCount} activos filtrados de ${Object.keys(assetPerformance).length} totales`);
+  console.log(`[Attribution] Attributions generadas: ${attributions.length}`);
   
   // 8. Validar suma de contribuciones vs ROI del portafolio
   const sumOfContributions = attributions.reduce((sum, a) => sum + a.contribution, 0);

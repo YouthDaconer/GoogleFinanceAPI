@@ -134,6 +134,22 @@ const PERIOD_LABELS = {
 };
 
 /**
+ * Mapeo de período a campo de retorno en currentPrices
+ * 
+ * NOTA: Este mapeo ya no se usa en el backend (removida dependencia de currentPrices).
+ * Se mantiene para referencia del frontend si necesita obtener retornos on-demand.
+ */
+const PERIOD_TO_RETURN_FIELD = {
+  '1M': 'oneMonthReturn',
+  '3M': 'threeMonthReturn',
+  '6M': 'sixMonthReturn',
+  'YTD': 'ytdReturn',
+  '1Y': 'yearReturn',
+  '2Y': 'yearReturn', // Aproximación - no hay campo 2Y
+  'ALL': 'yearReturn' // Aproximación
+};
+
+/**
  * Obtiene el label del período
  * @param {string} period - Código del período
  * @returns {string} Label legible
@@ -174,6 +190,7 @@ function getPeriodStartDate(period) {
 module.exports = {
   CONTRIBUTION_COLORS,
   PERIOD_LABELS,
+  PERIOD_TO_RETURN_FIELD,
   getContributionColor,
   getPeriodLabel,
   getPeriodStartDate

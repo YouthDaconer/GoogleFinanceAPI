@@ -119,18 +119,24 @@ async function calculateDailyPortfolioPerformance(db) {
           const assetPerformance = {};
           
           for (const account of accounts) {
-            const accountAssets = allAssets.filter(a => a.portfolioAccountId === account.id);
+            // FIX: El modelo Asset usa 'portfolioAccount' no 'portfolioAccountId'
+            const accountAssets = allAssets.filter(a => a.portfolioAccount === account.id);
             
             for (const asset of accountAssets) {
               const priceData = currentPrices.find(p => 
                 p.symbol === asset.name || p.id === asset.name
               );
               
-              if (priceData && asset.amount > 0) {
-                const assetValue = asset.amount * (priceData.price || 0);
-                const assetInvestment = asset.amount * (asset.purchasePrice || 0);
+              // FIX: El modelo Asset usa 'units' no 'amount'
+              const units = asset.units || 0;
+              if (priceData && units > 0) {
+                const assetValue = units * (priceData.price || 0);
+                // FIX: Cálculo de inversión igual que portfolioCalculations.js
+                // unitValue está en USD. NO multiplicar por acquisitionDollarValue - 
+                // ese campo es para convertCurrency cuando la moneda base es COP
+                const initialInvestmentUSD = units * (asset.unitValue || 0);
                 
-                // Convertir a la moneda del reporte
+                // Convertir valor actual a la moneda del reporte
                 const valueConverted = convertCurrency(
                   assetValue,
                   priceData.currency || 'USD',
@@ -138,11 +144,15 @@ async function calculateDailyPortfolioPerformance(db) {
                   currencies
                 );
                 
+                // Convertir inversión a la moneda del reporte
+                // Usar los parámetros especiales para manejar acquisitionDollarValue correctamente
                 const investmentConverted = convertCurrency(
-                  assetInvestment,
-                  asset.currency || 'USD',
+                  initialInvestmentUSD,
+                  'USD',
                   currency.code,
-                  currencies
+                  currencies,
+                  asset.defaultCurrencyForAdquisitionDollar,
+                  asset.acquisitionDollarValue
                 );
                 
                 totalValue += valueConverted;
@@ -153,12 +163,27 @@ async function calculateDailyPortfolioPerformance(db) {
                   assetPerformance[assetKey] = {
                     totalValue: 0,
                     totalInvestment: 0,
-                    units: 0
+                    totalROI: 0,
+                    dailyReturn: 0,
+                    monthlyReturn: 0,
+                    annualReturn: 0,
+                    dailyChangePercentage: 0,
+                    adjustedDailyChangePercentage: 0,
+                    rawDailyChangePercentage: 0,
+                    totalCashFlow: 0,
+                    units: 0,
+                    unrealizedProfitAndLoss: 0
                   };
                 }
                 assetPerformance[assetKey].totalValue += valueConverted;
                 assetPerformance[assetKey].totalInvestment += investmentConverted;
-                assetPerformance[assetKey].units += asset.amount;
+                assetPerformance[assetKey].units += units;
+                // Calcular ROI y P&L no realizada
+                const assetData = assetPerformance[assetKey];
+                assetData.unrealizedProfitAndLoss = assetData.totalValue - assetData.totalInvestment;
+                assetData.totalROI = assetData.totalInvestment > 0 
+                  ? ((assetData.totalValue - assetData.totalInvestment) / assetData.totalInvestment) * 100 
+                  : 0;
               }
             }
           }
