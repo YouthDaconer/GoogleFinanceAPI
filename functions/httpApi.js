@@ -1249,11 +1249,13 @@ app.get("/attribution", async (req, res) => {
       });
     }
     
+    // FIX: Reconocer tanto 'overall' como 'all' como "todas las cuentas"
+    const isAllAccounts = accountIds === 'overall' || accountIds === 'all'
     const result = await getPortfolioAttribution({
       userId,
       period,
       currency,
-      accountIds: accountIds === 'overall' ? ['overall'] : accountIds.split(','),
+      accountIds: isAllAccounts ? ['overall'] : accountIds.split(','),
       options: {
         benchmarkReturn: parseFloat(benchmarkReturn) || 0,
         maxWaterfallBars: parseInt(maxBars) || 8,
