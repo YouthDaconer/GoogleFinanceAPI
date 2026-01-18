@@ -171,11 +171,112 @@ exports.updateMarketStatusHttp = onRequest({
   }
 });
 
+/**
+ * OPT-DEMAND-400-FIX: Sincronizar festivos de NYSE desde Finnhub
+ * 
+ * Esta función consulta el endpoint /stock/market-holiday de Finnhub
+ * y guarda todos los festivos en la colección marketHolidays/US.
+ * 
+ * Se ejecuta mensualmente (1er día de cada mes a las 2:00 AM ET)
+ * para mantener la lista de festivos actualizada.
+ * 
+ * @see https://finnhub.io/docs/api/market-holiday
+ */
+async function syncMarketHolidays() {
+  const db = admin.firestore();
+  const now = DateTime.now().setZone('America/New_York');
+  
+  try {
+    console.log('🗓️ Sincronizando festivos de NYSE desde Finnhub...');
+    
+    const response = await axios.get(
+      `https://finnhub.io/api/v1/stock/market-holiday?exchange=US&token=${FINNHUB_TOKEN}`
+    );
+    
+    if (!response.data || !response.data.data) {
+      console.error('❌ Respuesta inválida de Finnhub market-holiday');
+      return { success: false, error: 'Invalid response' };
+    }
+    
+    const holidays = response.data.data;
+    
+    // Crear un mapa de festivos por fecha para búsqueda rápida
+    // Formato: { "2026-01-19": "Martin Luther King Jr. Day", ... }
+    const holidayMap = {};
+    const holidayList = [];
+    
+    for (const holiday of holidays) {
+      if (holiday.atDate) {
+        holidayMap[holiday.atDate] = holiday.eventName;
+        holidayList.push({
+          date: holiday.atDate,
+          name: holiday.eventName,
+          tradingHour: holiday.tradingHour || null // null = cerrado todo el día
+        });
+      }
+    }
+    
+    // Guardar en Firestore
+    const dataToSave = {
+      exchange: 'US',
+      holidays: holidayMap,
+      holidayList: holidayList,
+      totalHolidays: holidayList.length,
+      lastSynced: admin.firestore.FieldValue.serverTimestamp(),
+      syncedAt: now.toISO(),
+      source: 'finnhub'
+    };
+    
+    await db.collection('marketHolidays').doc('US').set(dataToSave, { merge: true });
+    
+    console.log(`✅ Festivos sincronizados: ${holidayList.length} días festivos guardados`);
+    console.log(`📅 Próximos festivos:`, holidayList.slice(0, 5).map(h => `${h.date}: ${h.name}`));
+    
+    return { success: true, holidaysCount: holidayList.length };
+    
+  } catch (error) {
+    console.error('❌ Error sincronizando festivos:', error.message);
+    return { success: false, error: error.message };
+  }
+}
+
+/**
+ * Sincronización mensual de festivos de NYSE
+ * Ejecuta el 1er día de cada mes a las 2:00 AM ET
+ */
+exports.scheduledHolidaySync = onSchedule({
+  schedule: '0 2 1 * *', // 1er día de cada mes a las 2:00 AM
+  timeZone: 'America/New_York',
+  retryCount: 3,
+  minBackoff: '5m',
+}, async (event) => {
+  console.log('🗓️ Ejecutando sincronización mensual de festivos de NYSE');
+  const result = await syncMarketHolidays();
+  console.log('Sincronización completada:', result);
+  return null;
+});
+
+/**
+ * Sincronización de festivos bajo demanda (HTTP)
+ */
+exports.syncHolidaysHttp = onRequest({
+}, async (req, res) => {
+  try {
+    const result = await syncMarketHolidays();
+    res.status(200).send({ success: true, message: 'Festivos sincronizados', ...result });
+  } catch (error) {
+    res.status(500).send({ success: false, error: error.message });
+  }
+});
+
 // Exportar todas las funciones
 module.exports = {
   updateMarketStatus,
   getMarketStatus,
+  syncMarketHolidays,
   scheduledMarketStatusUpdate: exports.scheduledMarketStatusUpdate,
   scheduledMarketStatusUpdateAdditional: exports.scheduledMarketStatusUpdateAdditional,
-  updateMarketStatusHttp: exports.updateMarketStatusHttp
+  updateMarketStatusHttp: exports.updateMarketStatusHttp,
+  scheduledHolidaySync: exports.scheduledHolidaySync,
+  syncHolidaysHttp: exports.syncHolidaysHttp
 };

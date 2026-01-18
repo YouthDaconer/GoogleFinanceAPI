@@ -144,6 +144,98 @@ function isInClosingWindow(closeHour = NYSE_CLOSE_HOUR) {
 }
 
 /**
+ * OPT-DEMAND-400-FIX: Lista de festivos de NYSE como fallback
+ * 
+ * NOTA: Esta lista es un FALLBACK en caso de que marketHolidays no esté disponible.
+ * La fuente principal de verdad es la colección marketHolidays/US sincronizada
+ * desde Finnhub mediante scheduledHolidaySync.
+ * 
+ * @see marketStatusService.js - syncMarketHolidays()
+ */
+const NYSE_HOLIDAYS_FALLBACK = new Set([
+  // 2025
+  '2025-01-01', '2025-01-20', '2025-02-17', '2025-04-18', '2025-05-26',
+  '2025-06-19', '2025-07-04', '2025-09-01', '2025-11-27', '2025-12-25',
+  // 2026
+  '2026-01-01', '2026-01-19', '2026-02-16', '2026-04-03', '2026-05-25',
+  '2026-06-19', '2026-07-03', '2026-09-07', '2026-11-26', '2026-12-25',
+  // 2027
+  '2027-01-01', '2027-01-18', '2027-02-15', '2027-03-26', '2027-05-31',
+  '2027-06-18', '2027-07-05', '2027-09-06', '2027-11-25', '2027-12-24',
+]);
+
+/**
+ * OPT-DEMAND-400-FIX: Verifica si una fecha fue un día de trading válido de NYSE
+ * 
+ * Un día es válido para guardar en portfolioPerformance si:
+ * 1. NO fue fin de semana (sábado o domingo)
+ * 2. NO fue un día festivo de NYSE
+ * 
+ * Orden de consulta para festivos:
+ * 1. marketHolidays/US (sincronizado desde Finnhub - fuente principal)
+ * 2. NYSE_HOLIDAYS_FALLBACK (lista estática - respaldo)
+ * 
+ * @param {FirebaseFirestore.Firestore} db - Instancia de Firestore
+ * @param {DateTime} date - Fecha a verificar (Luxon DateTime)
+ * @returns {Promise<{isValid: boolean, reason: string, holiday?: string}>}
+ */
+async function isValidTradingDay(db, date) {
+  const dayOfWeek = date.weekday; // 1=Monday, 7=Sunday
+  const formattedDate = date.toISODate();
+  
+  // 1. Verificar fin de semana
+  if (dayOfWeek === 6) {
+    return { isValid: false, reason: 'saturday', formattedDate };
+  }
+  if (dayOfWeek === 7) {
+    return { isValid: false, reason: 'sunday', formattedDate };
+  }
+  
+  // 2. Verificar festivo en marketHolidays/US (fuente principal - sincronizado desde Finnhub)
+  try {
+    const holidaysDoc = await db.collection('marketHolidays').doc('US').get();
+    
+    if (holidaysDoc.exists) {
+      const holidaysData = holidaysDoc.data();
+      
+      // El campo 'holidays' es un mapa: { "2026-01-19": "Martin Luther King Jr. Day", ... }
+      if (holidaysData.holidays && holidaysData.holidays[formattedDate]) {
+        const holidayName = holidaysData.holidays[formattedDate];
+        logInfo(`🎄 Holiday detected from marketHolidays: ${holidayName} (${formattedDate})`);
+        return { 
+          isValid: false, 
+          reason: 'holiday-marketHolidays', 
+          holiday: holidayName,
+          formattedDate 
+        };
+      }
+      
+      // Si llegamos aquí, marketHolidays existe pero la fecha no es festivo
+      return { isValid: true, reason: 'trading-day', formattedDate };
+    }
+    
+    // Si marketHolidays no existe, usar fallback estático
+    logWarn('⚠️ marketHolidays/US no encontrado, usando lista estática como fallback');
+    
+  } catch (error) {
+    logWarn(`⚠️ Error consultando marketHolidays: ${error.message}, usando fallback`);
+  }
+  
+  // 3. Fallback: Verificar en lista estática
+  if (NYSE_HOLIDAYS_FALLBACK.has(formattedDate)) {
+    return { 
+      isValid: false, 
+      reason: 'holiday-fallback-list', 
+      holiday: 'NYSE Holiday',
+      formattedDate 
+    };
+  }
+  
+  // Si pasó todas las validaciones, es un día de trading válido
+  return { isValid: true, reason: 'trading-day', formattedDate };
+}
+
+/**
  * 🚀 OPTIMIZACIÓN: Función unificada que obtiene todos los datos de mercado en una sola llamada
  * Combina monedas y símbolos de activos para minimizar llamadas a la API Lambda
  */
@@ -355,11 +447,16 @@ class PerformanceDataCache {
 async function calculateDailyPortfolioPerformance(db, currentPrices, currencies) {
   logInfo('🔄 Calculando rendimiento diario del portafolio (API Lambda)...');
   
+  // OPT-DEMAND-400-FIX: Usar fecha del DÍA ANTERIOR para el cálculo
+  // Esta función se ejecuta a las 00:05 ET del día siguiente,
+  // por lo que los precios corresponden al día de trading anterior
   const now = DateTime.now().setZone('America/New_York');
-  const formattedDate = now.toISODate();
+  const yesterday = now.minus({ days: 1 });
+  const formattedDate = yesterday.toISODate();
   let calculationsCount = 0;
   
-  logDebug(`📅 Fecha de cálculo (NY): ${formattedDate}`);
+  logDebug(`📅 Fecha de cálculo (día anterior): ${formattedDate}`);
+  logDebug(`📅 Hora actual de ejecución (NY): ${now.toISO()}`);
   
   // OPT-DEMAND-CLEANUP: Solo consultar datos que NO vienen del API
   const [
@@ -757,21 +854,25 @@ async function calculateDailyPortfolioPerformance(db, currentPrices, currencies)
  * 
  * OPT-DEMAND-CLEANUP: Función consolidada que ejecuta 1x/día al cierre del mercado.
  * 
- * Schedule: 17:05 ET (5 minutos después del cierre de NYSE)
+ * Schedule: 00:05 ET del día siguiente (Ma-Sa para cubrir L-V)
  * 
  * Flujo:
  * 1. Obtener símbolos únicos de assets activos
- * 2. Consultar precios del API Lambda
+ * 2. Consultar precios del API Lambda (precios de cierre del día anterior)
  * 3. Consultar currencies del API Lambda
- * 4. Calcular performance del portafolio (EOD)
+ * 4. Calcular performance del portafolio (EOD del día anterior)
  * 5. Calcular riesgo del portafolio
  * 6. Invalidar cache de performance
+ * 
+ * NOTA: Se ejecuta después de medianoche para garantizar precios de cierre definitivos.
+ * La fecha de cálculo es el DÍA ANTERIOR (el día de trading que cerró).
  * 
  * @see docs/architecture/OPT-DEMAND-CLEANUP-phase4-closure-subplan.md
  */
 exports.unifiedMarketDataUpdate = onSchedule({
-  // OPT-DEMAND-CLEANUP: Ejecutar 1x/día a las 17:05 ET (5 min después del cierre)
-  schedule: '5 17 * * 1-5',  // 17:05 L-V
+  // OPT-DEMAND-400-FIX: Ejecutar a las 00:05 ET del día siguiente para precios de cierre definitivos
+  // Martes-Sábado para cubrir trading days Lunes-Viernes
+  schedule: '5 0 * * 2-6',  // 00:05 Ma-Sa (guarda datos de L-V)
   timeZone: 'America/New_York',
   memory: '512MiB',
   timeoutSeconds: 540,  // 9 minutos
@@ -779,7 +880,7 @@ exports.unifiedMarketDataUpdate = onSchedule({
   labels: {
     status: 'active',
     purpose: 'eod-portfolio-calculations',
-    updated: '2026-01-16'
+    updated: '2026-01-17'
   }
 }, async (event) => {
   // Inicializar logger estructurado (SCALE-CORE-002)
@@ -787,15 +888,45 @@ exports.unifiedMarketDataUpdate = onSchedule({
   
   const db = admin.firestore();
   const startTime = Date.now();
+  const now = DateTime.now().setZone('America/New_York');
+  const yesterday = now.minus({ days: 1 });
   
   logger.info('🚀 Starting End-of-Day Portfolio Update', {
     trigger: 'scheduled',
-    time: DateTime.now().setZone('America/New_York').toISO()
+    currentTime: now.toISO(),
+    targetDate: yesterday.toISODate()
   });
 
   const mainOp = logger.startOperation('eodPortfolioUpdate');
   
   try {
+    // =========================================================================
+    // OPT-DEMAND-400-FIX: Verificar si el día anterior fue un día de trading válido
+    // Solo guardamos en portfolioPerformance si NO fue fin de semana y NO fue festivo
+    // =========================================================================
+    const tradingDayCheck = await isValidTradingDay(db, yesterday);
+    
+    if (!tradingDayCheck.isValid) {
+      logger.info('⏭️ Skipping EOD update - not a valid trading day', {
+        date: tradingDayCheck.formattedDate,
+        reason: tradingDayCheck.reason,
+        holiday: tradingDayCheck.holiday || null
+      });
+      
+      mainOp.success({
+        skipped: true,
+        reason: tradingDayCheck.reason,
+        date: tradingDayCheck.formattedDate
+      });
+      
+      return null;
+    }
+    
+    logger.info('✅ Valid trading day confirmed', {
+      date: tradingDayCheck.formattedDate,
+      reason: tradingDayCheck.reason
+    });
+    
     // Paso 1: Obtener símbolos únicos de assets activos
     const assetsOp = logger.startOperation('fetchAssetSymbols');
     const assetsSnapshot = await db.collection('assets').where('isActive', '==', true).get();

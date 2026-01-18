@@ -135,6 +135,10 @@ exports.scheduledMarketStatusUpdateV2 = marketStatusService.scheduledMarketStatu
 exports.scheduledMarketStatusUpdateAdditionalV2 = marketStatusService.scheduledMarketStatusUpdateAdditional;
 exports.updateMarketStatusHttpV2 = marketStatusService.updateMarketStatusHttp;
 
+// OPT-DEMAND-400-FIX: Sincronización de festivos de NYSE desde Finnhub
+exports.scheduledHolidaySyncV2 = marketStatusService.scheduledHolidaySync;
+exports.syncHolidaysHttpV2 = marketStatusService.syncHolidaysHttp;
+
 exports.weeklyProfitableWeeksCalculation = onSchedule({
   schedule: "every sunday 23:00",
   timeZone: "America/New_York",
