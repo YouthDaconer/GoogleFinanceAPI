@@ -1,14 +1,18 @@
 /* eslint-disable require-jsdoc */
 const axios = require("axios");
+const { FINANCE_QUERY_API_URL, getServiceHeaders } = require('./config');
 
 /**
  * Obtiene todos los índices del endpoint
+ * SEC-CF-001: Migrado a Cloudflare Tunnel
+ * SEC-TOKEN-004: Incluye headers de autenticación de servicio
  * @returns {Promise<Array>} Array con todos los índices
  */
 async function requestIndicesFromFinance() {
   try {
     const response = await axios.get(
-      "https://dmn46d7xas3rvio6tugd2vzs2q0hxbmb.lambda-url.us-east-1.on.aws/v1/indices"
+      `${FINANCE_QUERY_API_URL}/indices`,
+      { headers: getServiceHeaders() }
     );
     return response.data;
   } catch (error) {

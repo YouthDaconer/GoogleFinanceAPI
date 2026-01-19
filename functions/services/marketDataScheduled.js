@@ -20,12 +20,14 @@
  * 
  * @module services/marketDataScheduled
  * @see docs/architecture/firebase-cost-analysis-detailed.md
+ * @see docs/architecture/SEC-CF-001-cloudflare-tunnel-migration-plan.md
  */
 
 const { onSchedule } = require("firebase-functions/v2/scheduler");
 const admin = require('./firebaseAdmin');
 const requestIndicesFromFinance = require('./requestIndicesFromFinance');
 const axios = require('axios');
+const { FINANCE_QUERY_API_URL, getServiceHeaders } = require('./config');
 
 // ============================================================================
 // UTILIDADES
@@ -78,6 +80,7 @@ const saveIndicesHistoryData = onSchedule({
   timeZone: 'America/New_York',
   retryCount: 2,
   memory: '256MiB',
+  // SEC-TOKEN-003: SERVICE_TOKEN_SECRET se lee de process.env via config.js
 }, async (event) => {
   const startTime = Date.now();
   const formattedDate = new Date().toISOString().split('T')[0];
@@ -164,15 +167,19 @@ const saveSectorsSnapshot = onSchedule({
   timeZone: 'America/New_York',
   retryCount: 2,
   memory: '256MiB',
+  // SEC-TOKEN-003: SERVICE_TOKEN_SECRET se lee de process.env via config.js
 }, async (event) => {
   const startTime = Date.now();
   const formattedDate = new Date().toISOString().split('T')[0];
   
   console.log(`[saveSectorsSnapshot] Iniciando captura de sectores - ${formattedDate}`);
 
+  // SEC-CF-001: URL via Cloudflare Tunnel
+  // SEC-TOKEN-004: Incluir headers de autenticación
   try {
     const response = await axios.get(
-      'https://dmn46d7xas3rvio6tugd2vzs2q0hxbmb.lambda-url.us-east-1.on.aws/v1/sectors'
+      `${FINANCE_QUERY_API_URL}/sectors`,
+      { headers: getServiceHeaders() }
     );
     const sectors = response.data;
 

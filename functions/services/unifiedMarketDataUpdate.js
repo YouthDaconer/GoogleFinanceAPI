@@ -34,10 +34,14 @@ const { getPricesFromApi, getCurrencyRatesFromApi } = require('./marketDataHelpe
  * - scheduledPortfolioCalculations (deprecada)
  * 
  * @see docs/architecture/OPT-DEMAND-CLEANUP-phase4-closure-subplan.md
+ * @see docs/architecture/SEC-CF-001-cloudflare-tunnel-migration-plan.md
  * @see docs/stories/85.story.md (OPT-DEMAND-302)
  */
 
-const API_BASE_URL = 'https://dmn46d7xas3rvio6tugd2vzs2q0hxbmb.lambda-url.us-east-1.on.aws/v1';
+const { FINANCE_QUERY_API_URL } = require('./config');
+
+// SEC-CF-001: API URL via Cloudflare Tunnel
+const API_BASE_URL = FINANCE_QUERY_API_URL;
 
 // Flag para habilitar logs detallados (puede causar mucho ruido en producción)
 const ENABLE_DETAILED_LOGS = process.env.ENABLE_DETAILED_LOGS === 'true';
@@ -877,10 +881,11 @@ exports.unifiedMarketDataUpdate = onSchedule({
   memory: '512MiB',
   timeoutSeconds: 540,  // 9 minutos
   retryCount: 2,
+  // SEC-TOKEN-003: SERVICE_TOKEN_SECRET se lee de process.env via config.js
   labels: {
     status: 'active',
     purpose: 'eod-portfolio-calculations',
-    updated: '2026-01-17'
+    updated: '2026-01-19'
   }
 }, async (event) => {
   // Inicializar logger estructurado (SCALE-CORE-002)

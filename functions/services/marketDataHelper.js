@@ -16,6 +16,7 @@
  * - processDividendPayments.js
  * 
  * @see docs/architecture/OPT-DEMAND-CLEANUP-firestore-fallback-removal.md
+ * @see docs/architecture/SEC-CF-001-cloudflare-tunnel-migration-plan.md
  * @module services/marketDataHelper
  */
 
@@ -23,11 +24,12 @@ const admin = require('firebase-admin');
 const { getQuotes } = require('./financeQuery');
 const { StructuredLogger } = require('../utils/logger');
 const axios = require('axios');
+const { FINANCE_QUERY_API_URL, getServiceHeaders } = require('./config');
 
 const logger = new StructuredLogger('marketDataHelper');
 
-// API Lambda URL para tasas de cambio
-const API_BASE_URL = 'https://dmn46d7xas3rvio6tugd2vzs2q0hxbmb.lambda-url.us-east-1.on.aws/v1';
+// SEC-CF-001: API URL via Cloudflare Tunnel
+const API_BASE_URL = FINANCE_QUERY_API_URL;
 
 // Cache en memoria para tasas de cambio (evita llamadas repetidas en la misma ejecución)
 let currencyRatesCache = null;
@@ -215,7 +217,11 @@ async function getCurrencyRatesFromApi() {
         const symbolsParam = currencySymbols.join(',');
         const url = `${API_BASE_URL}/market-quotes?symbols=${symbolsParam}`;
         
-        const { data } = await axios.get(url, { timeout: 15000 });
+        // SEC-TOKEN-004: Incluir headers de autenticación de servicio
+        const { data } = await axios.get(url, { 
+          timeout: 15000,
+          headers: getServiceHeaders(),
+        });
         
         // Extraer tasas de la respuesta
         if (Array.isArray(data)) {

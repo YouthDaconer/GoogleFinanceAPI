@@ -1,17 +1,23 @@
 /**
  * Finance Query Service with Circuit Breaker
  * 
- * Client for the finance-query AWS Lambda API.
+ * Client for the finance-query API via Cloudflare Tunnel.
  * Now protected by circuit breaker pattern for resilience.
  * 
+ * SEC-CF-001: Migrated from Lambda URL to Cloudflare Tunnel
+ * SEC-TOKEN-004: Includes service token for authentication
  * @see SCALE-BE-003 - Circuit Breaker para APIs Externas
+ * @see docs/architecture/SEC-CF-001-cloudflare-tunnel-migration-plan.md
+ * @see docs/architecture/SEC-TOKEN-001-api-security-hardening-plan.md
  */
 
 const { getCircuit } = require('../utils/circuitBreaker');
 const { getCachedPrices, getCachedCurrencyRates } = require('./cacheService');
 const { StructuredLogger } = require('../utils/logger');
+const { FINANCE_QUERY_API_URL, getServiceHeaders } = require('./config');
 
-const API_BASE_URL = 'https://dmn46d7xas3rvio6tugd2vzs2q0hxbmb.lambda-url.us-east-1.on.aws/v1';
+// SEC-CF-001: URL centralizada via Cloudflare Tunnel
+const API_BASE_URL = FINANCE_QUERY_API_URL;
 const logger = new StructuredLogger('financeQuery');
 
 // Circuit breakers per endpoint type
@@ -36,7 +42,10 @@ const fetchData = async (endpoint, maxRetries = 3, delay = 1000) => {
 
   while (attempts < maxRetries) {
     try {
-      const response = await fetch(`${API_BASE_URL}${endpoint}`);
+      // SEC-TOKEN-004: Incluir headers de autenticación de servicio
+      const response = await fetch(`${API_BASE_URL}${endpoint}`, {
+        headers: getServiceHeaders(),
+      });
       if (!response.ok) {
         throw new Error('Network response was not ok');
       }

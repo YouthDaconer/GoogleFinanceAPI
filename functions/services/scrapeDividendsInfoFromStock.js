@@ -4,21 +4,25 @@
  * OPT-DEMAND-CLEANUP: Refactorizado para:
  * - Leer símbolos de `assets` en lugar de `currentPrices`
  * - NO escribir a Firestore (retornar datos en memoria)
- * - Los datos de dividendos vienen del API Lambda directamente
+ * - Los datos de dividendos vienen del API directamente
+ * 
+ * SEC-CF-001: Migrado a Cloudflare Tunnel
  * 
  * @module scrapeDividendsInfoFromStock
  * @see docs/architecture/OPT-DEMAND-CLEANUP-phase4-closure-subplan.md
+ * @see docs/architecture/SEC-CF-001-cloudflare-tunnel-migration-plan.md
  */
 
 const axios = require("axios");
 const { DateTime } = require("luxon");
 const admin = require("firebase-admin");
+const { FINANCE_QUERY_API_URL } = require('./config');
 
-// API Lambda para datos de mercado (fallback)
-const LAMBDA_API_BASE_URL = 'https://dmn46d7xas3rvio6tugd2vzs2q0hxbmb.lambda-url.us-east-1.on.aws/v1';
+// SEC-CF-001: API URL via Cloudflare Tunnel
+const LAMBDA_API_BASE_URL = FINANCE_QUERY_API_URL;
 
 // FastAPI con StockEvents scraper (fuente primaria - datos más actualizados)
-const FASTAPI_BASE_URL = 'https://dmn46d7xas3rvio6tugd2vzs2q0hxbmb.lambda-url.us-east-1.on.aws/v1';
+const FASTAPI_BASE_URL = FINANCE_QUERY_API_URL;
 
 /**
  * Obtiene información de dividendos para un símbolo desde StockEvents via FastAPI

@@ -2,6 +2,7 @@ const { onSchedule } = require("firebase-functions/v2/scheduler");
 const admin = require('./firebaseAdmin');
 const requestIndicesFromFinance = require('./requestIndicesFromFinance');
 const axios = require('axios');
+const { FINANCE_QUERY_API_URL, getServiceHeaders } = require('./config');
 
 const normalizeNumber = (value) => {
   if (!value) return null;
@@ -12,6 +13,7 @@ exports.saveAllIndicesAndSectorsHistoryData = onSchedule({
   schedule: '*/10 9-17 * * 1-5',
   timeZone: 'America/New_York',
   retryCount: 3,
+  // SEC-TOKEN-003: SERVICE_TOKEN_SECRET se lee de process.env via config.js
 }, async (event) => {
   const batch = admin.firestore().batch();
   const formattedDate = new Date().toISOString().split('T')[0];
@@ -64,8 +66,12 @@ exports.saveAllIndicesAndSectorsHistoryData = onSchedule({
   }
 
   // Obtener y guardar sectores (independiente de índices)
+  // SEC-CF-001: URL via Cloudflare Tunnel
+  // SEC-TOKEN-004: Incluir headers de autenticación
   try {
-    const response = await axios.get('https://dmn46d7xas3rvio6tugd2vzs2q0hxbmb.lambda-url.us-east-1.on.aws/v1/sectors');
+    const response = await axios.get(`${FINANCE_QUERY_API_URL}/sectors`, {
+      headers: getServiceHeaders()
+    });
     const sectors = response.data;
 
     // Mapeo de nombres de sectores a etfSectors
