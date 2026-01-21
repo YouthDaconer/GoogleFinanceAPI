@@ -461,7 +461,10 @@ async function calculateIntradayPerformance(params) {
       console.log(`[IntradayCalc] Processing array response with ${pricesResponse.length} items`);
       for (const quote of pricesResponse) {
         if (quote && quote.symbol) {
-          const price = typeof quote.price === 'string' ? parseFloat(quote.price) : quote.price;
+          // INTRADAY-FIX: Eliminar comas de miles antes de parsear (ej: "89,290.02" → 89290.02)
+          const price = typeof quote.price === 'string' 
+            ? parseFloat(quote.price.replace(/,/g, '')) 
+            : quote.price;
           if (typeof price === 'number' && !isNaN(price) && price > 0) {
             currentPrices[quote.symbol] = {
               price: price,
@@ -475,7 +478,10 @@ async function calculateIntradayPerformance(params) {
       console.log(`[IntradayCalc] Processing object response with keys: ${Object.keys(pricesResponse).slice(0, 5).join(', ')}...`);
       for (const [symbol, data] of Object.entries(pricesResponse)) {
         if (data && (typeof data.price === 'number' || typeof data.price === 'string')) {
-          const price = typeof data.price === 'string' ? parseFloat(data.price) : data.price;
+          // INTRADAY-FIX: Eliminar comas de miles antes de parsear (ej: "89,290.02" → 89290.02)
+          const price = typeof data.price === 'string' 
+            ? parseFloat(data.price.replace(/,/g, '')) 
+            : data.price;
           if (!isNaN(price) && price > 0) {
             currentPrices[symbol] = {
               price: price,

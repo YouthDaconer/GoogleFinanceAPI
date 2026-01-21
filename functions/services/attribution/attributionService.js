@@ -298,20 +298,23 @@ async function getPortfolioAttribution(params) {
     // INTRADAY-001: Combinar TWR histórico con factor intraday
     // Fórmula TWR: (1 + histórico) × todayFactor - 1
     // 
-    // DECISIÓN DE DISEÑO (2026-01-21):
-    // NO aplicar intraday en Attribution cuando hay más de 1 día de diferencia.
-    // Esto es porque:
-    // 1. Attribution usa datos de portfolioPerformance (último día bursátil guardado)
-    // 2. PortfolioSummary usa datos "live" del store con precios actuales
-    // 3. Aplicar el factor sobre datos de hace 5 días distorsiona los cálculos
-    // 4. El usuario entiende que Attribution muestra datos hasta el último cierre
+    // DECISIÓN DE DISEÑO (2026-01-21) - ACTUALIZADO:
+    // SIEMPRE aplicar el factor intraday para mantener coherencia con PortfolioSummary.
+    // 
+    // El frontend combina TWR histórico + cambio desde el último día con datos,
+    // sin importar cuántos días hayan pasado (festivos, fines de semana, etc.).
+    // Para que Attribution muestre el mismo YTD que el Dashboard, debemos
+    // replicar exactamente esa lógica.
     //
-    // El campo metadata.portfolioDate indica claramente la fecha de los datos.
+    // Semánticamente, lo que el usuario quiere ver es "rendimiento hasta hoy",
+    // no "rendimiento hasta el último día bursátil".
+    //
+    // @see docs/architecture/portfolio-summary-vs-attribution-calculation-analysis.md
     let intradayAdjustedTWR = periodTWR;
     let intradayApplied = false;
     
     if (intradayPerformance && intradayPerformance.success && intradayPerformance.todayFactor !== 1) {
-      // Calcular diferencia de días
+      // Calcular diferencia de días para logging/diagnóstico
       const today = new Date();
       const previousDayDate = intradayPerformance.previousDayDate 
         ? new Date(intradayPerformance.previousDayDate) 
@@ -323,16 +326,15 @@ async function getPortfolioAttribution(params) {
         daysDifference = Math.floor(diffMs / (1000 * 60 * 60 * 24));
       }
       
-      // Solo aplicar intraday si los datos son de ayer o hoy (máximo 1 día)
-      // Esto evita distorsiones por fines de semana o festivos
-      if (daysDifference <= 1) {
-        intradayAdjustedTWR = combineHistoricalWithIntraday(periodTWR, intradayPerformance.todayFactor);
-        console.log(`[Attribution] TWR ajustado con intraday: ${periodTWR.toFixed(2)}% → ${intradayAdjustedTWR.toFixed(2)}%`);
-        periodTWR = intradayAdjustedTWR;
-        intradayApplied = true;
-      } else {
-        console.log(`[Attribution] Intraday NO aplicado: datos de hace ${daysDifference} días (${intradayPerformance.previousDayDate}). Usando TWR histórico: ${periodTWR.toFixed(2)}%`);
-        intradayPerformance.skippedReason = `Datos históricos de ${daysDifference} días atrás. Attribution muestra rendimiento hasta el último cierre bursátil (${intradayPerformance.previousDayDate}).`;
+      // SIEMPRE aplicar el factor para mantener coherencia con PortfolioSummary
+      intradayAdjustedTWR = combineHistoricalWithIntraday(periodTWR, intradayPerformance.todayFactor);
+      console.log(`[Attribution] TWR ajustado: ${periodTWR.toFixed(2)}% → ${intradayAdjustedTWR.toFixed(2)}% (factor=${intradayPerformance.todayFactor.toFixed(6)}, días=${daysDifference})`);
+      periodTWR = intradayAdjustedTWR;
+      intradayApplied = true;
+      
+      // Agregar nota informativa si hay varios días de diferencia
+      if (daysDifference > 1) {
+        intradayPerformance.note = `Cambio de ${daysDifference} días incluido (desde ${intradayPerformance.previousDayDate})`;
       }
     }
     
@@ -451,7 +453,7 @@ async function getPortfolioAttribution(params) {
             assetsWithPrice: intradayPerformance.assetsWithPrice,
             symbolsRequested: intradayPerformance.symbolsRequested,
             symbolsWithPrice: intradayPerformance.symbolsWithPrice,
-            skippedReason: intradayPerformance.skippedReason || null
+            note: intradayPerformance.note || null  // Info si hay varios días de diferencia
           } : {})
         }
       };
