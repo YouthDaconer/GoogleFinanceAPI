@@ -7,20 +7,14 @@
  * MEJORADO: Ahora usa TWR (Time-Weighted Return) del período correcto
  * en lugar de totalROI para mayor precisión.
  * 
- * INTRADAY-001: Incluye rendimiento intraday en tiempo real para
- * consistencia con PortfolioSummary del frontend.
- * 
  * @module services/attribution/attributionService
  * @see docs/architecture/portfolio-attribution-coherence-analysis.md
  */
 
-const { calculateContributions, enrichWithCurrentPrices, findNearestPerformanceData, getLatestPerformanceData } = require('./contributionCalculator');
+const { calculateContributions, enrichWithCurrentPrices, findNearestPerformanceData } = require('./contributionCalculator');
 const { generateWaterfallFromContributions } = require('./waterfallGenerator');
 const { generateSummary } = require('./summaryGenerator');
 const { getPeriodLabel, getPeriodStartDate } = require('./types');
-// INTRADAY-001: Importar cálculo intraday para rendimiento en tiempo real
-const { calculateIntradayPerformance, combineHistoricalWithIntraday } = require('./intradayCalculator');
-const { getQuotes } = require('../financeQuery');
 
 const admin = require('../firebaseAdmin');
 const db = admin.firestore();
@@ -178,9 +172,6 @@ async function calculateMultiAccountTWR(userId, period, currency, accountIds) {
  * Este es el punto de entrada principal para obtener todos los datos
  * de atribución necesarios para el dashboard.
  * 
- * INTRADAY-001: Ahora incluye el rendimiento intraday en tiempo real
- * para consistencia con PortfolioSummary del frontend.
- * 
  * @param {Object} params - Parámetros de la solicitud
  * @param {string} params.userId - ID del usuario
  * @param {string} params.period - Período de análisis ('YTD', '1M', '3M', etc.)
@@ -191,7 +182,6 @@ async function calculateMultiAccountTWR(userId, period, currency, accountIds) {
  * @param {number} params.options.maxWaterfallBars - Máximo de barras en waterfall
  * @param {boolean} params.options.includeMetadata - Incluir metadata de debug
  * @param {number} params.options.portfolioReturn - TWR pre-calculado del frontend (opcional)
- * @param {boolean} params.options.includeIntraday - Incluir rendimiento intraday (default: true)
  * @returns {Promise<Object>} AttributionResponse completo
  */
 async function getPortfolioAttribution(params) {
@@ -207,15 +197,10 @@ async function getPortfolioAttribution(params) {
     benchmarkReturn = 0,
     maxWaterfallBars = 8,
     includeMetadata = true,
-    portfolioReturn: frontendTWR, // TWR pasado desde el frontend
-    includeIntraday = true // INTRADAY-001: Incluir rendimiento intraday por defecto
+    portfolioReturn: frontendTWR // TWR pasado desde el frontend
   } = options;
   
   const startTime = Date.now();
-  
-  // INTRADAY-001: Variables para tracking de intraday
-  let intradayPerformance = null;
-  let intradayError = null;
   
   try {
     // =========================================================================
@@ -231,111 +216,28 @@ async function getPortfolioAttribution(params) {
     }
     
     // =========================================================================
-    // 2. OBTENER TWR DEL PERÍODO (HISTÓRICO) + INTRADAY EN PARALELO
+    // 2. OBTENER TWR DEL PERÍODO
     // =========================================================================
-    // Calcular TWR histórico y performance intraday en paralelo para mejor performance
-    
-    let periodTWR = 0; // Inicializar con valor por defecto
+    // Si el frontend pasó el TWR, usarlo para consistencia
+    // Si no, calcular localmente
+    let periodTWR;
     let hasTWRData = false;
-    let historicalTWR = 0; // Inicializar con valor por defecto
     
-    // INTRADAY-001: Calcular intraday en paralelo si está habilitado
-    const promises = [];
-    
-    // Promise para TWR histórico
     if (frontendTWR !== undefined && !isNaN(frontendTWR)) {
       periodTWR = frontendTWR;
-      historicalTWR = frontendTWR;
       hasTWRData = true;
       console.log(`[Attribution] Usando TWR del frontend: ${periodTWR.toFixed(2)}%`);
     } else {
-      promises.push(
-        calculateMultiAccountTWR(userId, period, currency, accountIds)
-          .then(twrResult => {
-            periodTWR = twrResult.twr || 0;
-            historicalTWR = twrResult.twr || 0;
-            hasTWRData = twrResult.hasData;
-            console.log(`[Attribution] Usando TWR calculado del período ${period}: ${periodTWR.toFixed(2)}%`);
-          })
-          .catch(err => {
-            console.error(`[Attribution] Error calculando TWR:`, err);
-            periodTWR = 0;
-            historicalTWR = 0;
-            hasTWRData = false;
-          })
+      // Calcular TWR localmente (fallback)
+      const twrResult = await calculateMultiAccountTWR(
+        userId, 
+        period, 
+        currency, 
+        accountIds
       );
-    }
-    
-    // Promise para intraday performance (si está habilitado)
-    if (includeIntraday) {
-      promises.push(
-        calculateIntradayPerformance({
-          userId,
-          currency,
-          accountIds
-        })
-          .then(result => {
-            if (result.success) {
-              intradayPerformance = result;
-              console.log(`[Attribution] Intraday calculado: factor=${result.todayFactor.toFixed(6)}, cambio=${result.dailyChangePercent.toFixed(2)}%`);
-            } else {
-              intradayError = result.error;
-              console.log(`[Attribution] Intraday falló: ${result.error}`);
-            }
-          })
-          .catch(err => {
-            intradayError = err.message;
-            console.error(`[Attribution] Error calculando intraday:`, err);
-          })
-      );
-    }
-    
-    // Esperar todas las promises en paralelo
-    if (promises.length > 0) {
-      await Promise.all(promises);
-    }
-    
-    // INTRADAY-001: Combinar TWR histórico con factor intraday
-    // Fórmula TWR: (1 + histórico) × todayFactor - 1
-    // 
-    // DECISIÓN DE DISEÑO (2026-01-21) - ACTUALIZADO:
-    // SIEMPRE aplicar el factor intraday para mantener coherencia con PortfolioSummary.
-    // 
-    // El frontend combina TWR histórico + cambio desde el último día con datos,
-    // sin importar cuántos días hayan pasado (festivos, fines de semana, etc.).
-    // Para que Attribution muestre el mismo YTD que el Dashboard, debemos
-    // replicar exactamente esa lógica.
-    //
-    // Semánticamente, lo que el usuario quiere ver es "rendimiento hasta hoy",
-    // no "rendimiento hasta el último día bursátil".
-    //
-    // @see docs/architecture/portfolio-summary-vs-attribution-calculation-analysis.md
-    let intradayAdjustedTWR = periodTWR;
-    let intradayApplied = false;
-    
-    if (intradayPerformance && intradayPerformance.success && intradayPerformance.todayFactor !== 1) {
-      // Calcular diferencia de días para logging/diagnóstico
-      const today = new Date();
-      const previousDayDate = intradayPerformance.previousDayDate 
-        ? new Date(intradayPerformance.previousDayDate) 
-        : null;
-      
-      let daysDifference = 0;
-      if (previousDayDate) {
-        const diffMs = today.getTime() - previousDayDate.getTime();
-        daysDifference = Math.floor(diffMs / (1000 * 60 * 60 * 24));
-      }
-      
-      // SIEMPRE aplicar el factor para mantener coherencia con PortfolioSummary
-      intradayAdjustedTWR = combineHistoricalWithIntraday(periodTWR, intradayPerformance.todayFactor);
-      console.log(`[Attribution] TWR ajustado: ${periodTWR.toFixed(2)}% → ${intradayAdjustedTWR.toFixed(2)}% (factor=${intradayPerformance.todayFactor.toFixed(6)}, días=${daysDifference})`);
-      periodTWR = intradayAdjustedTWR;
-      intradayApplied = true;
-      
-      // Agregar nota informativa si hay varios días de diferencia
-      if (daysDifference > 1) {
-        intradayPerformance.note = `Cambio de ${daysDifference} días incluido (desde ${intradayPerformance.previousDayDate})`;
-      }
+      periodTWR = twrResult.twr;
+      hasTWRData = twrResult.hasData;
+      console.log(`[Attribution] Usando TWR calculado del período ${period}: ${periodTWR.toFixed(2)}%`);
     }
     
     // =========================================================================
@@ -418,7 +320,7 @@ async function getPortfolioAttribution(params) {
       response.metadata = {
         calculatedAt: new Date().toISOString(),
         processingTimeMs: Date.now() - startTime,
-        dataSource: intradayPerformance ? 'assetPerformance + TWR + intraday' : 'assetPerformance + TWR',
+        dataSource: 'assetPerformance + TWR',
         portfolioDate: contributionResult.latestDate,
         periodStartDate: contributionResult.periodStartDate,
         period,
@@ -429,32 +331,11 @@ async function getPortfolioAttribution(params) {
         diagnostics: {
           totalAssets: contributionResult.attributions.length,
           sumOfContributions: contributionResult.sumOfContributions,
-          historicalTWR: historicalTWR,
           periodTWR: hasTWRData ? periodTWR : null,
           originalTotalROI: contributionResult.originalPortfolioReturn,
           portfolioReturn: contributionResult.portfolioReturn,
           discrepancy: contributionResult.discrepancy,
           normalized: contributionResult.normalized
-        },
-        // INTRADAY-001: Información de rendimiento intraday
-        intraday: {
-          included: !!intradayPerformance,
-          enabled: includeIntraday,
-          applied: intradayApplied, // INTRADAY-FIX: Si realmente se aplicó el ajuste
-          error: intradayError,
-          ...(intradayPerformance ? {
-            date: intradayPerformance.date,
-            todayFactor: intradayPerformance.todayFactor,
-            dailyChangePercent: intradayPerformance.dailyChangePercent,
-            adjustedDailyChangePercent: intradayPerformance.adjustedDailyChangePercent,
-            totalValue: intradayPerformance.totalValue,
-            previousDayTotalValue: intradayPerformance.previousDayTotalValue,
-            previousDayDate: intradayPerformance.previousDayDate,
-            assetsWithPrice: intradayPerformance.assetsWithPrice,
-            symbolsRequested: intradayPerformance.symbolsRequested,
-            symbolsWithPrice: intradayPerformance.symbolsWithPrice,
-            note: intradayPerformance.note || null  // Info si hay varios días de diferencia
-          } : {})
         }
       };
     }

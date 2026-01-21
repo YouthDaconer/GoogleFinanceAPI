@@ -196,7 +196,22 @@ const calculateAccountPerformance = (assets, currentPrices, currencies, totalVal
         const priceCurrency = priceData?.currency || 'USD';
         const assetValueInPriceCurrency = currentPrice * asset.units;
 
-        const initialInvestmentUSD = asset.unitValue * asset.units;
+        // FIX-CURRENCY-002: El unitValue está en la moneda del asset (asset.currency), NO en USD
+        // Para activos comprados en monedas extranjeras (COP, EUR, etc.), el unitValue es en esa moneda
+        // Debemos convertir de asset.currency a USD usando acquisitionDollarValue
+        const assetCurrency = asset.currency || 'USD';
+        const initialInvestmentInAssetCurrency = asset.unitValue * asset.units;
+        
+        // Si el asset fue comprado en moneda extranjera, convertir a USD usando la tasa de adquisición
+        let initialInvestmentUSD;
+        if (assetCurrency !== 'USD' && asset.acquisitionDollarValue) {
+          // acquisitionDollarValue es la tasa USD/XXX al momento de compra (ej: 3750.75 para COP)
+          initialInvestmentUSD = initialInvestmentInAssetCurrency / asset.acquisitionDollarValue;
+        } else {
+          // El asset ya está en USD
+          initialInvestmentUSD = initialInvestmentInAssetCurrency;
+        }
+        
         const assetInvestment = convertCurrency(initialInvestmentUSD, 'USD', currency.code, currencies, asset.defaultCurrencyForAdquisitionDollar, asset.acquisitionDollarValue);
         // FIX-CURRENCY-001: Convertir desde la moneda real del precio, no asumir USD
         const assetValue = convertCurrency(assetValueInPriceCurrency, priceCurrency, currency.code, currencies);
