@@ -40,6 +40,21 @@ const NON_CURRENCY_FIELDS = [
   'docsCount', 'version', 'lastUpdated'
 ];
 
+/**
+ * OPT-DEMAND-500: Límites de validación para cambios diarios
+ * 
+ * Un cambio diario > 50% o < -50% es altamente improbable para un portafolio diversificado.
+ * Valores más extremos indican datos corruptos que no deben consolidarse.
+ * 
+ * Nota: Estos límites son conservadores. El S&P 500 nunca ha caído más del 23% en un día
+ * (Black Monday 1987). Un portafolio individual podría tener días más volátiles
+ * con posiciones concentradas, pero -100% significaría pérdida total.
+ */
+const DAILY_CHANGE_LIMITS = {
+  MAX_REASONABLE: 100,  // +100% en un día (ej: meme stock duplica)
+  MIN_REASONABLE: -90   // -90% en un día (pérdida casi total, pero no >100%)
+};
+
 // ============================================================================
 // FUNCIONES DE CONSOLIDACIÓN
 // ============================================================================
@@ -174,6 +189,15 @@ function consolidateCurrencyData(sortedDocs, currencyCode) {
     // Actualizar factor compuesto (TWR)
     const adjustedDailyChange = currencyData.adjustedDailyChangePercentage;
     if (adjustedDailyChange !== undefined && adjustedDailyChange !== null) {
+      // OPT-DEMAND-500: Validar que el cambio diario está dentro de límites razonables
+      // Valores fuera de rango indican datos corruptos que contaminarían la consolidación
+      if (adjustedDailyChange > DAILY_CHANGE_LIMITS.MAX_REASONABLE || 
+          adjustedDailyChange < DAILY_CHANGE_LIMITS.MIN_REASONABLE) {
+        console.warn(`[consolidateCurrencyData] ⚠️ Skipping corrupt data: ${data.date} ${currencyCode} adjustedDailyChange=${adjustedDailyChange}% (outside ${DAILY_CHANGE_LIMITS.MIN_REASONABLE}% to ${DAILY_CHANGE_LIMITS.MAX_REASONABLE}%)`);
+        // NO actualizar el factor - saltar este documento corrupto
+        return; // Continuar al siguiente documento
+      }
+      
       currentFactor = currentFactor * (1 + adjustedDailyChange / 100);
       validDocsCount++;
     }
@@ -196,6 +220,13 @@ function consolidateCurrencyData(sortedDocs, currencyCode) {
         
         const assetChange = assetData.adjustedDailyChangePercentage;
         if (assetChange !== undefined && assetChange !== null) {
+          // OPT-DEMAND-500: Validar límites también para assets individuales
+          if (assetChange > DAILY_CHANGE_LIMITS.MAX_REASONABLE || 
+              assetChange < DAILY_CHANGE_LIMITS.MIN_REASONABLE) {
+            // Silenciosamente saltar assets corruptos (muy verboso si se loguea cada uno)
+            return;
+          }
+          
           af.currentFactor = af.currentFactor * (1 + assetChange / 100);
           af.validDocsCount++;
         }
@@ -825,6 +856,7 @@ module.exports = {
   // Constantes
   CONSOLIDATED_SCHEMA_VERSION,
   NON_CURRENCY_FIELDS,
+  DAILY_CHANGE_LIMITS, // OPT-DEMAND-500: Límites de validación
   
   // Consolidación
   consolidatePeriod,

@@ -52,7 +52,7 @@ const db = admin.firestore();
 
 const CONFIG = {
   // API de precios históricos
-  HISTORICAL_API_BASE: 'https://dmn46d7xas3rvio6tugd2vzs2q0hxbmb.lambda-url.us-east-1.on.aws/v1',
+  HISTORICAL_API_BASE: 'https://354sdh5hcrnztw5vquw6sxiduu0gigku.lambda-url.us-east-1.on.aws/v1',
   
   // Monedas activas
   CURRENCIES: ['USD', 'COP', 'EUR', 'MXN', 'BRL', 'GBP', 'CAD'],

@@ -387,6 +387,62 @@ class PerformanceDataCache {
     logInfo(`✅ Caché precargado: ${this.userLastPerformance.size} usuarios, ${this.accountLastPerformance.size} cuentas`);
   }
 
+  /**
+   * OPT-DEMAND-500: Valida consistencia entre datos de usuario y cuentas.
+   * 
+   * Detecta situaciones donde el overall tiene datos más recientes que las cuentas,
+   * lo cual causaría cálculos incorrectos de adjustedDailyChangePercentage.
+   * 
+   * @param {string} userId - ID del usuario
+   * @param {string[]} accountIds - IDs de las cuentas del usuario
+   * @returns {{isConsistent: boolean, userDate: string|null, accountDates: Object, gap: number}}
+   */
+  validateDataConsistency(userId, accountIds) {
+    const userData = this.userLastPerformance.get(userId);
+    const userDate = userData?.date || null;
+    
+    const accountDates = {};
+    let minAccountDate = null;
+    let maxAccountDate = null;
+    
+    for (const accountId of accountIds) {
+      const accountData = this.accountLastPerformance.get(accountId);
+      const accountDate = accountData?.date || null;
+      accountDates[accountId] = accountDate;
+      
+      if (accountDate) {
+        if (!minAccountDate || accountDate < minAccountDate) {
+          minAccountDate = accountDate;
+        }
+        if (!maxAccountDate || accountDate > maxAccountDate) {
+          maxAccountDate = accountDate;
+        }
+      }
+    }
+    
+    // Calcular gap en días entre overall y la cuenta más antigua
+    let gap = 0;
+    if (userDate && minAccountDate && userDate !== minAccountDate) {
+      const userDateTime = DateTime.fromISO(userDate);
+      const minAccountDateTime = DateTime.fromISO(minAccountDate);
+      gap = Math.abs(userDateTime.diff(minAccountDateTime, 'days').days);
+    }
+    
+    // Es inconsistente si:
+    // 1. El overall tiene fecha más reciente que alguna cuenta
+    // 2. Hay un gap de más de 1 día entre cuentas
+    const isConsistent = gap <= 1 && (!userDate || !minAccountDate || userDate <= maxAccountDate);
+    
+    return {
+      isConsistent,
+      userDate,
+      accountDates,
+      minAccountDate,
+      maxAccountDate,
+      gap
+    };
+  }
+
   getUserLastPerformance(userId, currencies) {
     const data = this.userLastPerformance.get(userId);
     if (!data) {
@@ -532,6 +588,29 @@ async function calculateDailyPortfolioPerformance(db, currentPrices, currencies)
   // ✨ OPTIMIZACIÓN: Sistema de caché para datos históricos
   const cache = new PerformanceDataCache();
   await cache.preloadHistoricalData(db, formattedDate, userPortfolios, sellTransactions);
+
+  // OPT-DEMAND-500: Validar consistencia de datos antes de calcular
+  // Esto previene corrupciones cuando overall y cuentas tienen fechas diferentes
+  const inconsistentUsers = [];
+  for (const [userId, accounts] of Object.entries(userPortfolios)) {
+    const accountIds = accounts.map(acc => acc.id);
+    const consistency = cache.validateDataConsistency(userId, accountIds);
+    
+    if (!consistency.isConsistent) {
+      inconsistentUsers.push({
+        userId,
+        ...consistency
+      });
+    }
+  }
+  
+  if (inconsistentUsers.length > 0) {
+    logWarn(`⚠️ OPT-DEMAND-500: Detectados ${inconsistentUsers.length} usuarios con datos inconsistentes`);
+    for (const user of inconsistentUsers) {
+      logWarn(`   Usuario ${user.userId}: overall=${user.userDate}, cuentas min=${user.minAccountDate}, max=${user.maxAccountDate}, gap=${user.gap} días`);
+    }
+    // TODO: En futuras versiones, considerar auto-reparación o skip de usuarios inconsistentes
+  }
 
   // ✨ OPTIMIZACIÓN: Batch único para todas las operaciones
   const BATCH_SIZE = 450;

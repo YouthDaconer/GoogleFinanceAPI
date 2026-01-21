@@ -1,3 +1,24 @@
+/**
+ * @deprecated OPT-DEMAND-CLEANUP (2026-01-21)
+ * 
+ * ESTA FUNCIÓN ESTÁ DEPRECADA Y NO DEBE USARSE.
+ * 
+ * Razones:
+ * 1. NO está exportada en index.js (no desplegada)
+ * 2. Reemplazada por unifiedMarketDataUpdate (EOD) + cálculos on-demand del frontend
+ * 3. Era costosa: ~160 ejecuciones/día vs 1 ejecución de unifiedMarketDataUpdate
+ * 
+ * Arquitectura actual:
+ * - Durante el día: Frontend calcula rendimiento ON-DEMAND usando API Lambda
+ * - Al cierre (00:05 ET): unifiedMarketDataUpdate guarda snapshot EOD
+ * 
+ * Este archivo se mantiene temporalmente como referencia.
+ * TODO: Eliminar después de 2026-02-01 si no hay problemas.
+ * 
+ * @see docs/architecture/OPT-DEMAND-CLEANUP-final-summary.md
+ * @see services/unifiedMarketDataUpdate.js (reemplazo activo)
+ */
+
 const { onSchedule } = require("firebase-functions/v2/scheduler");
 const admin = require('firebase-admin');
 const { calculateAccountPerformance, convertCurrency } = require('../utils/portfolioCalculations');
@@ -5,6 +26,9 @@ const { DateTime } = require('luxon');
 // OPT-DEMAND-CLEANUP: Importar helper para obtener precios y currencies del API Lambda
 const { getPricesFromApi, getCurrencyRatesFromApi } = require('./marketDataHelper');
 
+/**
+ * @deprecated NO USAR - Reemplazada por unifiedMarketDataUpdate
+ */
 exports.calcDailyPortfolioPerf = onSchedule({
   schedule: '*/3 9-17 * * 1-5',
   timeZone: 'America/New_York',
