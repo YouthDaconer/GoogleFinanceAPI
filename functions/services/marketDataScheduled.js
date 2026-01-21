@@ -25,13 +25,31 @@
 
 const { onSchedule } = require("firebase-functions/v2/scheduler");
 const admin = require('./firebaseAdmin');
-const requestIndicesFromFinance = require('./requestIndicesFromFinance');
 const axios = require('axios');
 const { FINANCE_QUERY_API_URL, getServiceHeaders } = require('./config');
 
 // ============================================================================
 // UTILIDADES
 // ============================================================================
+
+/**
+ * Obtiene todos los índices del endpoint de finanzas
+ * SEC-CF-001: Migrado a Cloudflare Tunnel
+ * SEC-TOKEN-004: Incluye headers de autenticación de servicio
+ * 
+ * @returns {Promise<Array>} Array con todos los índices
+ */
+async function requestIndicesFromFinance() {
+  try {
+    const response = await axios.get(
+      `${FINANCE_QUERY_API_URL}/indices`,
+      { headers: getServiceHeaders() }
+    );
+    return response.data;
+  } catch (error) {
+    throw new Error(`Error fetching indices: ${error.message}`);
+  }
+}
 
 /**
  * Normaliza un valor numérico desde string con formato (%, +, etc.)

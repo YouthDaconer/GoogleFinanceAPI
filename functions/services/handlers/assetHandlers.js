@@ -15,11 +15,8 @@ const { HttpsError } = require("firebase-functions/v2/https");
 const admin = require('../firebaseAdmin');
 const db = admin.firestore();
 
-// Importar función de invalidación de cache de rendimientos (OPT-002)
-const { invalidatePerformanceCache } = require('../historicalReturnsService');
-
-// Importar función de invalidación de cache de distribución (SCALE-OPT-001)
-const { invalidateDistributionCache } = require('../portfolioDistributionService');
+// Importar funciones de invalidación de cache (consolidadas en cacheInvalidationService)
+const { invalidatePerformanceCache, invalidateDistributionCache } = require('../cacheInvalidationService');
 
 // Importar getQuotes para crear currentPrices de nuevos tickers
 const { getQuotes } = require('../financeQuery');
@@ -396,6 +393,55 @@ async function updateAsset(context, payload) {
       batch.update(accountRef, {
         [`balances.${currency}`]: newBalance,
       });
+    }
+
+    // 8.1. Actualizar la transacción de compra asociada (si existe)
+    const transactionQuery = await db.collection('transactions')
+      .where('assetId', '==', data.assetId)
+      .where('type', '==', 'buy')
+      .limit(1)
+      .get();
+    
+    if (!transactionQuery.empty) {
+      const transactionRef = transactionQuery.docs[0].ref;
+      const transactionUpdate = {};
+      
+      // Solo actualizar los campos que cambiaron
+      if (updateData.name !== undefined) {
+        transactionUpdate.assetName = updateData.name;
+      }
+      if (updateData.units !== undefined) {
+        transactionUpdate.amount = updateData.units;
+      }
+      if (updateData.unitValue !== undefined) {
+        transactionUpdate.price = updateData.unitValue;
+      }
+      if (updateData.currency !== undefined) {
+        transactionUpdate.currency = updateData.currency;
+      }
+      if (updateData.acquisitionDate !== undefined) {
+        transactionUpdate.date = updateData.acquisitionDate;
+      }
+      if (updateData.commission !== undefined) {
+        transactionUpdate.commission = updateData.commission;
+      }
+      if (updateData.assetType !== undefined) {
+        transactionUpdate.assetType = updateData.assetType;
+      }
+      if (updateData.acquisitionDollarValue !== undefined) {
+        transactionUpdate.dollarPriceToDate = updateData.acquisitionDollarValue;
+      }
+      if (updateData.market !== undefined) {
+        transactionUpdate.market = updateData.market;
+      }
+      if (updateData.defaultCurrencyForAdquisitionDollar !== undefined) {
+        transactionUpdate.defaultCurrencyForAdquisitionDollar = updateData.defaultCurrencyForAdquisitionDollar;
+      }
+      
+      if (Object.keys(transactionUpdate).length > 0) {
+        batch.update(transactionRef, transactionUpdate);
+        console.log(`[assetHandlers][updateAsset] Actualizando transacción asociada: ${transactionRef.id}`);
+      }
     }
 
     await batch.commit();

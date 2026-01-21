@@ -3,7 +3,7 @@ const admin = require('firebase-admin');
 const axios = require('axios');
 const { calculateAccountPerformance, convertCurrency } = require('../utils/portfolioCalculations');
 const { calculatePortfolioRisk } = require('./calculatePortfolioRisk');
-const { invalidatePerformanceCacheBatch } = require('./historicalReturnsService');
+const { invalidatePerformanceCacheBatch } = require('./cacheInvalidationService');
 const { DateTime } = require('luxon');
 
 // Importar generador de logos

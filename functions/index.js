@@ -27,11 +27,13 @@ const {
 const { onSchedule } = require("firebase-functions/v2/scheduler");
 const { calculateProfitableWeeks } = require('./services/calculateProfitableWeeks');
 
-// Cloud Functions Callable para operaciones de assets (REF-002)
-const assetOperations = require('./services/assetOperations');
+// DEPRECATED: Cloud Functions Callable para operaciones de assets (REF-002)
+// Consolidadas en portfolioOperations (SCALE-CF-001) - ya no se requiere este import
+// const assetOperations = require('./services/assetOperations');
 
-// Cloud Function Callable para precios filtrados por usuario (OPT-001)
-const userPricesService = require('./services/userPricesService');
+// DEPRECATED: Cloud Function Callable para precios filtrados por usuario (OPT-001)
+// Consolidada en queryOperations (SCALE-CF-001) - ya no se requiere este import
+// const userPricesService = require('./services/userPricesService');
 
 // Cloud Function Callable para rendimientos históricos pre-calculados (OPT-002)
 const historicalReturnsService = require('./services/historicalReturnsService');
@@ -220,8 +222,9 @@ exports.weeklyProfitableWeeksCalculation = onSchedule({
 // DEPRECATED: Estas funciones fueron consolidadas en settingsOperations (SCALE-CF-001)
 // TODO: Eliminar después de 2 semanas de uso exitoso (2025-01-07)
 
-// Cloud Functions para currencies y userData
-const settingsOperations = require('./services/settingsOperations');
+// DEPRECATED: Cloud Functions para currencies y userData
+// Consolidadas en unified/settingsOperations.js (SCALE-CF-001)
+// const settingsOperations = require('./services/settingsOperations');
 
 /*
  * Agrega una nueva moneda al sistema
@@ -271,8 +274,9 @@ const settingsOperations = require('./services/settingsOperations');
 // DEPRECATED: Estas funciones fueron consolidadas en accountOperations (SCALE-CF-001)
 // TODO: Eliminar después de 2 semanas de uso exitoso (2025-01-07)
 
-// Cloud Functions para portfolioAccounts
-const portfolioAccountOperations = require('./services/portfolioAccountOperations');
+// DEPRECATED: Cloud Functions para portfolioAccounts
+// Consolidadas en unified/accountOperations.js (SCALE-CF-001)
+// const portfolioAccountOperations = require('./services/portfolioAccountOperations');
 
 /*
  * Crea una nueva cuenta de portafolio
@@ -365,7 +369,8 @@ exports.refreshIndexCache = indexHistoryService.refreshIndexCache;
 // TODO: Eliminar después de 2 semanas de uso exitoso (2025-01-07)
 
 const { onCall, HttpsError } = require('firebase-functions/v2/https');
-const portfolioDistributionService = require('./services/portfolioDistributionService');
+// DEPRECATED: portfolioDistributionService consolidado en unified/queryOperations
+// const portfolioDistributionService = require('./services/portfolioDistributionService');
 const { withRateLimit } = require('./utils/rateLimiter');
 
 /*

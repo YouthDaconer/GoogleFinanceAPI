@@ -28,9 +28,9 @@ const db = admin.firestore();
 const portfolioDistributionService = require('../portfolioDistributionService');
 const { 
   calculateHistoricalReturns, 
-  calculateDynamicTTL,
   getHistoricalReturnsInternal 
 } = require('../historicalReturnsService');
+const { calculateDynamicTTL } = require('../cacheInvalidationService');
 const { calculateIndexData } = require('../indexHistoryService');
 const { DateTime } = require('luxon');
 
