@@ -75,7 +75,7 @@ const etfProcessingOpts = {
   },
   // Sin instancias mínimas para evitar cargos continuos
   minInstances: 0, 
-  cpu: 1 // Asignar 1 CPU completo 
+  cpu: 1 // Asignar 1 CPU completo
 };
 
 // Exportar la app HTTP con las configuraciones específicas

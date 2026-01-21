@@ -45,6 +45,9 @@ const { getPerformanceOnDemand } = require('../handlers/performanceOnDemandHandl
  * 
  * Memory: 512MiB (requerido por getHistoricalReturns)
  * MaxInstances: 20 (alto tráfico esperado ~1500 invocaciones/día)
+ * 
+ * SEC-TOKEN-001: CF_SERVICE_TOKEN se carga desde .env para autenticación
+ * server-to-server con el API finance-query via Cloudflare Tunnel.
  */
 const FUNCTION_CONFIG = {
   cors: true,

@@ -43,11 +43,21 @@ const fetchData = async (endpoint, maxRetries = 3, delay = 1000) => {
   while (attempts < maxRetries) {
     try {
       // SEC-TOKEN-004: Incluir headers de autenticación de servicio
-      const response = await fetch(`${API_BASE_URL}${endpoint}`, {
-        headers: getServiceHeaders(),
-      });
+      const headers = getServiceHeaders();
+      const url = `${API_BASE_URL}${endpoint}`;
+      
+      // DEBUG: Log request details (solo primeros 3 intentos de la sesión)
+      if (attempts === 0) {
+        console.log(`[FinanceQuery] Calling: ${url.substring(0, 100)}...`);
+        console.log(`[FinanceQuery] Headers: x-service-token=${headers['x-service-token'] ? 'SET' : 'NOT SET'}`);
+      }
+      
+      const response = await fetch(url, { headers });
+      
       if (!response.ok) {
-        throw new Error('Network response was not ok');
+        const errorText = await response.text().catch(() => 'Unable to read response body');
+        console.error(`[FinanceQuery] HTTP ${response.status}: ${errorText.substring(0, 200)}`);
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
       }
       data = await response.json();
       return data;
@@ -148,6 +158,10 @@ const search = (query) => getWithGracefulDegradation(`/search?query=${query}`, [
 const getQuotes = (symbols) => getQuotesWithFallback(symbols);
 const getSimpleQuotes = (symbols) => getSimpleQuotesWithFallback(symbols);
 
+// Market quotes for currencies (COP=X, EUR=X, etc.) and indices
+// INTRADAY-001: Endpoint específico para tasas de cambio en tiempo real
+const getMarketQuotes = (symbols) => getWithGracefulDegradation(`/market-quotes?symbols=${symbols}`, {});
+
 // These don't have fallback - they throw on circuit open
 const getSimilarStocks = (symbol) => fetchData(`/similar-stocks/?symbol=${symbol}`);
 const getHistorical = (symbol, time, interval) => fetchData(`/historical/?symbol=${symbol}&time=${time}&interval=${interval}`);
@@ -162,6 +176,7 @@ module.exports = {
   getNews,
   getQuotes,
   getSimpleQuotes,
+  getMarketQuotes,
   getSimilarStocks,
   getSectors,
   search,

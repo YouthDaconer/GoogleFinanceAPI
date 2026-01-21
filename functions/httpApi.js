@@ -1222,6 +1222,8 @@ const {
  * Obtiene la atribución completa del portafolio.
  * Calcula la contribución de cada activo al rendimiento total.
  * 
+ * INTRADAY-001: Ahora incluye rendimiento intraday en tiempo real por defecto.
+ * 
  * Query params:
  * - userId: (required) ID del usuario
  * - period: Período de análisis ('YTD', '1M', '3M', '6M', '1Y', '2Y', 'ALL')
@@ -1230,6 +1232,7 @@ const {
  * - benchmarkReturn: Retorno del benchmark para comparar
  * - maxBars: Máximo de barras en waterfall (default: 8)
  * - portfolioReturn: (optional) TWR pre-calculado del frontend para consistencia
+ * - includeIntraday: (optional) Incluir rendimiento intraday (default: 'true')
  */
 app.get("/attribution", async (req, res) => {
   const { 
@@ -1239,7 +1242,8 @@ app.get("/attribution", async (req, res) => {
     accountIds = 'overall',
     benchmarkReturn = '0',
     maxBars = '8',
-    portfolioReturn
+    portfolioReturn,
+    includeIntraday = 'true'
   } = req.query;
   
   try {
@@ -1260,7 +1264,8 @@ app.get("/attribution", async (req, res) => {
         benchmarkReturn: parseFloat(benchmarkReturn) || 0,
         maxWaterfallBars: parseInt(maxBars) || 8,
         includeMetadata: true,
-        portfolioReturn: portfolioReturn ? parseFloat(portfolioReturn) : undefined
+        portfolioReturn: portfolioReturn ? parseFloat(portfolioReturn) : undefined,
+        includeIntraday: includeIntraday !== 'false' // INTRADAY-001: true por defecto
       }
     });
     

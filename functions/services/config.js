@@ -29,11 +29,11 @@ const FINANCE_QUERY_API_URL = process.env.FINANCE_QUERY_API_URL ||
   'https://ws.portastock.top/v1';
 
 /**
- * URL legacy de Lambda (solo para referencia/fallback)
- * @deprecated Usar FINANCE_QUERY_API_URL en su lugar
- * @type {string}
+ * SEC-TOKEN-009: Lambda URL pública DESHABILITADA (19-Ene-2026)
+ * La función inverstock-prod ya no tiene Function URL configurada.
+ * Todo el tráfico debe pasar por Cloudflare Tunnel (ws.portastock.top).
+ * @deprecated ELIMINADA - No usar
  */
-const LEGACY_LAMBDA_URL = 'https://dmn46d7xas3rvio6tugd2vzs2q0hxbmb.lambda-url.us-east-1.on.aws/v1';
 
 /**
  * SEC-TOKEN-003: Token de servicio para autenticación server-to-server
@@ -88,7 +88,6 @@ function isServiceAuthConfigured() {
 
 module.exports = {
   FINANCE_QUERY_API_URL,
-  LEGACY_LAMBDA_URL,
   SERVICE_TOKEN_SECRET,
   getServiceHeaders,
   isServiceAuthConfigured,

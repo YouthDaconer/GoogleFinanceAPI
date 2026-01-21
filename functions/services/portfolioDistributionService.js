@@ -14,6 +14,8 @@ const admin = require('./firebaseAdmin');
 const db = admin.firestore();
 const { StructuredLogger } = require('../utils/logger');
 const fetch = require('node-fetch');
+// SEC-CF-001: Configuración centralizada de URLs y headers
+const { FINANCE_QUERY_API_URL, getServiceHeaders } = require('./config');
 // OPT-DEMAND-SECTOR: Importar servicio de financeQuery para precios on-demand
 const { getQuotes } = require('./financeQuery');
 
@@ -589,18 +591,21 @@ async function fetchETFDataFromAPIWithRetry(symbol, maxRetries = 3) {
 
 /**
  * Obtiene datos de un ETF desde la API externa
+ * SEC-CF-001: Usa Cloudflare Tunnel y token de servicio
  * Retorna 'RATE_LIMITED' si hay error 429 para permitir retry
  */
 async function fetchETFDataFromAPI(symbol) {
-  const url = `https://dmn46d7xas3rvio6tugd2vzs2q0hxbmb.lambda-url.us-east-1.on.aws/v1/etf/${symbol}/unified`;
+  // SEC-CF-001: Usar URL centralizada (sin /v1 duplicado)
+  const baseUrl = FINANCE_QUERY_API_URL.replace('/v1', '');
+  const url = `${baseUrl}/v1/etf/${symbol}/unified`;
   
   try {
     const response = await fetch(url, { 
       timeout: 15000,
-      headers: {
-        'Accept': 'application/json',
-        'User-Agent': 'PortfolioDistributionService/1.0'
-      }
+      // SEC-TOKEN-004: Headers con token de servicio
+      headers: getServiceHeaders({
+        'Accept': 'application/json'
+      })
     });
     
     if (response.status === 429) {

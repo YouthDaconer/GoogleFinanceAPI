@@ -21,15 +21,20 @@ const { getPeriodLabel, getPeriodStartDate } = require('./types');
  */
 function generateSummary(contributionResult, period, options = {}) {
   const {
-    attributions,
-    totalPortfolioValue,
-    totalPortfolioInvestment,
-    portfolioReturn,
+    attributions = [],
+    totalPortfolioValue = 0,
+    totalPortfolioInvestment = 0,
+    portfolioReturn = 0,
     latestDate,
     periodStartDate: startDateStr
-  } = contributionResult;
+  } = contributionResult || {};
   
   const { benchmarkReturn = 0 } = options;
+  
+  // Asegurar que portfolioReturn sea un número válido
+  const safePortfolioReturn = typeof portfolioReturn === 'number' && !isNaN(portfolioReturn) 
+    ? portfolioReturn 
+    : 0;
   
   // =========================================================================
   // TOP Y WORST CONTRIBUTORS
@@ -76,14 +81,16 @@ function generateSummary(contributionResult, period, options = {}) {
   // =========================================================================
   // CÁLCULO DE ALPHA
   // =========================================================================
-  const alpha = portfolioReturn - benchmarkReturn;
-  const beatingBenchmark = portfolioReturn > benchmarkReturn;
+  const alpha = safePortfolioReturn - benchmarkReturn;
+  const beatingBenchmark = safePortfolioReturn > benchmarkReturn;
   
   // =========================================================================
   // VALOR AL INICIO DEL PERÍODO
   // =========================================================================
   // Calcular valor inicial basado en el retorno
-  const portfolioValueStart = totalPortfolioValue / (1 + portfolioReturn / 100);
+  const portfolioValueStart = safePortfolioReturn !== 0 
+    ? totalPortfolioValue / (1 + safePortfolioReturn / 100)
+    : totalPortfolioValue;
   const portfolioReturnAbsolute = totalPortfolioValue - portfolioValueStart;
   
   // =========================================================================
@@ -123,8 +130,8 @@ function generateSummary(contributionResult, period, options = {}) {
   
   // Concentración: qué porcentaje del retorno viene de los top 5
   const top5Contribution = sorted.slice(0, 5).reduce((sum, a) => sum + a.contribution, 0);
-  const concentrationRatio = portfolioReturn !== 0 
-    ? (top5Contribution / portfolioReturn) * 100 
+  const concentrationRatio = safePortfolioReturn !== 0 
+    ? (top5Contribution / safePortfolioReturn) * 100 
     : 0;
   
   return {
@@ -134,7 +141,7 @@ function generateSummary(contributionResult, period, options = {}) {
     periodLabel: getPeriodLabel(period),
     
     // Retornos
-    portfolioReturn,
+    portfolioReturn: safePortfolioReturn,
     portfolioReturnAbsolute,
     benchmarkReturn,
     alpha,

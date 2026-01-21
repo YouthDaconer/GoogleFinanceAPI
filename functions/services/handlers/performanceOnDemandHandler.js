@@ -14,13 +14,15 @@
 const { HttpsError } = require("firebase-functions/v2/https");
 const admin = require('../firebaseAdmin');
 const db = admin.firestore();
+// SEC-CF-001: Configuración centralizada de URLs y headers
+const { FINANCE_QUERY_API_URL, getServiceHeaders } = require('../config');
 
 // ============================================================================
 // CONFIGURACIÓN
 // ============================================================================
 
-const FINANCE_QUERY_API = process.env.FINANCE_QUERY_API_URL || 
-  'https://dmn46d7xas3rvio6tugd2vzs2q0hxbmb.lambda-url.us-east-1.on.aws';
+// SEC-CF-001: Usar URL centralizada (sin /v1 al final)
+const FINANCE_QUERY_API = FINANCE_QUERY_API_URL.replace('/v1', '');
 
 // Cache simple en memoria (1 minuto TTL)
 const cache = new Map();
@@ -58,10 +60,13 @@ async function fetchLivePrices(symbols, currencyCodes) {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 10000);
     
+    // SEC-TOKEN-004: Usar headers con token de servicio
     const response = await fetch(
       `${FINANCE_QUERY_API}/v1/market-quotes?symbols=${allSymbols.join(',')}`,
       { 
-        headers: { 'x-api-key': ADMIN_API_KEY },
+        headers: getServiceHeaders({
+          'Accept': 'application/json'
+        }),
         signal: controller.signal
       }
     );
