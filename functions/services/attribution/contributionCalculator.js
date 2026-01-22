@@ -337,19 +337,39 @@ async function calculateContributions(userId, period, currency = 'USD', accountI
     const unitsStart = startAssetData?.units || 0;
     const unitsEnd = assetData.units || 0;
     
-    // Cambio de valor en el período (incluye apreciación + nuevas inversiones)
-    const periodValueChange = assetValueEnd - assetValueStart;
-    
     // P&L realizada de ventas parciales en el período
     const sellData = sellsByAsset[assetKey];
     const realizedPnLInPeriod = sellData?.totalRealizedPnL || 0;
     const totalSoldAmount = sellData?.totalSold || 0;
     
-    // Cambio total = cambio de valor no realizado + P&L realizada
-    const totalChange = periodValueChange + realizedPnLInPeriod;
+    // =========================================================================
+    // CALCULAR CONTRIBUCIÓN CORRECTAMENTE
+    // 
+    // Para activos que EXISTÍAN al inicio del período:
+    //   Contribución = (valorFinal - valorInicial + PnL realizada) / valorInicialPortafolio
+    //   Esto mide cuánto aportó el cambio de precio del activo al rendimiento
+    //
+    // Para activos NUEVOS (comprados durante el período):
+    //   El "cambio de valor" no es ganancia/pérdida, es inyección de capital nuevo
+    //   Contribución = unrealizedPnL / valorInicialPortafolio
+    //   Esto mide la ganancia/pérdida real desde la compra
+    // =========================================================================
+    
+    const isNewAsset = assetValueStart === 0 && unitsStart === 0;
+    const unrealizedPnL = assetData.unrealizedProfitAndLoss || (assetValueEnd - assetInvestment);
+    
+    let totalChange;
+    if (isNewAsset) {
+      // Activo nuevo: la contribución es el P&L desde la compra, no el valor total inyectado
+      totalChange = unrealizedPnL + realizedPnLInPeriod;
+    } else {
+      // Activo existente: cambio de valor en el período + P&L realizada
+      const periodValueChange = assetValueEnd - assetValueStart;
+      totalChange = periodValueChange + realizedPnLInPeriod;
+    }
     
     // CONTRIBUCIÓN = cambioTotal / valorInicialPortafolio × 100
-    // Esto mide directamente cuánto contribuyó este activo al rendimiento del portafolio
+    // Para activos nuevos, esto ahora refleja la pérdida/ganancia real
     const contribution = startTotalValue > 0 
       ? (totalChange / startTotalValue) * 100 
       : 0;
@@ -385,10 +405,7 @@ async function calculateContributions(userId, period, currency = 'USD', accountI
     // Calcular peso actual (usando peso al final del período)
     const weight = totalPortfolioValue > 0 ? assetValueEnd / totalPortfolioValue : 0;
     
-    console.log(`[Attribution] ${ticker}: startVal=$${assetValueStart.toFixed(2)}, endVal=$${assetValueEnd.toFixed(2)}, units=${unitsStart.toFixed(4)}->${unitsEnd.toFixed(4)}${hasUnitChange ? ' (cambio)' : ''}, periodReturn=${periodReturn.toFixed(2)}%, weight=${(weight*100).toFixed(2)}%, contribution=${contribution.toFixed(4)}pp`);
-    
-    // P&L no realizada
-    const unrealizedPnL = assetData.unrealizedProfitAndLoss || 0;
+    console.log(`[Attribution] ${ticker}: startVal=$${assetValueStart.toFixed(2)}, endVal=$${assetValueEnd.toFixed(2)}, units=${unitsStart.toFixed(4)}->${unitsEnd.toFixed(4)}${hasUnitChange ? ' (cambio)' : ''}${isNewAsset ? ' (NUEVO)' : ''}, periodReturn=${periodReturn.toFixed(2)}%, weight=${(weight*100).toFixed(2)}%, contribution=${contribution.toFixed(4)}pp`);
     
     // ROI para mostrar: usar el retorno del período calculado
     let displayROI = periodReturn;
@@ -420,6 +437,7 @@ async function calculateContributions(userId, period, currency = 'USD', accountI
       valueEnd: assetValueEnd,     // Valor al final del período
       valueChange: totalChange,
       hasUnitChange,               // Flag: hubo compras/ventas durante el período
+      isNewAsset,                  // Flag: activo comprado durante el período (no existía al inicio)
       hasPartialSales: realizedPnLInPeriod !== 0,
       partialSalesPnL: realizedPnLInPeriod !== 0 ? realizedPnLInPeriod : undefined,
       partialSalesCount: sellData?.transactions?.length,
