@@ -370,14 +370,36 @@ async function getPortfolioAttribution(params) {
       // Re-normalizar SOLO contribuciones (pp) con el nuevo portfolioReturn
       // NO normalizar valores absolutos (contributionAbsolute, valueChange)
       const sumOfContributions = contributionResult.attributions.reduce((sum, a) => sum + a.contribution, 0);
-      if (Math.abs(sumOfContributions) > 0.01) {
+      
+      // FIX: Solo normalizar si:
+      // 1. La suma de contribuciones tiene magnitud significativa
+      // 2. Ambos valores tienen el MISMO SIGNO (para evitar invertir todas las contribuciones)
+      // 3. La diferencia es menor al 50% (para evitar distorsiones extremas)
+      const sameSign = (sumOfContributions >= 0 && periodTWR >= 0) || (sumOfContributions < 0 && periodTWR < 0);
+      const ratio = Math.abs(sumOfContributions) > 0.01 ? Math.abs(periodTWR / sumOfContributions) : 1;
+      const reasonableRatio = ratio > 0.1 && ratio < 10; // Factor entre 0.1x y 10x
+      
+      if (Math.abs(sumOfContributions) > 0.01 && sameSign && reasonableRatio) {
         const normalizationFactor = periodTWR / sumOfContributions;
+        console.log(`[Attribution] Normalizando contribuciones: factor=${normalizationFactor.toFixed(4)}`);
         for (const attr of contributionResult.attributions) {
           attr.contribution *= normalizationFactor;
           // NO normalizar contributionAbsolute ni valueChange - son valores absolutos en USD
         }
         contributionResult.normalized = true;
         contributionResult.sumOfContributions = periodTWR;
+      } else {
+        // Si no podemos normalizar de forma segura, mantener las contribuciones originales
+        // pero reportar la discrepancia
+        console.log(`[Attribution] NO normalizando: sumOfContrib=${sumOfContributions.toFixed(2)}%, periodTWR=${periodTWR.toFixed(2)}%, sameSign=${sameSign}, ratio=${ratio.toFixed(2)}`);
+        contributionResult.normalized = false;
+        contributionResult.sumOfContributions = sumOfContributions;
+        contributionResult.normalizationSkipped = {
+          reason: !sameSign ? 'opposite_signs' : !reasonableRatio ? 'extreme_ratio' : 'unknown',
+          sumOfContributions,
+          periodTWR,
+          ratio
+        };
       }
     }
     

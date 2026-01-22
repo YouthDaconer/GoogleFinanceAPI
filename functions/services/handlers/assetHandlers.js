@@ -334,6 +334,16 @@ async function updateAsset(context, payload) {
     // 3. Validar ownership via portfolioAccount
     const account = await validateAccountOwnership(oldAsset.portfolioAccount, auth.uid);
 
+    // 3.1. Si está cambiando de cuenta, validar ownership de la nueva cuenta
+    let newAccount = null;
+    const isChangingAccount = data.updates.portfolioAccount && 
+                              data.updates.portfolioAccount !== oldAsset.portfolioAccount;
+    
+    if (isChangingAccount) {
+      newAccount = await validateAccountOwnership(data.updates.portfolioAccount, auth.uid);
+      console.log(`[assetHandlers][updateAsset] Cambiando cuenta de ${oldAsset.portfolioAccount} a ${data.updates.portfolioAccount}`);
+    }
+
     // 4. Calcular valores antiguos y nuevos
     const oldUnits = cleanDecimal(Number(oldAsset.units));
     const oldUnitValue = cleanDecimal(Number(oldAsset.unitValue));
@@ -387,7 +397,36 @@ async function updateAsset(context, payload) {
 
     batch.update(assetRef, updateData);
 
-    if (valueDifference !== 0) {
+    // 8.0. Ajuste de balances
+    if (isChangingAccount) {
+      // Si cambia de cuenta: devolver valor a cuenta original, cobrar de cuenta nueva
+      const oldAccountRef = db.collection('portfolioAccounts').doc(oldAsset.portfolioAccount);
+      const newAccountRef = db.collection('portfolioAccounts').doc(data.updates.portfolioAccount);
+      
+      // Devolver el valor total a la cuenta original
+      const returnBalance = cleanDecimal((account.balances?.[currency] || 0) + oldTotalValue);
+      batch.update(oldAccountRef, {
+        [`balances.${currency}`]: returnBalance,
+      });
+      
+      // Validar saldo suficiente en la nueva cuenta
+      const newAccountBalance = newAccount.balances?.[currency] || 0;
+      if (newAccountBalance < newTotalValue) {
+        throw new HttpsError(
+          'failed-precondition',
+          `Saldo insuficiente en la nueva cuenta. Disponible: ${newAccountBalance.toFixed(2)} ${currency}, Requerido: ${newTotalValue.toFixed(2)} ${currency}`
+        );
+      }
+      
+      // Cobrar el valor total de la nueva cuenta
+      const chargeBalance = cleanDecimal(newAccountBalance - newTotalValue);
+      batch.update(newAccountRef, {
+        [`balances.${currency}`]: chargeBalance,
+      });
+      
+      console.log(`[assetHandlers][updateAsset] Balance ajustado: cuenta original +${oldTotalValue}, cuenta nueva -${newTotalValue}`);
+    } else if (valueDifference !== 0) {
+      // Si no cambia de cuenta, solo ajustar la diferencia
       const newBalance = cleanDecimal((account.balances?.[currency] || 0) - valueDifference);
       const accountRef = db.collection('portfolioAccounts').doc(oldAsset.portfolioAccount);
       batch.update(accountRef, {
@@ -436,6 +475,10 @@ async function updateAsset(context, payload) {
       }
       if (updateData.defaultCurrencyForAdquisitionDollar !== undefined) {
         transactionUpdate.defaultCurrencyForAdquisitionDollar = updateData.defaultCurrencyForAdquisitionDollar;
+      }
+      // Actualizar portfolioAccountId si cambió la cuenta
+      if (updateData.portfolioAccount !== undefined) {
+        transactionUpdate.portfolioAccountId = updateData.portfolioAccount;
       }
       
       if (Object.keys(transactionUpdate).length > 0) {

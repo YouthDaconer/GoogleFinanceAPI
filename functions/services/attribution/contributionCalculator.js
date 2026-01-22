@@ -492,22 +492,17 @@ async function calculateContributions(userId, period, currency = 'USD', accountI
   console.log(`[Attribution] Resumen: ${includedCount} activos incluidos, ${skippedCount} activos filtrados de ${Object.keys(assetPerformance).length} totales`);
   console.log(`[Attribution] Attributions generadas: ${attributions.length}`);
   
-  // 8. Validar suma de contribuciones vs ROI del portafolio
+  // 8. Calcular suma de contribuciones (esto es el rendimiento del período basado en Brinson)
+  // La suma de las contribuciones ES el rendimiento del período (cambio de valor / valor inicial)
   const sumOfContributions = attributions.reduce((sum, a) => sum + a.contribution, 0);
+  
+  // NOTA: NO normalizamos aquí. La normalización se hace en attributionService.js
+  // usando el TWR del período que es más preciso que el portfolioROI.
+  // El portfolioROI es el ROI total desde compra, no el rendimiento del período.
+  const normalized = false;
   const discrepancy = Math.abs(sumOfContributions - portfolioROI);
   
-  // 9. Normalizar si hay discrepancia significativa (> 1pp)
-  // NOTA: Solo normalizamos la contribución (puntos porcentuales), 
-  // NO los valores absolutos (contributionAbsolute, valueChange) que son en USD
-  let normalized = false;
-  if (discrepancy > 1 && Math.abs(sumOfContributions) > 0.01) {
-    const normalizationFactor = portfolioROI / sumOfContributions;
-    for (const attr of attributions) {
-      attr.contribution *= normalizationFactor;
-      // NO normalizar contributionAbsolute ni valueChange - son valores absolutos en USD
-    }
-    normalized = true;
-  }
+  console.log(`[Attribution] Sum of contributions: ${sumOfContributions.toFixed(4)}%, portfolioROI: ${portfolioROI.toFixed(2)}%, discrepancy: ${discrepancy.toFixed(2)}pp`);
   
   return {
     attributions,
