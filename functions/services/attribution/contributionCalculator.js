@@ -357,50 +357,89 @@ async function calculateContributions(userId, period, currency = 'USD', accountI
     
     const isNewAsset = assetValueStart === 0 && unitsStart === 0;
     const unrealizedPnL = assetData.unrealizedProfitAndLoss || (assetValueEnd - assetInvestment);
-    
-    let totalChange;
-    if (isNewAsset) {
-      // Activo nuevo: la contribución es el P&L desde la compra, no el valor total inyectado
-      totalChange = unrealizedPnL + realizedPnLInPeriod;
-    } else {
-      // Activo existente: cambio de valor en el período + P&L realizada
-      const periodValueChange = assetValueEnd - assetValueStart;
-      totalChange = periodValueChange + realizedPnLInPeriod;
-    }
-    
-    // CONTRIBUCIÓN = cambioTotal / valorInicialPortafolio × 100
-    // Para activos nuevos, esto ahora refleja la pérdida/ganancia real
-    const contribution = startTotalValue > 0 
-      ? (totalChange / startTotalValue) * 100 
-      : 0;
+    const hasUnitChange = Math.abs(unitsEnd - unitsStart) > 0.0001;
+    const hasPartialSales = unitsEnd < unitsStart - 0.0001;  // Vendió unidades
+    const hasPartialBuys = unitsEnd > unitsStart + 0.0001;   // Compró unidades adicionales
     
     // =========================================================================
-    // CALCULAR RETORNO DEL PERÍODO (para mostrar, NO para contribución)
+    // FIX-ATTRIBUTION-001: CALCULAR RETORNO DEL PERÍODO
     // 
-    // El retorno del período es el cambio de PRECIO del activo, no el cambio de valor.
-    // Esto es consistente con lo que muestra la página del activo (Rendimiento YTD).
+    // El retorno del período es el cambio de PRECIO del activo.
     // 
-    // Para assets con cambio de unidades (compras/ventas), calculamos el retorno
-    // basado en el precio: (precioFinal - precioInicial) / precioInicial × 100
+    // PROBLEMA: Cuando hay ventas, el cálculo valueEnd/unitsEnd vs valueStart/unitsStart
+    // puede dar resultados incorrectos porque los valores incluyen diferentes lotes.
+    // 
+    // SOLUCIÓN: Solo calculamos el retorno del precio cuando NO hay ventas.
+    // Para activos con ventas, mantenemos periodReturn = 0 y usamos la contribución
+    // basada en el cambio total del valor + P&L realizado.
     // =========================================================================
     let periodReturn = 0;
-    const hasUnitChange = Math.abs(unitsEnd - unitsStart) > 0.0001;
+    let priceStart = 0;
+    let priceEnd = 0;
     
     if (assetValueStart > 0 && unitsStart > 0) {
-      if (hasUnitChange && unitsEnd > 0) {
-        // Asset con cambio de unidades: calcular retorno del PRECIO
-        // Esto da el retorno real del activo sin verse afectado por nuevas compras
-        const priceStart = assetValueStart / unitsStart;
-        const priceEnd = assetValueEnd / unitsEnd;
+      priceStart = assetValueStart / unitsStart;
+      
+      if (!hasPartialSales && assetValueEnd > 0 && unitsEnd > 0) {
+        // Sin ventas: podemos calcular retorno del precio correctamente
+        priceEnd = assetValueEnd / unitsEnd;
         periodReturn = ((priceEnd - priceStart) / priceStart) * 100;
-      } else {
-        // Asset sin cambio de unidades: cambio de valor = cambio de precio
-        periodReturn = ((assetValueEnd - assetValueStart) / assetValueStart) * 100;
+      } else if (hasPartialSales) {
+        // Con ventas: NO podemos calcular retorno del precio con precisión
+        // porque valueEnd/unitsEnd no es comparable a valueStart/unitsStart
+        // El periodReturn se calculará después basado en el cambio total
+        priceEnd = priceStart; // Asumir sin cambio por ahora
+        periodReturn = 0; // Se recalculará abajo
       }
     } else if (assetValueEnd > 0 && assetInvestment > 0) {
       // Asset nuevo en el período: usar el ROI desde la compra
       periodReturn = assetTotalROI;
     }
+    
+    // =========================================================================
+    // FIX-ATTRIBUTION-001: CALCULAR CONTRIBUCIÓN CORRECTAMENTE
+    // 
+    // CASOS:
+    // 1. Activo nuevo: contribution = unrealizedPnL / startTotalValue
+    // 2. Activo con COMPRAS adicionales: contribution = (priceChange × unitsStart) / startTotalValue
+    //    Esto aísla el rendimiento de las unidades que YA teníamos
+    // 3. Activo con VENTAS: contribution = (valueChange + realizedPnL) / startTotalValue
+    //    Para ventas, el cambio total de valor + P&L realizado es la medida correcta
+    // 4. Activo sin cambio de unidades: contribution = valueChange / startTotalValue
+    // =========================================================================
+    
+    let totalChange;
+    if (isNewAsset) {
+      // Activo nuevo: la contribución es el P&L desde la compra
+      totalChange = unrealizedPnL + realizedPnLInPeriod;
+    } else if (hasPartialSales) {
+      // FIX-ATTRIBUTION-001: Activo con VENTAS parciales
+      // El cambio de valor incluye: reducción por ventas + cambio de precio de lo restante
+      // Más el P&L realizado de las ventas
+      const periodValueChange = assetValueEnd - assetValueStart;
+      totalChange = periodValueChange + realizedPnLInPeriod;
+      
+      // Recalcular periodReturn basado en el cambio total relativo al valor inicial
+      if (assetValueStart > 0) {
+        periodReturn = (totalChange / assetValueStart) * 100;
+      }
+    } else if (hasPartialBuys && priceStart > 0) {
+      // FIX-ATTRIBUTION-001: Activo con COMPRAS adicionales (sin ventas)
+      // Solo contabilizar el rendimiento de las unidades que teníamos al inicio
+      // Esto aísla el efecto del cambio de precio de las inyecciones de capital
+      const priceChange = priceEnd - priceStart;
+      const valueChangeFromPrice = priceChange * unitsStart;
+      totalChange = valueChangeFromPrice + realizedPnLInPeriod;
+    } else {
+      // Activo existente SIN cambio de unidades: cambio de valor = cambio de precio
+      const periodValueChange = assetValueEnd - assetValueStart;
+      totalChange = periodValueChange + realizedPnLInPeriod;
+    }
+    
+    // CONTRIBUCIÓN = cambioTotal / valorInicialPortafolio × 100
+    const contribution = startTotalValue > 0 
+      ? (totalChange / startTotalValue) * 100 
+      : 0;
     
     // Calcular peso actual (usando peso al final del período)
     const weight = totalPortfolioValue > 0 ? assetValueEnd / totalPortfolioValue : 0;

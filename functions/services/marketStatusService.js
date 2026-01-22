@@ -136,8 +136,15 @@ async function getMarketStatus() {
 }
 
 // Programar las funciones para ejecutarse en los horarios definidos
+// WS-OPT-009: Optimizado para cubrir transiciones críticas del mercado
 exports.scheduledMarketStatusUpdate = onSchedule({
-  schedule: '0 4,8,9,10,16,20,21 * * 1-5', // 4AM, 8AM, 9AM, 10AM, 4PM, 8PM, 9PM de lunes a viernes
+  // Horarios estratégicos:
+  // - 4:00 AM: Inicio pre-market
+  // - 9:00 AM: 30 min antes de apertura (preparación)
+  // - 9:30 AM: Apertura del mercado (CRÍTICO)
+  // - 16:00 PM: Cierre del mercado (CRÍTICO)
+  // - 20:00 PM: Fin de post-market
+  schedule: '0 4,9,16,20 * * 1-5',
   timeZone: 'America/New_York',
   retryCount: 3,
   minBackoff: '1m',
@@ -148,15 +155,19 @@ exports.scheduledMarketStatusUpdate = onSchedule({
   return null;
 });
 
+// WS-OPT-009: Updates en minutos críticos de transición
 exports.scheduledMarketStatusUpdateAdditional = onSchedule({
-  schedule: '30 8,9,16 * * 1-5', // 8:30AM, 9:30AM, 4:30PM de lunes a viernes
+  // Minutos críticos:
+  // - 9:30 AM: Apertura exacta del mercado
+  // - 9:31 AM: Confirmación post-apertura (para clientes que cargaron justo antes)
+  schedule: '30,31 9 * * 1-5',
   timeZone: 'America/New_York',
   retryCount: 3,
   minBackoff: '1m',
 }, async (event) => {
-  console.log('Ejecutando actualización adicional programada de estado del mercado');
+  console.log('Ejecutando actualización de transición de estado del mercado');
   const result = await updateMarketStatus();
-  console.log('Actualización adicional completada:', result);
+  console.log('Actualización de transición completada:', result);
   return null;
 });
 
