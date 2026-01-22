@@ -71,6 +71,20 @@ const CONFIG = {
     '2025-11-27', '2025-12-25'
   ],
   
+  // Días festivos NYSE 2026
+  NYSE_HOLIDAYS_2026: [
+    '2026-01-01', // New Year's Day
+    '2026-01-19', // MLK Day
+    '2026-02-16', // Presidents Day
+    '2026-04-03', // Good Friday
+    '2026-05-25', // Memorial Day
+    '2026-06-19', // Juneteenth
+    '2026-07-03', // Independence Day (observed)
+    '2026-09-07', // Labor Day
+    '2026-11-26', // Thanksgiving
+    '2026-12-25', // Christmas
+  ],
+  
   // Defaults
   DEFAULT_USER_ID: 'DDeR8P5hYgfuN8gcU4RsQfdTJqx2',
   DEFAULT_START_DATE: '2025-01-02',
@@ -118,21 +132,27 @@ function parseArgs() {
  */
 function generateBusinessDays(startDate, endDate) {
   const days = [];
-  let current = new Date(startDate);
-  const end = new Date(endDate);
+  // Usar hora fija para evitar problemas de zona horaria
+  let current = new Date(startDate + 'T12:00:00Z');
+  const end = new Date(endDate + 'T12:00:00Z');
   
-  // Combinar festivos de ambos años
-  const allHolidays = [...CONFIG.NYSE_HOLIDAYS_2024, ...CONFIG.NYSE_HOLIDAYS_2025];
+  // Combinar festivos de todos los años
+  const allHolidays = [
+    ...CONFIG.NYSE_HOLIDAYS_2024, 
+    ...CONFIG.NYSE_HOLIDAYS_2025,
+    ...CONFIG.NYSE_HOLIDAYS_2026
+  ];
 
   while (current <= end) {
-    const dayOfWeek = current.getDay();
+    // Usar getUTCDay para evitar problemas de zona horaria
+    const dayOfWeek = current.getUTCDay();
     const dateStr = current.toISOString().split('T')[0];
     
-    // Excluir fines de semana y festivos
+    // Excluir fines de semana (0=domingo, 6=sábado) y festivos
     if (dayOfWeek !== 0 && dayOfWeek !== 6 && !allHolidays.includes(dateStr)) {
       days.push(dateStr);
     }
-    current.setDate(current.getDate() + 1);
+    current.setUTCDate(current.getUTCDate() + 1);
   }
   
   return days;
@@ -290,6 +310,25 @@ async function getExistingPerformance(userId, accountId, startDate, endDate) {
 }
 
 /**
+ * Obtener el último documento de performance ANTES de una fecha específica.
+ * Útil para calcular dailyChangePercentage del primer día de un backfill.
+ */
+async function getLastPerformanceBefore(userId, accountId, beforeDate) {
+  const path = accountId 
+    ? `portfolioPerformance/${userId}/accounts/${accountId}/dates`
+    : `portfolioPerformance/${userId}/dates`;
+  
+  const snapshot = await db.collection(path)
+    .where('date', '<', beforeDate)
+    .orderBy('date', 'desc')
+    .limit(1)
+    .get();
+  
+  if (snapshot.empty) return null;
+  return snapshot.docs[0].data();
+}
+
+/**
  * Obtener cuentas del usuario
  */
 async function getUserAccounts(userId) {
@@ -319,6 +358,20 @@ function calculateHoldingsAtDate(transactions, targetDate, exchangeRates = {}) {
   
   // Filtrar transacciones hasta la fecha objetivo
   const relevantTx = transactions.filter(tx => tx.date <= targetDate);
+  
+  // BUGFIX: Ordenar transacciones para garantizar que BUY se procese antes de SELL
+  // en el mismo día. Sin esto, el orden depende del document ID de Firestore,
+  // lo cual puede causar que SELL se procese antes de que exista el holding.
+  // NOTA: Usamos ?? en lugar de || porque 0 es un valor válido (buy=0)
+  const typeOrder = { 'buy': 0, 'cash_income': 1, 'dividendPay': 2, 'sell': 3, 'cash_outcome': 4 };
+  relevantTx.sort((a, b) => {
+    // Primero ordenar por fecha
+    if (a.date !== b.date) return a.date.localeCompare(b.date);
+    // Luego por tipo: buy/cash_income antes de sell/cash_outcome
+    const orderA = typeOrder[a.type] ?? 99;
+    const orderB = typeOrder[b.type] ?? 99;
+    return orderA - orderB;
+  });
   
   relevantTx.forEach(tx => {
     const assetKey = tx.assetName ? `${tx.assetName}_${tx.assetType || 'stock'}` : null;
@@ -913,6 +966,16 @@ async function main() {
             previousDayPerformance = existing.get(prevDate);
             previousDayDate = prevDate;
             break;
+          }
+        }
+        
+        // FIX: Si no encontramos día anterior dentro del rango, buscar ANTES del rango
+        if (!previousDayPerformance && currentIdx === 0) {
+          const beforeRangePerf = await getLastPerformanceBefore(options.userId, account.id, date);
+          if (beforeRangePerf) {
+            previousDayPerformance = beforeRangePerf;
+            previousDayDate = beforeRangePerf.date;
+            log('DEBUG', `    Usando documento anterior fuera del rango: ${previousDayDate}`);
           }
         }
         

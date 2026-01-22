@@ -73,7 +73,11 @@ const convertCurrency = (amount, fromCurrency, toCurrency, currencies, defaultCu
   const fromRate = currencies.find(c => c.code === fromCurrency)?.exchangeRate || 1;
   const toRate = currencies.find(c => c.code === toCurrency)?.exchangeRate || 1;
 
-  if (fromCurrency === 'USD' && toCurrency === defaultCurrency && acquisitionDollarValue) {
+  // FIX-CURRENCY-003: Solo usar acquisitionDollarValue cuando:
+  // 1. Convertimos DE USD a la moneda de adquisición del asset (defaultCurrency)
+  // 2. Y esa moneda NO es USD (para evitar multiplicar cuando no debe)
+  // Ejemplo: USD -> COP con acquisitionDollarValue=3750.75 => amount * 3750.75
+  if (fromCurrency === 'USD' && toCurrency === defaultCurrency && defaultCurrency !== 'USD' && acquisitionDollarValue) {
     return amount * acquisitionDollarValue;
   }
   return (amount * toRate) / fromRate;

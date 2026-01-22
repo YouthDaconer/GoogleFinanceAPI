@@ -109,8 +109,18 @@ async function getPricesFromApi(symbols) {
  * @returns {Object} Quote normalizado
  */
 function normalizeQuote(quote) {
-  const priceValue = parseFloat(quote.price) || 
-                     parseFloat(quote.regularMarketPrice) || 0;
+  // FIX-PRICE-001: El API puede devolver precios con comas como separador de miles
+  // Ejemplo: "2,235.00" para ECOPETROL.CL
+  // parseFloat("2,235.00") retorna 2, no 2235
+  // Debemos limpiar las comas antes de parsear
+  const cleanPrice = (val) => {
+    if (typeof val === 'number') return val;
+    if (typeof val === 'string') return parseFloat(val.replace(/,/g, '')) || 0;
+    return 0;
+  };
+  
+  const priceValue = cleanPrice(quote.price) || 
+                     cleanPrice(quote.regularMarketPrice) || 0;
   
   return {
     symbol: quote.symbol,
@@ -124,8 +134,8 @@ function normalizeQuote(quote) {
     currency: quote.currency || 'USD',
     country: quote.country || null,
     exchange: quote.exchange || null,
-    change: parseFloat(quote.change) || parseFloat(quote.regularMarketChange) || 0,
-    percentChange: parseFloat(String(quote.changePercent || quote.regularMarketChangePercent || '0').replace('%', '')) || 0,
+    change: cleanPrice(quote.change) || cleanPrice(quote.regularMarketChange) || 0,
+    percentChange: parseFloat(String(quote.changePercent || quote.regularMarketChangePercent || '0').replace(/[%,]/g, '')) || 0,
   };
 }
 
