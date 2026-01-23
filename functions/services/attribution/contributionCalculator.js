@@ -380,16 +380,15 @@ async function calculateContributions(userId, period, currency = 'USD', accountI
     if (assetValueStart > 0 && unitsStart > 0) {
       priceStart = assetValueStart / unitsStart;
       
-      if (!hasPartialSales && assetValueEnd > 0 && unitsEnd > 0) {
-        // Sin ventas: podemos calcular retorno del precio correctamente
+      if (assetValueEnd > 0 && unitsEnd > 0) {
+        // FIX-ATTRIBUTION-002: Calcular priceEnd siempre que tengamos unidades al final
+        // El precio actual es el mismo para todas las unidades (ya sean originales o nuevas)
         priceEnd = assetValueEnd / unitsEnd;
         periodReturn = ((priceEnd - priceStart) / priceStart) * 100;
-      } else if (hasPartialSales) {
-        // Con ventas: NO podemos calcular retorno del precio con precisión
-        // porque valueEnd/unitsEnd no es comparable a valueStart/unitsStart
-        // El periodReturn se calculará después basado en el cambio total
-        priceEnd = priceStart; // Asumir sin cambio por ahora
-        periodReturn = 0; // Se recalculará abajo
+      } else if (hasPartialSales && unitsEnd === 0) {
+        // Vendió TODAS las unidades: priceEnd no aplica
+        priceEnd = 0;
+        periodReturn = 0; // Se calculará basado en el P&L realizado
       }
     } else if (assetValueEnd > 0 && assetInvestment > 0) {
       // Asset nuevo en el período: usar el ROI desde la compra
@@ -397,41 +396,32 @@ async function calculateContributions(userId, period, currency = 'USD', accountI
     }
     
     // =========================================================================
-    // FIX-ATTRIBUTION-001: CALCULAR CONTRIBUCIÓN CORRECTAMENTE
+    // FIX-ATTRIBUTION-002: CALCULAR CONTRIBUCIÓN CORRECTAMENTE
+    // 
+    // La contribución mide cuánto del rendimiento del portafolio se debe a este activo.
+    // La fórmula correcta SIEMPRE aísla el EFECTO DEL CAMBIO DE PRECIO sobre las
+    // unidades que teníamos al inicio del período.
     // 
     // CASOS:
     // 1. Activo nuevo: contribution = unrealizedPnL / startTotalValue
-    // 2. Activo con COMPRAS adicionales: contribution = (priceChange × unitsStart) / startTotalValue
-    //    Esto aísla el rendimiento de las unidades que YA teníamos
-    // 3. Activo con VENTAS: contribution = (valueChange + realizedPnL) / startTotalValue
-    //    Para ventas, el cambio total de valor + P&L realizado es la medida correcta
-    // 4. Activo sin cambio de unidades: contribution = valueChange / startTotalValue
+    // 2. Activo existente (con o sin cashflows):
+    //    contribution = [(priceEnd - priceStart) × unitsStart + realizedPnL] / startTotalValue
+    //    Esto aísla correctamente el efecto del cambio de precio
     // =========================================================================
     
     let totalChange;
     if (isNewAsset) {
       // Activo nuevo: la contribución es el P&L desde la compra
       totalChange = unrealizedPnL + realizedPnLInPeriod;
-    } else if (hasPartialSales) {
-      // FIX-ATTRIBUTION-001: Activo con VENTAS parciales
-      // El cambio de valor incluye: reducción por ventas + cambio de precio de lo restante
-      // Más el P&L realizado de las ventas
-      const periodValueChange = assetValueEnd - assetValueStart;
-      totalChange = periodValueChange + realizedPnLInPeriod;
-      
-      // Recalcular periodReturn basado en el cambio total relativo al valor inicial
-      if (assetValueStart > 0) {
-        periodReturn = (totalChange / assetValueStart) * 100;
-      }
-    } else if (hasPartialBuys && priceStart > 0) {
-      // FIX-ATTRIBUTION-001: Activo con COMPRAS adicionales (sin ventas)
-      // Solo contabilizar el rendimiento de las unidades que teníamos al inicio
-      // Esto aísla el efecto del cambio de precio de las inyecciones de capital
+    } else if (priceStart > 0) {
+      // FIX-ATTRIBUTION-002: Para CUALQUIER activo existente (compras, ventas, o sin cambio)
+      // Usar la misma fórmula: efecto del cambio de precio sobre unidades iniciales
+      // Esto aísla correctamente el rendimiento y evita incluir cashflows como rendimiento
       const priceChange = priceEnd - priceStart;
       const valueChangeFromPrice = priceChange * unitsStart;
       totalChange = valueChangeFromPrice + realizedPnLInPeriod;
     } else {
-      // Activo existente SIN cambio de unidades: cambio de valor = cambio de precio
+      // Fallback para casos edge (ej: precio inicial 0)
       const periodValueChange = assetValueEnd - assetValueStart;
       totalChange = periodValueChange + realizedPnLInPeriod;
     }
