@@ -33,7 +33,7 @@ const { REQUIRED_FIELDS, LIMITS } = require('./types');
 const FUNCTION_CONFIG = {
   cors: true,
   memory: "256MiB",
-  timeoutSeconds: 30,     // AC-040: Must respond in < 3 seconds typically
+  timeoutSeconds: 60,     // Increased for ticker validation API calls
   maxInstances: 20,
   minInstances: 0,
   region: 'us-central1',

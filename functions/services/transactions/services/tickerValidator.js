@@ -122,13 +122,17 @@ async function validateSingleTicker(ticker) {
   }
   
   try {
-    // Call finance-query /v1/search
-    const searchResults = await search(ticker);
+    // Call finance-query /v1/search with timeout
+    const searchResults = await Promise.race([
+      search(ticker),
+      new Promise((_, reject) => 
+        setTimeout(() => reject(new Error('Timeout')), 5000)
+      )
+    ]);
     
     if (!searchResults || !Array.isArray(searchResults) || searchResults.length === 0) {
-      // No results - try to find suggestion
+      // No results - skip suggestion lookup for speed
       result.error = 'Ticker not found';
-      result.suggestion = await findSuggestion(ticker);
       return result;
     }
     

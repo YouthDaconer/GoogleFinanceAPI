@@ -33,11 +33,11 @@ const ALL_FIELDS = [
 
 /**
  * Required fields for a valid transaction import
+ * Note: 'type' is optional with default value 'buy'
  * @type {TransactionField[]}
  */
 const REQUIRED_FIELDS = [
   'ticker', 
-  'type', 
   'amount', 
   'price', 
   'date',
@@ -48,6 +48,7 @@ const REQUIRED_FIELDS = [
  * @type {TransactionField[]}
  */
 const OPTIONAL_FIELDS = [
+  'type',         // Default: buy
   'currency',     // Default: USD
   'commission',   // Default: 0
   'market',       // Inferred from ticker
@@ -205,7 +206,7 @@ const KNOWN_BROKERS = [
 const LIMITS = {
   maxPayloadSize: 1024 * 1024,    // 1MB
   maxSampleRows: 100,             // Max rows to analyze
-  maxTickerSample: 20,            // Max tickers to validate against API
+  maxTickerSample: 5,             // Max tickers to validate against API (reduced for speed)
   maxSampleValuesPerColumn: 5,    // Sample values to show in mapping
   maxBatchTransactions: 500,      // Max transactions per import batch
   maxFirestoreBatch: 500,         // Firestore batch limit
