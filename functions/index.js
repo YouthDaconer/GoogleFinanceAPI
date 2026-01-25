@@ -657,3 +657,32 @@ exports.getMarketDataToken = getMarketDataToken;
 // - queryOperations: Para cálculos on-demand
 //
 // @see docs/architecture/OPT-DEMAND-CLEANUP-firestore-fallback-removal.md
+
+// ============================================================================
+// FEAT-IMPORT: Transaction Import Module (IMPORT-001, IMPORT-002)
+// ============================================================================
+
+/**
+ * Cloud Function: analyzeTransactionFile
+ * 
+ * Analyzes uploaded transaction files (Excel/CSV) and returns automatic
+ * column mappings with confidence levels. Supports known broker formats
+ * (Interactive Brokers, TD Ameritrade, Fidelity, eToro) and generic detection.
+ * 
+ * @see docs/stories/89.story.md (IMPORT-001)
+ * @see docs/architecture/FEAT-IMPORT-001-smart-transaction-import-design.md
+ */
+const { analyzeTransactionFile, importTransactionBatch } = require('./services/transactions');
+exports.analyzeTransactionFile = analyzeTransactionFile;
+
+/**
+ * Cloud Function: importTransactionBatch
+ * 
+ * Imports a batch of validated transactions to Firestore. Creates assets
+ * if they don't exist, enriches with market data, detects duplicates,
+ * and updates asset balances atomically.
+ * 
+ * @see docs/stories/90.story.md (IMPORT-002)
+ * @see docs/architecture/FEAT-IMPORT-001-smart-transaction-import-design.md
+ */
+exports.importTransactionBatch = importTransactionBatch;

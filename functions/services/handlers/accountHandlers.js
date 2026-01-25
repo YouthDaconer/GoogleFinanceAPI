@@ -142,11 +142,14 @@ async function updatePortfolioAccount(context, payload) {
 }
 
 /**
- * Eliminar una cuenta de portafolio
+ * Eliminar una cuenta de portafolio y todos sus datos asociados
+ * 
+ * REF-SEC-002: Eliminación completa manejada en backend
+ * Elimina atómicamente: assets, transacciones, referencia en portfolioDistribution, y la cuenta
  * 
  * @param {Object} context - Contexto de ejecución
  * @param {Object} payload - Datos de la cuenta
- * @returns {Promise<{success: boolean, accountId: string, deletedAccountName: string}>}
+ * @returns {Promise<{success: boolean, accountId: string, deletedAccountName: string, deletedAssets: number, deletedTransactions: number}>}
  */
 async function deletePortfolioAccount(context, payload) {
   const { auth } = context;
@@ -172,18 +175,84 @@ async function deletePortfolioAccount(context, payload) {
       throw new HttpsError("permission-denied", "No tienes permiso para eliminar esta cuenta");
     }
 
-    // Eliminar la cuenta
+    // =========================================================================
+    // REF-SEC-002: Eliminación completa de datos asociados
+    // =========================================================================
+    
+    let deletedAssetsCount = 0;
+    let deletedTransactionsCount = 0;
+
+    // 1. Eliminar todos los assets asociados a esta cuenta
+    console.log(`[accountHandlers][deletePortfolioAccount] Eliminando assets de la cuenta ${accountId}`);
+    const assetsQuery = db.collection("assets")
+      .where("portfolioAccountId", "==", accountId)
+      .where("userId", "==", userId);
+    
+    const assetsSnapshot = await assetsQuery.get();
+    
+    if (!assetsSnapshot.empty) {
+      const batch = db.batch();
+      assetsSnapshot.docs.forEach(doc => {
+        batch.delete(doc.ref);
+      });
+      await batch.commit();
+      deletedAssetsCount = assetsSnapshot.size;
+      console.log(`[accountHandlers][deletePortfolioAccount] Eliminados ${deletedAssetsCount} assets`);
+    }
+
+    // 2. Eliminar todas las transacciones asociadas a esta cuenta
+    console.log(`[accountHandlers][deletePortfolioAccount] Eliminando transacciones de la cuenta ${accountId}`);
+    const transactionsQuery = db.collection("transactions")
+      .where("portfolioAccountId", "==", accountId);
+    
+    const transactionsSnapshot = await transactionsQuery.get();
+    
+    if (!transactionsSnapshot.empty) {
+      // Eliminar en batches de 500 (límite de Firestore)
+      const BATCH_SIZE = 500;
+      const docs = transactionsSnapshot.docs;
+      
+      for (let i = 0; i < docs.length; i += BATCH_SIZE) {
+        const batch = db.batch();
+        const batchDocs = docs.slice(i, i + BATCH_SIZE);
+        batchDocs.forEach(doc => {
+          batch.delete(doc.ref);
+        });
+        await batch.commit();
+      }
+      deletedTransactionsCount = transactionsSnapshot.size;
+      console.log(`[accountHandlers][deletePortfolioAccount] Eliminadas ${deletedTransactionsCount} transacciones`);
+    }
+
+    // 3. Eliminar la referencia de la cuenta en portfolioDistribution
+    console.log(`[accountHandlers][deletePortfolioAccount] Limpiando portfolioDistribution`);
+    const distributionRef = db.collection("portfolioDistribution").doc(userId);
+    const distributionDoc = await distributionRef.get();
+    
+    if (distributionDoc.exists) {
+      const distributionData = distributionDoc.data();
+      if (distributionData?.accounts && distributionData.accounts[accountId]) {
+        await distributionRef.update({
+          [`accounts.${accountId}`]: FieldValue.delete()
+        });
+        console.log(`[accountHandlers][deletePortfolioAccount] Referencia eliminada de portfolioDistribution`);
+      }
+    }
+
+    // 4. Eliminar la cuenta
     await accountRef.delete();
 
-    // Invalidar cache de distribución
+    // 5. Invalidar cache de distribución
     invalidateDistributionCache(userId);
 
-    console.log(`[accountHandlers][deletePortfolioAccount] Éxito - accountId: ${accountId}`);
+    console.log(`[accountHandlers][deletePortfolioAccount] Éxito - accountId: ${accountId}, assets: ${deletedAssetsCount}, transactions: ${deletedTransactionsCount}`);
 
     return {
       success: true,
       accountId,
       deletedAccountName: accountData.name,
+      deletedAssets: deletedAssetsCount,
+      deletedTransactions: deletedTransactionsCount,
     };
   } catch (error) {
     if (error instanceof HttpsError) throw error;

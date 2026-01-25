@@ -23,10 +23,11 @@ service cloud.firestore {
     
     // ---- TRANSACTIONS ----
     // Lectura: Usuarios autenticados pueden leer sus transacciones
-    // Escritura: SOLO via Cloud Functions
+    // Escritura: SOLO via Cloud Functions (Admin SDK bypasea reglas)
+    // REF-SEC-002: Eliminación de cuenta/transacciones manejada en backend
     match /transactions/{txId} {
       allow read: if request.auth != null;
-      // Cloud Functions escriben con Admin SDK (bypasea reglas)
+      // Todas las escrituras solo via Cloud Functions (Admin SDK)
       allow write: if false;
     }
     
