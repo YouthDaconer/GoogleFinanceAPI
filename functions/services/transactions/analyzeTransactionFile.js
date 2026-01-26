@@ -95,7 +95,12 @@ const analyzeTransactionFile = onCall(
     // ─────────────────────────────────────────────────────────────────────
     // 2. PAYLOAD VALIDATION (AC-003, AC-004)
     // ─────────────────────────────────────────────────────────────────────
-    const { sampleData, fileName, hasHeader: providedHasHeader } = data || {};
+    const { 
+      sampleData, 
+      fileName, 
+      hasHeader: providedHasHeader,
+      uniqueTickers: providedUniqueTickers  // NEW: All unique tickers from full file
+    } = data || {};
     
     // Validate sampleData
     if (!sampleData || !Array.isArray(sampleData)) {
@@ -193,29 +198,46 @@ const analyzeTransactionFile = onCall(
     
     // ─────────────────────────────────────────────────────────────────────
     // 6. TICKER VALIDATION (AC-022 to AC-026)
+    // Uses /v1/quotes for batch validation of ALL unique tickers
     // ─────────────────────────────────────────────────────────────────────
     const tickerMapping = mappings.find(m => m.targetField === 'ticker');
     let tickerValidation = {
       total: 0,
       valid: 0,
       invalid: 0,
+      unverified: 0,
       invalidTickers: [],
+      unverifiedTickers: [],
       suggestions: {},
       details: {},
+      validDetails: {},
     };
     
     if (tickerMapping) {
-      const dataStartRow = hasHeader ? 1 : 0;
-      const tickerColumnIndex = tickerMapping.sourceColumn;
+      // Determine which tickers to validate:
+      // 1. If frontend provided uniqueTickers (all from full file), use those
+      // 2. Otherwise, extract from sampleData (backward compatibility)
+      let tickersToValidate;
       
-      const tickerSample = truncatedData
-        .slice(dataStartRow)
-        .map(row => row[tickerColumnIndex])
-        .filter(Boolean);
+      if (providedUniqueTickers && Array.isArray(providedUniqueTickers) && providedUniqueTickers.length > 0) {
+        // Frontend sent all unique tickers from the complete file
+        tickersToValidate = providedUniqueTickers;
+        console.log(`[analyzeTransactionFile] Using ${tickersToValidate.length} tickers from frontend`);
+      } else {
+        // Extract from sample data (legacy behavior)
+        const dataStartRow = hasHeader ? 1 : 0;
+        const tickerColumnIndex = tickerMapping.sourceColumn;
+        
+        tickersToValidate = truncatedData
+          .slice(dataStartRow)
+          .map(row => row[tickerColumnIndex])
+          .filter(Boolean);
+        console.log(`[analyzeTransactionFile] Extracted ${tickersToValidate.length} tickers from sample`);
+      }
       
-      if (tickerSample.length > 0) {
-        console.log(`[analyzeTransactionFile] Validating ${tickerSample.length} ticker samples`);
-        tickerValidation = await validateTickerSample(tickerSample);
+      if (tickersToValidate.length > 0) {
+        console.log(`[analyzeTransactionFile] Validating tickers using /quotes...`);
+        tickerValidation = await validateTickerSample(tickersToValidate);
       }
     } else {
       console.log(`[analyzeTransactionFile] No ticker column mapped - skipping validation`);

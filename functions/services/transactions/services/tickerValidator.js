@@ -1,36 +1,45 @@
 /**
  * Ticker Validation Service
  * 
- * Validates sample tickers against the finance-query API /v1/search endpoint.
- * Returns validation results with asset info for valid tickers and
- * suggestions for invalid ones.
+ * Validates ALL unique tickers against the finance-query API /v1/quotes endpoint.
+ * Uses batch validation for efficiency (single API call for all tickers).
+ * Returns validation results with asset info for valid tickers.
  * 
  * @module transactions/services/tickerValidator
  * @see docs/stories/89.story.md (IMPORT-001)
  */
 
-const { search } = require('../../financeQuery');
+const { getQuotes, search } = require('../../financeQuery');
 const { LIMITS } = require('../types');
+
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+const QUOTES_TIMEOUT_MS = 15000;  // 15 seconds timeout for batch validation
+const MAX_TICKERS_PER_REQUEST = 100;  // API limit
 
 // ============================================================================
 // MAIN VALIDATION FUNCTION
 // ============================================================================
 
 /**
- * Validates a sample of tickers against the market data API
+ * Validates ALL unique tickers against the market data API using /v1/quotes
  * 
- * @param {string[]} tickers - Array of tickers from file
+ * This function validates all tickers in a single API call (or batched if >100).
+ * Much more efficient than individual /search calls.
+ * 
+ * @param {string[]} tickers - Array of ALL tickers from file (can include duplicates)
  * @returns {Promise<Object>} Validation summary with details per ticker
  * 
  * @example
- * const result = await validateTickerSample(['AAPL', 'NVDA', 'XXXX']);
+ * const result = await validateTickerSample(['AAPL', 'NVDA', 'APPL', 'XYZ']);
  * // {
- * //   total: 3,
+ * //   total: 4,
  * //   valid: 2,
- * //   invalid: 1,
- * //   invalidTickers: ['XXXX'],
- * //   suggestions: { 'XXXX': 'XOM' },
- * //   details: { ... }
+ * //   invalid: 2,
+ * //   invalidTickers: ['APPL', 'XYZ'],
+ * //   validDetails: { 'AAPL': { name: 'Apple Inc', ... }, ... }
  * // }
  */
 async function validateTickerSample(tickers) {
@@ -38,11 +47,12 @@ async function validateTickerSample(tickers) {
     total: 0,
     valid: 0,
     invalid: 0,
-    unverified: 0,  // Tickers that couldn't be verified due to API errors
+    unverified: 0,
     invalidTickers: [],
-    unverifiedTickers: [],  // Tickers that timed out or had API errors
+    unverifiedTickers: [],
     suggestions: {},
     details: {},
+    validDetails: {},  // NEW: Contains metadata for valid tickers (name, sector, logo)
   };
   
   if (!tickers || tickers.length === 0) {
@@ -56,47 +66,139 @@ async function validateTickerSample(tickers) {
       .filter(t => t && t.length > 0)
   )];
   
-  // Limit to max sample size
-  const tickersToValidate = uniqueTickers.slice(0, LIMITS.maxTickerSample);
-  result.total = tickersToValidate.length;
+  result.total = uniqueTickers.length;
   
-  console.log(`[tickerValidator] Validating ${tickersToValidate.length} unique tickers`);
+  console.log(`[tickerValidator] Validating ${uniqueTickers.length} unique tickers using /quotes`);
   
-  // Validate each ticker (parallel with limit)
-  const validationPromises = tickersToValidate.map(ticker => 
-    validateSingleTicker(ticker).catch(err => ({
-      originalTicker: ticker,
-      isValid: false,
-      error: err.message,
-    }))
-  );
-  
-  const validations = await Promise.all(validationPromises);
-  
-  // Process results
-  for (const validation of validations) {
-    result.details[validation.originalTicker] = validation;
+  try {
+    // Call /v1/quotes with all tickers at once
+    const quotes = await validateWithQuotes(uniqueTickers);
     
-    if (validation.isValid) {
-      result.valid++;
-    } else if (validation.isUnverified) {
-      // API timeout or error - don't count as invalid
-      result.unverified++;
-      result.unverifiedTickers.push(validation.originalTicker);
-    } else {
-      // Actually invalid ticker (not found)
-      result.invalid++;
-      result.invalidTickers.push(validation.originalTicker);
+    // Build set of valid symbols from response
+    const validSymbols = new Set(quotes.map(q => q.symbol?.toUpperCase()).filter(Boolean));
+    
+    // Process each ticker
+    for (const ticker of uniqueTickers) {
+      const upperTicker = ticker.toUpperCase();
+      const quote = quotes.find(q => q.symbol?.toUpperCase() === upperTicker);
       
-      if (validation.suggestion) {
-        result.suggestions[validation.originalTicker] = validation.suggestion;
+      if (quote) {
+        // Valid ticker - store details
+        result.valid++;
+        result.details[ticker] = {
+          originalTicker: ticker,
+          isValid: true,
+          normalizedTicker: quote.symbol,
+          companyName: quote.name || quote.shortName,
+          sector: quote.sector,
+          industry: quote.industry,
+          logo: quote.logo,
+          assetType: detectAssetType(quote),
+          currency: quote.currency || 'USD',
+        };
+        result.validDetails[ticker] = {
+          symbol: quote.symbol,
+          name: quote.name || quote.shortName,
+          sector: quote.sector,
+          industry: quote.industry,
+          logo: quote.logo,
+        };
+      } else {
+        // Invalid ticker - try to find suggestion
+        result.invalid++;
+        result.invalidTickers.push(ticker);
+        result.details[ticker] = {
+          originalTicker: ticker,
+          isValid: false,
+          error: 'Ticker not found',
+        };
+        
+        // Try to find a suggestion using search (only for invalid tickers)
+        const suggestion = await findSuggestion(ticker);
+        if (suggestion) {
+          result.suggestions[ticker] = suggestion;
+          result.details[ticker].suggestion = suggestion;
+        }
       }
+    }
+    
+  } catch (error) {
+    console.error(`[tickerValidator] Batch validation failed: ${error.message}`);
+    
+    // Mark all as unverified due to API error
+    result.unverified = uniqueTickers.length;
+    result.unverifiedTickers = [...uniqueTickers];
+    
+    for (const ticker of uniqueTickers) {
+      result.details[ticker] = {
+        originalTicker: ticker,
+        isValid: false,
+        isUnverified: true,
+        error: error.message,
+      };
     }
   }
   
   console.log(`[tickerValidator] Results: ${result.valid} valid, ${result.invalid} invalid, ${result.unverified} unverified`);
   
   return result;
+}
+
+// ============================================================================
+// BATCH VALIDATION WITH /v1/quotes
+// ============================================================================
+
+/**
+ * Validates tickers using /v1/quotes endpoint (batch)
+ * 
+ * @param {string[]} tickers - Array of unique tickers
+ * @returns {Promise<Object[]>} Array of quote objects for valid tickers
+ */
+async function validateWithQuotes(tickers) {
+  if (tickers.length === 0) return [];
+  
+  // If more than 100 tickers, batch them (rare case)
+  if (tickers.length > MAX_TICKERS_PER_REQUEST) {
+    console.log(`[tickerValidator] Batching ${tickers.length} tickers`);
+    const batches = [];
+    for (let i = 0; i < tickers.length; i += MAX_TICKERS_PER_REQUEST) {
+      batches.push(tickers.slice(i, i + MAX_TICKERS_PER_REQUEST));
+    }
+    
+    const results = await Promise.all(
+      batches.map(batch => validateSingleBatch(batch))
+    );
+    
+    return results.flat();
+  }
+  
+  return validateSingleBatch(tickers);
+}
+
+/**
+ * Validates a single batch of tickers
+ * 
+ * @param {string[]} tickers - Batch of tickers (max 100)
+ * @returns {Promise<Object[]>} Array of quote objects
+ */
+async function validateSingleBatch(tickers) {
+  const symbolsParam = tickers.join(',');
+  
+  // Call with timeout
+  const quotes = await Promise.race([
+    getQuotes(symbolsParam),
+    new Promise((_, reject) => 
+      setTimeout(() => reject(new Error('Timeout')), QUOTES_TIMEOUT_MS)
+    )
+  ]);
+  
+  // Ensure we return an array
+  if (!quotes || !Array.isArray(quotes)) {
+    console.warn('[tickerValidator] Unexpected response from /quotes:', typeof quotes);
+    return [];
+  }
+  
+  return quotes;
 }
 
 // ============================================================================
@@ -341,6 +443,7 @@ module.exports = {
   validateTickerSample,
   validateSingleTicker,
   validateTickersBatched,
+  validateWithQuotes,
   normalizeTicker,
   detectAssetType,
 };
