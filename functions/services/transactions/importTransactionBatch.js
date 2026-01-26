@@ -10,6 +10,7 @@
  */
 
 const { onCall, HttpsError } = require("firebase-functions/v2/https");
+const { defineSecret } = require("firebase-functions/params");
 const admin = require('../firebaseAdmin');
 
 const { resolveAssets, normalizeTicker } = require('./services/assetResolver');
@@ -19,6 +20,13 @@ const { writeBatches } = require('./services/batchWriter');
 const { LIMITS, IMPORT_ERROR_CODES } = require('./types');
 
 const db = admin.firestore();
+
+// ============================================================================
+// SECRET DEFINITIONS
+// ============================================================================
+
+// SEC-TOKEN-003: Secret for service-to-service authentication with finance-query API
+const cfServiceToken = defineSecret("CF_SERVICE_TOKEN");
 
 // ============================================================================
 // CLOUD FUNCTION CONFIGURATION
@@ -42,6 +50,7 @@ const FUNCTION_CONFIG = {
   memory: "512MiB",
   minInstances: 0,
   maxInstances: 10,
+  secrets: [cfServiceToken],  // SEC-TOKEN-003: Bind secret for API authentication
 };
 
 // ============================================================================

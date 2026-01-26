@@ -38,7 +38,9 @@ async function validateTickerSample(tickers) {
     total: 0,
     valid: 0,
     invalid: 0,
+    unverified: 0,  // Tickers that couldn't be verified due to API errors
     invalidTickers: [],
+    unverifiedTickers: [],  // Tickers that timed out or had API errors
     suggestions: {},
     details: {},
   };
@@ -77,7 +79,12 @@ async function validateTickerSample(tickers) {
     
     if (validation.isValid) {
       result.valid++;
+    } else if (validation.isUnverified) {
+      // API timeout or error - don't count as invalid
+      result.unverified++;
+      result.unverifiedTickers.push(validation.originalTicker);
     } else {
+      // Actually invalid ticker (not found)
       result.invalid++;
       result.invalidTickers.push(validation.originalTicker);
       
@@ -87,7 +94,7 @@ async function validateTickerSample(tickers) {
     }
   }
   
-  console.log(`[tickerValidator] Results: ${result.valid} valid, ${result.invalid} invalid`);
+  console.log(`[tickerValidator] Results: ${result.valid} valid, ${result.invalid} invalid, ${result.unverified} unverified`);
   
   return result;
 }
@@ -106,6 +113,7 @@ async function validateSingleTicker(ticker) {
   const result = {
     originalTicker: ticker,
     isValid: false,
+    isUnverified: false,  // True if couldn't verify due to API error (not the same as invalid)
     normalizedTicker: null,
     assetType: null,
     market: null,
@@ -123,10 +131,11 @@ async function validateSingleTicker(ticker) {
   
   try {
     // Call finance-query /v1/search with timeout
+    // Note: 15 seconds to account for Cloud Functions cold start + API latency
     const searchResults = await Promise.race([
       search(ticker),
       new Promise((_, reject) => 
-        setTimeout(() => reject(new Error('Timeout')), 5000)
+        setTimeout(() => reject(new Error('Timeout')), 15000)
       )
     ]);
     
@@ -167,7 +176,10 @@ async function validateSingleTicker(ticker) {
     
   } catch (error) {
     console.error(`[tickerValidator] Error validating ${ticker}:`, error.message);
-    result.error = `API error: ${error.message}`;
+    // API errors (timeout, network issues) should mark as unverified, not invalid
+    // The ticker might still be valid, we just couldn't check it
+    result.isUnverified = true;
+    result.error = `No se pudo verificar: ${error.message}`;
     return result;
   }
 }

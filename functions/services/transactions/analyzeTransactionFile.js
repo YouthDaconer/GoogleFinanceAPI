@@ -15,6 +15,7 @@
  */
 
 const { onCall, HttpsError } = require("firebase-functions/v2/https");
+const { defineSecret } = require("firebase-functions/params");
 
 // Import services
 const { detectBrokerFormat, getBrokerMappings } = require('./services/brokerPatterns');
@@ -22,6 +23,13 @@ const { detectColumnsGeneric, detectHasHeader } = require('./services/columnDete
 const { validateTickerSample } = require('./services/tickerValidator');
 const { calculateOverallConfidence, generateFeedback, evaluateReadiness } = require('./services/confidenceCalculator');
 const { REQUIRED_FIELDS, LIMITS } = require('./types');
+
+// ============================================================================
+// SECRET DEFINITIONS
+// ============================================================================
+
+// SEC-TOKEN-003: Secret for service-to-service authentication with finance-query API
+const cfServiceToken = defineSecret("CF_SERVICE_TOKEN");
 
 // ============================================================================
 // CLOUD FUNCTION CONFIGURATION
@@ -37,6 +45,7 @@ const FUNCTION_CONFIG = {
   maxInstances: 20,
   minInstances: 0,
   region: 'us-central1',
+  secrets: [cfServiceToken],  // SEC-TOKEN-003: Bind secret for API authentication
 };
 
 // ============================================================================
