@@ -1,9 +1,18 @@
 require('dotenv').config();
 const { onRequest } = require("firebase-functions/v2/https");
+const { defineSecret } = require("firebase-functions/params");
 const httpApp = require('./httpApi');
 
 // Función unificada EOD que calcula performance y riesgo del portafolio
 const { unifiedMarketDataUpdate } = require('./services/unifiedMarketDataUpdate');
+
+/**
+ * SEC-TOKEN-001: Secret para autenticación server-to-server con API finance-query
+ * Usado por httpApi para endpoints /quotes, /simple-quotes, /search, etc.
+ * 
+ * @see docs/architecture/SEC-TOKEN-001-api-security-hardening-plan.md
+ */
+const cfServiceToken = defineSecret('CF_SERVICE_TOKEN');
 
 const processDividendPayments = require('./services/processDividendPayments');
 const marketStatusService = require('./services/marketStatusService');
@@ -77,7 +86,8 @@ const etfProcessingOpts = {
   },
   // Sin instancias mínimas para evitar cargos continuos
   minInstances: 0, 
-  cpu: 1 // Asignar 1 CPU completo
+  cpu: 1, // Asignar 1 CPU completo
+  secrets: [cfServiceToken],  // SEC-TOKEN-001: Binding del secret para API auth
 };
 
 // Exportar la app HTTP con las configuraciones específicas

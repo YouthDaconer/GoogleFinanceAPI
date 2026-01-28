@@ -30,13 +30,42 @@ const etfMemoryCache = new Map();
 const ETF_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
 
 // ============================================================================
-// OPT-DEMAND-CLEANUP (2026-01-17): Funciones de cache de precios ELIMINADAS
+// OPT-DEMAND-CLEANUP (2026-01-17): Funciones de cache de precios DEPRECADAS
 // ============================================================================
-// getCachedPrices() y getCachedCurrencyRates() fueron eliminadas porque:
+// getCachedPrices() y getCachedCurrencyRates() retornan arrays vacíos porque:
 // - El frontend usa polling al API Lambda para datos frescos
 // - Cachear precios obsoletos de Firestore es peor que mostrar error + retry
 // - Las tasas de cambio vienen del API Lambda junto con los precios
+// 
+// NOTA: Estas funciones DEBEN existir porque financeQuery.js las importa
+// para usarlas como fallback del circuit breaker. Si no existen, el circuit
+// breaker falla con TypeError cuando el API no responde.
 // ============================================================================
+
+/**
+ * @deprecated OPT-DEMAND-CLEANUP - Retorna array vacío.
+ * Mantenida para compatibilidad con circuit breaker en financeQuery.js
+ * 
+ * @param {string[]} symbols - Lista de símbolos (ignorada)
+ * @returns {Promise<Array>} Array vacío siempre
+ */
+async function getCachedPrices(symbols) {
+  logger.warn('getCachedPrices called (deprecated, returning empty array)', {
+    symbolCount: symbols?.length || 0,
+  });
+  return [];
+}
+
+/**
+ * @deprecated OPT-DEMAND-CLEANUP - Retorna objeto vacío.
+ * Mantenida para compatibilidad con imports en otros módulos.
+ * 
+ * @returns {Promise<Object>} Objeto vacío siempre
+ */
+async function getCachedCurrencyRates() {
+  logger.warn('getCachedCurrencyRates called (deprecated, returning empty object)');
+  return {};
+}
 
 async function getCachedMarketStatus() {
   const MARKET_DOC_ID = 'US';
@@ -123,6 +152,10 @@ function getEtfCacheStats() {
 }
 
 module.exports = {
+  // Funciones deprecadas (OPT-DEMAND-CLEANUP) - retornan vacío pero existen para compatibilidad
+  getCachedPrices,
+  getCachedCurrencyRates,
+  // Funciones activas
   getCachedMarketStatus,
   cacheMarketStatus,
   getCachedEtfData,

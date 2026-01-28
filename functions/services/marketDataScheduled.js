@@ -24,9 +24,18 @@
  */
 
 const { onSchedule } = require("firebase-functions/v2/scheduler");
+const { defineSecret } = require("firebase-functions/params");
 const admin = require('./firebaseAdmin');
 const axios = require('axios');
 const { FINANCE_QUERY_API_URL, getServiceHeaders } = require('./config');
+
+/**
+ * SEC-TOKEN-001: Secret para autenticación server-to-server con API finance-query
+ * Usado por saveIndicesHistoryData y saveSectorsSnapshot.
+ * 
+ * @see docs/architecture/SEC-TOKEN-001-api-security-hardening-plan.md
+ */
+const cfServiceToken = defineSecret('CF_SERVICE_TOKEN');
 
 // ============================================================================
 // UTILIDADES
@@ -98,7 +107,7 @@ const saveIndicesHistoryData = onSchedule({
   timeZone: 'America/New_York',
   retryCount: 2,
   memory: '256MiB',
-  // SEC-TOKEN-003: SERVICE_TOKEN_SECRET se lee de process.env via config.js
+  secrets: [cfServiceToken],  // SEC-TOKEN-001: Binding del secret para API auth
 }, async (event) => {
   const startTime = Date.now();
   const formattedDate = new Date().toISOString().split('T')[0];
@@ -185,7 +194,7 @@ const saveSectorsSnapshot = onSchedule({
   timeZone: 'America/New_York',
   retryCount: 2,
   memory: '256MiB',
-  // SEC-TOKEN-003: SERVICE_TOKEN_SECRET se lee de process.env via config.js
+  secrets: [cfServiceToken],  // SEC-TOKEN-001: Binding del secret para API auth
 }, async (event) => {
   const startTime = Date.now();
   const formattedDate = new Date().toISOString().split('T')[0];

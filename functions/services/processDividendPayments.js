@@ -1,14 +1,24 @@
 const { onSchedule } = require("firebase-functions/v2/scheduler");
+const { defineSecret } = require("firebase-functions/params");
 const admin = require('firebase-admin');
 const { DateTime } = require('luxon');
 const { scrapeDividendsInfoFromStockEvents } = require('./scrapeDividendsInfoFromStock');
 // OPT-DEMAND-CLEANUP: Importar helper para obtener precios y currencies del API Lambda
 const { getPricesFromApi, getCurrencyRatesFromApi } = require('./marketDataHelper');
 
+/**
+ * SEC-TOKEN-001: Secret para autenticación server-to-server con API finance-query
+ * Usado por getPricesFromApi/getCurrencyRatesFromApi para obtener datos de dividendos.
+ * 
+ * @see docs/architecture/SEC-TOKEN-001-api-security-hardening-plan.md
+ */
+const cfServiceToken = defineSecret('CF_SERVICE_TOKEN');
+
 exports.processDividendPayments = onSchedule({
   schedule: '0 7,18 * * *',  // Ejecutar a las 7:00 AM y 6:00 PM todos los días
   timeZone: 'America/New_York',
   retryCount: 3,
+  secrets: [cfServiceToken],  // SEC-TOKEN-001: Binding del secret para API auth
 }, async (event) => {
   const db = admin.firestore();
   const now = DateTime.now().setZone('America/New_York');

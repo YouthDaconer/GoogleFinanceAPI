@@ -19,6 +19,7 @@
  */
 
 const { onCall, HttpsError } = require("firebase-functions/v2/https");
+const { defineSecret } = require("firebase-functions/params");
 const { rateLimiter } = require('../../utils/rateLimiter');
 const { getRateLimitConfig } = require('../../config/rateLimits');
 
@@ -30,6 +31,14 @@ const assetHandlers = require('../handlers/assetHandlers');
 // ============================================================================
 
 /**
+ * SEC-TOKEN-001: Secret para autenticación server-to-server con API finance-query
+ * Usado por createAsset para enriquecer datos de nuevos tickers.
+ * 
+ * @see docs/architecture/SEC-TOKEN-001-api-security-hardening-plan.md
+ */
+const cfServiceToken = defineSecret('CF_SERVICE_TOKEN');
+
+/**
  * Configuración de Cloud Function
  */
 const FUNCTION_CONFIG = {
@@ -38,6 +47,7 @@ const FUNCTION_CONFIG = {
   timeoutSeconds: 60,
   maxInstances: 10,
   minInstances: 0,
+  secrets: [cfServiceToken],  // SEC-TOKEN-001: Binding del secret para API auth
 };
 
 /**

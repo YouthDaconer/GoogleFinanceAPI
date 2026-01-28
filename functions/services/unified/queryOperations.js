@@ -29,6 +29,7 @@
  */
 
 const { onCall, HttpsError } = require("firebase-functions/v2/https");
+const { defineSecret } = require("firebase-functions/params");
 const { rateLimiter } = require('../../utils/rateLimiter');
 const { getRateLimitConfig } = require('../../config/rateLimits');
 
@@ -41,13 +42,21 @@ const { getPerformanceOnDemand } = require('../handlers/performanceOnDemandHandl
 // ============================================================================
 
 /**
+ * SEC-TOKEN-001: Secret para autenticación server-to-server con API finance-query
+ * Este secret permite a Cloud Functions autenticarse con el API via Cloudflare Tunnel.
+ * 
+ * @see docs/architecture/SEC-TOKEN-001-api-security-hardening-plan.md
+ */
+const cfServiceToken = defineSecret('CF_SERVICE_TOKEN');
+
+/**
  * Configuración de Cloud Function
  * 
  * Memory: 512MiB (requerido por getHistoricalReturns)
  * MaxInstances: 20 (alto tráfico esperado ~1500 invocaciones/día)
  * 
- * SEC-TOKEN-001: CF_SERVICE_TOKEN se carga desde .env para autenticación
- * server-to-server con el API finance-query via Cloudflare Tunnel.
+ * SEC-TOKEN-001: CF_SERVICE_TOKEN se bindea desde Secret Manager para
+ * autenticación server-to-server con el API finance-query via Cloudflare Tunnel.
  */
 const FUNCTION_CONFIG = {
   cors: true,
@@ -55,6 +64,7 @@ const FUNCTION_CONFIG = {
   timeoutSeconds: 60,
   maxInstances: 20,
   minInstances: 0,
+  secrets: [cfServiceToken],  // SEC-TOKEN-001: Binding del secret para API auth
 };
 
 /**
