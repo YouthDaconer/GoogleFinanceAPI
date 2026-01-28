@@ -4,30 +4,64 @@ service cloud.firestore {
   match /databases/{database}/documents {
     
     // ============================================================
-    // REGLAS DE SEGURIDAD POST-REFACTORIZACIÓN (REF-004)
-    // Fecha: 2025-12-02
+    // REGLAS DE SEGURIDAD - OPT-SEC-002 + RBAC-001
+    // Fecha: 2026-01-07
+    // Actualizado: Fortificación con helper functions y validación estricta
+    //              + Sistema RBAC con Custom Claims
     // 
-    // Las operaciones de escritura en assets, transactions y 
-    // portfolioAccounts ahora se realizan via Cloud Functions.
-    // El frontend solo tiene permisos de LECTURA.
+    // PRINCIPIOS:
+    // 1. Mínimo Privilegio: Solo acceso a datos propios
+    // 2. Zero Trust: Validar ownership en cada operación
+    // 3. Solo Lectura: Frontend no puede escribir (Cloud Functions)
+    // 4. RBAC: Roles via Custom Claims en el token
+    // ============================================================
+
+    // ============================================================
+    // HELPER FUNCTIONS DE SEGURIDAD (OPT-SEC-002 + RBAC-001)
+    // ============================================================
+    
+    // Verifica que el usuario está autenticado
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    // Verifica que el usuario es el propietario del recurso
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+    
+    // ✅ RBAC-001: Verifica si el usuario es admin via Custom Claims
+    // Firebase Best Practice: Verificar directamente en el token
+    // Sin consulta adicional a Firestore (zero-cost, zero-latency)
+    function isAdmin() {
+      return isAuthenticated() && request.auth.token.admin == true;
+    }
+    
+    // Verifica que una cuenta de portafolio pertenece al usuario
+    function belongsToUser(accountId) {
+      return isAuthenticated() &&
+             exists(/databases/$(database)/documents/portfolioAccounts/$(accountId)) &&
+             get(/databases/$(database)/documents/portfolioAccounts/$(accountId)).data.userId == request.auth.uid;
+    }
+
+    // ============================================================
+    // COLECCIONES PRINCIPALES
     // ============================================================
 
     // ---- ASSETS ----
-    // Lectura: Usuarios autenticados pueden leer sus propios assets
-    // Escritura: SOLO via Cloud Functions (createAsset, sellAsset, etc.)
+    // Lectura: Solo assets cuya cuenta pertenece al usuario
+    // Escritura: BLOQUEADA - Solo via Cloud Functions
     match /assets/{assetId} {
-      allow read: if request.auth != null;
-      // Permitir escritura temporal para updateAsset y deleteAsset (pendiente migrar)
-      allow write: if request.auth != null;
+      allow read: if belongsToUser(resource.data.portfolioAccount);
+      allow write: if false;  // SEGURIDAD: Solo Cloud Functions pueden escribir
     }
     
     // ---- TRANSACTIONS ----
-    // Lectura: Usuarios autenticados pueden leer sus transacciones
-    // Escritura: SOLO via Cloud Functions (Admin SDK bypasea reglas)
-    // REF-SEC-002: Eliminación de cuenta/transacciones manejada en backend
+    // Lectura: Solo transacciones cuya cuenta pertenece al usuario
+    // Nota: Transacciones antiguas no tienen userId, usan portfolioAccountId
+    // Escritura: BLOQUEADA - Solo via Cloud Functions
     match /transactions/{txId} {
-      allow read: if request.auth != null;
-      // Todas las escrituras solo via Cloud Functions (Admin SDK)
+      allow read: if belongsToUser(resource.data.portfolioAccountId);
       allow write: if false;
     }
     
@@ -35,178 +69,199 @@ service cloud.firestore {
     // Lectura: Solo el propietario puede leer sus cuentas
     // Escritura: Usuario puede crear/editar sus propias cuentas
     // Nota: Los balances se actualizan via Cloud Functions
-    // FIX-DEC-002: Permitir list queries con filtro userId para consultas desde frontend
     match /portfolioAccounts/{accountId} {
-      // Permitir lectura (get/list) si el usuario está autenticado
-      // La seguridad se garantiza porque el frontend siempre filtra por userId
-      // y las Cloud Functions usan Admin SDK
-      allow read: if request.auth != null;
-      allow create: if request.auth != null 
-        && request.auth.uid == request.resource.data.userId;
-      allow update, delete: if request.auth != null 
-        && request.auth.uid == resource.data.userId;
+      allow read: if isOwner(resource.data.userId);
+      allow create: if isOwner(request.resource.data.userId);
+      allow update, delete: if isOwner(resource.data.userId);
     }
     
     // ---- CURRENT PRICES ----
-    // Lectura: Pública (cualquier usuario autenticado)
+    // Lectura: Cualquier usuario autenticado (requerido para polling OPT-COST-005)
     // Escritura: SOLO backend (GoogleFinanceAPI/unifiedMarketDataUpdate)
     match /currentPrices/{symbol} {
-      allow read: if request.auth != null;
+      allow read: if isAuthenticated();
       allow write: if false;
     }
     
     // ---- CURRENCIES ----
-    // Lectura: Pública
-    // Escritura: SOLO backend
+    // Lectura: Pública - requerido para registro de usuarios
+    // Escritura: 🔒 RBAC-001 - Solo admins via Custom Claims
+    // Nota: En producción, las escrituras se hacen via Cloud Functions
+    //       Esta regla es un backup de seguridad adicional
     match /currencies/{currencyId} {
-      allow read: if request.auth != null;
-      allow write: if false;
+      allow read: if true;  // Público - requerido para registro
+      allow write: if isAdmin();  // RBAC-001: Solo admins
     }
     
     // ---- USER DATA ----
     // Lectura/Escritura: Solo el propietario
     match /userData/{userId} {
-      allow read, write: if request.auth != null 
-        && request.auth.uid == userId;
+      allow read, write: if isOwner(userId);
     }
     
     // ---- PORTFOLIO PERFORMANCE ----
     // Lectura: Solo el propietario
     // Escritura: SOLO backend (calculateDailyPortfolioPerformance)
     match /portfolioPerformance/{userId} {
-      allow read: if request.auth != null 
-        && request.auth.uid == userId;
+      allow read: if isOwner(userId);
       allow write: if false;
       
-      // Subcolección dates (para vista "overall" / todas las cuentas)
+      // Subcolección dates (para vista "overall")
       match /dates/{dateId} {
-        allow read: if request.auth != null 
-          && request.auth.uid == userId;
+        allow read: if isOwner(userId);
         allow write: if false;
+      }
+      
+      // Subcolección consolidatedPeriods (COST-OPT-001)
+      match /consolidatedPeriods/{periodType} {
+        allow read: if isOwner(userId);
+        allow write: if false;
+        
+        match /periods/{periodId} {
+          allow read: if isOwner(userId);
+          allow write: if false;
+        }
       }
       
       // Subcolección accounts
       match /accounts/{accountId} {
-        allow read: if request.auth != null 
-          && request.auth.uid == userId;
+        allow read: if isOwner(userId);
         allow write: if false;
         
-        // Subcolección dates (por cuenta específica)
+        // Subcolección dates (para vista por cuenta)
         match /dates/{dateId} {
-          allow read: if request.auth != null 
-            && request.auth.uid == userId;
+          allow read: if isOwner(userId);
           allow write: if false;
+        }
+        
+        // Subcolección consolidatedPeriods por cuenta
+        match /consolidatedPeriods/{periodType} {
+          allow read: if isOwner(userId);
+          allow write: if false;
+          
+          match /periods/{periodId} {
+            allow read: if isOwner(userId);
+            allow write: if false;
+          }
         }
       }
     }
     
     // ---- CATÁLOGOS (Solo Lectura) ----
     match /markets/{marketId} {
-      allow read: if request.auth != null;
+      allow read: if isAuthenticated();
+      allow write: if false;
+    }
+    
+    // ---- SYSTEM STATUS (OPT-016) ----
+    // Documento de señal para sincronización de rendimientos en tiempo real
+    // Lectura: Cualquier usuario autenticado
+    // Escritura: SOLO backend (unifiedMarketDataUpdate)
+    match /systemStatus/{docId} {
+      allow read: if isAuthenticated();
       allow write: if false;
     }
     
     match /sectors/{sectorId} {
-      allow read: if request.auth != null;
+      allow read: if isAuthenticated();
       allow write: if false;
     }
     
     match /assetTypes/{typeId} {
-      allow read: if request.auth != null;
+      allow read: if isAuthenticated();
       allow write: if false;
     }
     
+    // ---- PAÍSES Y MONEDAS (Lectura Pública) ----
+    // Necesarios para el formulario de registro antes de autenticarse
     match /countries/{countryId} {
-      allow read: if request.auth != null;
+      allow read: if true;  // Público - requerido para registro
       allow write: if false;
     }
     
     // ---- ETF DATA ----
     match /etfData/{etfId} {
-      allow read: if request.auth != null;
+      allow read: if isAuthenticated();
       allow write: if false;
     }
     
     match /etfSectors/{etfId} {
-      allow read: if request.auth != null;
+      allow read: if isAuthenticated();
       allow write: if false;
     }
     
     // ---- ETF ANALYSES (Usuario puede guardar sus análisis) ----
     match /etfAnalyses/{analysisId} {
-      allow read: if request.auth != null;
-      allow create: if request.auth != null;
-      allow update, delete: if request.auth != null 
-        && request.auth.uid == resource.data.userId;
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated();
+      allow update, delete: if isOwner(resource.data.userId);
     }
     
     // ---- INDEX HISTORIES ----
     match /indexHistories/{indexId} {
-      allow read: if request.auth != null;
+      allow read: if isAuthenticated();
       allow write: if false;
       
       match /dates/{dateId} {
-        allow read: if request.auth != null;
+        allow read: if isAuthenticated();
         allow write: if false;
       }
+    }
+    
+    // ---- INDEX CACHE (OPT-009) ----
+    // Cache global de índices históricos - solo lectura para usuarios autenticados
+    // Las Cloud Functions escriben con privilegios de admin
+    match /indexCache/{cacheId} {
+      allow read: if isAuthenticated();
+      allow write: if false;
     }
     
     // ---- PORTFOLIO DISTRIBUTION/METRICS ----
     match /portfolioDistribution/{docId} {
-      allow read: if request.auth != null;
+      allow read: if isAuthenticated();
       allow write: if false;
     }
     
-    // portfolioMetrics tiene estructura jerárquica por usuario:
-    // portfolioMetrics/{userId}/weeklyMetrics/{docId}
-    // portfolioMetrics/{userId}/riskMetrics/{docId}
-    // portfolioMetrics/{userId}/accounts/{accountId}/weeklyMetrics/{docId}
-    // portfolioMetrics/{userId}/accounts/{accountId}/riskMetrics/{docId}
+    // ---- PORTFOLIO METRICS ----
+    // Estructura:
+    //   portfolioMetrics/{userId}/weeklyMetrics/latest
+    //   portfolioMetrics/{userId}/riskMetrics/latest
+    //   portfolioMetrics/{userId}/accounts/{accountId}/weeklyMetrics/latest
+    //   portfolioMetrics/{userId}/accounts/{accountId}/riskMetrics/latest
     match /portfolioMetrics/{userId} {
-      allow read: if request.auth != null 
-        && request.auth.uid == userId;
+      // Documento raíz del usuario
+      allow read: if isOwner(userId);
       allow write: if false;
       
-      // Subcolección weeklyMetrics
+      // Subcolección weeklyMetrics (profitable weeks data)
       match /weeklyMetrics/{docId} {
-        allow read: if request.auth != null 
-          && request.auth.uid == userId;
+        allow read: if isOwner(userId);
         allow write: if false;
       }
       
-      // Subcolección riskMetrics
+      // Subcolección riskMetrics (portfolio risk data)
       match /riskMetrics/{docId} {
-        allow read: if request.auth != null 
-          && request.auth.uid == userId;
+        allow read: if isOwner(userId);
         allow write: if false;
       }
       
-      // Subcolección accounts con sus propias subcolecciones
+      // Subcolección accounts con sus métricas
       match /accounts/{accountId} {
-        allow read: if request.auth != null 
-          && request.auth.uid == userId;
+        allow read: if isOwner(userId);
         allow write: if false;
         
+        // weeklyMetrics por cuenta
         match /weeklyMetrics/{docId} {
-          allow read: if request.auth != null 
-            && request.auth.uid == userId;
+          allow read: if isOwner(userId);
           allow write: if false;
         }
         
+        // riskMetrics por cuenta
         match /riskMetrics/{docId} {
-          allow read: if request.auth != null 
-            && request.auth.uid == userId;
+          allow read: if isOwner(userId);
           allow write: if false;
         }
       }
-    }
-    
-    // ---- SYSTEM STATUS (OPT-016) ----
-    // Lectura: Usuarios autenticados (para marketDataStatus sync)
-    // Escritura: SOLO backend
-    match /systemStatus/{docId} {
-      allow read: if request.auth != null;
-      allow write: if false;
     }
   }
 }

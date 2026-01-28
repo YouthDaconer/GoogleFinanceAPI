@@ -160,7 +160,8 @@ const getSimpleQuotes = (symbols) => getSimpleQuotesWithFallback(symbols);
 
 // Market quotes for currencies (COP=X, EUR=X, etc.) and indices
 // INTRADAY-001: Endpoint específico para tasas de cambio en tiempo real
-const getMarketQuotes = (symbols) => getWithGracefulDegradation(`/market-quotes?symbols=${symbols}`, {});
+// Note: Returns [] on error so invalid tickers are properly detected
+const getMarketQuotes = (symbols) => getWithGracefulDegradation(`/market-quotes?symbols=${symbols}`, []);
 
 // These don't have fallback - they throw on circuit open
 const getSimilarStocks = (symbol) => fetchData(`/similar-stocks/?symbol=${symbol}`);

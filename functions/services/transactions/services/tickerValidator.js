@@ -1,15 +1,21 @@
 /**
  * Ticker Validation Service
  * 
- * Validates ALL unique tickers against the finance-query API /v1/quotes endpoint.
+ * Validates ALL unique tickers against the finance-query API /v1/market-quotes endpoint.
  * Uses batch validation for efficiency (single API call for all tickers).
  * Returns validation results with asset info for valid tickers.
+ * 
+ * NOTE: Uses /market-quotes instead of /quotes because:
+ * - /market-quotes uses Yahoo Finance API directly
+ * - Only returns data for tickers that actually exist
+ * - Returns quoteType for mapping to assetType
+ * - Returns currency for the asset
  * 
  * @module transactions/services/tickerValidator
  * @see docs/stories/89.story.md (IMPORT-001)
  */
 
-const { getQuotes, search } = require('../../financeQuery');
+const { getMarketQuotes, search } = require('../../financeQuery');
 const { LIMITS } = require('../types');
 
 // ============================================================================
@@ -68,11 +74,15 @@ async function validateTickerSample(tickers) {
   
   result.total = uniqueTickers.length;
   
-  console.log(`[tickerValidator] Validating ${uniqueTickers.length} unique tickers using /quotes`);
+  console.log(`[tickerValidator] Validating ${uniqueTickers.length} unique tickers using /market-quotes`);
+  console.log(`[tickerValidator] Tickers to validate:`, uniqueTickers.slice(0, 10).join(', '), uniqueTickers.length > 10 ? `... and ${uniqueTickers.length - 10} more` : '');
   
   try {
-    // Call /v1/quotes with all tickers at once
+    // Call /v1/market-quotes with all tickers at once
     const quotes = await validateWithQuotes(uniqueTickers);
+    
+    console.log(`[tickerValidator] Received ${quotes.length} quotes from API`);
+    console.log(`[tickerValidator] Valid symbols:`, quotes.map(q => q.symbol).slice(0, 10).join(', '));
     
     // Build set of valid symbols from response
     const validSymbols = new Set(quotes.map(q => q.symbol?.toUpperCase()).filter(Boolean));
@@ -95,13 +105,21 @@ async function validateTickerSample(tickers) {
           logo: quote.logo,
           assetType: detectAssetType(quote),
           currency: quote.currency || 'USD',
+          quoteType: quote.quoteType,
+          exchange: quote.exchange,
+          fullExchangeName: quote.fullExchangeName,
         };
+        // Store enriched metadata for asset creation
         result.validDetails[ticker] = {
           symbol: quote.symbol,
           name: quote.name || quote.shortName,
           sector: quote.sector,
           industry: quote.industry,
           logo: quote.logo,
+          currency: quote.currency || 'USD',
+          quoteType: quote.quoteType,
+          exchange: quote.exchange,
+          fullExchangeName: quote.fullExchangeName,
         };
       } else {
         // Invalid ticker - try to find suggestion
@@ -176,7 +194,7 @@ async function validateWithQuotes(tickers) {
 }
 
 /**
- * Validates a single batch of tickers
+ * Validates a single batch of tickers using /v1/market-quotes
  * 
  * @param {string[]} tickers - Batch of tickers (max 100)
  * @returns {Promise<Object[]>} Array of quote objects
@@ -184,19 +202,28 @@ async function validateWithQuotes(tickers) {
 async function validateSingleBatch(tickers) {
   const symbolsParam = tickers.join(',');
   
+  console.log(`[tickerValidator] Calling /market-quotes with ${tickers.length} symbols`);
+  
   // Call with timeout
-  const quotes = await Promise.race([
-    getQuotes(symbolsParam),
+  const response = await Promise.race([
+    getMarketQuotes(symbolsParam),
     new Promise((_, reject) => 
       setTimeout(() => reject(new Error('Timeout')), QUOTES_TIMEOUT_MS)
     )
   ]);
   
-  // Ensure we return an array
-  if (!quotes || !Array.isArray(quotes)) {
-    console.warn('[tickerValidator] Unexpected response from /quotes:', typeof quotes);
-    return [];
+  // /market-quotes returns an array of quotes for valid symbols
+  // Invalid symbols are simply not included in the response
+  let quotes = [];
+  
+  if (Array.isArray(response)) {
+    quotes = response;
+  } else if (response && typeof response === 'object') {
+    // Handle case where response might be wrapped
+    quotes = Object.values(response).filter(q => q && q.symbol);
   }
+  
+  console.log(`[tickerValidator] /market-quotes returned ${quotes.length} valid quotes`);
   
   return quotes;
 }

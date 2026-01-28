@@ -184,8 +184,9 @@ async function deletePortfolioAccount(context, payload) {
 
     // 1. Eliminar todos los assets asociados a esta cuenta
     console.log(`[accountHandlers][deletePortfolioAccount] Eliminando assets de la cuenta ${accountId}`);
+    // FIX-DELETE-001: Campo correcto es "portfolioAccount" no "portfolioAccountId"
     const assetsQuery = db.collection("assets")
-      .where("portfolioAccountId", "==", accountId)
+      .where("portfolioAccount", "==", accountId)
       .where("userId", "==", userId);
     
     const assetsSnapshot = await assetsQuery.get();
