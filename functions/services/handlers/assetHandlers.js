@@ -38,6 +38,41 @@ const cleanDecimal = (num, decimals = 8) =>
   Number(Math.round(Number(num + "e" + decimals)) / 10 ** decimals);
 
 /**
+ * FIX-TIMESTAMP-001: Combina una fecha seleccionada por el usuario con la hora actual del servidor
+ * 
+ * Esta función garantiza precisión temporal en el registro de transacciones y assets,
+ * permitiendo ordenamiento determinístico cuando hay múltiples operaciones el mismo día.
+ * 
+ * @param {string} dateString - Fecha en formato YYYY-MM-DD
+ * @returns {string} Fecha ISO con hora actual del servidor (ej: "2025-01-28T14:30:45.123Z")
+ * @example
+ * // Si dateString es "2025-01-28" y la hora actual es 14:30:45.123
+ * combineDateWithCurrentTime("2025-01-28") // => "2025-01-28T14:30:45.123Z"
+ */
+const combineDateWithCurrentTime = (dateString) => {
+  // Si ya tiene formato ISO con hora, retornarlo como está
+  if (dateString && dateString.includes('T')) {
+    return dateString;
+  }
+  
+  const now = new Date();
+  const [year, month, day] = dateString.split('-').map(Number);
+  
+  // Crear fecha combinando la fecha del usuario con la hora actual
+  const combined = new Date(
+    year,
+    month - 1, // JavaScript months are 0-indexed
+    day,
+    now.getHours(),
+    now.getMinutes(),
+    now.getSeconds(),
+    now.getMilliseconds()
+  );
+  
+  return combined.toISOString();
+};
+
+/**
  * Valida que el usuario sea propietario de la cuenta de portafolio
  * @param {string} portfolioAccountId - ID de la cuenta
  * @param {string} userId - UID del usuario
@@ -222,6 +257,9 @@ async function createAsset(context, payload) {
     // 5. Ejecutar transacción atómica
     const batch = db.batch();
 
+    // FIX-TIMESTAMP-001: Combinar fecha con hora actual para precisión temporal
+    const acquisitionDateWithTime = combineDateWithCurrentTime(data.acquisitionDate);
+
     // 5.1. Crear el asset
     const assetRef = db.collection('assets').doc();
     const assetData = {
@@ -232,7 +270,7 @@ async function createAsset(context, payload) {
       currency: data.currency,
       units: units,
       unitValue: unitValue,
-      acquisitionDate: data.acquisitionDate,
+      acquisitionDate: acquisitionDateWithTime,
       acquisitionDollarValue: cleanDecimal(Number(data.acquisitionDollarValue) || 1),
       defaultCurrencyForAdquisitionDollar: data.defaultCurrencyForAdquisitionDollar || 'USD',
       commission: commission,
@@ -251,7 +289,7 @@ async function createAsset(context, payload) {
       amount: units,
       price: unitValue,
       currency: data.currency,
-      date: data.acquisitionDate,
+      date: acquisitionDateWithTime,
       portfolioAccountId: data.portfolioAccount,
       commission: commission,
       assetType: data.assetType,
@@ -390,6 +428,10 @@ async function updateAsset(context, payload) {
     }
     if (updateData.acquisitionDollarValue !== undefined) {
       updateData.acquisitionDollarValue = cleanDecimal(Number(updateData.acquisitionDollarValue));
+    }
+    // FIX-TIMESTAMP-001: Combinar fecha con hora actual si se actualiza acquisitionDate
+    if (updateData.acquisitionDate !== undefined) {
+      updateData.acquisitionDate = combineDateWithCurrentTime(updateData.acquisitionDate);
     }
 
     // 8. Ejecutar transacción atómica
@@ -585,6 +627,11 @@ async function sellAsset(context, payload) {
       batch.update(assetRef, { units: remainingUnits });
     }
 
+    // FIX-TIMESTAMP-001: Usar fecha proporcionada o generar timestamp con hora actual
+    const sellDate = data.sellDate 
+      ? combineDateWithCurrentTime(data.sellDate)
+      : new Date().toISOString();
+
     const transactionRef = db.collection('transactions').doc();
     const transactionData = {
       assetId: data.assetId,
@@ -593,7 +640,7 @@ async function sellAsset(context, payload) {
       amount: sellAmount,
       price: sellPrice,
       currency: asset.currency,
-      date: new Date().toISOString().split('T')[0],
+      date: sellDate,
       portfolioAccountId: data.portfolioAccountId,
       commission: sellCommission,
       assetType: asset.assetType,
@@ -711,7 +758,10 @@ async function sellPartialAssetsFIFO(context, payload) {
     const soldAssets = [];
     const pricePerUnit = cleanDecimal(Number(data.pricePerUnit) || 0);
     const totalCommission = cleanDecimal(Number(data.totalCommission) || 0);
-    const today = new Date().toISOString().split('T')[0];
+    // FIX-TIMESTAMP-001: Usar fecha proporcionada o generar timestamp con hora actual
+    const sellDate = data.sellDate 
+      ? combineDateWithCurrentTime(data.sellDate)
+      : new Date().toISOString();
     const currency = assetsList[0]?.currency || 'USD';
 
     for (const asset of assetsList) {
@@ -749,7 +799,7 @@ async function sellPartialAssetsFIFO(context, payload) {
         amount: unitsToSellFromAsset,
         price: pricePerUnit,
         currency: asset.currency,
-        date: today,
+        date: sellDate,
         portfolioAccountId: data.portfolioAccountId,
         commission: proportionalCommission,
         assetType: asset.assetType,
@@ -869,6 +919,11 @@ async function addCashTransaction(context, payload) {
     // 5. Ejecutar transacción atómica
     const batch = db.batch();
 
+    // FIX-TIMESTAMP-001: Usar fecha proporcionada o generar timestamp con hora actual
+    const transactionDate = data.date 
+      ? combineDateWithCurrentTime(data.date)
+      : new Date().toISOString();
+
     const transactionRef = db.collection('transactions').doc();
     const transactionData = {
       assetName: `${data.type === 'cash_income' ? 'Ingreso' : 'Egreso'} de ${data.currency}`,
@@ -876,7 +931,7 @@ async function addCashTransaction(context, payload) {
       amount: amount,
       price: 1,
       currency: data.currency,
-      date: data.date || new Date().toISOString().split('T')[0],
+      date: transactionDate,
       portfolioAccountId: data.portfolioAccountId,
       commission: 0,
       assetType: 'cash',
