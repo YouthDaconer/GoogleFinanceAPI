@@ -113,8 +113,9 @@ async function resolveAssets(groupedByTicker, portfolioAccountId, userId, create
       }
       
       // AC-009: Find first buy date for acquisitionDate
+      // FIX-TIMESTAMP-002: Use full timestamp (from enriched transaction or current time)
       const firstBuy = findFirstBuyTransaction(transactions);
-      const acquisitionDate = firstBuy ? firstBuy.date : new Date().toISOString().split('T')[0];
+      const acquisitionDate = firstBuy ? firstBuy.date : new Date().toISOString();
       const acquisitionPrice = firstBuy ? firstBuy.price : 0;
       
       // Create new asset document

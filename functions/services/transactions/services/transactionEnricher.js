@@ -315,34 +315,68 @@ function parseNumber(value) {
 }
 
 /**
- * Normalizes a date to YYYY-MM-DD format
+ * Normalizes a date to ISO timestamp format (YYYY-MM-DDTHH:mm:ss.sssZ)
+ * 
+ * FIX-TIMESTAMP-002: Preserva el timestamp si viene en el input.
+ * Si solo viene la fecha (sin hora), agrega la hora actual del servidor.
+ * Esto garantiza consistencia con la migración de timestamps existentes.
+ * 
  * @param {string} date - Date string in various formats
- * @returns {string|null} Normalized date or null if invalid
+ * @returns {string|null} Normalized ISO timestamp or null if invalid
  */
 function normalizeDate(date) {
   if (!date) return null;
   
   const cleaned = date.toString().trim();
   
-  // ISO format: YYYY-MM-DD (already normalized)
-  if (/^\d{4}-\d{2}-\d{2}$/.test(cleaned)) {
+  // Helper: Get current server time components for appending to date-only values
+  const getServerTimeComponent = () => {
+    const now = new Date();
+    return now.toISOString().substring(10); // Returns "THH:mm:ss.sssZ"
+  };
+  
+  // ISO format with full timestamp: YYYY-MM-DDTHH:MM:SS.sssZ (preserve as-is)
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.test(cleaned)) {
+    // Already has full timestamp, normalize to ISO format
+    try {
+      const parsed = new Date(cleaned);
+      if (!isNaN(parsed.getTime())) {
+        return parsed.toISOString();
+      }
+    } catch {
+      // Fall through to return cleaned
+    }
     return cleaned;
   }
   
-  // ISO with time: YYYY-MM-DDTHH:MM:SS
-  if (/^\d{4}-\d{2}-\d{2}[T\s]/.test(cleaned)) {
-    return cleaned.substring(0, 10);
+  // ISO format: YYYY-MM-DD (add server time)
+  if (/^\d{4}-\d{2}-\d{2}$/.test(cleaned)) {
+    return cleaned + getServerTimeComponent();
+  }
+  
+  // ISO with time but no timezone: YYYY-MM-DD HH:MM:SS or YYYY-MM-DDTHH:MM:SS
+  if (/^\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}(:\d{2})?$/.test(cleaned)) {
+    // Parse and convert to ISO
+    try {
+      const normalized = cleaned.replace(' ', 'T');
+      const parsed = new Date(normalized + 'Z');
+      if (!isNaN(parsed.getTime())) {
+        return parsed.toISOString();
+      }
+    } catch {
+      // Fall through
+    }
+    // Fallback: add server time to date portion
+    return cleaned.substring(0, 10) + getServerTimeComponent();
   }
   
   // US format: MM/DD/YYYY or M/D/YYYY
   const usMatch = cleaned.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
   if (usMatch) {
     const [, month, day, year] = usMatch;
-    return `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}`;
+    const dateOnly = `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}`;
+    return dateOnly + getServerTimeComponent();
   }
-  
-  // European format: DD/MM/YYYY
-  // Ambiguous - try US format first (common for brokers)
   
   // Text month: Jan 15, 2024
   const textMatch = cleaned.match(/^([A-Z][a-z]{2})\s+(\d{1,2}),?\s+(\d{4})$/);
@@ -354,7 +388,8 @@ function normalizeDate(date) {
     };
     const month = months[monthStr];
     if (month) {
-      return `${year}-${month}-${day.padStart(2, '0')}`;
+      const dateOnly = `${year}-${month}-${day.padStart(2, '0')}`;
+      return dateOnly + getServerTimeComponent();
     }
   }
   
@@ -362,7 +397,7 @@ function normalizeDate(date) {
   try {
     const parsed = new Date(cleaned);
     if (!isNaN(parsed.getTime())) {
-      return parsed.toISOString().substring(0, 10);
+      return parsed.toISOString();
     }
   } catch {
     // Ignore parse errors
