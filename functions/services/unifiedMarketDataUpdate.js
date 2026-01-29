@@ -522,18 +522,27 @@ async function calculateDailyPortfolioPerformance(db, currentPrices, currencies)
   const now = DateTime.now().setZone('America/New_York');
   const yesterday = now.minus({ days: 1 });
   const formattedDate = yesterday.toISODate();
+  
+  // FIX-TIMESTAMP-002: Rango de fechas para soportar campo date con timestamp completo
+  const dateRangeStart = `${formattedDate}T00:00:00.000Z`;
+  const dateRangeEnd = `${formattedDate}T23:59:59.999Z`;
+  
   let calculationsCount = 0;
   
   logDebug(`📅 Fecha de cálculo (día anterior): ${formattedDate}`);
   logDebug(`📅 Hora actual de ejecución (NY): ${now.toISO()}`);
   
   // OPT-DEMAND-CLEANUP: Solo consultar datos que NO vienen del API
+  // FIX-TIMESTAMP-002: Usar rango de fechas para soportar timestamps completos
   const [
     transactionsSnapshot,
     activeAssetsSnapshot,
     portfolioAccountsSnapshot
   ] = await Promise.all([
-    db.collection('transactions').where('date', '==', formattedDate).get(),
+    db.collection('transactions')
+      .where('date', '>=', dateRangeStart)
+      .where('date', '<=', dateRangeEnd)
+      .get(),
     db.collection('assets').where('isActive', '==', true).get(),
     db.collection('portfolioAccounts').where('isActive', '==', true).get()
   ]);

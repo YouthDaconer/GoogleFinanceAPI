@@ -159,6 +159,51 @@ function generateBusinessDays(startDate, endDate) {
 }
 
 /**
+ * FIX-TIMESTAMP-002: Extrae la parte de fecha (YYYY-MM-DD) de un string
+ * Soporta tanto formato solo fecha como timestamp completo
+ * @param {string} dateString - Fecha en formato YYYY-MM-DD o YYYY-MM-DDTHH:MM:SS.sssZ
+ * @returns {string} Fecha en formato YYYY-MM-DD
+ */
+function getDatePart(dateString) {
+  if (!dateString) return '';
+  // Si tiene 'T', tomar solo los primeros 10 caracteres (YYYY-MM-DD)
+  if (dateString.includes('T')) {
+    return dateString.substring(0, 10);
+  }
+  return dateString;
+}
+
+/**
+ * FIX-TIMESTAMP-002: Compara si una fecha de transacción está en o antes de una fecha objetivo
+ * @param {string} txDate - Fecha de la transacción (puede tener timestamp)
+ * @param {string} targetDate - Fecha objetivo en formato YYYY-MM-DD
+ * @returns {boolean} true si txDate <= targetDate
+ */
+function isDateOnOrBefore(txDate, targetDate) {
+  return getDatePart(txDate) <= targetDate;
+}
+
+/**
+ * FIX-TIMESTAMP-002: Compara si una fecha de transacción es exactamente igual a una fecha objetivo
+ * @param {string} txDate - Fecha de la transacción (puede tener timestamp)
+ * @param {string} targetDate - Fecha objetivo en formato YYYY-MM-DD
+ * @returns {boolean} true si txDate === targetDate (ignorando hora)
+ */
+function isDateEqual(txDate, targetDate) {
+  return getDatePart(txDate) === targetDate;
+}
+
+/**
+ * FIX-TIMESTAMP-002: Compara si una fecha de transacción está después de una fecha
+ * @param {string} txDate - Fecha de la transacción (puede tener timestamp)
+ * @param {string} afterDate - Fecha a comparar en formato YYYY-MM-DD
+ * @returns {boolean} true si txDate > afterDate
+ */
+function isDateAfter(txDate, afterDate) {
+  return getDatePart(txDate) > afterDate;
+}
+
+/**
  * Sleep utility para rate limiting
  */
 function sleep(ms) {
@@ -356,8 +401,8 @@ function calculateHoldingsAtDate(transactions, targetDate, exchangeRates = {}) {
   let totalInvestmentUSD = 0;
   let totalCashFlowUSD = 0;
   
-  // Filtrar transacciones hasta la fecha objetivo
-  const relevantTx = transactions.filter(tx => tx.date <= targetDate);
+  // FIX-TIMESTAMP-002: Filtrar transacciones hasta la fecha objetivo (soporta timestamps)
+  const relevantTx = transactions.filter(tx => isDateOnOrBefore(tx.date, targetDate));
   
   // BUGFIX: Ordenar transacciones para garantizar que BUY se procese antes de SELL
   // en el mismo día. Sin esto, el orden depende del document ID de Firestore,
@@ -365,7 +410,7 @@ function calculateHoldingsAtDate(transactions, targetDate, exchangeRates = {}) {
   // NOTA: Usamos ?? en lugar de || porque 0 es un valor válido (buy=0)
   const typeOrder = { 'buy': 0, 'cash_income': 1, 'dividendPay': 2, 'sell': 3, 'cash_outcome': 4 };
   relevantTx.sort((a, b) => {
-    // Primero ordenar por fecha
+    // Primero ordenar por fecha (usar fecha completa para ordenar correctamente dentro del día)
     if (a.date !== b.date) return a.date.localeCompare(b.date);
     // Luego por tipo: buy/cash_income antes de sell/cash_outcome
     const orderA = typeOrder[a.type] ?? 99;
@@ -474,8 +519,9 @@ function calculateDailyDonePnL(transactions, targetDate) {
   const byAsset = new Map();
   let total = 0;
   
+  // FIX-TIMESTAMP-002: Usar isDateEqual para soportar timestamps
   transactions
-    .filter(tx => tx.date === targetDate && tx.type === 'sell')
+    .filter(tx => isDateEqual(tx.date, targetDate) && tx.type === 'sell')
     .forEach(tx => {
       const pnl = tx.valuePnL || 0;
       total += pnl;
@@ -503,8 +549,9 @@ function calculateDailyDonePnL(transactions, targetDate) {
  * como parte del valor total (aunque no visible en los activos).
  */
 function calculateDailyCashFlow(transactions, targetDate) {
+  // FIX-TIMESTAMP-002: Usar isDateEqual para soportar timestamps
   return transactions
-    .filter(tx => tx.date === targetDate)
+    .filter(tx => isDateEqual(tx.date, targetDate))
     .reduce((sum, tx) => {
       if (tx.type === 'buy') return sum - (tx.amount || 0) * (tx.price || 0);
       if (tx.type === 'sell') return sum + (tx.amount || 0) * (tx.price || 0);
@@ -523,8 +570,9 @@ function calculateDailyCashFlow(transactions, targetDate) {
  * @returns {number} Cashflow acumulado
  */
 function calculateAccumulatedCashFlow(transactions, startDateExclusive, endDateInclusive) {
+  // FIX-TIMESTAMP-002: Usar funciones helper para soportar timestamps
   return transactions
-    .filter(tx => tx.date > startDateExclusive && tx.date <= endDateInclusive)
+    .filter(tx => isDateAfter(tx.date, startDateExclusive) && isDateOnOrBefore(tx.date, endDateInclusive))
     .reduce((sum, tx) => {
       if (tx.type === 'buy') return sum - (tx.amount || 0) * (tx.price || 0);
       if (tx.type === 'sell') return sum + (tx.amount || 0) * (tx.price || 0);
