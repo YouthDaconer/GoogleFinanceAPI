@@ -19,7 +19,8 @@ const { generateWaterfallFromContributions } = require('./waterfallGenerator');
 const { generateSummary } = require('./summaryGenerator');
 const { getPeriodLabel, getPeriodStartDate } = require('./types');
 // INTRADAY-001: Importar cálculo intraday para rendimiento en tiempo real
-const { calculateIntradayPerformance, combineHistoricalWithIntraday } = require('./intradayCalculator');
+// INTRADAY-002: calculateIntradayContributions para contribuciones por activo
+const { calculateIntradayPerformance, calculateIntradayContributions, combineHistoricalWithIntraday } = require('./intradayCalculator');
 const { getQuotes } = require('../financeQuery');
 
 const admin = require('../firebaseAdmin');
@@ -361,47 +362,109 @@ async function getPortfolioAttribution(params) {
     // Guardar el ROI original para diagnóstico
     contributionResult.originalPortfolioReturn = contributionResult.portfolioReturn;
     
-    // IMPORTANTE: Sobrescribir portfolioReturn con el TWR del período
+    // =========================================================================
+    // 3.1 INTRADAY-002: Aplicar contribuciones intraday a cada activo
+    // 
+    // Cuando includeIntraday está habilitado, calculamos cuánto contribuye
+    // cada activo al cambio intraday y lo sumamos a su contribución del período.
+    // Esto permite que la suma de contribuciones coincida con el TWR ajustado.
+    // =========================================================================
+    let intradayContributionsApplied = false;
+    let totalIntradayContribution = 0;
+    
+    if (intradayApplied && intradayPerformance?.success) {
+      // Obtener los datos del último día para calcular contribuciones intraday
+      const latestData = await getLatestPerformanceData(userId, accountIds[0] || 'overall');
+      
+      if (latestData) {
+        const intradayContribResult = await calculateIntradayContributions({
+          userId,
+          currency,
+          accountIds,
+          latestPerformanceData: latestData
+        });
+        
+        if (intradayContribResult.success) {
+          console.log(`[Attribution] Aplicando contribuciones intraday a ${Object.keys(intradayContribResult.contributions).length} activos`);
+          
+          // Aplicar contribución intraday a cada activo
+          for (const attr of contributionResult.attributions) {
+            const intradayContrib = intradayContribResult.contributions[attr.assetKey] || 0;
+            
+            if (intradayContrib !== 0) {
+              // Guardar contribución histórica para diagnóstico
+              attr.historicalContribution = attr.contribution;
+              attr.intradayContribution = intradayContrib;
+              
+              // Sumar contribución intraday
+              attr.contribution += intradayContrib;
+              totalIntradayContribution += intradayContrib;
+            }
+          }
+          
+          intradayContributionsApplied = true;
+          console.log(`[Attribution] Total contribución intraday aplicada: ${totalIntradayContribution.toFixed(4)}pp`);
+        } else {
+          console.log(`[Attribution] No se pudieron calcular contribuciones intraday: ${intradayContribResult.error}`);
+        }
+      }
+    }
+    
+    // IMPORTANTE: Sobrescribir portfolioReturn con el TWR del período (ya incluye intraday)
     // El totalROI de assetPerformance es el ROI total desde compra, NO del período
     if (hasTWRData && periodTWR !== 0) {
       console.log(`[Attribution] Reemplazando portfolioReturn: ${contributionResult.portfolioReturn.toFixed(2)}% → ${periodTWR.toFixed(2)}%`);
       contributionResult.portfolioReturn = periodTWR;
       
-      // Re-normalizar SOLO contribuciones (pp) con el nuevo portfolioReturn
-      // NO normalizar valores absolutos (contributionAbsolute, valueChange)
+      // =========================================================================
+      // FIX-ATTR-CONSISTENCY: NORMALIZACIÓN OBLIGATORIA
+      // 
+      // La suma de contribuciones DEBE ser igual al TWR para mostrar datos consistentes
+      // al usuario (el TWR del PortfolioSummary debe coincidir con la suma de atribuciones).
+      // 
+      // Método: Distribuir el residuo (diferencia) proporcionalmente entre los activos.
+      // Esto preserva la dirección (signo) de cada contribución individual mientras
+      // garantiza que la suma sea exactamente igual al TWR.
+      // =========================================================================
       const sumOfContributions = contributionResult.attributions.reduce((sum, a) => sum + a.contribution, 0);
+      const residual = periodTWR - sumOfContributions;
       
-      // FIX: Solo normalizar si:
-      // 1. La suma de contribuciones tiene magnitud significativa
-      // 2. Ambos valores tienen el MISMO SIGNO (para evitar invertir todas las contribuciones)
-      // 3. La diferencia es menor al 50% (para evitar distorsiones extremas)
-      const sameSign = (sumOfContributions >= 0 && periodTWR >= 0) || (sumOfContributions < 0 && periodTWR < 0);
-      const ratio = Math.abs(sumOfContributions) > 0.01 ? Math.abs(periodTWR / sumOfContributions) : 1;
-      const reasonableRatio = ratio > 0.1 && ratio < 10; // Factor entre 0.1x y 10x
+      console.log(`[Attribution] Suma contribuciones: ${sumOfContributions.toFixed(4)}%, TWR: ${periodTWR.toFixed(4)}%, Residuo: ${residual.toFixed(4)}pp`);
       
-      if (Math.abs(sumOfContributions) > 0.01 && sameSign && reasonableRatio) {
-        const normalizationFactor = periodTWR / sumOfContributions;
-        console.log(`[Attribution] Normalizando contribuciones: factor=${normalizationFactor.toFixed(4)}`);
-        for (const attr of contributionResult.attributions) {
-          attr.contribution *= normalizationFactor;
-          // NO normalizar contributionAbsolute ni valueChange - son valores absolutos en USD
+      if (Math.abs(residual) > 0.001) {
+        // Distribuir el residuo proporcionalmente al peso de cada activo
+        // Usamos el valor absoluto de la contribución como peso para la distribución
+        const totalAbsContribution = contributionResult.attributions.reduce((sum, a) => sum + Math.abs(a.contribution), 0);
+        
+        if (totalAbsContribution > 0) {
+          for (const attr of contributionResult.attributions) {
+            // Guardar contribución original para diagnóstico
+            attr.originalContribution = attr.contribution;
+            
+            // Distribuir residuo proporcionalmente al peso del activo
+            const weight = Math.abs(attr.contribution) / totalAbsContribution;
+            const adjustment = residual * weight;
+            attr.contribution += adjustment;
+            attr.normalizationAdjustment = adjustment;
+          }
+          
+          console.log(`[Attribution] Residuo distribuido entre ${contributionResult.attributions.length} activos`);
         }
+        
         contributionResult.normalized = true;
         contributionResult.sumOfContributions = periodTWR;
+        contributionResult.residualDistributed = residual;
       } else {
-        // Si no podemos normalizar de forma segura, mantener las contribuciones originales
-        // pero reportar la discrepancia
-        console.log(`[Attribution] NO normalizando: sumOfContrib=${sumOfContributions.toFixed(2)}%, periodTWR=${periodTWR.toFixed(2)}%, sameSign=${sameSign}, ratio=${ratio.toFixed(2)}`);
-        contributionResult.normalized = false;
+        // Residuo insignificante, no es necesario ajustar
+        console.log(`[Attribution] Residuo insignificante (${residual.toFixed(4)}pp), sin ajuste necesario`);
+        contributionResult.normalized = true;
         contributionResult.sumOfContributions = sumOfContributions;
-        contributionResult.normalizationSkipped = {
-          reason: !sameSign ? 'opposite_signs' : !reasonableRatio ? 'extreme_ratio' : 'unknown',
-          sumOfContributions,
-          periodTWR,
-          ratio
-        };
       }
     }
+    
+    // Guardar info de contribuciones intraday en el resultado
+    contributionResult.intradayContributionsApplied = intradayContributionsApplied;
+    contributionResult.totalIntradayContribution = totalIntradayContribution;
     
     // =========================================================================
     // 4. ENRIQUECER CON DATOS DE CURRENTPRICES
@@ -463,6 +526,8 @@ async function getPortfolioAttribution(params) {
           included: !!intradayPerformance,
           enabled: includeIntraday,
           applied: intradayApplied, // INTRADAY-FIX: Si realmente se aplicó el ajuste
+          contributionsApplied: intradayContributionsApplied, // INTRADAY-002: Si se aplicaron contribuciones por activo
+          totalIntradayContribution: totalIntradayContribution, // INTRADAY-002: Suma de contribuciones intraday
           error: intradayError,
           ...(intradayPerformance ? {
             date: intradayPerformance.date,

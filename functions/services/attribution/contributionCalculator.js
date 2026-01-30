@@ -213,7 +213,44 @@ async function calculateContributions(userId, period, currency = 'USD', accountI
   }
   
   console.log(`[Attribution] Usando datos de cuenta: ${accountId} (input: ${accountIds.join(',')})`);
-  console.log(`[Attribution] allowedAssetKeys es null? ${allowedAssetKeys === null}, size: ${allowedAssetKeys?.size || 0}`);  
+  console.log(`[Attribution] allowedAssetKeys es null? ${allowedAssetKeys === null}, size: ${allowedAssetKeys?.size || 0}`);
+  
+  // =========================================================================
+  // FIX-GHOST-ASSETS: Obtener activos activos del usuario para validar fantasmas
+  // 
+  // Esto nos permite detectar activos que aparecen en portfolioPerformance
+  // pero no existen como activos activos (son datos corruptos/fantasmas).
+  // =========================================================================
+  const activeAssetKeys = new Set();
+  try {
+    // Obtener todas las cuentas del usuario
+    const accountsSnapshot = await db.collection('portfolioAccounts')
+      .where('userId', '==', userId)
+      .where('isActive', '==', true)
+      .get();
+    
+    const userAccountIds = accountsSnapshot.docs.map(doc => doc.id);
+    
+    // Obtener todos los activos activos de esas cuentas
+    for (const accId of userAccountIds) {
+      const assetsSnapshot = await db.collection('assets')
+        .where('portfolioAccount', '==', accId)
+        .where('isActive', '==', true)
+        .get();
+      
+      assetsSnapshot.docs.forEach(doc => {
+        const asset = doc.data();
+        if (asset.units > 0) {
+          const assetKey = `${asset.name}_${asset.assetType || 'stock'}`;
+          activeAssetKeys.add(assetKey);
+        }
+      });
+    }
+    console.log(`[Attribution] Activos activos del usuario: ${activeAssetKeys.size}`);
+  } catch (error) {
+    console.warn(`[Attribution] Error obteniendo activos activos: ${error.message}`);
+  }
+  
   // 1. Obtener documento más reciente (valores actuales)
   const latestData = await getLatestPerformanceData(userId, accountId);
   if (!latestData) {
@@ -290,6 +327,23 @@ async function calculateContributions(userId, period, currency = 'USD', accountI
   console.log(`[Attribution] Total P&L realizada en período: $${totalRealizedPnL.toFixed(2)}`);
   
   // =========================================================================
+  // 4.1 FIX-ATTR-CONSISTENCY: NO obtener precios de mercado actuales
+  // 
+  // IMPORTANTE: Las contribuciones históricas deben calcularse usando los datos
+  // del documento de portfolioPerformance (cierre del día anterior), NO precios actuales.
+  // 
+  // Los precios actuales se usan SOLO para las contribuciones intraday, que se
+  // calculan por separado en intradayCalculator.js y se suman después.
+  // 
+  // Esto garantiza:
+  // - Suma de contribuciones históricas ≈ TWR histórico
+  // - Suma de contribuciones históricas + intraday ≈ TWR ajustado
+  // 
+  // Para activos con cambio de unidades, usamos el precio implícito del documento:
+  // priceEnd = valueEnd / unitsEnd (precio promedio ponderado al cierre)
+  // =========================================================================
+  
+  // =========================================================================
   // 5. Calcular contribuciones para cada activo activo
   // 
   // MÉTODO: Brinson Attribution simplificado
@@ -302,6 +356,7 @@ async function calculateContributions(userId, period, currency = 'USD', accountI
   const attributions = [];
   const processedAssetKeys = new Set();
   let skippedCount = 0;
+  let skippedGhostAssets = 0;
   let includedCount = 0;
   
   console.log(`[Attribution] Procesando ${Object.keys(assetPerformance).length} activos de assetPerformance`);
@@ -315,10 +370,42 @@ async function calculateContributions(userId, period, currency = 'USD', accountI
       continue; // Saltar activos que no pertenecen a las cuentas seleccionadas
     }
     
-    includedCount++;
     const parts = assetKey.split('_');
     const ticker = parts[0];
     const type = parts[1] || 'stock';
+    
+    // =========================================================================
+    // FIX-GHOST-ASSETS: Detectar y excluir activos "fantasma"
+    // 
+    // Un activo fantasma es uno que:
+    // 1. NO existía al inicio del período (unitsStart = 0)
+    // 2. NO tiene transacciones que lo respalden
+    // 3. NO está activo actualmente en la colección assets
+    // 4. Pero aparece en el documento final con unidades > 0
+    // 
+    // Esto puede ocurrir por datos corruptos en portfolioPerformance.
+    // 
+    // IMPORTANTE: Si el activo ESTÁ activo actualmente (en activeAssetKeys),
+    // es válido aunque no tenga transacciones (fue importado manualmente).
+    // =========================================================================
+    const startAssetData = startAssetPerformance[assetKey];
+    const unitsStart = startAssetData?.units || 0;
+    const unitsEnd = assetData.units || 0;
+    const sellData = sellsByAsset[assetKey];
+    const hasSellData = sellData && sellData.totalSold > 0;
+    
+    const isNewAssetInPeriod = unitsStart === 0 && unitsEnd > 0;
+    const hasNoTransactionSupport = !hasSellData; // No hay ventas registradas
+    const isCurrentlyActive = activeAssetKeys.has(assetKey); // Existe como activo activo
+    
+    // Si es "nuevo" pero no hay transacciones Y no está activo actualmente, es fantasma
+    if (isNewAssetInPeriod && hasNoTransactionSupport && !isCurrentlyActive) {
+      console.warn(`[Attribution] ⚠️ Activo fantasma detectado: ${ticker} - apareció con ${unitsEnd} unidades sin respaldo (inactivo en assets)`);
+      skippedGhostAssets++;
+      continue;
+    }
+    
+    includedCount++;
     
     const assetValueEnd = assetData.totalValue || 0;
     const assetInvestment = assetData.totalInvestment || 0;
@@ -332,13 +419,9 @@ async function calculateContributions(userId, period, currency = 'USD', accountI
     // Este método es correcto tanto para assets sin cambios como con compras/ventas
     // porque mide directamente cuánto contribuyó al rendimiento del portafolio.
     // =========================================================================
-    const startAssetData = startAssetPerformance[assetKey];
     const assetValueStart = startAssetData?.totalValue || 0;
-    const unitsStart = startAssetData?.units || 0;
-    const unitsEnd = assetData.units || 0;
     
     // P&L realizada de ventas parciales en el período
-    const sellData = sellsByAsset[assetKey];
     const realizedPnLInPeriod = sellData?.totalRealizedPnL || 0;
     const totalSoldAmount = sellData?.totalSold || 0;
     
@@ -381,8 +464,17 @@ async function calculateContributions(userId, period, currency = 'USD', accountI
       priceStart = assetValueStart / unitsStart;
       
       if (assetValueEnd > 0 && unitsEnd > 0) {
-        // FIX-ATTRIBUTION-002: Calcular priceEnd siempre que tengamos unidades al final
-        // El precio actual es el mismo para todas las unidades (ya sean originales o nuevas)
+        // =========================================================================
+        // FIX-ATTR-CONSISTENCY: Usar precio del documento de portfolioPerformance
+        // 
+        // Para contribuciones HISTÓRICAS, usamos el precio implícito del documento
+        // (valueEnd / unitsEnd). Este es el precio al cierre del día anterior.
+        // 
+        // Las contribuciones INTRADAY (cambio desde cierre de ayer hasta ahora)
+        // se calculan por separado en intradayCalculator.js usando precios actuales.
+        // 
+        // Esto garantiza que la suma de contribuciones coincida con el TWR del período.
+        // =========================================================================
         priceEnd = assetValueEnd / unitsEnd;
         periodReturn = ((priceEnd - priceStart) / priceStart) * 100;
       } else if (hasPartialSales && unitsEnd === 0) {
@@ -536,7 +628,7 @@ async function calculateContributions(userId, period, currency = 'USD', accountI
   // 7. Ordenar por contribución descendente
   attributions.sort((a, b) => b.contribution - a.contribution);
   
-  console.log(`[Attribution] Resumen: ${includedCount} activos incluidos, ${skippedCount} activos filtrados de ${Object.keys(assetPerformance).length} totales`);
+  console.log(`[Attribution] Resumen: ${includedCount} activos incluidos, ${skippedCount} filtrados por cuenta, ${skippedGhostAssets} fantasmas excluidos de ${Object.keys(assetPerformance).length} totales`);
   console.log(`[Attribution] Attributions generadas: ${attributions.length}`);
   
   // 8. Calcular suma de contribuciones (esto es el rendimiento del período basado en Brinson)

@@ -121,7 +121,8 @@ async function getCurrencyRates() {
   
   try {
     // 2. Construir símbolos de moneda para Yahoo Finance (ej: COP=X, EUR=X)
-    const currencySymbols = currencyCodes.map(code => `${code}=X`);
+    // INTRADAY-FIX: Codificar = como %3D para que el API lo reciba correctamente
+    const currencySymbols = currencyCodes.map(code => `${code}%3DX`);
     const symbolsString = currencySymbols.join(',');
     
     console.log(`[IntradayCalc] Fetching currency rates for: ${symbolsString}`);
@@ -137,7 +138,7 @@ async function getCurrencyRates() {
     const quotesMap = {};
     
     if (Array.isArray(quotesResponse)) {
-      // Formato array: [{symbol: "COP=X", price: "4150.25"}, ...]
+      // Formato array: [{symbol: "COP=X", regularMarketPrice: 4150.25}, ...]
       console.log(`[IntradayCalc] Processing MarketQuotes array with ${quotesResponse.length} items`);
       for (const quote of quotesResponse) {
         if (quote && quote.symbol) {
@@ -145,7 +146,7 @@ async function getCurrencyRates() {
         }
       }
     } else if (quotesResponse && typeof quotesResponse === 'object') {
-      // Formato objeto: {"COP=X": {price: 4150.25}, ...}
+      // Formato objeto: {"COP=X": {regularMarketPrice: 4150.25}, ...}
       Object.assign(quotesMap, quotesResponse);
     }
     
@@ -155,16 +156,18 @@ async function getCurrencyRates() {
       const quoteData = quotesMap[symbol];
       
       if (quoteData) {
-        const price = typeof quoteData.price === 'string' ? parseFloat(quoteData.price) : quoteData.price;
-        if (typeof price === 'number' && !isNaN(price) && price > 0) {
+        // INTRADAY-FIX: El API devuelve regularMarketPrice, no price
+        const price = quoteData.regularMarketPrice || quoteData.price;
+        const parsedPrice = typeof price === 'string' ? parseFloat(price) : price;
+        if (typeof parsedPrice === 'number' && !isNaN(parsedPrice) && parsedPrice > 0) {
           // El precio de COP=X es cuántos COP por 1 USD
           currencies[code] = {
             code: code,
-            exchangeRate: price
+            exchangeRate: parsedPrice
           };
-          console.log(`[IntradayCalc] ${code}: ${price}`);
+          console.log(`[IntradayCalc] ${code}: ${parsedPrice}`);
         } else {
-          console.warn(`[IntradayCalc] Invalid price for ${symbol}: ${quoteData.price}`);
+          console.warn(`[IntradayCalc] Invalid price for ${symbol}: ${price}`);
         }
       } else {
         console.warn(`[IntradayCalc] No rate found for ${symbol}, will use Firestore fallback`);
@@ -651,8 +654,158 @@ function combineHistoricalWithIntraday(historicalReturnPercent, todayFactor) {
   return (combinedFactor - 1) * 100;
 }
 
+/**
+ * Calcula las contribuciones intraday por activo
+ * 
+ * INTRADAY-002: Esta función calcula cuánto contribuye cada activo al cambio 
+ * intraday del portafolio. Esto permite que las contribuciones individuales
+ * sumen al TWR ajustado (incluyendo intraday).
+ * 
+ * Fórmula por activo:
+ *   contribuciónIntraday = (precioActual - precioAlCierre) × unidades / valorPortafolioAlCierre
+ * 
+ * @param {Object} params - Parámetros de cálculo
+ * @param {string} params.userId - ID del usuario
+ * @param {string} params.currency - Moneda para los cálculos
+ * @param {string[]} params.accountIds - IDs de cuentas
+ * @param {Object} params.latestPerformanceData - Datos del último documento de portfolioPerformance
+ * @returns {Promise<Object>} Mapa de assetKey → contribuciónIntraday
+ */
+async function calculateIntradayContributions(params) {
+  const {
+    userId,
+    currency = 'USD',
+    accountIds = ['overall'],
+    latestPerformanceData
+  } = params;
+  
+  try {
+    // Si no hay datos del día anterior, no podemos calcular intraday
+    if (!latestPerformanceData) {
+      console.log('[IntradayCalc] No latestPerformanceData provided, skipping intraday contributions');
+      return { success: false, contributions: {}, error: 'No latestPerformanceData' };
+    }
+    
+    const currencyData = latestPerformanceData[currency] || latestPerformanceData.USD || {};
+    const previousDayTotalValue = currencyData.totalValue || 0;
+    const assetPerformance = currencyData.assetPerformance || {};
+    
+    if (previousDayTotalValue === 0) {
+      console.log('[IntradayCalc] No previous day value, skipping intraday contributions');
+      return { success: false, contributions: {}, error: 'No previousDayTotalValue' };
+    }
+    
+    // Obtener todos los tickers de los activos
+    const tickers = Object.keys(assetPerformance).map(key => key.split('_')[0]);
+    const uniqueTickers = [...new Set(tickers)];
+    
+    if (uniqueTickers.length === 0) {
+      console.log('[IntradayCalc] No assets to calculate intraday contributions');
+      return { success: false, contributions: {}, error: 'No assets' };
+    }
+    
+    console.log(`[IntradayCalc] Calculating intraday contributions for ${uniqueTickers.length} assets`);
+    
+    // Obtener tasas de cambio para conversión de monedas
+    const currencyRates = await getCurrencyRates();
+    
+    // Obtener precios de mercado actuales
+    const quotes = await getQuotes(uniqueTickers.join(','));
+    
+    // Crear mapa de precios con información de moneda
+    const marketData = {};
+    for (const quote of quotes) {
+      if (quote && quote.symbol) {
+        let price = quote.price;
+        if (typeof price === 'string') {
+          price = parseFloat(price.replace(/,/g, ''));
+        }
+        if (typeof price === 'number' && !isNaN(price) && price > 0) {
+          marketData[quote.symbol] = {
+            price: price,
+            currency: quote.currency || 'USD'
+          };
+        }
+      }
+    }
+    
+    console.log(`[IntradayCalc] Got market prices for ${Object.keys(marketData).length}/${uniqueTickers.length} assets`);
+    
+    // Calcular contribución intraday de cada activo
+    const contributions = {};
+    let totalIntradayChange = 0;
+    
+    for (const [assetKey, assetData] of Object.entries(assetPerformance)) {
+      const ticker = assetKey.split('_')[0];
+      const units = assetData.units || 0;
+      const valueAtClose = assetData.totalValue || 0;
+      const quoteData = marketData[ticker];
+      
+      if (!quoteData || units === 0 || valueAtClose === 0) {
+        contributions[assetKey] = 0;
+        continue;
+      }
+      
+      let marketPrice = quoteData.price;
+      const quoteCurrency = quoteData.currency;
+      
+      // INTRADAY-FIX: Convertir precio de mercado a USD si es necesario
+      // El valueAtClose ya está en USD (de portfolioPerformance)
+      if (quoteCurrency && quoteCurrency !== 'USD' && currencyRates[quoteCurrency]) {
+        const exchangeRate = currencyRates[quoteCurrency].exchangeRate;
+        if (exchangeRate && exchangeRate > 0) {
+          // Convertir de moneda local a USD (dividir por tasa)
+          const priceInUSD = marketPrice / exchangeRate;
+          console.log(`[IntradayCalc] ${ticker}: Converting ${quoteCurrency} ${marketPrice.toFixed(2)} → USD $${priceInUSD.toFixed(2)} (rate: ${exchangeRate})`);
+          marketPrice = priceInUSD;
+        }
+      }
+      
+      // Precio al cierre (del documento de portfolioPerformance, ya en USD)
+      const priceAtClose = valueAtClose / units;
+      
+      // Cambio de precio desde el cierre (ahora ambos en USD)
+      const priceChange = marketPrice - priceAtClose;
+      
+      // Cambio de valor de este activo
+      const valueChange = priceChange * units;
+      
+      // Contribución intraday = cambioValor / valorInicialPortafolio × 100
+      const intradayContribution = (valueChange / previousDayTotalValue) * 100;
+      
+      contributions[assetKey] = intradayContribution;
+      totalIntradayChange += intradayContribution;
+      
+      if (Math.abs(intradayContribution) > 0.01) {
+        console.log(`[IntradayCalc] ${ticker}: priceClose=$${priceAtClose.toFixed(2)}, priceNow=$${marketPrice.toFixed(2)}, intradayContrib=${intradayContribution.toFixed(4)}pp`);
+      }
+    }
+    
+    console.log(`[IntradayCalc] Total intraday contribution: ${totalIntradayChange.toFixed(4)}pp`);
+    
+    return {
+      success: true,
+      contributions,
+      totalIntradayChange,
+      assetsWithPrice: Object.keys(marketData).length,
+      totalAssets: uniqueTickers.length,
+      previousDayTotalValue,
+      previousDayDate: latestPerformanceData.date || latestPerformanceData.id
+    };
+    
+  } catch (error) {
+    console.error('[IntradayCalc] Error calculating intraday contributions:', error);
+    return {
+      success: false,
+      contributions: {},
+      error: error.message
+    };
+  }
+}
+
 module.exports = {
   calculateIntradayPerformance,
+  calculateIntradayContributions,
   combineHistoricalWithIntraday,
   getActiveAssets,
   getActiveCurrencyCodes,

@@ -408,10 +408,15 @@ function calculateHoldingsAtDate(transactions, targetDate, exchangeRates = {}) {
   // en el mismo día. Sin esto, el orden depende del document ID de Firestore,
   // lo cual puede causar que SELL se procese antes de que exista el holding.
   // NOTA: Usamos ?? en lugar de || porque 0 es un valor válido (buy=0)
+  // FIX-TIMESTAMP-003: Usar getDatePart() para comparar solo la parte de fecha,
+  // no el timestamp completo. Esto asegura que transacciones del mismo día
+  // se ordenen por tipo (BUY antes de SELL) independientemente del timestamp.
   const typeOrder = { 'buy': 0, 'cash_income': 1, 'dividendPay': 2, 'sell': 3, 'cash_outcome': 4 };
   relevantTx.sort((a, b) => {
-    // Primero ordenar por fecha (usar fecha completa para ordenar correctamente dentro del día)
-    if (a.date !== b.date) return a.date.localeCompare(b.date);
+    // Primero ordenar por fecha (solo parte YYYY-MM-DD, ignorando timestamp)
+    const dateA = getDatePart(a.date);
+    const dateB = getDatePart(b.date);
+    if (dateA !== dateB) return dateA.localeCompare(dateB);
     // Luego por tipo: buy/cash_income antes de sell/cash_outcome
     const orderA = typeOrder[a.type] ?? 99;
     const orderB = typeOrder[b.type] ?? 99;
@@ -743,20 +748,17 @@ function calculateDayPerformance(
     }
     
     // =========================================================================
-    // CORRECCIÓN: Detectar y corregir cambios anormales
-    // Si el cambio es mayor a ±5% sin cashflow significativo, probablemente
-    // hay una inconsistencia entre los precios o días faltantes.
-    // En ese caso, usar un valor más razonable (0%).
+    // FIX-BACKFILL-001: ELIMINADA la lógica de "corrección" de cambios anormales
+    // 
+    // La lógica anterior ponía 0% cuando detectaba cambios > 5% sin cashflow
+    // significativo. Esto era INCORRECTO porque:
+    // 1. El mercado puede subir/bajar más de 5% en un día
+    // 2. Compras pequeñas pueden cambiar significativamente el promedio
+    // 3. Los datos reales del mercado son la fuente de verdad
+    // 
+    // Si hay datos incorrectos, deben corregirse en la fuente (assets, 
+    // transactions, precios), no enmascarándolos con 0%.
     // =========================================================================
-    const hasSignificantCashFlow = Math.abs(totalCashFlow) > 50; // $50 mínimo
-    const isAbnormalChange = Math.abs(adjustedDailyChangePercentage) > 5; // Umbral 5%
-    
-    if (isAbnormalChange && !hasSignificantCashFlow && !isNewInvestment) {
-      // Cambio anormal detectado - probablemente inconsistencia de datos o días faltantes
-      // Usar 0% como valor seguro
-      adjustedDailyChangePercentage = 0;
-      rawDailyChangePercentage = 0;
-    }
     
     // 3. dailyChangePercentage: Por convención, igual que rawDailyChangePercentage
     const dailyChangePercentage = rawDailyChangePercentage;
