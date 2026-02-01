@@ -45,10 +45,12 @@ const FINANCE_QUERY_API_URL = process.env.FINANCE_QUERY_API_URL ||
  * Usa CF_SERVICE_TOKEN como nombre de variable para evitar conflicto con
  * secrets previamente configurados en Cloud Run.
  * 
+ * NOTA: Se hace trim() para eliminar posibles \r\n que Firebase puede agregar
+ * 
  * @type {string}
  */
-const SERVICE_TOKEN_SECRET = process.env.CF_SERVICE_TOKEN || 
-  process.env.SERVICE_TOKEN_SECRET || '';
+const SERVICE_TOKEN_SECRET = (process.env.CF_SERVICE_TOKEN || 
+  process.env.SERVICE_TOKEN_SECRET || '').trim();
 
 /**
  * Genera headers de autenticación para llamadas al API
