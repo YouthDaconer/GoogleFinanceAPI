@@ -44,6 +44,183 @@ let currencyRatesCache = null;
 let currencyRatesCacheTimestamp = 0;
 const CURRENCY_RATES_CACHE_TTL = 15 * 60 * 1000; // 15 minutos
 
+// ============================================================================
+// SECTOR-HOMOLOGATION: Mapeo de sectores externos a sectores estándar
+// Los sectores estándar están definidos en la colección 'sectors' de Firestore
+// Este mapeo normaliza nombres de sectores de diversas fuentes (APIs de ETFs,
+// finance-query, etc.) a los 11 sectores estándar del sistema.
+// ============================================================================
+const EXTERNAL_SECTOR_MAPPINGS = {
+  // === Technology ===
+  'Electronic Technology': 'Technology',
+  'Technology Services': 'Technology',
+  'INFORMATION TECHNOLOGY': 'Technology',
+  'Information Technology': 'Technology',
+  'Tech': 'Technology',
+  'IT': 'Technology',
+  
+  // === Financial Services ===
+  'Finance': 'Financial Services',
+  'FINANCIALS': 'Financial Services',
+  'Financials': 'Financial Services',
+  'Banking': 'Financial Services',
+  'Insurance': 'Financial Services',
+  'Investment Services': 'Financial Services',
+  
+  // === Healthcare ===
+  'Health Technology': 'Healthcare',
+  'Health Services': 'Healthcare',
+  'HEALTH CARE': 'Healthcare',
+  'Health Care': 'Healthcare',
+  'Medical': 'Healthcare',
+  'Pharmaceuticals': 'Healthcare',
+  'Biotechnology': 'Healthcare',
+  
+  // === Consumer Cyclical ===
+  'Consumer Durables': 'Consumer Cyclical',
+  'Consumer Services': 'Consumer Cyclical',
+  'Retail Trade': 'Consumer Cyclical',
+  'CONSUMER DISCRETIONARY': 'Consumer Cyclical',
+  'Consumer Discretionary': 'Consumer Cyclical',
+  'Leisure': 'Consumer Cyclical',
+  'Apparel': 'Consumer Cyclical',
+  'Automotive': 'Consumer Cyclical',
+  'Hotels': 'Consumer Cyclical',
+  'Restaurants': 'Consumer Cyclical',
+  
+  // === Consumer Defensive ===
+  'Consumer Non-Durables': 'Consumer Defensive',
+  'CONSUMER STAPLES': 'Consumer Defensive',
+  'Consumer Staples': 'Consumer Defensive',
+  'Food': 'Consumer Defensive',
+  'Beverages': 'Consumer Defensive',
+  'Tobacco': 'Consumer Defensive',
+  'Household Products': 'Consumer Defensive',
+  
+  // === Industrials ===
+  'Producer Manufacturing': 'Industrials',
+  'Transportation': 'Industrials',
+  'Commercial Services': 'Industrials',
+  'Industrial Services': 'Industrials',
+  'INDUSTRIALS': 'Industrials',
+  'Aerospace': 'Industrials',
+  'Defense': 'Industrials',
+  'Machinery': 'Industrials',
+  'Construction': 'Industrials',
+  'Engineering': 'Industrials',
+  
+  // === Basic Materials ===
+  'Non-Energy Minerals': 'Basic Materials',
+  'MATERIALS': 'Basic Materials',
+  'Materials': 'Basic Materials',
+  'Chemicals': 'Basic Materials',
+  'Mining': 'Basic Materials',
+  'Metals': 'Basic Materials',
+  'Paper': 'Basic Materials',
+  'Forest Products': 'Basic Materials',
+  
+  // === Communication Services ===
+  'COMMUNICATION SERVICES': 'Communication Services',
+  'Communications': 'Communication Services',
+  'Telecommunications': 'Communication Services',
+  'Media': 'Communication Services',
+  'Entertainment': 'Communication Services',
+  'Interactive Media': 'Communication Services',
+  
+  // === Energy ===
+  'ENERGY': 'Energy',
+  'Oil & Gas': 'Energy',
+  'Oil': 'Energy',
+  'Gas': 'Energy',
+  'Petroleum': 'Energy',
+  'Energy Minerals': 'Energy',
+  
+  // === Utilities ===
+  'UTILITIES': 'Utilities',
+  'Electric Utilities': 'Utilities',
+  'Water Utilities': 'Utilities',
+  'Gas Utilities': 'Utilities',
+  'Power': 'Utilities',
+  
+  // === Real Estate ===
+  'REAL ESTATE': 'Real Estate',
+  'REITs': 'Real Estate',
+  'Property': 'Real Estate',
+  'Real Estate Services': 'Real Estate',
+  
+  // === Other (sectores que no encajan en las categorías estándar) ===
+  'Government': 'Other',
+  'CASH': 'Other',
+  'Cash': 'Other',
+  'Miscellaneous': 'Other',
+  'Other': 'Other',
+  'Unknown': 'Other',
+  'N/A': 'Other',
+  'Unclassified': 'Other',
+  'Diversified': 'Other',
+};
+
+/**
+ * Normaliza un nombre de sector a los sectores estándar del sistema
+ * @param {string} sectorName - Nombre del sector a normalizar
+ * @param {Object} firestoreMappings - Mapeos adicionales desde Firestore
+ * @returns {string} Nombre del sector estándar
+ */
+function normalizeSectorName(sectorName, firestoreMappings = {}) {
+  if (!sectorName || typeof sectorName !== 'string') {
+    return 'Other';
+  }
+  
+  const trimmedSector = sectorName.trim();
+  
+  // 1. Verificar si ya es un sector estándar
+  const standardSectors = [
+    'Basic Materials', 'Communication Services', 'Consumer Cyclical',
+    'Consumer Defensive', 'Energy', 'Financial Services', 'Healthcare',
+    'Industrials', 'Real Estate', 'Technology', 'Utilities', 'Other'
+  ];
+  
+  if (standardSectors.includes(trimmedSector)) {
+    return trimmedSector;
+  }
+  
+  // 2. Buscar en mapeos de Firestore (etfSectorName)
+  if (firestoreMappings[trimmedSector]) {
+    return firestoreMappings[trimmedSector];
+  }
+  
+  // 3. Buscar en mapeos externos estáticos
+  if (EXTERNAL_SECTOR_MAPPINGS[trimmedSector]) {
+    return EXTERNAL_SECTOR_MAPPINGS[trimmedSector];
+  }
+  
+  // 4. Búsqueda case-insensitive
+  const upperSector = trimmedSector.toUpperCase();
+  for (const [key, value] of Object.entries(EXTERNAL_SECTOR_MAPPINGS)) {
+    if (key.toUpperCase() === upperSector) {
+      return value;
+    }
+  }
+  
+  // 5. Búsqueda parcial (contiene)
+  const lowerSector = trimmedSector.toLowerCase();
+  if (lowerSector.includes('tech')) return 'Technology';
+  if (lowerSector.includes('financ') || lowerSector.includes('bank')) return 'Financial Services';
+  if (lowerSector.includes('health') || lowerSector.includes('pharma') || lowerSector.includes('bio')) return 'Healthcare';
+  if (lowerSector.includes('consumer') && lowerSector.includes('discret')) return 'Consumer Cyclical';
+  if (lowerSector.includes('consumer') && lowerSector.includes('staple')) return 'Consumer Defensive';
+  if (lowerSector.includes('industr') || lowerSector.includes('manufact')) return 'Industrials';
+  if (lowerSector.includes('material') || lowerSector.includes('mineral') || lowerSector.includes('metal')) return 'Basic Materials';
+  if (lowerSector.includes('commun') || lowerSector.includes('telecom') || lowerSector.includes('media')) return 'Communication Services';
+  if (lowerSector.includes('energy') || lowerSector.includes('oil') || lowerSector.includes('gas') || lowerSector.includes('petrol')) return 'Energy';
+  if (lowerSector.includes('utilit') || lowerSector.includes('electric') || lowerSector.includes('power')) return 'Utilities';
+  if (lowerSector.includes('real estate') || lowerSector.includes('reit') || lowerSector.includes('property')) return 'Real Estate';
+  
+  // 6. Si no se encuentra mapeo, loguear y retornar 'Other'
+  logger.warn('Unmapped sector found', { originalSector: sectorName });
+  return 'Other';
+}
+
 /**
  * Sanitiza valores numéricos para evitar NaN/Infinity que no se pueden serializar a JSON
  * @param {any} value - Valor a sanitizar
@@ -906,8 +1083,9 @@ function calculateSectorDistribution(assets, prices, etfData, sectorMappings, po
       }
 
       // Procesar sectores del ETF
+      // SECTOR-HOMOLOGATION: Usar normalizeSectorName para mapear a sectores estándar
       for (const sector of (etfInfo.sectors || [])) {
-        const standardSector = sectorMappings[sector.name] || sector.name;
+        const standardSector = normalizeSectorName(sector.name, sectorMappings);
         if (!standardSector) continue;
 
         const contribution = (sector.weight || 0) * etfWeight;
@@ -937,7 +1115,8 @@ function calculateSectorDistribution(assets, prices, etfData, sectorMappings, po
     const currency = price.currency || 'USD';
     const assetValueUSD = convertToUSD(valueInLocalCurrency, currency, currencyRates);
     const stockWeight = assetValueUSD / totalValue;
-    const standardSector = sectorMappings[price.sector] || price.sector;
+    // SECTOR-HOMOLOGATION: Usar normalizeSectorName para mapear a sectores estándar
+    const standardSector = normalizeSectorName(price.sector, sectorMappings);
 
     if (!sectorsMap[standardSector]) {
       sectorsMap[standardSector] = { sector: standardSector, weight: 0 };
@@ -953,7 +1132,13 @@ function calculateSectorDistribution(assets, prices, etfData, sectorMappings, po
     }))
     .sort((a, b) => b.weight - a.weight);
 
+  // SECTOR-HOMOLOGATION: Agregar percentage y ordenar por peso
   const sectors = Object.values(sectorsMap)
+    .map(s => ({
+      sector: s.sector,
+      weight: s.weight,
+      percentage: s.weight * 100
+    }))
     .sort((a, b) => b.weight - a.weight);
 
   return { holdings, sectors, etfStats };

@@ -28,6 +28,8 @@ const { defineSecret } = require("firebase-functions/params");
 const admin = require('./firebaseAdmin');
 const axios = require('axios');
 const { FINANCE_QUERY_API_URL, getServiceHeaders } = require('./config');
+// OPT-CACHE-001: Importar función para invalidar cache de índices
+const { invalidateAllIndexCaches } = require('./indexHistoryService');
 
 /**
  * SEC-TOKEN-001: Secret para autenticación server-to-server con API finance-query
@@ -159,6 +161,16 @@ const saveIndicesHistoryData = onSchedule({
     });
 
     await batch.commit();
+    
+    // OPT-CACHE-001: Invalidar cache de índices para que el frontend reciba datos frescos
+    // Esto fuerza que la próxima consulta regenere el cache con los nuevos datos
+    try {
+      const invalidatedCount = await invalidateAllIndexCaches();
+      console.log(`[saveIndicesHistoryData] Cache invalidado: ${invalidatedCount} documentos`);
+    } catch (cacheError) {
+      // No fallar la función por error de cache, solo loggear
+      console.warn(`[saveIndicesHistoryData] Error invalidando cache: ${cacheError.message}`);
+    }
     
     const duration = Date.now() - startTime;
     console.log(`[saveIndicesHistoryData] Guardados ${count} índices en ${duration}ms`);

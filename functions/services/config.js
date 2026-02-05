@@ -45,12 +45,28 @@ const FINANCE_QUERY_API_URL = process.env.FINANCE_QUERY_API_URL ||
  * Usa CF_SERVICE_TOKEN como nombre de variable para evitar conflicto con
  * secrets previamente configurados en Cloud Run.
  * 
- * NOTA: Se hace trim() para eliminar posibles \r\n que Firebase puede agregar
+ * FIX-SECRET-001: En Firebase Functions v2, los secrets se inyectan en 
+ * process.env DESPUÉS de que los módulos se cargan (durante cold start).
+ * Por eso usamos una función getter en lugar de una constante.
  * 
- * @type {string}
+ * @returns {string} El token de servicio limpio (sin caracteres extraños)
  */
-const SERVICE_TOKEN_SECRET = (process.env.CF_SERVICE_TOKEN || 
-  process.env.SERVICE_TOKEN_SECRET || '').trim();
+function getServiceTokenSecret() {
+  const rawToken = process.env.CF_SERVICE_TOKEN || 
+    process.env.SERVICE_TOKEN_SECRET || '';
+  
+  // FIX-SECRET-001: Limpiar exhaustivamente cualquier carácter no válido para headers HTTP
+  // - trim() elimina espacios/tabs/newlines al inicio y final
+  // - El regex elimina cualquier carácter que no sea hexadecimal (el token es hex)
+  // - Esto previene errores "Invalid character in header content"
+  return rawToken
+    .trim()
+    .replace(/[^a-fA-F0-9]/g, ''); // Solo caracteres hexadecimales válidos
+}
+
+// DEPRECATED: Mantener para compatibilidad con código existente
+// Pero el valor puede estar vacío si el módulo se carga antes de la inyección del secret
+const SERVICE_TOKEN_SECRET = getServiceTokenSecret();
 
 /**
  * Genera headers de autenticación para llamadas al API
@@ -60,10 +76,16 @@ const SERVICE_TOKEN_SECRET = (process.env.CF_SERVICE_TOKEN ||
  * 
  * SEC-CF-002: Incluye Referer y User-Agent para pasar Cloudflare WAF.
  * 
+ * FIX-SECRET-001: Lee el secret dinámicamente en cada llamada para asegurar
+ * que esté disponible después de la inyección de Firebase Functions v2.
+ * 
  * @param {Object} additionalHeaders - Headers adicionales a incluir
  * @returns {Object} Headers con autenticación
  */
 function getServiceHeaders(additionalHeaders = {}) {
+  // FIX-SECRET-001: Leer dinámicamente y limpiar caracteres inválidos
+  const serviceToken = getServiceTokenSecret();
+  
   const headers = {
     'Content-Type': 'application/json',
     // SEC-CF-002: Cloudflare WAF requiere User-Agent y Referer válidos
@@ -72,9 +94,9 @@ function getServiceHeaders(additionalHeaders = {}) {
     ...additionalHeaders,
   };
   
-  // Solo agregar si está configurado
-  if (SERVICE_TOKEN_SECRET) {
-    headers['x-service-token'] = SERVICE_TOKEN_SECRET;
+  // Solo agregar si está configurado y limpio
+  if (serviceToken) {
+    headers['x-service-token'] = serviceToken;
   }
   
   return headers;
@@ -82,15 +104,17 @@ function getServiceHeaders(additionalHeaders = {}) {
 
 /**
  * Verifica si la autenticación de servicio está configurada
+ * FIX-SECRET-001: Usa la función getter para verificación dinámica
  * @returns {boolean}
  */
 function isServiceAuthConfigured() {
-  return Boolean(SERVICE_TOKEN_SECRET);
+  return Boolean(getServiceTokenSecret());
 }
 
 module.exports = {
   FINANCE_QUERY_API_URL,
-  SERVICE_TOKEN_SECRET,
+  SERVICE_TOKEN_SECRET, // DEPRECATED: usar getServiceTokenSecret() para garantizar valor actual
+  getServiceTokenSecret,
   getServiceHeaders,
   isServiceAuthConfigured,
 };
