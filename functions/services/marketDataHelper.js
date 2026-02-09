@@ -136,6 +136,12 @@ function normalizeQuote(quote) {
     exchange: quote.exchange || null,
     change: cleanPrice(quote.change) || cleanPrice(quote.regularMarketChange) || 0,
     percentChange: parseFloat(String(quote.changePercent || quote.regularMarketChangePercent || '0').replace(/[%,]/g, '')) || 0,
+    // FIX-DIV-001: Incluir campos de dividendos para processDividendPayments
+    dividend: quote.dividend || null,
+    dividendDate: quote.dividendDate || null,
+    exDividend: quote.exDividend || null,
+    yield: quote.yield || null,
+    lastDividend: quote.lastDividend || null,
   };
 }
 
