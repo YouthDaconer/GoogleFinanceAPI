@@ -1,22 +1,22 @@
 /**
  * Configuración centralizada de URLs de API
  * 
- * SEC-CF-001: Migración a Cloudflare Tunnel
+ * LM-008: Migración a AWS Lambda + API Gateway
  * SEC-TOKEN-001: Token de servicio para autenticación server-to-server
- * Fecha: 19 de Enero de 2026
+ * Fecha: 10 de Febrero de 2026
  * 
  * Este archivo centraliza la configuración de URLs del API de finanzas
  * para facilitar cambios futuros y permitir configuración por entorno.
  * 
  * @module services/config
- * @see docs/architecture/SEC-CF-001-cloudflare-tunnel-migration-plan.md
+ * @see docs/architecture/lambda-decoupled-architecture-analysis.md
  * @see docs/architecture/SEC-TOKEN-001-api-security-hardening-plan.md
  */
 
 /**
  * URL base del API de finanzas (finance-query)
  * 
- * En producción: via Cloudflare Tunnel (wss://ws.portastock.top)
+ * En producción: via AWS API Gateway (https://api.portastock.top)
  * En desarrollo: localhost o variable de entorno
  * 
  * La variable de entorno FINANCE_QUERY_API_URL puede configurarse en:
@@ -26,13 +26,11 @@
  * @type {string}
  */
 const FINANCE_QUERY_API_URL = process.env.FINANCE_QUERY_API_URL || 
-  'https://ws.portastock.top/v1';
+  'https://api.portastock.top/v1';
 
 /**
- * SEC-TOKEN-009: Lambda URL pública DESHABILITADA (19-Ene-2026)
- * La función inverstock-prod ya no tiene Function URL configurada.
- * Todo el tráfico debe pasar por Cloudflare Tunnel (ws.portastock.top).
- * @deprecated ELIMINADA - No usar
+ * LM-008: Migración completada a Lambda (10-Feb-2026)
+ * El endpoint ahora es api.portastock.top via API Gateway HTTP v2.
  */
 
 /**

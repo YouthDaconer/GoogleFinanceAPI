@@ -52,7 +52,14 @@ const db = admin.firestore();
 
 const CONFIG = {
   // API de precios históricos
-  HISTORICAL_API_BASE: 'https://354sdh5hcrnztw5vquw6sxiduu0gigku.lambda-url.us-east-1.on.aws/v1',
+  HISTORICAL_API_BASE: 'https://api.portastock.top/v1',
+  
+  // Headers de autenticación para API
+  API_HEADERS: {
+    'x-service-token': '26ca00231ead1b5fbd63c6bba10a16e2f619b56809013ab3b3bcbbfb029aff10',
+    'origin': 'https://portafolio-inversiones.web.app',
+    'referer': 'https://portafolio-inversiones.web.app'
+  },
   
   // Monedas activas
   CURRENCIES: ['USD', 'COP', 'EUR', 'MXN', 'BRL', 'GBP', 'CAD'],
@@ -255,7 +262,9 @@ async function fetchHistoricalPrices(symbol, startDate = null) {
     }
     
     const url = `${CONFIG.HISTORICAL_API_BASE}/historical?symbol=${encodeURIComponent(symbol)}&range=${range}&interval=1d`;
-    const response = await fetch(url);
+    const response = await fetch(url, {
+      headers: CONFIG.API_HEADERS
+    });
     
     if (!response.ok) {
       log('WARNING', `No se pudieron obtener precios para ${symbol}: ${response.status}`);

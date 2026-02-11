@@ -18,6 +18,7 @@
   },
   "main": "index.js",
   "dependencies": {
+    "@types/markdown-it": "^12.2.3",
     "ajv": "^8.12.0",
     "ajv-formats": "^2.1.1",
     "axios": "^1.8.4",
@@ -29,6 +30,7 @@
     "firebase-functions": "^6.3.2",
     "firebase-tools": "^13.20.2",
     "luxon": "^3.5.0",
+    "markdown-it": "^12.3.2",
     "moment": "^2.30.1",
     "multer": "^1.4.5-lts.2",
     "node-cache": "^5.1.2",
