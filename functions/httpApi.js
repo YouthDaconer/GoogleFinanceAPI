@@ -1,5 +1,6 @@
 const express = require("express");
 const cors = require('cors');
+const crypto = require('crypto'); // SEC-AUDIT-002: C-MED-04 - For timing-safe comparison
 const rateLimit = require("express-rate-limit");
 // Agregar multer para manejar la carga de archivos
 const multer = require('multer');
@@ -48,6 +49,30 @@ const corsOptions = {
   origin: ["https://portafolio-inversiones.web.app", "https://portafolio-inversiones.firebaseapp.com", "http://localhost:3000", "http://localhost:3001"],
   optionsSuccessStatus: 200
 };
+
+// SEC-AUDIT-002: C-MED-03 - Helper para sanitizar errores sin exponer detalles internos
+function sanitizeError(error, context = 'operation') {
+  // Log completo server-side
+  console.error(`[${context}] Error:`, error.message, error.stack);
+  // Retornar mensaje genérico al cliente
+  return `Error during ${context}`;
+}
+
+// SEC-AUDIT-002: C-MED-04 - Comparación timing-safe para API keys
+function safeCompareApiKey(providedKey, expectedKey) {
+  if (!providedKey || !expectedKey) return false;
+  try {
+    const a = Buffer.from(providedKey);
+    const b = Buffer.from(expectedKey);
+    // Si longitudes diferentes, usar misma longitud para evitar timing leak
+    if (a.length !== b.length) {
+      return crypto.timingSafeEqual(a, a.slice(0, a.length)) && false;
+    }
+    return crypto.timingSafeEqual(a, b);
+  } catch {
+    return false;
+  }
+}
 app.use(cors(corsOptions));
 
 // Parsear JSON en el body de las peticiones
@@ -67,7 +92,8 @@ app.use((req, res, next) => {
     apiKey = demoApiKey;
     req.headers['x-api-key'] = demoApiKey;
     demoApiLimiter(req, res, next);
-  } else if (apiKey === process.env.API_KEY) {
+  } else if (safeCompareApiKey(apiKey, process.env.API_KEY)) {
+    // SEC-AUDIT-002: C-MED-04 - Use timing-safe comparison
     next();
   } else {
     demoApiLimiter(req, res, next);
@@ -104,7 +130,7 @@ app.get("/indices", async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({
-      error: "Ocurrió un error al raspar el sitio web: " + error.message,
+      error: sanitizeError(error, 'scraping indices'),
     });
   }
 });
@@ -123,7 +149,7 @@ app.get("/fullQuote", async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({
-      error: "Ocurrió un error al buscar la acción: " + error.message,
+      error: sanitizeError(error, 'fetching quote'),
     });
   }
 });
@@ -143,11 +169,11 @@ app.get("/quote", async (req, res) => {
     console.error(error);
     if (error.message.includes("no es un número válido")) {
       res.status(400).json({
-        error: "Datos inválidos devueltos por el API: " + error.message,
+        error: sanitizeError(error, 'invalid data'),
       });
     } else {
       res.status(500).json({
-        error: "Ocurrió un error al buscar la acción: " + error.message,
+        error: sanitizeError(error, 'simple quote'),
       });
     }
   }
@@ -181,7 +207,7 @@ app.get("/apiQuote", async (req, res) => {
       });
     } else {
       res.status(500).json({
-        error: "Ocurrió un error al buscar la acción: " + error.message,
+        error: sanitizeError(error, 'api quote'),
       });
     }
   }
@@ -201,7 +227,7 @@ app.get("/currencie", async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({
-      error: "Ocurrió un error al buscar la moneda: " + error.message,
+      error: sanitizeError(error, 'currency'),
     });
   }
 });
@@ -213,7 +239,7 @@ app.get("/active", async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({
-      error: "Ocurrió un error al raspar el sitio web: " + error.message,
+      error: sanitizeError(error, 'active stocks'),
     });
   }
 });
@@ -225,7 +251,7 @@ app.get("/gainers", async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({
-      error: "Ocurrió un error al raspar el sitio web: " + error.message,
+      error: sanitizeError(error, 'gainers'),
     });
   }
 });
@@ -237,7 +263,7 @@ app.get("/losers", async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({
-      error: "Ocurrió un error al raspar el sitio web: " + error.message,
+      error: sanitizeError(error, 'losers'),
     });
   }
 });
@@ -256,7 +282,7 @@ app.get("/news", async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({
-      error: "Ocurrió un error al buscar la acción: " + error.message,
+      error: sanitizeError(error, 'news'),
     });
   }
 });
@@ -305,7 +331,7 @@ app.get('/quotes', async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({
-      error: 'Ocurrió un error al obtener las cotizaciones: ' + error.message,
+      error: sanitizeError(error, 'quotes'),
     });
   }
 });
@@ -325,7 +351,7 @@ app.get('/simple-quotes', async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({
-      error: 'Ocurrió un error al obtener las cotizaciones simplificadas: ' + error.message,
+      error: sanitizeError(error, 'simple quotes'),
     });
   }
 });
@@ -345,7 +371,7 @@ app.get('/news-from-quote', async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({
-      error: 'Ocurrió un error al obtener las noticias del símbolo: ' + error.message,
+      error: sanitizeError(error, 'news from quote'),
     });
   }
 });
@@ -365,7 +391,7 @@ app.get('/search', async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({
-      error: 'Ocurrió un error al obtener resultados de la búsqueda: ' + error.message,
+      error: sanitizeError(error, 'search'),
     });
   }
 });
@@ -688,7 +714,7 @@ app.post('/process-etf-excel', uploadMiddleware, async (req, res) => {
       console.error(`📊 [${requestId}] Error al leer archivo Excel:`, xlsxError);
       return res.status(422).json({ 
         error: 'No se pudo leer el archivo Excel', 
-        details: xlsxError.message 
+        details: sanitizeError(xlsxError, 'xlsx parsing') 
       });
     }
     
@@ -748,7 +774,7 @@ app.post('/process-etf-excel', uploadMiddleware, async (req, res) => {
       console.error(`📊 [${requestId}] Error al convertir hoja a JSON:`, jsonError);
       return res.status(422).json({ 
         error: 'Error al convertir los datos de Excel', 
-        details: jsonError.message 
+        details: sanitizeError(jsonError, 'json parsing') 
       });
     }
     
@@ -820,7 +846,7 @@ app.post('/process-etf-excel', uploadMiddleware, async (req, res) => {
       console.error(`📊 [${requestId}] Error al procesar datos ETF:`, procError);
       return res.status(500).json({ 
         error: 'Error al procesar los datos ETF', 
-        details: procError.message 
+        details: sanitizeError(procError, 'processing') 
       });
     }
     
@@ -921,7 +947,7 @@ app.post('/process-etf-excel', uploadMiddleware, async (req, res) => {
     }
     return res.status(500).json({ 
       error: 'Error procesando los datos', 
-      details: error.message,
+      details: sanitizeError(error, 'processing'),
       stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
     });
   }
@@ -986,7 +1012,7 @@ app.post('/process-etf-excel-lite', uploadMiddleware, async (req, res) => {
       console.error(`📊 [${requestId}] Error al leer archivo Excel:`, xlsxError);
       return res.status(422).json({ 
         error: 'No se pudo leer el archivo Excel', 
-        details: xlsxError.message 
+        details: sanitizeError(xlsxError, 'xlsx parsing') 
       });
     }
     
@@ -1033,7 +1059,7 @@ app.post('/process-etf-excel-lite', uploadMiddleware, async (req, res) => {
     } catch (jsonError) {
       return res.status(422).json({ 
         error: 'Error al convertir los datos de Excel', 
-        details: jsonError.message 
+        details: sanitizeError(jsonError, 'json parsing') 
       });
     }
     
@@ -1111,7 +1137,7 @@ app.post('/process-etf-excel-lite', uploadMiddleware, async (req, res) => {
     } catch (procError) {
       return res.status(500).json({ 
         error: 'Error al procesar los datos ETF', 
-        details: procError.message 
+        details: sanitizeError(procError, 'processing') 
       });
     }
     
@@ -1190,7 +1216,7 @@ app.post('/process-etf-excel-lite', uploadMiddleware, async (req, res) => {
     
     return res.status(500).json({ 
       error: 'Error procesando los datos (versión lite)', 
-      details: error.message
+      details: sanitizeError(error, 'processing')
     });
   }
 });
@@ -1280,7 +1306,7 @@ app.get("/attribution", async (req, res) => {
   } catch (error) {
     console.error('[/attribution] Error:', error);
     res.status(500).json({
-      error: "Error calculando atribución: " + error.message
+      error: sanitizeError(error, 'attribution')
     });
   }
 });
@@ -1330,7 +1356,7 @@ app.get("/attribution/top", async (req, res) => {
   } catch (error) {
     console.error('[/attribution/top] Error:', error);
     res.status(500).json({
-      error: "Error obteniendo top contributors: " + error.message
+      error: sanitizeError(error, 'contributors')
     });
   }
 });
@@ -1359,7 +1385,7 @@ app.get("/attribution/check", async (req, res) => {
   } catch (error) {
     console.error('[/attribution/check] Error:', error);
     res.status(500).json({
-      error: "Error verificando disponibilidad: " + error.message
+      error: sanitizeError(error, 'availability')
     });
   }
 });
@@ -1486,7 +1512,7 @@ app.get("/risk-metrics", async (req, res) => {
     res.status(500).json({
       success: false,
       error: "SERVER_ERROR",
-      message: "Error calculando métricas de riesgo: " + error.message,
+      message: sanitizeError(error, 'risk metrics'),
       requestId
     });
   }
@@ -1634,7 +1660,7 @@ app.get("/closed-positions", async (req, res) => {
     res.status(500).json({
       success: false,
       error: "SERVER_ERROR",
-      message: "Error obteniendo posiciones cerradas: " + error.message,
+      message: sanitizeError(error, 'closed positions'),
       requestId
     });
   }
@@ -1786,7 +1812,7 @@ app.get("/news/batch", async (req, res) => {
     res.status(500).json({
       success: false,
       error: "SERVER_ERROR",
-      message: "Error obteniendo noticias: " + error.message,
+      message: sanitizeError(error, 'news'),
       requestId
     });
   }
