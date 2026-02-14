@@ -1086,7 +1086,7 @@ exports.unifiedMarketDataUpdate = onSchedule({
     try {
       await db.collection('systemStatus').doc('marketData').set({
         lastCompleteUpdate: admin.firestore.FieldValue.serverTimestamp(),
-        lastUpdateDate: new Date().toISO(),
+        lastUpdateDate: DateTime.now().toISO(),  // FIX: Date nativo no tiene .toISO(), usar Luxon DateTime
         source: 'api-lambda',  // OPT-DEMAND-CLEANUP: Indicar fuente de datos
         performanceCalculated: portfolioResult.count,
         cachesInvalidated: cacheInvalidationResult.cachesDeleted,

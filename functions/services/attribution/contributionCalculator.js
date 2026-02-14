@@ -164,53 +164,124 @@ async function calculateContributions(userId, period, currency = 'USD', accountI
   // Determinar si usamos overall o cuentas específicas
   const useOverall = accountIds.length === 0 || accountIds.includes('overall');
   
-  // Para el cálculo, siempre usamos 'overall' que tiene los totales correctos
-  // Pero si hay cuentas específicas, filtramos los activos después
-  const accountId = 'overall';
+  // =========================================================================
+  // FIX-MULTI-ACCOUNT-001: Cuando hay cuentas específicas, debemos agregar
+  // los datos de cada cuenta individual, NO usar el documento 'overall'
+  // 
+  // El documento 'overall' tiene valores agregados de TODAS las cuentas.
+  // Si un ticker existe en cuentas no seleccionadas, el valor en 'overall'
+  // incluiría esas cuentas incorrectamente.
+  // 
+  // Solución: Obtener portfolioPerformance de cada cuenta seleccionada
+  // y agregar los datos manualmente.
+  // =========================================================================
   
-  // Si hay cuentas específicas (no overall), obtener los activos permitidos
+  // Variables para datos agregados de cuentas específicas
+  let aggregatedAssetPerformance = {};
+  let aggregatedStartAssetPerformance = {};
+  let aggregatedTotalValue = 0;
+  let aggregatedTotalInvestment = 0;
+  let aggregatedStartTotalValue = 0;
+  let latestDateUsed = null;
+  let startDateUsed = null;
+  
+  // Si hay cuentas específicas (no overall), obtener los activos permitidos Y agregar datos
   let allowedAssetKeys = null;
+  
   if (!useOverall && accountIds.length > 0) {
     allowedAssetKeys = new Set();
     
-    // FIX: Obtener activos directamente de la colección 'assets' que tiene el campo portfolioAccount
-    // Los assets no tienen userId directamente, pero podemos filtrar por portfolioAccount
-    try {
-      // Consultar activos de cada cuenta seleccionada
-      for (const accId of accountIds) {
-        console.log(`[Attribution] Buscando activos para cuenta: ${accId}`);
-        const assetsSnapshot = await db.collection('assets')
-          .where('portfolioAccount', '==', accId)
-          .where('isActive', '==', true)
-          .get();
-        
-        console.log(`[Attribution] Encontrados ${assetsSnapshot.size} activos en cuenta ${accId}`);
-        
-        assetsSnapshot.docs.forEach(doc => {
-          const asset = doc.data();
-          // Construir la key del mismo formato que assetPerformance: {ticker}_{type}
-          const assetKey = `${asset.name}_${asset.assetType || 'stock'}`;
-          allowedAssetKeys.add(assetKey);
-          console.log(`[Attribution] Asset permitido: ${assetKey} (${asset.name}, tipo: ${asset.assetType})`);
-        });
+    console.log(`[Attribution] FIX-MULTI-ACCOUNT-001: Agregando datos de ${accountIds.length} cuentas específicas`);
+    
+    const { getPeriodStartDate } = require('./types');
+    const periodStartDate = getPeriodStartDate(period);
+    const periodStartStr = periodStartDate.toISOString().split('T')[0];
+    
+    // Obtener datos de cada cuenta y agregar
+    for (const accId of accountIds) {
+      console.log(`[Attribution] Procesando cuenta: ${accId}`);
+      
+      // Obtener datos más recientes de esta cuenta
+      const accLatestData = await getLatestPerformanceData(userId, accId);
+      if (!accLatestData) {
+        console.log(`[Attribution] Cuenta ${accId}: sin datos de performance`);
+        continue;
       }
       
-      console.log(`[Attribution] Filtrando activos para ${accountIds.length} cuentas: ${allowedAssetKeys.size} activos permitidos`);
-      console.log(`[Attribution] AllowedAssetKeys: ${Array.from(allowedAssetKeys).join(', ')}`);
-    } catch (error) {
-      console.error(`[Attribution] Error obteniendo activos: ${error.message}`);
-      // Fallback: intentar obtener de portfolioPerformance como antes
-      for (const accId of accountIds) {
-        const accData = await getLatestPerformanceData(userId, accId);
-        if (accData) {
-          const accCurrencyData = accData[currency] || accData.USD || {};
-          const accAssets = Object.keys(accCurrencyData.assetPerformance || {});
-          accAssets.forEach(key => allowedAssetKeys.add(key));
+      const accDate = accLatestData.id || accLatestData.date;
+      if (!latestDateUsed || accDate > latestDateUsed) {
+        latestDateUsed = accDate;
+      }
+      
+      const accCurrencyData = accLatestData[currency] || accLatestData.USD || {};
+      const accAssetPerformance = accCurrencyData.assetPerformance || {};
+      
+      // Agregar totales de esta cuenta
+      aggregatedTotalValue += accCurrencyData.totalValue || 0;
+      aggregatedTotalInvestment += accCurrencyData.totalInvestment || 0;
+      
+      // Agregar assetPerformance de esta cuenta
+      for (const [assetKey, assetData] of Object.entries(accAssetPerformance)) {
+        allowedAssetKeys.add(assetKey);
+        
+        if (!aggregatedAssetPerformance[assetKey]) {
+          // Primera vez que vemos este activo - copiar datos
+          aggregatedAssetPerformance[assetKey] = { ...assetData };
+        } else {
+          // Activo ya existe en otra cuenta - sumar valores
+          const existing = aggregatedAssetPerformance[assetKey];
+          existing.totalValue = (existing.totalValue || 0) + (assetData.totalValue || 0);
+          existing.totalInvestment = (existing.totalInvestment || 0) + (assetData.totalInvestment || 0);
+          existing.units = (existing.units || 0) + (assetData.units || 0);
+          existing.unrealizedProfitAndLoss = (existing.unrealizedProfitAndLoss || 0) + (assetData.unrealizedProfitAndLoss || 0);
+          // El ROI se recalcula como promedio ponderado después
         }
       }
-      console.log(`[Attribution] Fallback: ${allowedAssetKeys.size} activos de portfolioPerformance`);
+      
+      // Obtener datos de inicio del período para esta cuenta
+      const accStartData = await findNearestPerformanceData(userId, periodStartStr, accId, 'asc');
+      if (accStartData) {
+        const accStartDate = accStartData.id || accStartData.date;
+        if (!startDateUsed || accStartDate < startDateUsed) {
+          startDateUsed = accStartDate;
+        }
+        
+        const accStartCurrencyData = accStartData[currency] || accStartData.USD || {};
+        const accStartAssetPerformance = accStartCurrencyData.assetPerformance || {};
+        
+        // Agregar totales iniciales de esta cuenta
+        aggregatedStartTotalValue += accStartCurrencyData.totalValue || 0;
+        
+        // Agregar startAssetPerformance de esta cuenta
+        for (const [assetKey, assetData] of Object.entries(accStartAssetPerformance)) {
+          if (!aggregatedStartAssetPerformance[assetKey]) {
+            aggregatedStartAssetPerformance[assetKey] = { ...assetData };
+          } else {
+            const existing = aggregatedStartAssetPerformance[assetKey];
+            existing.totalValue = (existing.totalValue || 0) + (assetData.totalValue || 0);
+            existing.totalInvestment = (existing.totalInvestment || 0) + (assetData.totalInvestment || 0);
+            existing.units = (existing.units || 0) + (assetData.units || 0);
+          }
+        }
+      }
+      
+      console.log(`[Attribution] Cuenta ${accId}: ${Object.keys(accAssetPerformance).length} activos, valor=$${(accCurrencyData.totalValue || 0).toFixed(2)}`);
     }
+    
+    // Recalcular ROI para activos agregados
+    for (const [assetKey, assetData] of Object.entries(aggregatedAssetPerformance)) {
+      if (assetData.totalInvestment > 0) {
+        assetData.totalROI = ((assetData.totalValue - assetData.totalInvestment) / assetData.totalInvestment) * 100;
+      }
+    }
+    
+    console.log(`[Attribution] FIX-MULTI-ACCOUNT-001: Agregados ${Object.keys(aggregatedAssetPerformance).length} activos únicos`);
+    console.log(`[Attribution] Valor total agregado: $${aggregatedTotalValue.toFixed(2)}, Inversión: $${aggregatedTotalInvestment.toFixed(2)}`);
+    console.log(`[Attribution] Valor inicial agregado: $${aggregatedStartTotalValue.toFixed(2)}`);
   }
+  
+  // Para overall, usar el flujo original
+  const accountId = useOverall ? 'overall' : accountIds[0]; // Solo para fallback
   
   console.log(`[Attribution] Usando datos de cuenta: ${accountId} (input: ${accountIds.join(',')})`);
   console.log(`[Attribution] allowedAssetKeys es null? ${allowedAssetKeys === null}, size: ${allowedAssetKeys?.size || 0}`);
@@ -251,65 +322,61 @@ async function calculateContributions(userId, period, currency = 'USD', accountI
     console.warn(`[Attribution] Error obteniendo activos activos: ${error.message}`);
   }
   
-  // 1. Obtener documento más reciente (valores actuales)
-  const latestData = await getLatestPerformanceData(userId, accountId);
-  if (!latestData) {
-    return {
-      attributions: [],
-      totalPortfolioValue: 0,
-      totalPortfolioInvestment: 0,
-      portfolioReturn: 0,
-      error: 'No performance data found'
-    };
-  }
+  // =========================================================================
+  // FIX-MULTI-ACCOUNT-001: Usar datos agregados cuando hay cuentas específicas
+  // =========================================================================
+  let assetPerformance;
+  let startAssetPerformance;
+  let totalPortfolioValue;
+  let totalPortfolioInvestment;
+  let startTotalValue;
+  let latestDate;
   
-  const latestDate = latestData.id || latestData.date;
-  const currencyData = latestData[currency] || latestData.USD || {};
-  const assetPerformance = currencyData.assetPerformance || {};
+  const { getPeriodStartDate } = require('./types');
+  const periodStartDate = getPeriodStartDate(period);
+  const periodStartStr = periodStartDate.toISOString().split('T')[0];
   
-  // 2. Obtener valores de referencia
-  // Si hay cuentas específicas, calcular totales solo de los activos permitidos
-  let totalPortfolioValue = 0;
-  let totalPortfolioInvestment = 0;
-  
-  if (allowedAssetKeys) {
-    // Sumar solo activos de las cuentas seleccionadas
-    for (const [assetKey, assetData] of Object.entries(assetPerformance)) {
-      if (allowedAssetKeys.has(assetKey)) {
-        totalPortfolioValue += assetData.totalValue || 0;
-        totalPortfolioInvestment += assetData.totalInvestment || 0;
-      }
-    }
-    console.log(`[Attribution] Valor filtrado para ${accountIds.length} cuentas: $${totalPortfolioValue.toFixed(2)}`);
+  if (!useOverall && allowedAssetKeys && Object.keys(aggregatedAssetPerformance).length > 0) {
+    // CUENTAS ESPECÍFICAS: Usar datos agregados
+    console.log(`[Attribution] Usando datos AGREGADOS de ${accountIds.length} cuentas`);
+    
+    assetPerformance = aggregatedAssetPerformance;
+    startAssetPerformance = aggregatedStartAssetPerformance;
+    totalPortfolioValue = aggregatedTotalValue;
+    totalPortfolioInvestment = aggregatedTotalInvestment;
+    startTotalValue = aggregatedStartTotalValue || aggregatedTotalValue;
+    latestDate = latestDateUsed;
+    
   } else {
+    // OVERALL: Usar documento overall (flujo original)
+    console.log(`[Attribution] Usando datos de documento 'overall'`);
+    
+    const latestData = await getLatestPerformanceData(userId, 'overall');
+    if (!latestData) {
+      return {
+        attributions: [],
+        totalPortfolioValue: 0,
+        totalPortfolioInvestment: 0,
+        portfolioReturn: 0,
+        error: 'No performance data found'
+      };
+    }
+    
+    latestDate = latestData.id || latestData.date;
+    const currencyData = latestData[currency] || latestData.USD || {};
+    assetPerformance = currencyData.assetPerformance || {};
     totalPortfolioValue = currencyData.totalValue || 0;
     totalPortfolioInvestment = currencyData.totalInvestment || 0;
+    
+    const startData = await findNearestPerformanceData(userId, periodStartStr, 'overall', 'asc');
+    const startCurrencyData = startData?.[currency] || startData?.USD || {};
+    startAssetPerformance = startCurrencyData.assetPerformance || {};
+    startTotalValue = startCurrencyData.totalValue || totalPortfolioValue;
   }
   
   const portfolioROI = totalPortfolioInvestment > 0 
     ? ((totalPortfolioValue - totalPortfolioInvestment) / totalPortfolioInvestment) * 100 
     : 0;
-  
-  // 3. Obtener datos de inicio del período
-  const { getPeriodStartDate } = require('./types');
-  const periodStartDate = getPeriodStartDate(period);
-  const periodStartStr = periodStartDate.toISOString().split('T')[0];
-  
-  const startData = await findNearestPerformanceData(userId, periodStartStr, accountId, 'asc');
-  const startCurrencyData = startData?.[currency] || startData?.USD || {};
-  const startAssetPerformance = startCurrencyData.assetPerformance || {};
-  
-  // Calcular valor inicial solo de activos permitidos
-  let startTotalValue = 0;
-  if (allowedAssetKeys) {
-    for (const [assetKey, assetData] of Object.entries(startAssetPerformance)) {
-      if (allowedAssetKeys.has(assetKey)) {
-        startTotalValue += assetData.totalValue || 0;
-      }
-    }
-  } else {
-    startTotalValue = startCurrencyData.totalValue || totalPortfolioValue;
-  }
   
   // 4. NUEVO: Obtener ventas realizadas en el período
   const sellsByAsset = await getSellTransactionsInPeriod(
@@ -360,11 +427,11 @@ async function calculateContributions(userId, period, currency = 'USD', accountI
   let includedCount = 0;
   
   console.log(`[Attribution] Procesando ${Object.keys(assetPerformance).length} activos de assetPerformance`);
-  console.log(`[Attribution] Usando datos de inicio del período: ${startData?.id || periodStartStr}`);
+  console.log(`[Attribution] Usando datos de inicio del período: ${startDateUsed || periodStartStr}`);
   console.log(`[Attribution] Valor inicial del portafolio: $${startTotalValue.toFixed(2)}`);
   
   for (const [assetKey, assetData] of Object.entries(assetPerformance)) {
-    // FILTRO: Si hay cuentas específicas, solo incluir activos de esas cuentas
+    // FILTRO: Ya no necesario cuando usamos datos agregados, pero mantenemos por si acaso
     if (allowedAssetKeys && !allowedAssetKeys.has(assetKey)) {
       skippedCount++;
       continue; // Saltar activos que no pertenecen a las cuentas seleccionadas
