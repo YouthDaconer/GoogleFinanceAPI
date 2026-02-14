@@ -18,6 +18,9 @@ const db = admin.firestore();
 // Importar funciones de invalidación de cache (consolidadas en cacheInvalidationService)
 const { invalidatePerformanceCache, invalidateDistributionCache } = require('../cacheInvalidationService');
 
+// LATE-REG-002: Detección y marcado de transacciones retroactivas
+const { checkAndMarkStaleIfRetroactive } = require('../../utils/performanceStaleMarker');
+
 // Importar getQuotes para crear currentPrices de nuevos tickers
 const { getQuotes } = require('../financeQuery');
 
@@ -317,6 +320,13 @@ async function createAsset(context, payload) {
     // 8. Invalidar caches
     await invalidatePerformanceCache(auth.uid);
     invalidateDistributionCache(auth.uid);
+
+    // 9. LATE-REG-002: Detectar transacción retroactiva y marcar stale si aplica
+    checkAndMarkStaleIfRetroactive(auth.uid, acquisitionDateWithTime, {
+      reason: 'retroactive_transaction',
+      transactionType: 'buy',
+      portfolioAccount: data.portfolioAccount,
+    });
 
     console.log(`[assetHandlers][createAsset] Éxito - assetId: ${assetRef.id}`);
 
@@ -678,6 +688,13 @@ async function sellAsset(context, payload) {
     await invalidatePerformanceCache(auth.uid);
     invalidateDistributionCache(auth.uid);
 
+    // 9. LATE-REG-002: Detectar transacción retroactiva y marcar stale si aplica
+    checkAndMarkStaleIfRetroactive(auth.uid, sellDate, {
+      reason: 'retroactive_transaction',
+      transactionType: 'sell',
+      portfolioAccount: data.portfolioAccountId,
+    });
+
     console.log(`[assetHandlers][sellAsset] Éxito - transactionId: ${transactionRef.id}`);
 
     return {
@@ -848,6 +865,13 @@ async function sellPartialAssetsFIFO(context, payload) {
     await invalidatePerformanceCache(auth.uid);
     invalidateDistributionCache(auth.uid);
 
+    // 8. LATE-REG-002: Detectar transacción retroactiva y marcar stale si aplica
+    checkAndMarkStaleIfRetroactive(auth.uid, sellDate, {
+      reason: 'retroactive_transaction',
+      transactionType: 'sell_partial_fifo',
+      portfolioAccount: data.portfolioAccountId,
+    });
+
     console.log(`[assetHandlers][sellPartialAssetsFIFO] Éxito - lotes: ${soldAssets.length}`);
 
     return {
@@ -949,6 +973,13 @@ async function addCashTransaction(context, payload) {
     });
 
     await batch.commit();
+
+    // 6. LATE-REG-002: Detectar transacción retroactiva y marcar stale si aplica
+    checkAndMarkStaleIfRetroactive(auth.uid, transactionDate, {
+      reason: 'retroactive_transaction',
+      transactionType: data.type, // 'cash_income' o 'cash_expense'
+      portfolioAccount: data.portfolioAccountId,
+    });
 
     console.log(`[assetHandlers][addCashTransaction] Éxito - transactionId: ${transactionRef.id}`);
 

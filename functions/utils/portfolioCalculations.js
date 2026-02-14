@@ -395,6 +395,19 @@ const calculateAccountPerformance = (assets, currentPrices, currencies, totalVal
       // para que totalCashFlow incluya también los cashflows detectados por diferencia de unidades
       totalCashFlow += groupCashFlow;
 
+      // ========================================================================
+      // FIX LATE-REG-001: Neutralizar cashflow de nuevas inversiones (TWR-compliant)
+      // Según GIPS/TWR, cuando un activo aparece por primera vez (isNewInvestment),
+      // su inversión inicial es un cashflow entrante ($CF_in) que debe restarse
+      // para neutralizar su efecto en adjustedDailyChangePercentage del portafolio.
+      // Fórmula TWR: r = (MVE - MVB - CF_in) / MVB
+      // @see docs/architecture/LATE-REGISTRATION-001-retroactive-transactions-analysis.md
+      // ========================================================================
+      if (isNewInvestment && groupInvestment > 0) {
+        // Cashflow negativo = dinero que "entró" al portafolio
+        totalCashFlow += -groupInvestment;
+      }
+
       assetPerformance[groupKey] = {
         totalInvestment: groupInvestment,
         totalValue: groupValue,

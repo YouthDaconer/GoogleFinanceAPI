@@ -6,6 +6,9 @@ const httpApp = require('./httpApi');
 // Función unificada EOD que calcula performance y riesgo del portafolio
 const { unifiedMarketDataUpdate } = require('./services/unifiedMarketDataUpdate');
 
+// LATE-REG-003: Reconciliación automática de performance stale
+const { reconcileStalePerformance } = require('./services/reconcileStalePerformance');
+
 /**
  * SEC-TOKEN-001: Secret para autenticación server-to-server con API finance-query
  * Usado por httpApi para endpoints /quotes, /simple-quotes, /search, etc.
@@ -150,6 +153,19 @@ exports.updateMarketStatusHttpV2 = marketStatusService.updateMarketStatusHttp;
 // OPT-DEMAND-400-FIX: Sincronización de festivos de NYSE desde Finnhub
 exports.scheduledHolidaySyncV2 = marketStatusService.scheduledHolidaySync;
 exports.syncHolidaysHttpV2 = marketStatusService.syncHolidaysHttp;
+
+// ============================================================================
+// LATE-REG-003: Reconciliación de Performance Stale
+// ============================================================================
+/**
+ * Recalcula portfolioPerformance para usuarios con datos marcados como stale
+ * debido a transacciones retroactivas.
+ * 
+ * Schedule: 02:00 ET, martes a sábado
+ * 
+ * @see docs/architecture/LATE-REGISTRATION-001-retroactive-transactions-analysis.md
+ */
+exports.reconcileStalePerformance = reconcileStalePerformance;
 
 exports.weeklyProfitableWeeksCalculation = onSchedule({
   schedule: "every sunday 23:00",
