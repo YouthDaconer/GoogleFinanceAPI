@@ -3,6 +3,6 @@
     "luxon": "^3.5.0"
   },
   "devDependencies": {
-    "firebase-tools": "^15.5.1"
+    "firebase-tools": "^15.6.0"
   }
 }
