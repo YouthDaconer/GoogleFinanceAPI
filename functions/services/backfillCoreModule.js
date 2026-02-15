@@ -8,7 +8,10 @@
  * @see docs/architecture/LATE-REGISTRATION-001-retroactive-transactions-analysis.md
  */
 
-const fetch = require('node-fetch');
+// node-fetch v3 exports as ESM, so we need to handle both v2 and v3
+const nodeFetch = require('node-fetch');
+const fetch = nodeFetch.default || nodeFetch;
+
 const admin = require('./firebaseAdmin');
 const db = admin.firestore();
 
@@ -209,6 +212,20 @@ function calculateDailyCashFlow(transactions, targetDate, exchangeRates = {}) {
 }
 
 /**
+ * Calculate daily realized P&L (doneProfitAndLoss) from sell transactions
+ * This represents gains/losses REALIZED from sales on a specific day.
+ * 
+ * @param {Array} transactions - All transactions
+ * @param {string} targetDate - Target date (YYYY-MM-DD)
+ * @returns {number} Total realized P&L for the day in original currencies
+ */
+function calculateDailyDonePnL(transactions, targetDate) {
+  return transactions
+    .filter(tx => isDateEqual(tx.date, targetDate) && tx.type === 'sell')
+    .reduce((sum, tx) => sum + (tx.valuePnL || 0), 0);
+}
+
+/**
  * Get today's date in YYYY-MM-DD format
  */
 function getTodayDate() {
@@ -242,6 +259,35 @@ async function generateTradingDays(startDate, endDate, holidays = null) {
   }
   
   return days;
+}
+
+/**
+ * Get the previous NYSE trading day before a given date
+ * Skips weekends and holidays going backwards
+ * 
+ * @param {string} dateStr - YYYY-MM-DD
+ * @param {number} maxLookback - Maximum days to look back (default: 10)
+ * @returns {Promise<string|null>} Previous trading day or null if not found
+ */
+async function getPreviousTradingDay(dateStr, maxLookback = 10) {
+  const nyseHolidays = await getNYSEHolidays();
+  
+  let current = new Date(dateStr + 'T12:00:00Z');
+  current.setUTCDate(current.getUTCDate() - 1); // Start from day before
+  
+  for (let i = 0; i < maxLookback; i++) {
+    const dayOfWeek = current.getUTCDay();
+    const checkDate = current.toISOString().split('T')[0];
+    
+    // Check if it's a trading day (not weekend, not holiday)
+    if (dayOfWeek !== 0 && dayOfWeek !== 6 && !nyseHolidays.includes(checkDate)) {
+      return checkDate;
+    }
+    
+    current.setUTCDate(current.getUTCDate() - 1);
+  }
+  
+  return null;
 }
 
 // ============================================================================
@@ -370,6 +416,34 @@ async function getUserAccountIds(userId) {
     .get();
   
   return snapshot.docs.map(doc => doc.id);
+}
+
+/**
+ * Get all active portfolio accounts for a user (with full data)
+ * @param {string} userId - User ID
+ * @returns {Promise<Array<{id: string, name: string, ...}>>} Array of account objects
+ */
+async function getUserAccounts(userId) {
+  const snapshot = await db.collection('portfolioAccounts')
+    .where('userId', '==', userId)
+    .where('isActive', '==', true)
+    .get();
+  
+  return snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+}
+
+/**
+ * Get transactions for a specific account
+ * @param {string} accountId - Portfolio account ID
+ * @returns {Promise<Array>} Transactions sorted by date
+ */
+async function getTransactionsByAccount(accountId) {
+  const snapshot = await db.collection('transactions')
+    .where('portfolioAccountId', '==', accountId)
+    .orderBy('date', 'asc')
+    .get();
+  
+  return snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
 }
 
 /**
@@ -521,7 +595,188 @@ function reconstructAssetStateForDate(transactions, targetDate, exchangeRates = 
 // ============================================================================
 
 /**
+ * Calculate performance for a single account on a single day
+ * 
+ * @param {Array} transactions - Account transactions
+ * @param {string} date - Target date
+ * @param {Object} exchangeRates - Exchange rates for this date
+ * @param {Object} pricesBySymbol - Historical prices by symbol
+ * @param {Object|null} previousDayData - Previous day's data for daily change calculation
+ * @returns {Object} Performance data for this day
+ */
+function calculateAccountDayPerformance(transactions, date, exchangeRates, pricesBySymbol, previousDayData) {
+  // Reconstruct asset state for this date
+  const assets = reconstructAssetStateForDate(transactions, date, exchangeRates);
+  
+  if (assets.length === 0) {
+    return null;
+  }
+  
+  // Calculate values with current prices
+  let totalValueUSD = 0;
+  let totalInvestmentUSD = 0;
+  let skippedAssets = 0;
+  
+  for (const asset of assets) {
+    const symbolPrices = pricesBySymbol[asset.name];
+    const price = getPriceForDate(symbolPrices, date);
+    
+    if (price > 0) {
+      const valueInLocalCurrency = asset.units * price;
+      
+      let valueInUSD = valueInLocalCurrency;
+      if (asset.currency && asset.currency !== 'USD') {
+        if (exchangeRates[asset.currency]) {
+          valueInUSD = valueInLocalCurrency / exchangeRates[asset.currency];
+        } else {
+          // CRITICAL: Skip assets without exchange rate to avoid inflated values
+          // A COP value treated as USD would be ~4000x inflated
+          console.warn(`[backfillCore] Skipping asset ${asset.name} (${asset.currency}): no exchange rate available`);
+          skippedAssets++;
+          continue;
+        }
+      }
+      
+      totalValueUSD += valueInUSD;
+      totalInvestmentUSD += asset.totalCostUSD;
+    }
+  }
+  
+  const previousTotalValue = previousDayData?.totalValue || 0;
+  const isNewInvestment = previousTotalValue === 0 && totalValueUSD > 0;
+  
+  const dailyCashFlowUSD = calculateDailyCashFlow(transactions, date, exchangeRates);
+  const dailyDonePnL = calculateDailyDonePnL(transactions, date);
+  
+  // rawDailyChangePercentage
+  let rawDailyChangePercentage = 0;
+  if (previousTotalValue > 0) {
+    rawDailyChangePercentage = ((totalValueUSD - previousTotalValue) / previousTotalValue) * 100;
+  }
+  
+  // adjustedDailyChangePercentage (TWR)
+  let adjustedDailyChangePercentage = 0;
+  if (isNewInvestment) {
+    adjustedDailyChangePercentage = 0;
+  } else if (previousTotalValue > 0) {
+    adjustedDailyChangePercentage = ((totalValueUSD - previousTotalValue + dailyCashFlowUSD) / previousTotalValue) * 100;
+  }
+  
+  const dailyChangePercentage = rawDailyChangePercentage;
+  const unrealizedProfitAndLoss = totalValueUSD - totalInvestmentUSD;
+  const totalROI = totalInvestmentUSD > 0 
+    ? ((totalValueUSD - totalInvestmentUSD) / totalInvestmentUSD) * 100 
+    : 0;
+  
+  return {
+    date,
+    USD: {
+      totalValue: totalValueUSD,
+      totalInvestment: totalInvestmentUSD,
+      totalCashFlow: dailyCashFlowUSD,
+      unrealizedProfitAndLoss,
+      doneProfitAndLoss: dailyDonePnL,
+      totalROI,
+      dailyChangePercentage,
+      rawDailyChangePercentage,
+      adjustedDailyChangePercentage,
+      dailyReturn: adjustedDailyChangePercentage / 100,
+      monthlyReturn: 0,
+      annualReturn: 0,
+    },
+    lastUpdated: new Date().toISOString(),
+  };
+}
+
+/**
+ * Aggregate OVERALL performance from multiple accounts using pre-change value method
+ * This ensures the combined change is always between min and max of individual accounts
+ * 
+ * @param {Map<string, Object>} accountsPerformance - Map of accountId -> performance data
+ * @param {string} date - Target date
+ * @returns {Object} Aggregated OVERALL performance
+ */
+function aggregateOverallPerformance(accountsPerformance, date) {
+  let totalValue = 0;
+  let totalInvestment = 0;
+  let totalCashFlow = 0;
+  let totalDonePnL = 0;
+  
+  // Pre-change value weighted aggregation
+  let totalPreChangeValue = 0;
+  let weightedAdjustedChange = 0;
+  let weightedRawChange = 0;
+  
+  for (const [accountId, perfData] of accountsPerformance.entries()) {
+    const usdData = perfData.USD;
+    if (!usdData) continue;
+    
+    const accountValue = usdData.totalValue || 0;
+    const accountAdjChange = usdData.adjustedDailyChangePercentage || 0;
+    const accountRawChange = usdData.rawDailyChangePercentage || 0;
+    
+    totalValue += accountValue;
+    totalInvestment += usdData.totalInvestment || 0;
+    totalCashFlow += usdData.totalCashFlow || 0;
+    totalDonePnL += usdData.doneProfitAndLoss || 0;
+    
+    // Pre-change value method for weighted average
+    if (accountValue > 0) {
+      const preChangeValue = accountAdjChange !== 0 
+        ? accountValue / (1 + accountAdjChange / 100) 
+        : accountValue;
+      
+      totalPreChangeValue += preChangeValue;
+      weightedAdjustedChange += preChangeValue * accountAdjChange;
+      weightedRawChange += preChangeValue * accountRawChange;
+    }
+  }
+  
+  // Calculate weighted percentages
+  let rawDailyChangePercentage = 0;
+  let adjustedDailyChangePercentage = 0;
+  
+  if (totalPreChangeValue > 0) {
+    adjustedDailyChangePercentage = weightedAdjustedChange / totalPreChangeValue;
+    rawDailyChangePercentage = weightedRawChange / totalPreChangeValue;
+  }
+  
+  const unrealizedProfitAndLoss = totalValue - totalInvestment;
+  const totalROI = totalInvestment > 0 
+    ? ((totalValue - totalInvestment) / totalInvestment) * 100 
+    : 0;
+  
+  return {
+    date,
+    USD: {
+      totalValue,
+      totalInvestment,
+      totalCashFlow,
+      doneProfitAndLoss: totalDonePnL,
+      unrealizedProfitAndLoss,
+      totalROI,
+      dailyChangePercentage: rawDailyChangePercentage,
+      rawDailyChangePercentage,
+      adjustedDailyChangePercentage,
+      dailyReturn: adjustedDailyChangePercentage / 100,
+      monthlyReturn: 0,
+      annualReturn: 0,
+    },
+    overall: {
+      totalValue,
+      totalInvestment,
+      totalROI,
+    },
+    lastUpdated: new Date().toISOString(),
+  };
+}
+
+/**
  * Recalculate performance for a user over a range of trading days
+ * 
+ * ATOMIC BACKFILL: Writes to both:
+ * - portfolioPerformance/{userId}/accounts/{accountId}/dates/{date} (per account)
+ * - portfolioPerformance/{userId}/dates/{date} (OVERALL aggregation)
  * 
  * @param {string} userId - User ID
  * @param {string[]} tradingDays - Array of dates (YYYY-MM-DD) to recalculate
@@ -536,35 +791,46 @@ async function backfillUserPerformance(userId, tradingDays) {
   }
   
   const startDate = tradingDays[0];
-  console.log(`[backfillCore] Starting backfill for user ${userId}: ${tradingDays.length} days from ${startDate}`);
+  console.log(`[backfillCore] Starting ATOMIC backfill for user ${userId}: ${tradingDays.length} days from ${startDate}`);
   
   try {
-    // 1. Get all transactions for the user
-    const allTransactions = await getTransactionsForUser(userId);
+    // 1. Get all accounts for the user
+    const accounts = await getUserAccounts(userId);
     
-    if (allTransactions.length === 0) {
-      console.log(`[backfillCore] User ${userId} has no transactions. Skipping.`);
+    if (accounts.length === 0) {
+      console.log(`[backfillCore] User ${userId} has no active accounts. Skipping.`);
       return { success: true, daysProcessed: 0, errors: [] };
     }
     
-    // 2. Get unique symbols from transactions
-    const symbols = [...new Set(allTransactions.map(t => t.assetName).filter(Boolean))];
+    console.log(`[backfillCore] Found ${accounts.length} accounts for user ${userId}`);
     
-    if (symbols.length === 0) {
+    // 2. Get transactions for each account
+    const transactionsByAccount = new Map();
+    const allSymbols = new Set();
+    
+    for (const account of accounts) {
+      const transactions = await getTransactionsByAccount(account.id);
+      transactionsByAccount.set(account.id, transactions);
+      
+      transactions.forEach(tx => {
+        if (tx.assetName) allSymbols.add(tx.assetName);
+      });
+    }
+    
+    if (allSymbols.size === 0) {
       console.log(`[backfillCore] User ${userId} has no valid symbols. Skipping.`);
       return { success: true, daysProcessed: 0, errors: [] };
     }
     
     // 3. Fetch historical prices for all symbols
-    console.log(`[backfillCore] Fetching prices for ${symbols.length} symbols...`);
+    console.log(`[backfillCore] Fetching prices for ${allSymbols.size} symbols...`);
     const pricesBySymbol = {};
-    for (const symbol of symbols) {
+    for (const symbol of allSymbols) {
       pricesBySymbol[symbol] = await fetchHistoricalPrices(symbol, startDate);
       await sleep(CONFIG.API_DELAY_MS);
     }
     
     // 4. Fetch exchange rates for all target dates
-    // Obtener monedas activas desde Firestore
     const activeCurrencies = await getActiveCurrencies();
     console.log(`[backfillCore] Fetching exchange rates for ${activeCurrencies.length} currencies...`);
     const ratesByDate = {};
@@ -578,131 +844,99 @@ async function backfillUserPerformance(userId, tradingDays) {
       }
     }
     
-    // 5. Process each trading day
-    let previousDayData = null;
+    // 5. Process each account for each trading day
+    // Track previous day data per account for daily change calculation
+    const previousDayByAccount = new Map();
+    
+    // 5.0 CRITICAL: Load previous day data from Firestore for the day BEFORE the first trading day
+    // This ensures accurate TWR calculation for the first day in the range
+    const dayBeforeStart = await getPreviousTradingDay(startDate);
+    if (dayBeforeStart) {
+      console.log(`[backfillCore] Loading previous day data from ${dayBeforeStart} for TWR baseline...`);
+      
+      for (const account of accounts) {
+        try {
+          const prevDoc = await db.collection('portfolioPerformance')
+            .doc(userId)
+            .collection('accounts')
+            .doc(account.id)
+            .collection('dates')
+            .doc(dayBeforeStart)
+            .get();
+          
+          if (prevDoc.exists) {
+            const prevData = prevDoc.data();
+            previousDayByAccount.set(account.id, {
+              totalValue: prevData?.USD?.totalValue || 0,
+              totalInvestment: prevData?.USD?.totalInvestment || 0,
+            });
+          }
+        } catch (e) {
+          console.warn(`[backfillCore] Could not load previous day for account ${account.id}: ${e.message}`);
+        }
+      }
+      
+      console.log(`[backfillCore] Loaded baseline data for ${previousDayByAccount.size} accounts`);
+    }
     
     for (const date of tradingDays) {
       try {
-        // Get exchange rates for this date
         const exchangeRates = ratesByDate[date] || { USD: 1 };
+        const accountsPerformanceForDay = new Map();
+        let anyAccountProcessed = false;
         
-        // Reconstruct asset state for this date with currency conversion
-        const assets = reconstructAssetStateForDate(allTransactions, date, exchangeRates);
-        
-        if (assets.length === 0) {
-          console.log(`[backfillCore] User ${userId} day ${date}: No assets. Skipping.`);
-          continue;
-        }
-        
-        // Calculate values with current prices
-        // IMPORTANT: Prices from API are in the asset's native currency
-        // For assets in non-USD currencies (e.g., ECOPETROL.CL in COP),
-        // we need to convert the market value to USD using exchange rates
-        let totalValueUSD = 0;
-        let totalInvestmentUSD = 0;
-        
-        for (const asset of assets) {
-          // Use getPriceForDate with fallback to previous days (same as backfillPortfolioPerformance)
-          const symbolPrices = pricesBySymbol[asset.name];
-          const price = getPriceForDate(symbolPrices, date);
+        // 5a. Calculate and write performance for each account
+        for (const account of accounts) {
+          const transactions = transactionsByAccount.get(account.id);
+          if (!transactions || transactions.length === 0) continue;
           
-          if (price > 0) {
-            // Price is in asset's native currency
-            const valueInLocalCurrency = asset.units * price;
+          const previousDayData = previousDayByAccount.get(account.id) || null;
+          
+          const accountPerformance = calculateAccountDayPerformance(
+            transactions,
+            date,
+            exchangeRates,
+            pricesBySymbol,
+            previousDayData
+          );
+          
+          if (accountPerformance) {
+            // Store for OVERALL aggregation
+            accountsPerformanceForDay.set(account.id, accountPerformance);
             
-            // Convert to USD if asset is not in USD
-            let valueInUSD = valueInLocalCurrency;
-            if (asset.currency && asset.currency !== 'USD' && exchangeRates[asset.currency]) {
-              // exchangeRates[COP] = 4100 means 1 USD = 4100 COP
-              // To convert COP to USD: value / exchangeRates[COP]
-              valueInUSD = valueInLocalCurrency / exchangeRates[asset.currency];
-            }
+            // Write to accounts/{accountId}/dates/{date}
+            await db.collection('portfolioPerformance').doc(userId)
+              .collection('accounts').doc(account.id)
+              .collection('dates').doc(date)
+              .set(accountPerformance, { merge: true });
             
-            totalValueUSD += valueInUSD;
-            totalInvestmentUSD += asset.totalCostUSD;
+            // Update previous day tracker
+            previousDayByAccount.set(account.id, {
+              totalValue: accountPerformance.USD.totalValue,
+              totalInvestment: accountPerformance.USD.totalInvestment,
+            });
+            
+            anyAccountProcessed = true;
           }
         }
         
-        // =========================================================================
-        // PERFORMANCE CALCULATION (identical to backfillPortfolioPerformance.js)
-        // =========================================================================
-        
-        const previousTotalValue = previousDayData?.totalValue || 0;
-        
-        // Detect if this is a "new investment" (no value yesterday but value today)
-        const isNewInvestment = previousTotalValue === 0 && totalValueUSD > 0;
-        
-        // Calculate daily cashflow for TWR adjustment
-        // Same convention as backfillPortfolioPerformance.js:
-        // - Negative for buys (money leaves pocket)
-        // - Positive for sells (money enters pocket)
-        const dailyCashFlowUSD = calculateDailyCashFlow(allTransactions, date, exchangeRates);
-        
-        // 1. rawDailyChangePercentage: Raw change without adjustments
-        let rawDailyChangePercentage = 0;
-        if (previousTotalValue > 0) {
-          rawDailyChangePercentage = ((totalValueUSD - previousTotalValue) / previousTotalValue) * 100;
+        // 5b. Aggregate OVERALL and write to dates/{date}
+        if (accountsPerformanceForDay.size > 0) {
+          const overallPerformance = aggregateOverallPerformance(accountsPerformanceForDay, date);
+          
+          // Write to main document (for latest state)
+          await db.collection('portfolioPerformance').doc(userId)
+            .set(overallPerformance, { merge: true });
+          
+          // Write to dates/{date} subcollection
+          await db.collection('portfolioPerformance').doc(userId)
+            .collection('dates').doc(date)
+            .set(overallPerformance, { merge: true });
         }
         
-        // 2. adjustedDailyChangePercentage: TWR-adjusted with cashflow
-        //    Formula: (endValue - startValue + cashFlow) / startValue * 100
-        //    cashFlow is negative for buys, positive for sells
-        //    Adding it "cancels out" the buy from the return calculation
-        let adjustedDailyChangePercentage = 0;
-        if (isNewInvestment) {
-          // First investment: 0% return (LATE-REG-001)
-          adjustedDailyChangePercentage = 0;
-        } else if (previousTotalValue > 0) {
-          // TWR formula with cashflow adjustment
-          adjustedDailyChangePercentage = ((totalValueUSD - previousTotalValue + dailyCashFlowUSD) / previousTotalValue) * 100;
+        if (anyAccountProcessed) {
+          daysProcessed++;
         }
-        
-        // 3. dailyChangePercentage: By convention, same as rawDailyChangePercentage
-        const dailyChangePercentage = rawDailyChangePercentage;
-        
-        // Total ROI
-        const totalROI = totalInvestmentUSD > 0 
-          ? ((totalValueUSD - totalInvestmentUSD) / totalInvestmentUSD) * 100 
-          : 0;
-        
-        // Unrealized P&L
-        const unrealizedProfitAndLoss = totalValueUSD - totalInvestmentUSD;
-        
-        // Prepare document data
-        const performanceData = {
-          date,
-          USD: {
-            totalValue: totalValueUSD,
-            totalInvestment: totalInvestmentUSD,
-            totalCashFlow: dailyCashFlowUSD, // TWR cashflow for the day
-            unrealizedProfitAndLoss,
-            doneProfitAndLoss: 0, // Simplified: no done P&L tracking
-            totalROI,
-            dailyChangePercentage,
-            rawDailyChangePercentage,
-            adjustedDailyChangePercentage,
-            dailyReturn: adjustedDailyChangePercentage / 100,
-            monthlyReturn: 0,
-            annualReturn: 0,
-          },
-          overall: {
-            totalValue: totalValueUSD,
-            totalInvestment: totalInvestmentUSD,
-            totalROI,
-          },
-          lastUpdated: new Date().toISOString(),
-        };
-        
-        // Save to Firestore
-        await db.collection('portfolioPerformance').doc(userId).set(performanceData, { merge: true });
-        
-        // Also save to dates subcollection for historical tracking
-        await db.collection('portfolioPerformance').doc(userId)
-          .collection('dates').doc(date)
-          .set(performanceData, { merge: true });
-        
-        previousDayData = { totalValue: totalValueUSD, totalInvestment: totalInvestmentUSD };
-        daysProcessed++;
         
       } catch (dayError) {
         const errMsg = `Day ${date}: ${dayError.message}`;
@@ -711,7 +945,7 @@ async function backfillUserPerformance(userId, tradingDays) {
       }
     }
     
-    console.log(`[backfillCore] Completed backfill for user ${userId}: ${daysProcessed}/${tradingDays.length} days processed`);
+    console.log(`[backfillCore] Completed ATOMIC backfill for user ${userId}: ${daysProcessed}/${tradingDays.length} days, ${accounts.length} accounts`);
     
     return {
       success: errors.length === 0,
@@ -746,8 +980,10 @@ module.exports = {
   getDatePart,
   getTodayDate,
   generateTradingDays,
+  getPreviousTradingDay,
   isDateEqual,
   calculateDailyCashFlow,
+  calculateDailyDonePnL,
   
   // Data fetching
   fetchHistoricalPrices,
@@ -756,11 +992,17 @@ module.exports = {
   
   // User data
   getUserAccountIds,
+  getUserAccounts,
   getAssetsForUser,
   getTransactionsForUser,
+  getTransactionsByAccount,
   
   // State reconstruction
   reconstructAssetStateForDate,
+  
+  // Performance calculation helpers
+  calculateAccountDayPerformance,
+  aggregateOverallPerformance,
   
   // Main backfill
   backfillUserPerformance,
