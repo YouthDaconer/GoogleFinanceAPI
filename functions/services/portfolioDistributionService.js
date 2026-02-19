@@ -13,7 +13,10 @@
 const admin = require('./firebaseAdmin');
 const db = admin.firestore();
 const { StructuredLogger } = require('../utils/logger');
-const fetch = require('node-fetch');
+// FIX-FETCH-001: Usar fetch nativo de Node.js 18+ en lugar de node-fetch
+// node-fetch no está en package.json como dependencia directa
+// const fetch = require('node-fetch');
+
 // SEC-CF-001: Configuración centralizada de URLs y headers
 const { FINANCE_QUERY_API_URL, getServiceHeaders } = require('./config');
 // OPT-DEMAND-SECTOR: Importar servicio de financeQuery para precios on-demand
@@ -271,11 +274,19 @@ function sanitizeForJSON(obj) {
  * @param {string} [options.accountId] - ID de cuenta específica (opcional)
  * @param {string} [options.currency] - Moneda de presentación (default: USD)
  * @param {boolean} [options.includeHoldings] - Incluir holdings detallados
+ * @param {boolean} [options.forceRefresh] - Forzar recarga ignorando cache
  * @returns {Promise<Object>} Distribución del portafolio
  */
 async function getPortfolioDistribution(userId, options = {}) {
   const startTime = Date.now();
   const cacheKey = buildCacheKey(userId, options);
+  
+  // FIX-DIST-001: Si forceRefresh, invalidar cache para esta key
+  if (options.forceRefresh) {
+    distributionCache.delete(cacheKey);
+    etfDataCache.clear(); // También limpiar cache de ETFs
+    logger.info('Force refresh requested, cache cleared', { userId, cacheKey });
+  }
   
   // Verificar cache con validación de timestamp
   const cached = distributionCache.get(cacheKey);
@@ -399,8 +410,26 @@ async function getPortfolioDistribution(userId, options = {}) {
       }
     };
 
-    // Guardar en cache
-    distributionCache.set(cacheKey, { data: result, timestamp: Date.now() });
+    // FIX-DIST-002: Solo cachear si cargamos ETF data correctamente
+    // Si hay ETFs pero no se cargaron datos, no cachear el resultado degradado
+    const hasFailedETFLoading = etfSymbols.length > 0 && etfData.size === 0;
+    
+    if (!hasFailedETFLoading) {
+      // Guardar en cache solo si ETF loading fue exitoso o no hay ETFs
+      distributionCache.set(cacheKey, { data: result, timestamp: Date.now() });
+      logger.info('Distribution calculated and cached', {
+        userId,
+        duration: Date.now() - startTime,
+        assetCount: assets.length,
+        etfDataLoaded: etfData.size
+      });
+    } else {
+      logger.warn('Distribution calculated but NOT cached (ETF loading failed)', {
+        userId,
+        etfCount: etfSymbols.length,
+        etfDataLoaded: etfData.size
+      });
+    }
     
     logger.info('Distribution calculated', {
       userId,
@@ -770,20 +799,28 @@ async function fetchETFDataFromAPIWithRetry(symbol, maxRetries = 3) {
  * Obtiene datos de un ETF desde la API externa
  * SEC-CF-001: Usa Cloudflare Tunnel y token de servicio
  * Retorna 'RATE_LIMITED' si hay error 429 para permitir retry
+ * FIX-FETCH-001: Usa fetch nativo con AbortController para timeout
  */
 async function fetchETFDataFromAPI(symbol) {
   // SEC-CF-001: Usar URL centralizada (sin /v1 duplicado)
   const baseUrl = FINANCE_QUERY_API_URL.replace('/v1', '');
   const url = `${baseUrl}/v1/etf/${symbol}/unified`;
   
+  // FIX-ETF-DEBUG-001: Log headers para diagnóstico
+  const headers = getServiceHeaders({ 'Accept': 'application/json' });
+  const hasToken = Boolean(headers['x-service-token']);
+  logger.debug('ETF API request', { symbol, url, hasToken });
+  
+  // FIX-FETCH-001: Usar AbortController para timeout (fetch nativo no soporta timeout param)
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 15000);
+  
   try {
     const response = await fetch(url, { 
-      timeout: 15000,
-      // SEC-TOKEN-004: Headers con token de servicio
-      headers: getServiceHeaders({
-        'Accept': 'application/json'
-      })
+      headers,
+      signal: controller.signal
     });
+    clearTimeout(timeoutId);
     
     if (response.status === 429) {
       logger.debug('ETF API rate limited', { symbol });
@@ -815,7 +852,16 @@ async function fetchETFDataFromAPI(symbol) {
     
     return data;
   } catch (error) {
-    logger.warn('ETF API fetch error', { symbol, error: error.message, url });
+    clearTimeout(timeoutId); // FIX-FETCH-001: Limpiar timeout en caso de error
+    // FIX-ETF-DEBUG-001: Logging detallado para diagnóstico
+    logger.warn('ETF API fetch error', { 
+      symbol, 
+      error: error.message,
+      errorName: error.name,
+      errorCode: error.code,
+      url,
+      stack: error.stack?.split('\n').slice(0, 3).join(' | ')
+    });
     return null;
   }
 }

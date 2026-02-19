@@ -659,9 +659,9 @@ async function getIndexHistory(context, payload) {
 async function getPortfolioDistribution(context, payload) {
   const { auth } = context;
   const userId = auth.uid;
-  const { accountIds, accountId, currency, includeHoldings } = payload || {};
+  const { accountIds, accountId, currency, includeHoldings, forceRefresh } = payload || {};
 
-  console.log(`[queryHandlers][getPortfolioDistribution] userId: ${userId}`);
+  console.log(`[queryHandlers][getPortfolioDistribution] userId: ${userId}, forceRefresh: ${forceRefresh}`);
 
   try {
     const result = await portfolioDistributionService.getPortfolioDistribution(
@@ -670,7 +670,8 @@ async function getPortfolioDistribution(context, payload) {
         accountIds, 
         accountId, 
         currency: currency || 'USD', 
-        includeHoldings: includeHoldings ?? true 
+        includeHoldings: includeHoldings ?? true,
+        forceRefresh: forceRefresh ?? false
       }
     );
 

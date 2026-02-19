@@ -33,7 +33,8 @@
  */
 
 const admin = require('firebase-admin');
-const fetch = require('node-fetch');
+// Usar fetch nativo de Node.js 18+ (node-fetch ya no es necesario)
+// const fetch = require('node-fetch');
 
 // Inicializar Firebase Admin
 const serviceAccount = require('../../../key.json');
