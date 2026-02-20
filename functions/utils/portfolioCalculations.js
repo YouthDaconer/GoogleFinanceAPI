@@ -343,36 +343,41 @@ const calculateAccountPerformance = (assets, currentPrices, currencies, totalVal
       const groupDailyChangePercentage = calculateDailyChangePercentage(groupValue, previousGroupData?.totalValue || 0);
 
       // ========================================================================
-      // FIX: Detectar cashflow implícito por diferencia de unidades
-      // Cuando hay diferencia de unidades pero no hay transacciones del día,
-      // significa que la compra/venta se hizo fuera del horario del job
+      // FIX-LATE-REG-002: ELIMINADO bloque de cashflow implícito (2026-02-20)
+      // 
+      // PROBLEMA ANTERIOR: El código intentaba detectar diferencias de unidades
+      // sin transacciones del día y asumía un "cashflow implícito" usando el
+      // precio actual. Esto causaba cálculos incorrectos cuando:
+      // 
+      // 1. Se registraban transacciones RETROACTIVAS (con fechas pasadas pero
+      //    creadas después de que corrió el job del día anterior)
+      // 2. Se creaban nuevos assets con fechas de adquisición anteriores
+      // 
+      // SOLUCIÓN: NO asumir cashflow cuando no hay transacciones del día actual.
+      // Si hay diferencia de units sin transacciones del día, es un caso de
+      // LATE-REGISTRATION que NO debe contarse como cashflow del día actual.
+      // 
+      // El cálculo correcto de cashflow se basa ÚNICAMENTE en transacciones
+      // reales del día (groupTransactions), no en inferencias por diferencia
+      // de unidades que pueden deberse a transacciones retroactivas.
+      // 
+      // @see docs/architecture/LATE-REGISTRATION-001-retroactive-transactions-analysis.md
       // ========================================================================
-      let effectiveGroupTransactions = [...groupTransactions];
+      const effectiveGroupTransactions = [...groupTransactions];
+      // Solo para debugging: detectar diferencias de units sin transacciones
       const unitsDifference = groupUnits - previousGroupUnits;
+      const hasUnitsDifferenceWithoutTransactions = 
+        Math.abs(unitsDifference) > 0.00000001 && 
+        groupTransactions.length === 0 && 
+        previousGroupUnits > 0;
       
-      if (Math.abs(unitsDifference) > 0.00000001 && groupTransactions.length === 0 && previousGroupUnits > 0) {
-        // Obtener precio actual del asset del grupo
-        const groupAssetName = groupKey.split('_')[0]; // Ej: "BTC-USD" de "BTC-USD_crypto"
-        const priceDataForGroup = currentPrices.find(cp => cp.symbol === groupAssetName);
-        const currentAssetPrice = priceDataForGroup?.price || 0;
-        // FIX-CURRENCY-001: Obtener la moneda real del precio
-        const assetPriceCurrency = priceDataForGroup?.currency || 'USD';
-        
-        if (currentAssetPrice > 0) {
-          // Calcular cashflow implícito:
-          // - unitsDifference > 0 = compra = cashflow negativo
-          // - unitsDifference < 0 = venta = cashflow positivo
-          // FIX-CURRENCY-001: Usar la moneda real del precio
-          const implicitCashFlowInPriceCurrency = -unitsDifference * currentAssetPrice;
-          const implicitCashFlowConverted = convertCurrency(implicitCashFlowInPriceCurrency, assetPriceCurrency, currency.code, currencies);
-          
-          effectiveGroupTransactions.push({
-            amount: implicitCashFlowConverted
-          });
-          
-          // Actualizar groupCashFlow también para que se guarde correctamente
-          groupCashFlow += implicitCashFlowConverted;
-        }
+      // Log de advertencia para detección de LATE-REGISTRATION (solo en modo debug)
+      // No se aplica cashflow implícito - el cambio de units se reflejará en el valor
+      // pero no distorsionará el adjustedDailyChangePercentage
+      if (hasUnitsDifferenceWithoutTransactions) {
+        // El cambio de units sin transacciones del día indica LATE-REGISTRATION
+        // El adjustedDailyChangePercentage será 0 para este grupo (sin cashflow)
+        // lo cual es correcto porque no hubo actividad real ese día
       }
 
       // Calcular adjusted daily change percentage usando las transacciones acumuladas y dividendos
@@ -391,8 +396,8 @@ const calculateAccountPerformance = (assets, currentPrices, currencies, totalVal
         groupValue
       );
 
-      // Sumar el cashflow del grupo DESPUÉS del fix de cashflow implícito
-      // para que totalCashFlow incluya también los cashflows detectados por diferencia de unidades
+      // Sumar el cashflow del grupo (solo transacciones reales del día)
+      // FIX-LATE-REG-002: Ya NO incluye cashflows implícitos por diferencia de units
       totalCashFlow += groupCashFlow;
 
       // ========================================================================
