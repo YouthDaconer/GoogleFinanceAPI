@@ -106,6 +106,17 @@ const validateAccountOwnership = async (portfolioAccountId, userId) => {
 
 /**
  * Valida que haya saldo suficiente en la cuenta
+ * 
+ * FIX-DECIMAL-001: Se usa tolerancia de 0.01 (1 centavo) para evitar falsos positivos
+ * por errores de punto flotante. Los valores se comparan redondeados a 2 decimales
+ * que es la precisión monetaria estándar.
+ * 
+ * Ejemplo del problema:
+ * - units: 0.4689, unitValue: 75.95 → totalCost: 35.6177955
+ * - currentBalance: 35.61 (en Firestore)
+ * - Sin tolerancia: 35.61 < 35.6177955 → "Saldo insuficiente" (falso positivo)
+ * - Con tolerancia: 35.61 + 0.01 >= 35.6177955 → OK
+ * 
  * @param {object} account - Datos de la cuenta
  * @param {string} currency - Moneda a verificar
  * @param {number} requiredAmount - Monto requerido
@@ -113,10 +124,19 @@ const validateAccountOwnership = async (portfolioAccountId, userId) => {
  */
 const validateSufficientFunds = (account, currency, requiredAmount) => {
   const currentBalance = account.balances?.[currency] || 0;
-  if (currentBalance < requiredAmount) {
+  
+  // FIX-DECIMAL-001: Redondear a 2 decimales para comparación monetaria precisa
+  // Esto evita falsos positivos por errores de punto flotante
+  const roundedBalance = Math.round(currentBalance * 100) / 100;
+  const roundedRequired = Math.round(requiredAmount * 100) / 100;
+  
+  // Usar tolerancia de 1 centavo para casos límite (ej: 35.61 vs 35.6177955)
+  const EPSILON = 0.01;
+  
+  if (roundedBalance + EPSILON < roundedRequired) {
     throw new HttpsError(
       'failed-precondition',
-      `Saldo insuficiente. Disponible: ${currentBalance.toFixed(2)} ${currency}, Requerido: ${requiredAmount.toFixed(2)} ${currency}`
+      `Saldo insuficiente. Disponible: ${roundedBalance.toFixed(2)} ${currency}, Requerido: ${roundedRequired.toFixed(2)} ${currency}`
     );
   }
 };
@@ -414,12 +434,17 @@ async function updateAsset(context, payload) {
     const currency = data.updates.currency || oldAsset.currency;
 
     // 6. Verificar saldo suficiente si el nuevo valor es mayor
+    // FIX-DECIMAL-001: Aplicar tolerancia para evitar falsos positivos por punto flotante
     if (valueDifference > 0) {
       const currentBalance = account.balances?.[currency] || 0;
-      if (currentBalance < valueDifference) {
+      const roundedBalance = Math.round(currentBalance * 100) / 100;
+      const roundedDifference = Math.round(valueDifference * 100) / 100;
+      const EPSILON = 0.01;
+      
+      if (roundedBalance + EPSILON < roundedDifference) {
         throw new HttpsError(
           'failed-precondition',
-          `Saldo insuficiente. Disponible: ${currentBalance.toFixed(2)} ${currency}, Requerido adicional: ${valueDifference.toFixed(2)} ${currency}`
+          `Saldo insuficiente. Disponible: ${roundedBalance.toFixed(2)} ${currency}, Requerido adicional: ${roundedDifference.toFixed(2)} ${currency}`
         );
       }
     }
@@ -462,11 +487,16 @@ async function updateAsset(context, payload) {
       });
       
       // Validar saldo suficiente en la nueva cuenta
+      // FIX-DECIMAL-001: Aplicar tolerancia para evitar falsos positivos por punto flotante
       const newAccountBalance = newAccount.balances?.[currency] || 0;
-      if (newAccountBalance < newTotalValue) {
+      const roundedNewBalance = Math.round(newAccountBalance * 100) / 100;
+      const roundedNewTotal = Math.round(newTotalValue * 100) / 100;
+      const EPSILON = 0.01;
+      
+      if (roundedNewBalance + EPSILON < roundedNewTotal) {
         throw new HttpsError(
           'failed-precondition',
-          `Saldo insuficiente en la nueva cuenta. Disponible: ${newAccountBalance.toFixed(2)} ${currency}, Requerido: ${newTotalValue.toFixed(2)} ${currency}`
+          `Saldo insuficiente en la nueva cuenta. Disponible: ${roundedNewBalance.toFixed(2)} ${currency}, Requerido: ${roundedNewTotal.toFixed(2)} ${currency}`
         );
       }
       
@@ -931,10 +961,15 @@ async function addCashTransaction(context, payload) {
     if (data.type === 'cash_income') {
       newBalance = cleanDecimal(currentBalance + amount);
     } else {
-      if (currentBalance < amount) {
+      // FIX-DECIMAL-001: Aplicar tolerancia para evitar falsos positivos por punto flotante
+      const roundedBalance = Math.round(currentBalance * 100) / 100;
+      const roundedAmount = Math.round(amount * 100) / 100;
+      const EPSILON = 0.01;
+      
+      if (roundedBalance + EPSILON < roundedAmount) {
         throw new HttpsError(
           'failed-precondition',
-          `Saldo insuficiente. Disponible: ${currentBalance.toFixed(2)} ${data.currency}, Solicitado: ${amount.toFixed(2)} ${data.currency}`
+          `Saldo insuficiente. Disponible: ${roundedBalance.toFixed(2)} ${data.currency}, Solicitado: ${roundedAmount.toFixed(2)} ${data.currency}`
         );
       }
       newBalance = cleanDecimal(currentBalance - amount);
