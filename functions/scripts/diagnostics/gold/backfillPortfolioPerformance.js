@@ -53,13 +53,13 @@ const db = admin.firestore();
 
 const CONFIG = {
   // API de precios históricos
-  HISTORICAL_API_BASE: 'https://api.portastock.top/v1',
+  HISTORICAL_API_BASE: 'https://api.portastock.net/v1',
   
   // Headers de autenticación para API
   API_HEADERS: {
     'x-service-token': '26ca00231ead1b5fbd63c6bba10a16e2f619b56809013ab3b3bcbbfb029aff10',
-    'origin': 'https://portafolio-inversiones.web.app',
-    'referer': 'https://portafolio-inversiones.web.app'
+    'origin': 'https://portastock.net',
+    'referer': 'https://portastock.net'
   },
   
   // Monedas activas

@@ -38,7 +38,7 @@ admin.initializeApp({ credential });
 const db = admin.firestore();
 
 // Configuración del API
-const FINANCE_QUERY_API_URL = 'https://ws.portastock.top/v1';
+const FINANCE_QUERY_API_URL = 'https://ws.portastock.net/v1';
 const SERVICE_TOKEN = '26ca00231ead1b5fbd63c6bba10a16e2f619b56809013ab3b3bcbbfb029aff10';
 
 // Headers necesarios para Cloudflare WAF

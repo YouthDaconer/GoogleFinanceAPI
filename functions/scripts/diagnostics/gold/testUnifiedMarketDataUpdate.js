@@ -15,7 +15,7 @@
  */
 
 // Configurar variables de entorno ANTES de cargar módulos
-process.env.FINANCE_QUERY_API_URL = 'https://api.portastock.top/v1';
+process.env.FINANCE_QUERY_API_URL = 'https://api.portastock.net/v1';
 process.env.CF_SERVICE_TOKEN = '26ca00231ead1b5fbd63c6bba10a16e2f619b56809013ab3b3bcbbfb029aff10';
 
 const admin = require('firebase-admin');

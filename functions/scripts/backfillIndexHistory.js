@@ -24,7 +24,7 @@ const axios = require('axios');
 // CONFIGURACIÓN
 // ============================================================================
 
-const FINANCE_QUERY_API_URL = process.env.FINANCE_QUERY_API_URL || 'https://ws.portastock.top/v1';
+const FINANCE_QUERY_API_URL = process.env.FINANCE_QUERY_API_URL || 'https://ws.portastock.net/v1';
 const SERVICE_TOKEN = process.env.CF_SERVICE_TOKEN || '';
 
 // Mapeo de códigos internos a símbolos de Yahoo Finance

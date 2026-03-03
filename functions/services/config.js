@@ -26,7 +26,7 @@
  * @type {string}
  */
 const FINANCE_QUERY_API_URL = process.env.FINANCE_QUERY_API_URL || 
-  'https://api.portastock.top/v1';
+  'https://api.portastock.net/v1';
 
 /**
  * LM-008: Migración completada a Lambda (10-Feb-2026)

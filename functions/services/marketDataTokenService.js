@@ -46,6 +46,8 @@ const TOKEN_AUDIENCE = 'finance-query-api';
  */
 const FUNCTION_CONFIG = {
   cors: [
+    'https://portastock.net',
+    'https://www.portastock.net',
     'https://portafolio-inversiones.web.app',
     'https://portafolio-inversiones.firebaseapp.com',
     'http://localhost:3000',

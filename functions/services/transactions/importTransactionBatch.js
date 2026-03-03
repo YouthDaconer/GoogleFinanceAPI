@@ -41,6 +41,8 @@ const cfServiceToken = defineSecret("CF_SERVICE_TOKEN");
  */
 const FUNCTION_CONFIG = {
   cors: [
+    'https://portastock.net',
+    'https://www.portastock.net',
     'https://portafolio-inversiones.web.app',
     'https://portafolio-inversiones.firebaseapp.com',
     'http://localhost:3000',
