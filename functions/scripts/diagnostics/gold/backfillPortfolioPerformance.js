@@ -562,14 +562,26 @@ function calculateDailyDonePnL(transactions, targetDate) {
  * porque representan transferencias internas de efectivo dentro del portfolio,
  * no inyecciones/retiros reales de capital. El efectivo ya está en el portfolio
  * como parte del valor total (aunque no visible en los activos).
+ * 
+ * FIX-MULTICURRENCY-001: Convertir todas las transacciones a USD usando dollarPriceToDate
+ * @returns {number} Cashflow en USD
  */
 function calculateDailyCashFlow(transactions, targetDate) {
   // FIX-TIMESTAMP-002: Usar isDateEqual para soportar timestamps
   return transactions
     .filter(tx => isDateEqual(tx.date, targetDate))
     .reduce((sum, tx) => {
-      if (tx.type === 'buy') return sum - (tx.amount || 0) * (tx.price || 0);
-      if (tx.type === 'sell') return sum + (tx.amount || 0) * (tx.price || 0);
+      const amountInOriginalCurrency = (tx.amount || 0) * (tx.price || 0);
+      
+      // FIX-MULTICURRENCY-001: Convertir a USD
+      let amountInUSD = amountInOriginalCurrency;
+      if (tx.currency && tx.currency !== 'USD' && tx.dollarPriceToDate) {
+        // dollarPriceToDate es la tasa USD/XXX (ej: 3750 para COP)
+        amountInUSD = amountInOriginalCurrency / parseFloat(tx.dollarPriceToDate);
+      }
+      
+      if (tx.type === 'buy') return sum - amountInUSD;
+      if (tx.type === 'sell') return sum + amountInUSD;
       // cash_income/cash_outcome NO se incluyen - son transferencias internas
       return sum;
     }, 0);
@@ -579,18 +591,29 @@ function calculateDailyCashFlow(transactions, targetDate) {
  * Calcular cashflow acumulado desde una fecha hasta otra (exclusive end)
  * Incluye cashflows de días intermedios que no tienen documento
  * 
+ * FIX-MULTICURRENCY-001: Convertir todas las transacciones a USD usando dollarPriceToDate
+ * 
  * @param {Array} transactions - Todas las transacciones
  * @param {string} startDateExclusive - Fecha inicio (exclusive)
  * @param {string} endDateInclusive - Fecha fin (inclusive)
- * @returns {number} Cashflow acumulado
+ * @returns {number} Cashflow acumulado en USD
  */
 function calculateAccumulatedCashFlow(transactions, startDateExclusive, endDateInclusive) {
   // FIX-TIMESTAMP-002: Usar funciones helper para soportar timestamps
   return transactions
     .filter(tx => isDateAfter(tx.date, startDateExclusive) && isDateOnOrBefore(tx.date, endDateInclusive))
     .reduce((sum, tx) => {
-      if (tx.type === 'buy') return sum - (tx.amount || 0) * (tx.price || 0);
-      if (tx.type === 'sell') return sum + (tx.amount || 0) * (tx.price || 0);
+      const amountInOriginalCurrency = (tx.amount || 0) * (tx.price || 0);
+      
+      // FIX-MULTICURRENCY-001: Convertir a USD
+      let amountInUSD = amountInOriginalCurrency;
+      if (tx.currency && tx.currency !== 'USD' && tx.dollarPriceToDate) {
+        // dollarPriceToDate es la tasa USD/XXX (ej: 3750 para COP)
+        amountInUSD = amountInOriginalCurrency / parseFloat(tx.dollarPriceToDate);
+      }
+      
+      if (tx.type === 'buy') return sum - amountInUSD;
+      if (tx.type === 'sell') return sum + amountInUSD;
       // cash_income/cash_outcome NO se incluyen - son transferencias internas
       return sum;
     }, 0);

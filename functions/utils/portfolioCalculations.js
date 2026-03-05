@@ -178,6 +178,8 @@ const calculateAccountPerformance = (assets, currentPrices, currencies, totalVal
       let groupUnits = 0;
       let groupCashFlow = 0;
       let groupDividends = 0;
+      // FIX-DUP-CF-001: Rastrear si hubo transacciones de compra del día para este grupo
+      let groupHasBuyTransactionsToday = false;
       const groupReturns = {
         dailyReturns: [],
         monthlyReturns: [],
@@ -227,6 +229,11 @@ const calculateAccountPerformance = (assets, currentPrices, currencies, totalVal
         // Acumular transacciones para el grupo
         const assetBuyTransactions = buyTransactions.filter(t => t.assetId === asset.id);
         const assetSellTransactions = sellTransactions.filter(t => t.assetId === asset.id);
+        
+        // FIX-DUP-CF-001: Marcar si hubo compras del día para este grupo
+        if (assetBuyTransactions.length > 0) {
+          groupHasBuyTransactionsToday = true;
+        }
         
         assetBuyTransactions.forEach(t => {
           const convertedAmount = convertCurrency(
@@ -407,9 +414,14 @@ const calculateAccountPerformance = (assets, currentPrices, currencies, totalVal
       // para neutralizar su efecto en adjustedDailyChangePercentage del portafolio.
       // Fórmula TWR: r = (MVE - MVB - CF_in) / MVB
       // @see docs/architecture/LATE-REGISTRATION-001-retroactive-transactions-analysis.md
+      //
+      // FIX-DUP-CF-001: Solo aplicar cuando NO hay transacciones de compra del día.
+      // Si hay compras del día, el cashflow ya está incluido en groupCashFlow
+      // (sumado arriba). Agregar -groupInvestment duplicaría el cashflow.
+      // Esto ocurre cuando la compra se registra el mismo día → groupCashFlow < 0
       // ========================================================================
-      if (isNewInvestment && groupInvestment > 0) {
-        // Cashflow negativo = dinero que "entró" al portafolio
+      if (isNewInvestment && groupInvestment > 0 && !groupHasBuyTransactionsToday) {
+        // Cashflow negativo = dinero que "entró" al portafolio (solo para registros retroactivos)
         totalCashFlow += -groupInvestment;
       }
 

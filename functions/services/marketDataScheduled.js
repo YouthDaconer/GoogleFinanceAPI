@@ -92,34 +92,113 @@ const SECTOR_MAPPING = {
 // ============================================================================
 
 /**
+ * Festivos NYSE — misma lista usada por unifiedMarketDataUpdate
+ * Sirve como fallback cuando marketHolidays/US no está disponible en Firestore.
+ */
+const NYSE_HOLIDAYS_FALLBACK = new Set([
+  // 2025
+  '2025-01-01', '2025-01-20', '2025-02-17', '2025-04-18', '2025-05-26',
+  '2025-06-19', '2025-07-04', '2025-09-01', '2025-11-27', '2025-12-25',
+  // 2026
+  '2026-01-01', '2026-01-19', '2026-02-16', '2026-04-03', '2026-05-25',
+  '2026-06-19', '2026-07-03', '2026-09-07', '2026-11-26', '2026-12-25',
+  // 2027
+  '2027-01-01', '2027-01-18', '2027-02-15', '2027-03-26', '2027-05-31',
+  '2027-06-18', '2027-07-05', '2027-09-06', '2027-11-25', '2027-12-24',
+]);
+
+/**
+ * Verifica si una fecha es un día de trading válido de NYSE.
+ * Consulta primero marketHolidays/US (Finnhub), luego fallback estático.
+ * Misma lógica que unifiedMarketDataUpdate.isValidTradingDay.
+ * 
+ * @param {string} dateStr - Fecha en formato YYYY-MM-DD
+ * @returns {Promise<{isValid: boolean, reason: string}>}
+ */
+async function isValidTradingDayForIndices(dateStr) {
+  const d = new Date(dateStr + 'T12:00:00Z');
+  const dayOfWeek = d.getUTCDay();
+  
+  // Fin de semana
+  if (dayOfWeek === 0 || dayOfWeek === 6) {
+    return { isValid: false, reason: dayOfWeek === 0 ? 'sunday' : 'saturday' };
+  }
+  
+  // Verificar festivo en marketHolidays/US (fuente principal)
+  try {
+    const holidaysDoc = await admin.firestore().collection('marketHolidays').doc('US').get();
+    if (holidaysDoc.exists) {
+      const holidaysData = holidaysDoc.data();
+      if (holidaysData.holidays && holidaysData.holidays[dateStr]) {
+        return { isValid: false, reason: `holiday: ${holidaysData.holidays[dateStr]}` };
+      }
+      return { isValid: true, reason: 'trading-day' };
+    }
+  } catch (err) {
+    console.warn(`[saveIndicesHistoryData] Error consultando marketHolidays: ${err.message}, usando fallback`);
+  }
+  
+  // Fallback estático
+  if (NYSE_HOLIDAYS_FALLBACK.has(dateStr)) {
+    return { isValid: false, reason: 'holiday-fallback' };
+  }
+  
+  return { isValid: true, reason: 'trading-day' };
+}
+
+/**
  * Guarda datos históricos de índices de mercado
  * 
- * Schedule: 2x/día - 9:35 AM y 4:35 PM ET
- * - 9:35: Captura valores de apertura (35 min después para estabilización)
- * - 16:35: Captura valores de cierre (5 min después del cierre)
+ * FIX-INDEX-001: Alineado con la temporalidad de unifiedMarketDataUpdate
+ * 
+ * ANTES: 2x/día a las 9:35 y 16:35 ET (L-V) — causaba datos intraday
+ *        cuando la ejecución de las 16:35 fallaba, quedaban precios de apertura
+ * 
+ * AHORA: 1x/día a las 00:10 ET (Ma-Sáb) — después de medianoche
+ *        Guarda datos del DÍA ANTERIOR (igual que unifiedMarketDataUpdate)
+ *        Valida festivos/fines de semana antes de escribir
+ * 
+ * Schedule: 00:10 ET Martes-Sábado (cubre trading days Lunes-Viernes)
+ * Se ejecuta 5 min DESPUÉS de unifiedMarketDataUpdate (00:05) para no competir.
  * 
  * Datos guardados:
  * - indexHistories/{code}: Información general (name, region)
  * - indexHistories/{code}/dates/{date}: Datos del día (score, change, percentChange)
  * 
  * @see docs/stories/14.story.md (OPT-009)
+ * @see unifiedMarketDataUpdate.js (función de referencia para temporalidad)
  */
 const saveIndicesHistoryData = onSchedule({
-  schedule: '35 9,16 * * 1-5', // 9:35 y 16:35 ET, lunes a viernes
+  // FIX-INDEX-001: 00:10 ET Martes-Sábado = datos de cierre definitivos del día anterior
+  schedule: '10 0 * * 2-6',
   timeZone: 'America/New_York',
   retryCount: 2,
   memory: '256MiB',
   secrets: [cfServiceToken],  // SEC-TOKEN-001: Binding del secret para API auth
+  labels: {
+    status: 'active',
+    purpose: 'index-history-eod',
+    updated: '2026-03-04'
+  }
 }, async (event) => {
   const startTime = Date.now();
-  const formattedDate = new Date().toISOString().split('T')[0];
-  const currentHour = new Date().toLocaleString('en-US', { 
-    hour: 'numeric', 
-    hour12: true, 
-    timeZone: 'America/New_York' 
-  });
   
-  console.log(`[saveIndicesHistoryData] Iniciando captura de índices - ${formattedDate} ${currentHour}`);
+  // FIX-INDEX-001: Calcular la fecha del DÍA ANTERIOR (el trading day que cerró)
+  const now = new Date();
+  const yesterday = new Date(now);
+  yesterday.setDate(yesterday.getDate() - 1);
+  const formattedDate = yesterday.toISOString().split('T')[0];
+  
+  console.log(`[saveIndicesHistoryData] Iniciando captura EOD de índices - target: ${formattedDate}`);
+
+  // FIX-INDEX-001: Validar que el día anterior fue un día de trading válido
+  const tradingDayCheck = await isValidTradingDayForIndices(formattedDate);
+  if (!tradingDayCheck.isValid) {
+    console.log(`[saveIndicesHistoryData] ⏭️ Saltando: ${formattedDate} no es día de trading (${tradingDayCheck.reason})`);
+    return null;
+  }
+  
+  console.log(`[saveIndicesHistoryData] ✅ ${formattedDate} es un día de trading válido`);
 
   try {
     const indices = await requestIndicesFromFinance();
@@ -145,7 +224,7 @@ const saveIndicesHistoryData = onSchedule({
         lastUpdated: Date.now()
       }, { merge: true });
 
-      // Documento de fecha con datos del día
+      // FIX-INDEX-001: Documento de fecha del DÍA ANTERIOR con datos de cierre
       const dateDocRef = generalDocRef.collection('dates').doc(formattedDate);
       
       batch.set(dateDocRef, {
@@ -154,7 +233,7 @@ const saveIndicesHistoryData = onSchedule({
         percentChange: normalizeNumber(index.percentChange),
         date: formattedDate,
         timestamp: Date.now(),
-        captureType: currentHour.includes('9') ? 'open' : 'close'
+        captureType: 'close'  // FIX-INDEX-001: Siempre es cierre (después de medianoche)
       }, { merge: true });
 
       count++;
@@ -163,17 +242,15 @@ const saveIndicesHistoryData = onSchedule({
     await batch.commit();
     
     // OPT-CACHE-001: Invalidar cache de índices para que el frontend reciba datos frescos
-    // Esto fuerza que la próxima consulta regenere el cache con los nuevos datos
     try {
       const invalidatedCount = await invalidateAllIndexCaches();
       console.log(`[saveIndicesHistoryData] Cache invalidado: ${invalidatedCount} documentos`);
     } catch (cacheError) {
-      // No fallar la función por error de cache, solo loggear
       console.warn(`[saveIndicesHistoryData] Error invalidando cache: ${cacheError.message}`);
     }
     
     const duration = Date.now() - startTime;
-    console.log(`[saveIndicesHistoryData] Guardados ${count} índices en ${duration}ms`);
+    console.log(`[saveIndicesHistoryData] ✅ Guardados ${count} índices para ${formattedDate} en ${duration}ms`);
 
   } catch (error) {
     console.error('[saveIndicesHistoryData] Error:', error.message);
