@@ -50,14 +50,19 @@ const PERIOD_DEFINITIONS = {
 /**
  * Umbrales mínimos de documentos por período para considerar datos suficientes
  */
+// FIX-MINDOCS-001: Valores anteriores (21, 63, 126, 252, 504, 1260) eran
+// los trading days teóricos por período, pero fallaban en meses con holidays
+// (ej: febrero con President's Day tiene ~19-20 trading days < 21).
+// Reducidos para alinearse con los umbrales del frontend en PortfolioSummary.tsx
+// que ya implementan lógica de visibilidad más granular.
 const MIN_DOCS = {
-  oneMonth: 21,
-  threeMonths: 63,
-  sixMonths: 126,
+  oneMonth: 5,
+  threeMonths: 15,
+  sixMonths: 30,
   ytd: 1,
-  oneYear: 252,
-  twoYears: 504,
-  fiveYears: 1260
+  oneYear: 60,
+  twoYears: 120,
+  fiveYears: 300
 };
 
 /**
