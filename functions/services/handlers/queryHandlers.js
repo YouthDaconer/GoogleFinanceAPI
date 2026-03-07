@@ -55,6 +55,7 @@ const { getPricesFromApi } = require('../marketDataHelper');
 
 const VALID_INDEX_RANGES = ["1M", "3M", "6M", "YTD", "1Y", "5Y", "MAX"];
 const INDEX_CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 horas
+const INDEX_INTRADAY_CACHE_TTL_MS = 5 * 60 * 1000; // 5 min (cuando falta punto de hoy)
 
 // ============================================================================
 // HANDLERS
@@ -610,8 +611,15 @@ async function getIndexHistory(context, payload) {
       const cacheData = cacheDoc.data();
       const cacheAge = Date.now() - (cacheData.lastUpdated || 0);
 
-      if (cacheAge < INDEX_CACHE_TTL_MS) {
-        console.log(`[queryHandlers][getIndexHistory] Cache hit para ${cacheKey}`);
+      // FIX-INDEX-INTRADAY: Use shorter TTL if cached data doesn't include today
+      const todayStr = new Date().toISOString().split('T')[0];
+      const lastCachedDate = (cacheData.chartData || []).length > 0
+        ? cacheData.chartData[cacheData.chartData.length - 1].date
+        : '';
+      const effectiveTTL = lastCachedDate === todayStr ? INDEX_CACHE_TTL_MS : INDEX_INTRADAY_CACHE_TTL_MS;
+
+      if (cacheAge < effectiveTTL) {
+        console.log(`[queryHandlers][getIndexHistory] Cache hit para ${cacheKey} (TTL=${effectiveTTL/1000}s)`);
         return {
           chartData: cacheData.chartData || [],
           overallChange: cacheData.overallChange || 0,

@@ -12,6 +12,7 @@ const { onCall, HttpsError } = require("firebase-functions/v2/https");
 const { onSchedule } = require("firebase-functions/v2/scheduler");
 const admin = require('./firebaseAdmin');
 const db = admin.firestore();
+const { FINANCE_QUERY_API_URL, getServiceHeaders } = require('./config');
 
 // Importar rate limiter (SCALE-BE-004)
 const { withRateLimit } = require('../utils/rateLimiter');
@@ -29,7 +30,11 @@ const callableConfig = {
 };
 
 const VALID_RANGES = ["1M", "3M", "6M", "YTD", "1Y", "5Y", "MAX"];
-const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 horas
+const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 horas (histórico)
+const INTRADAY_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutos (para punto intraday en memoria)
+
+// In-memory cache for intraday quote (avoids hammering API on every CF call)
+let _intradayCache = { data: null, timestamp: 0 };
 
 // ============================================================================
 // CLOUD FUNCTION: getIndexHistory (Callable)
@@ -82,7 +87,15 @@ const getIndexHistory = onCall(callableConfig, withRateLimit('getIndexHistory')(
       const cacheData = cacheDoc.data();
       const cacheAge = Date.now() - (cacheData.lastUpdated || 0);
 
-      if (cacheAge < CACHE_TTL_MS) {
+      // FIX-INDEX-INTRADAY: Use shorter TTL if cached data doesn't include today
+      const todayStr = new Date().toISOString().split('T')[0];
+      const lastCachedDate = (cacheData.chartData || []).length > 0
+        ? cacheData.chartData[cacheData.chartData.length - 1].date
+        : '';
+      // If cache has today's data → 24h TTL; if not → 5min TTL (will recalculate with intraday)
+      const effectiveTTL = lastCachedDate === todayStr ? CACHE_TTL_MS : INTRADAY_CACHE_TTL_MS;
+
+      if (cacheAge < effectiveTTL) {
         console.log(`[getIndexHistory] Cache hit para ${cacheKey}`);
         return {
           chartData: cacheData.chartData || [],
@@ -213,6 +226,26 @@ async function calculateIndexData(code, range) {
   if (!isFinite(overallChange)) overallChange = 0;
   if (!isFinite(latestValue)) latestValue = 0;
 
+  // ── FIX-INDEX-INTRADAY: Append live intraday point if last data is not today ──
+  const todayStr = new Date().toISOString().split('T')[0];
+  const lastChartDate = chartData.length > 0 ? chartData[chartData.length - 1].date : '';
+  
+  if (lastChartDate !== todayStr) {
+    const intradayPoint = await _fetchIntradayPoint(code, todayStr);
+    if (intradayPoint) {
+      chartData.push(intradayPoint);
+      latestValue = intradayPoint.value;
+      // Recalculate overallChange with the intraday point
+      if (chartData.length >= 2) {
+        const initialValue = chartData[0].value;
+        if (initialValue > 0 && isFinite(initialValue) && isFinite(latestValue)) {
+          overallChange = Math.round(((latestValue - initialValue) / initialValue) * 100 * 100) / 100;
+        }
+      }
+      console.log(`[calculateIndexData] Appended intraday point for ${code}: ${latestValue} on ${todayStr}`);
+    }
+  }
+
   return {
     chartData,
     overallChange: Math.round(overallChange * 100) / 100, // 2 decimales
@@ -223,6 +256,91 @@ async function calculateIndexData(code, range) {
       code,
     },
   };
+}
+
+// ============================================================================
+// FUNCIÓN AUXILIAR: _fetchIntradayPoint
+// ============================================================================
+
+/**
+ * FIX-INDEX-INTRADAY: Fetch live S&P 500 data from /v1/quotes endpoint.
+ * Uses an in-memory cache (5 min TTL) to avoid hammering the API.
+ * Does NOT write to Firestore — pure ephemeral cache.
+ * 
+ * @param {string} code - Index code (e.g., "GSPC")
+ * @param {string} todayStr - Today's date as YYYY-MM-DD
+ * @returns {Object|null} Chart data point {date, value, percentChange} or null
+ */
+async function _fetchIntradayPoint(code, todayStr) {
+  // Map index code to Yahoo Finance symbol
+  const symbolMap = {
+    'GSPC': '^GSPC',
+    'DJI': '^DJI',
+    'IXIC': '^IXIC',
+    'RUT': '^RUT',
+    'VIX': '^VIX',
+  };
+  
+  const yahooSymbol = symbolMap[code];
+  if (!yahooSymbol) {
+    console.log(`[_fetchIntradayPoint] No symbol mapping for code: ${code}`);
+    return null;
+  }
+  
+  // Check in-memory cache
+  const cacheKey = `intraday_${code}`;
+  if (_intradayCache.data && 
+      _intradayCache.key === cacheKey &&
+      Date.now() - _intradayCache.timestamp < INTRADAY_CACHE_TTL_MS) {
+    console.log(`[_fetchIntradayPoint] Memory cache hit for ${code}`);
+    return _intradayCache.data;
+  }
+  
+  try {
+    const url = `${FINANCE_QUERY_API_URL}/quotes?symbols=${encodeURIComponent(yahooSymbol)}`;
+    const headers = getServiceHeaders();
+    
+    const response = await fetch(url, { 
+      headers,
+      signal: AbortSignal.timeout(8000), // 8 second timeout
+    });
+    
+    if (!response.ok) {
+      console.warn(`[_fetchIntradayPoint] API returned ${response.status} for ${code}`);
+      return null;
+    }
+    
+    const data = await response.json();
+    const quote = Array.isArray(data) ? data[0] : data;
+    
+    if (!quote || !quote.price) {
+      console.warn(`[_fetchIntradayPoint] No price data for ${code}`);
+      return null;
+    }
+    
+    // Parse values (handle comma-formatted numbers like "6,740.02")
+    const price = parseFloat(String(quote.price).replace(/,/g, '')) || 0;
+    const pctRaw = String(quote.percentChange || '0').replace(/[%+,]/g, '');
+    const percentChange = parseFloat(pctRaw) || 0;
+    
+    if (price <= 0) return null;
+    
+    const point = {
+      date: todayStr,
+      value: Math.round(price * 100) / 100,
+      percentChange: Math.round(percentChange * 100) / 100,
+    };
+    
+    // Store in memory cache
+    _intradayCache = { data: point, key: cacheKey, timestamp: Date.now() };
+    
+    console.log(`[_fetchIntradayPoint] Live ${code}: ${point.value} (${point.percentChange}%)`);
+    return point;
+    
+  } catch (error) {
+    console.warn(`[_fetchIntradayPoint] Failed to fetch ${code}: ${error.message}`);
+    return null;
+  }
 }
 
 // ============================================================================
