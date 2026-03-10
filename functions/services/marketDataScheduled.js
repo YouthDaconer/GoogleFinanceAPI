@@ -44,9 +44,74 @@ const cfServiceToken = defineSecret('CF_SERVICE_TOKEN');
 // ============================================================================
 
 /**
+ * FIX-INDEX-002: Lista de índices clave para fallback cuando /indices falla
+ * Símbolos compatibles con Yahoo Finance /quotes endpoint
+ */
+const KEY_INDEX_SYMBOLS = [
+  { symbol: '^GSPC', code: 'GSPC', name: 'S&P 500', region: 'US' },
+  { symbol: '^DJI', code: 'DJI', name: 'Dow Jones Industrial Average', region: 'US' },
+  { symbol: '^IXIC', code: 'IXIC', name: 'NASDAQ Composite', region: 'US' },
+  { symbol: '^RUT', code: 'RUT', name: 'Russell 2000', region: 'US' },
+  { symbol: '^VIX', code: 'VIX', name: 'CBOE Volatility Index', region: 'US' },
+  { symbol: '^NYA', code: 'NYA', name: 'NYSE Composite', region: 'US' },
+  { symbol: '^FTSE', code: 'FTSE', name: 'FTSE 100', region: 'UK' },
+  { symbol: '^GDAXI', code: 'GDAXI', name: 'DAX Performance Index', region: 'DE' },
+  { symbol: '^FCHI', code: 'FCHI', name: 'CAC 40', region: 'FR' },
+  { symbol: '^N225', code: 'N225', name: 'Nikkei 225', region: 'JP' },
+  { symbol: '^HSI', code: 'HSI', name: 'Hang Seng Index', region: 'HK' },
+];
+
+/**
+ * FIX-INDEX-002: Fallback - obtiene índices via /quotes cuando /indices falla
+ * El endpoint /indices usa scraping de Yahoo Finance que puede fallar.
+ * El endpoint /quotes es más estable y proporciona datos equivalentes.
+ * 
+ * @returns {Promise<Array>} Array con índices en formato compatible
+ */
+async function requestIndicesViaQuotes() {
+  const symbols = KEY_INDEX_SYMBOLS.map(i => i.symbol).join(',');
+  
+  try {
+    const response = await axios.get(
+      `${FINANCE_QUERY_API_URL}/quotes`,
+      { 
+        headers: getServiceHeaders(),
+        params: { symbols }
+      }
+    );
+    
+    const quotes = response.data || [];
+    
+    // Transformar formato de /quotes al formato de /indices
+    return quotes.map(quote => {
+      const indexInfo = KEY_INDEX_SYMBOLS.find(i => i.symbol === quote.symbol) || {};
+      
+      // Parsear valores - pueden venir con comas y símbolos
+      const parseValue = (val) => {
+        if (!val) return 0;
+        const str = String(val).replace(/[,%$+]/g, '');
+        return parseFloat(str) || 0;
+      };
+      
+      return {
+        code: indexInfo.code || quote.symbol.replace('^', ''),
+        name: indexInfo.name || quote.name || quote.symbol,
+        region: indexInfo.region || 'US',
+        value: parseValue(quote.price),
+        change: parseValue(quote.change),
+        percentChange: quote.percentChange || '0%',
+      };
+    });
+  } catch (error) {
+    throw new Error(`Error fetching indices via quotes: ${error.message}`);
+  }
+}
+
+/**
  * Obtiene todos los índices del endpoint de finanzas
  * SEC-CF-001: Migrado a Cloudflare Tunnel
  * SEC-TOKEN-004: Incluye headers de autenticación de servicio
+ * FIX-INDEX-002: Fallback a /quotes si /indices falla
  * 
  * @returns {Promise<Array>} Array con todos los índices
  */
@@ -58,7 +123,16 @@ async function requestIndicesFromFinance() {
     );
     return response.data;
   } catch (error) {
-    throw new Error(`Error fetching indices: ${error.message}`);
+    console.warn(`[requestIndicesFromFinance] /indices falló: ${error.message}, usando fallback /quotes`);
+    
+    // FIX-INDEX-002: Usar endpoint /quotes como fallback
+    try {
+      const fallbackData = await requestIndicesViaQuotes();
+      console.log(`[requestIndicesFromFinance] Fallback exitoso: ${fallbackData.length} índices obtenidos via /quotes`);
+      return fallbackData;
+    } catch (fallbackError) {
+      throw new Error(`Error fetching indices (primary + fallback failed): ${error.message} | ${fallbackError.message}`);
+    }
   }
 }
 
