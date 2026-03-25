@@ -227,6 +227,13 @@ async function calculateIndexData(code, range) {
   if (!isFinite(latestValue)) latestValue = 0;
 
   // ── FIX-INDEX-INTRADAY: Append live intraday point if last data is not today ──
+  // FIX-BENCH-003: Preserve historicalOverallChange for accurate summary cards.
+  // The intraday point from /v1/quotes can differ from the official close stored
+  // in indexHistories (pre-close vs official close, after-hours data, etc.).
+  // overallChange should only use verified historical data + intraday ONLY during
+  // active market hours when the close hasn't been recorded yet.
+  const historicalOverallChange = Math.round(overallChange * 100) / 100;
+  
   const todayStr = new Date().toISOString().split('T')[0];
   const lastChartDate = chartData.length > 0 ? chartData[chartData.length - 1].date : '';
   
@@ -235,14 +242,32 @@ async function calculateIndexData(code, range) {
     if (intradayPoint) {
       chartData.push(intradayPoint);
       latestValue = intradayPoint.value;
-      // Recalculate overallChange with the intraday point
-      if (chartData.length >= 2) {
-        const initialValue = chartData[0].value;
-        if (initialValue > 0 && isFinite(initialValue) && isFinite(latestValue)) {
-          overallChange = Math.round(((latestValue - initialValue) / initialValue) * 100 * 100) / 100;
+      
+      // FIX-BENCH-003: Only update overallChange with intraday data if:
+      // 1. It's a weekday (Mon-Fri) — market could be open
+      // 2. The intraday value is reasonably close to the last historical close
+      //    (within 5% — avoids stale after-hours/pre-market contamination)
+      const dayOfWeek = new Date().getUTCDay(); // 0=Sun, 6=Sat
+      const isWeekday = dayOfWeek >= 1 && dayOfWeek <= 5;
+      const lastHistoricalValue = chartData.length >= 2 ? chartData[chartData.length - 2].value : 0;
+      const intradayDrift = lastHistoricalValue > 0 
+        ? Math.abs((intradayPoint.value - lastHistoricalValue) / lastHistoricalValue) 
+        : 0;
+      
+      if (isWeekday && intradayDrift < 0.05) {
+        // Recalculate overallChange with the intraday point
+        if (chartData.length >= 2) {
+          const initialValue = chartData[0].value;
+          if (initialValue > 0 && isFinite(initialValue) && isFinite(latestValue)) {
+            overallChange = Math.round(((latestValue - initialValue) / initialValue) * 100 * 100) / 100;
+          }
         }
+        console.log(`[calculateIndexData] Appended intraday point for ${code}: ${latestValue} on ${todayStr} (weekday, drift=${(intradayDrift*100).toFixed(2)}%)`);
+      } else {
+        // Keep historical overallChange — intraday data is stale or it's a weekend
+        overallChange = historicalOverallChange;
+        console.log(`[calculateIndexData] Appended intraday point for ${code}: ${latestValue} on ${todayStr} (using historicalOverallChange=${historicalOverallChange}, drift=${(intradayDrift*100).toFixed(2)}%, weekend=${!isWeekday})`);
       }
-      console.log(`[calculateIndexData] Appended intraday point for ${code}: ${latestValue} on ${todayStr}`);
     }
   }
 

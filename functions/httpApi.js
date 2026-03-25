@@ -1249,10 +1249,13 @@ const {
  * Calcula la contribución de cada activo al rendimiento total.
  * 
  * INTRADAY-001: Ahora incluye rendimiento intraday en tiempo real por defecto.
+ * FEAT-UX-001: Ahora acepta startDate/endDate opcionales para rangos exactos.
  * 
  * Query params:
  * - userId: (required) ID del usuario
  * - period: Período de análisis ('YTD', '1M', '3M', '6M', '1Y', '2Y', 'ALL')
+ * - startDate: (optional) Fecha inicio explícita (YYYY-MM-DD). Sobreescribe period.
+ * - endDate: (optional) Fecha fin explícita (YYYY-MM-DD). Default: hoy.
  * - currency: Moneda para cálculos ('USD', 'COP', 'EUR', etc.)
  * - accountIds: Comma-separated list de IDs de cuenta o 'overall'
  * - benchmarkReturn: Retorno del benchmark para comparar
@@ -1264,6 +1267,8 @@ app.get("/attribution", async (req, res) => {
   const { 
     userId, 
     period = 'YTD', 
+    startDate: startDateParam,
+    endDate: endDateParam,
     currency = 'USD',
     accountIds = 'overall',
     benchmarkReturn = '0',
@@ -1279,6 +1284,16 @@ app.get("/attribution", async (req, res) => {
       });
     }
     
+    // FEAT-UX-001: Construir dateRange si se proporcionan fechas explícitas
+    let dateRange = undefined;
+    if (startDateParam) {
+      const startDate = new Date(startDateParam + 'T00:00:00');
+      const endDate = endDateParam ? new Date(endDateParam + 'T23:59:59') : new Date();
+      if (!isNaN(startDate.getTime()) && !isNaN(endDate.getTime())) {
+        dateRange = { startDate, endDate };
+      }
+    }
+    
     // FIX: Reconocer tanto 'overall' como 'all' como "todas las cuentas"
     const isAllAccounts = accountIds === 'overall' || accountIds === 'all'
     const result = await getPortfolioAttribution({
@@ -1286,6 +1301,7 @@ app.get("/attribution", async (req, res) => {
       period,
       currency,
       accountIds: isAllAccounts ? ['overall'] : accountIds.split(','),
+      dateRange,
       options: {
         benchmarkReturn: parseFloat(benchmarkReturn) || 0,
         maxWaterfallBars: parseInt(maxBars) || 8,

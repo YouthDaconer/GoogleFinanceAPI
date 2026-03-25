@@ -181,7 +181,10 @@ function getPeriodStartDate(period) {
     case '2Y':
       return new Date(new Date(startOfDay).setFullYear(startOfDay.getFullYear() - 2));
     case 'ALL':
-      return new Date(2020, 0, 1);
+      // FIX-BENCH-004: Use 5 years back instead of a fixed 2020 date.
+      // The actual start is determined by findNearestPerformanceData in Firestore,
+      // but this avoids unnecessarily wide queries and date-range filters.
+      return new Date(new Date(startOfDay).setFullYear(startOfDay.getFullYear() - 5));
     default:
       return new Date(now.getFullYear(), 0, 1);
   }

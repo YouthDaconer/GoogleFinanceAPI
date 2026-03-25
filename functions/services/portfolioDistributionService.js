@@ -609,8 +609,8 @@ async function batchGetPrices(symbols) {
         // Formato array
         apiResponse.forEach(quote => {
           if (quote && quote.symbol) {
-            // OPT-DEMAND-SECTOR: Convertir precio de string a número
-            const priceValue = parseFloat(quote.price) || parseFloat(quote.regularMarketPrice) || 0;
+            // OPT-DEMAND-SECTOR: Convertir precio de string a número (strip commas for prices like "5,784.54")
+            const priceValue = parseFloat(String(quote.price).replace(/,/g, '')) || parseFloat(String(quote.regularMarketPrice).replace(/,/g, '')) || 0;
             prices[quote.symbol] = {
               symbol: quote.symbol,
               price: priceValue,
@@ -624,8 +624,8 @@ async function batchGetPrices(symbols) {
               exchange: quote.exchange,
               // Campos adicionales para compatibilidad
               regularMarketPrice: priceValue,
-              regularMarketChange: parseFloat(quote.change) || parseFloat(quote.regularMarketChange) || 0,
-              regularMarketChangePercent: parseFloat(String(quote.changePercent || quote.regularMarketChangePercent || '0').replace('%', '')) || 0,
+              regularMarketChange: parseFloat(String(quote.change).replace(/,/g, '')) || parseFloat(String(quote.regularMarketChange).replace(/,/g, '')) || 0,
+              regularMarketChangePercent: parseFloat(String(quote.changePercent || quote.regularMarketChangePercent || '0').replace(/[%,]/g, '')) || 0,
             };
           }
         });
@@ -633,8 +633,8 @@ async function batchGetPrices(symbols) {
         // Formato objeto { AAPL: {...}, MSFT: {...} }
         Object.entries(apiResponse).forEach(([symbol, quote]) => {
           if (quote && symbol) {
-            // OPT-DEMAND-SECTOR: Convertir precio de string a número
-            const priceValue = parseFloat(quote.price) || parseFloat(quote.regularMarketPrice) || 0;
+            // OPT-DEMAND-SECTOR: Convertir precio de string a número (strip commas for prices like "5,784.54")
+            const priceValue = parseFloat(String(quote.price).replace(/,/g, '')) || parseFloat(String(quote.regularMarketPrice).replace(/,/g, '')) || 0;
             prices[symbol] = {
               symbol,
               price: priceValue,
@@ -648,8 +648,8 @@ async function batchGetPrices(symbols) {
               exchange: quote.exchange,
               // Campos adicionales para compatibilidad
               regularMarketPrice: priceValue,
-              regularMarketChange: parseFloat(quote.change) || parseFloat(quote.regularMarketChange) || 0,
-              regularMarketChangePercent: parseFloat(String(quote.changePercent || quote.regularMarketChangePercent || '0').replace('%', '')) || 0,
+              regularMarketChange: parseFloat(String(quote.change).replace(/,/g, '')) || parseFloat(String(quote.regularMarketChange).replace(/,/g, '')) || 0,
+              regularMarketChangePercent: parseFloat(String(quote.changePercent || quote.regularMarketChangePercent || '0').replace(/[%,]/g, '')) || 0,
             };
           }
         });

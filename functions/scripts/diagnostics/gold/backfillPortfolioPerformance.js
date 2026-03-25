@@ -17,6 +17,7 @@
  *   --account=<accountId>  # Cuenta específica (default: todas las cuentas del usuario)
  *   --start=YYYY-MM-DD     # Fecha inicio (default: 2025-01-02)
  *   --end=YYYY-MM-DD       # Fecha fin (default: 2025-05-31)
+ *   --no-consolidate       # Omitir re-consolidación de períodos afectados
  * 
  * MÉTODO DE AGREGACIÓN OVERALL:
  * Para calcular el adjustedDailyChangePercentage de OVERALL (combinación de cuentas),
@@ -46,6 +47,9 @@ if (!admin.apps.length) {
 }
 
 const db = admin.firestore();
+
+// Utilidades de consolidación de períodos (COST-OPT-001)
+const { consolidatePeriod, CONSOLIDATED_SCHEMA_VERSION, NON_CURRENCY_FIELDS } = require('../../../utils/periodConsolidation');
 
 // ============================================================================
 // CONFIGURACIÓN
@@ -119,6 +123,7 @@ function parseArgs() {
     startDate: CONFIG.DEFAULT_START_DATE,
     endDate: CONFIG.DEFAULT_END_DATE,
     overwrite: false, // Si true, sobrescribe documentos existentes
+    noConsolidate: false, // Si true, omite re-consolidación de períodos
   };
 
   args.forEach(arg => {
@@ -126,6 +131,7 @@ function parseArgs() {
     else if (arg === '--fix') options.mode = 'fix';
     else if (arg === '--analyze') options.mode = 'analyze';
     else if (arg === '--overwrite') options.overwrite = true;
+    else if (arg === '--no-consolidate') options.noConsolidate = true;
     else if (arg.startsWith('--user=')) options.userId = arg.split('=')[1];
     else if (arg.startsWith('--account=')) options.accountId = arg.split('=')[1];
     else if (arg.startsWith('--start=')) options.startDate = arg.split('=')[1];
@@ -870,6 +876,215 @@ function calculateDayPerformance(
 }
 
 // ============================================================================
+// RE-CONSOLIDACIÓN DE PERÍODOS
+// ============================================================================
+
+/**
+ * Determinar meses afectados (formato YYYY-MM) a partir de un rango de fechas
+ * @param {string} startDate - Fecha de inicio YYYY-MM-DD
+ * @param {string} endDate - Fecha de fin YYYY-MM-DD
+ * @returns {string[]} Array de periodKeys ordenados (ej: ['2026-01', '2026-02'])
+ */
+function getAffectedMonths(startDate, endDate) {
+  const months = new Set();
+  const start = new Date(startDate + 'T12:00:00Z');
+  const end = new Date(endDate + 'T12:00:00Z');
+  
+  let current = new Date(start);
+  while (current <= end) {
+    const y = current.getUTCFullYear();
+    const m = String(current.getUTCMonth() + 1).padStart(2, '0');
+    months.add(`${y}-${m}`);
+    // Avanzar al primer día del siguiente mes
+    current.setUTCMonth(current.getUTCMonth() + 1);
+    current.setUTCDate(1);
+  }
+  
+  return [...months].sort();
+}
+
+/**
+ * Determinar años afectados a partir de un rango de fechas
+ * @param {string} startDate - Fecha de inicio YYYY-MM-DD
+ * @param {string} endDate - Fecha de fin YYYY-MM-DD
+ * @returns {string[]} Array de años ordenados (ej: ['2025', '2026'])
+ */
+function getAffectedYears(startDate, endDate) {
+  const startYear = parseInt(startDate.substring(0, 4));
+  const endYear = parseInt(endDate.substring(0, 4));
+  const years = [];
+  
+  for (let y = startYear; y <= endYear; y++) {
+    years.push(y.toString());
+  }
+  
+  return years;
+}
+
+/**
+ * Re-consolida un mes específico para un usuario/cuenta
+ * Lee documentos diarios del mes y genera el documento consolidado mensual.
+ * 
+ * @param {string} userId - ID del usuario
+ * @param {string|null} accountId - ID de cuenta (null para overall)
+ * @param {string} periodKey - Clave del período (ej: "2026-01")
+ * @returns {Promise<Object|null>} Documento consolidado o null si no hay datos
+ */
+async function reconsolidateMonth(userId, accountId, periodKey) {
+  const [year, month] = periodKey.split('-').map(Number);
+  const periodStart = new Date(Date.UTC(year, month - 1, 1)).toISOString().split('T')[0];
+  const periodEnd = new Date(Date.UTC(year, month, 0)).toISOString().split('T')[0]; // Último día del mes
+  
+  const basePath = accountId
+    ? `portfolioPerformance/${userId}/accounts/${accountId}`
+    : `portfolioPerformance/${userId}`;
+  
+  const datesPath = `${basePath}/dates`;
+  const consolidatedPath = `${basePath}/consolidatedPeriods/monthly/periods/${periodKey}`;
+  
+  const dailySnapshot = await db.collection(datesPath)
+    .where('date', '>=', periodStart)
+    .where('date', '<=', periodEnd)
+    .orderBy('date', 'asc')
+    .get();
+  
+  if (dailySnapshot.empty) return null;
+  
+  const consolidated = consolidatePeriod(dailySnapshot.docs, periodKey, 'month');
+  if (!consolidated) return null;
+  
+  await db.doc(consolidatedPath).set(consolidated);
+  return consolidated;
+}
+
+/**
+ * Encadena documentos mensuales consolidados en un documento anual.
+ * Réplica de consolidateMonthsToYear de periodConsolidationScheduled.js
+ * para evitar importar dependencias de firebase-functions/v2/scheduler.
+ * 
+ * @param {Array} monthlyDocs - Documentos mensuales (Firestore snapshots)
+ * @param {string} yearKey - Año del período
+ * @returns {Object|null} Documento anual consolidado
+ */
+function consolidateMonthsToYear(monthlyDocs, yearKey) {
+  if (!monthlyDocs || monthlyDocs.length === 0) return null;
+  
+  const firstDoc = monthlyDocs[0].data ? monthlyDocs[0].data() : monthlyDocs[0];
+  const lastDoc = monthlyDocs[monthlyDocs.length - 1].data
+    ? monthlyDocs[monthlyDocs.length - 1].data()
+    : monthlyDocs[monthlyDocs.length - 1];
+  
+  const currencies = new Set();
+  monthlyDocs.forEach(doc => {
+    const data = doc.data ? doc.data() : doc;
+    Object.keys(data).forEach(key => {
+      if (!NON_CURRENCY_FIELDS.includes(key)) currencies.add(key);
+    });
+  });
+  
+  const consolidated = {
+    periodType: 'year',
+    periodKey: yearKey,
+    startDate: firstDoc.startDate,
+    endDate: lastDoc.endDate,
+    docsCount: monthlyDocs.reduce((sum, doc) => {
+      const data = doc.data ? doc.data() : doc;
+      return sum + (data.docsCount || 0);
+    }, 0),
+    version: CONSOLIDATED_SCHEMA_VERSION,
+    lastUpdated: new Date().toISOString()
+  };
+  
+  currencies.forEach(currencyCode => {
+    let compoundFactor = 1;
+    let startTotalValue = 0;
+    let startTotalInvestment = 0;
+    let endTotalValue = 0;
+    let endTotalInvestment = 0;
+    let totalCashFlow = 0;
+    let foundFirst = false;
+    
+    monthlyDocs.forEach(doc => {
+      const data = doc.data ? doc.data() : doc;
+      const currencyData = data[currencyCode];
+      if (!currencyData) return;
+      
+      if (!foundFirst) {
+        startTotalValue = currencyData.startTotalValue || 0;
+        startTotalInvestment = currencyData.startTotalInvestment || 0;
+        foundFirst = true;
+      }
+      
+      endTotalValue = currencyData.endTotalValue || 0;
+      endTotalInvestment = currencyData.endTotalInvestment || 0;
+      
+      if (currencyData.endFactor && currencyData.startFactor) {
+        compoundFactor *= (currencyData.endFactor / currencyData.startFactor);
+      }
+      
+      totalCashFlow += currencyData.totalCashFlow || 0;
+    });
+    
+    let personalReturn = 0;
+    if (startTotalValue > 0 || totalCashFlow !== 0) {
+      const netDeposits = -totalCashFlow;
+      const investmentBase = startTotalValue + (netDeposits / 2);
+      if (investmentBase > 0) {
+        const gain = endTotalValue - startTotalValue - netDeposits;
+        personalReturn = (gain / investmentBase) * 100;
+      }
+    }
+    
+    consolidated[currencyCode] = {
+      startFactor: 1,
+      endFactor: compoundFactor,
+      periodReturn: (compoundFactor - 1) * 100,
+      startTotalValue,
+      endTotalValue,
+      startTotalInvestment,
+      endTotalInvestment,
+      totalCashFlow,
+      personalReturn,
+      validDocsCount: monthlyDocs.length
+    };
+  });
+  
+  return consolidated;
+}
+
+/**
+ * Re-consolida un año específico para un usuario/cuenta.
+ * Lee los documentos mensuales consolidados y genera el documento anual.
+ * 
+ * @param {string} userId - ID del usuario
+ * @param {string|null} accountId - ID de cuenta (null para overall)
+ * @param {string} yearKey - Año a consolidar (ej: "2026")
+ * @returns {Promise<Object|null>} Documento consolidado o null si no hay datos
+ */
+async function reconsolidateYear(userId, accountId, yearKey) {
+  const basePath = accountId
+    ? `portfolioPerformance/${userId}/accounts/${accountId}`
+    : `portfolioPerformance/${userId}`;
+  
+  const monthlyPath = `${basePath}/consolidatedPeriods/monthly/periods`;
+  const yearlyPath = `${basePath}/consolidatedPeriods/yearly/periods/${yearKey}`;
+  
+  const monthlySnapshot = await db.collection(monthlyPath)
+    .where('periodKey', '>=', `${yearKey}-01`)
+    .where('periodKey', '<=', `${yearKey}-12`)
+    .orderBy('periodKey', 'asc')
+    .get();
+  
+  if (monthlySnapshot.empty) return null;
+  
+  const consolidated = consolidateMonthsToYear(monthlySnapshot.docs, yearKey);
+  if (!consolidated) return null;
+  
+  await db.doc(yearlyPath).set(consolidated);
+  return consolidated;
+}
+
+// ============================================================================
 // PROCESO PRINCIPAL
 // ============================================================================
 
@@ -1406,7 +1621,75 @@ async function main() {
     }
   }
   
-  // 9. Resumen final
+  // 9. Re-consolidar períodos afectados (mensual y anual)
+  if (options.mode === 'fix' && !options.noConsolidate) {
+    console.log('');
+    log('PROGRESS', '═══ Re-consolidando períodos afectados ═══');
+    
+    const affectedMonths = getAffectedMonths(options.startDate, options.endDate);
+    const affectedYears = getAffectedYears(options.startDate, options.endDate);
+    
+    log('INFO', `  Meses afectados: ${affectedMonths.join(', ')}`);
+    log('INFO', `  Años afectados: ${affectedYears.join(', ')}`);
+    
+    const consolidationResults = { monthly: 0, yearly: 0, errors: 0 };
+    
+    // Targets: overall + cada cuenta procesada
+    const consolidationTargets = [
+      { accountId: null, label: 'OVERALL' },
+      ...targetAccounts.map(a => ({ accountId: a.id, label: a.name || a.id }))
+    ];
+    
+    // Paso 1: Consolidar todos los meses afectados
+    for (const target of consolidationTargets) {
+      for (const monthKey of affectedMonths) {
+        try {
+          const result = await reconsolidateMonth(options.userId, target.accountId, monthKey);
+          if (result) {
+            consolidationResults.monthly++;
+            log('SUCCESS', `    Mes ${monthKey} consolidado para ${target.label}`);
+          } else {
+            log('DEBUG', `    Mes ${monthKey} sin datos para ${target.label}`);
+          }
+        } catch (err) {
+          log('ERROR', `    Error consolidando mes ${monthKey} para ${target.label}: ${err.message}`);
+          consolidationResults.errors++;
+        }
+      }
+    }
+    
+    // Paso 2: Consolidar años afectados (requiere mensuales ya escritos)
+    for (const target of consolidationTargets) {
+      for (const yearKey of affectedYears) {
+        try {
+          const result = await reconsolidateYear(options.userId, target.accountId, yearKey);
+          if (result) {
+            consolidationResults.yearly++;
+            log('SUCCESS', `    Año ${yearKey} consolidado para ${target.label}`);
+          } else {
+            log('DEBUG', `    Año ${yearKey} sin datos mensuales para ${target.label}`);
+          }
+        } catch (err) {
+          log('ERROR', `    Error consolidando año ${yearKey} para ${target.label}: ${err.message}`);
+          consolidationResults.errors++;
+        }
+      }
+    }
+    
+    log('SUCCESS', `  Re-consolidación completada: ${consolidationResults.monthly} mensuales, ${consolidationResults.yearly} anuales` +
+      (consolidationResults.errors > 0 ? `, ${consolidationResults.errors} errores` : ''));
+    
+    results.consolidation = consolidationResults;
+    
+  } else if (options.mode === 'fix' && options.noConsolidate) {
+    log('INFO', '  [--no-consolidate] Omitiendo re-consolidación de períodos');
+  } else if (options.mode === 'dry-run') {
+    const affectedMonths = getAffectedMonths(options.startDate, options.endDate);
+    const affectedYears = getAffectedYears(options.startDate, options.endDate);
+    log('INFO', `  [DRY-RUN] Se re-consolidarían ${affectedMonths.length} meses (${affectedMonths.join(', ')}) y ${affectedYears.length} años (${affectedYears.join(', ')})`);
+  }
+  
+  // 10. Resumen final
   console.log('');
   console.log('═'.repeat(80));
   console.log('  RESUMEN');
@@ -1415,6 +1698,10 @@ async function main() {
   log('SUCCESS', `Días creados/simulados: ${results.daysCreated}`);
   if (results.daysSkipped > 0) log('INFO', `Días omitidos (analyze): ${results.daysSkipped}`);
   if (results.errors.length > 0) log('WARNING', `Errores: ${results.errors.length}`);
+  if (results.consolidation) {
+    log('SUCCESS', `Períodos consolidados: ${results.consolidation.monthly} mensuales, ${results.consolidation.yearly} anuales`);
+    if (results.consolidation.errors > 0) log('WARNING', `Errores de consolidación: ${results.consolidation.errors}`);
+  }
   
   if (options.mode === 'dry-run') {
     console.log('');

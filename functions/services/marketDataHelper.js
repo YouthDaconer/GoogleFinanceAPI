@@ -43,9 +43,17 @@ const CURRENCY_RATES_CACHE_TTL = 5 * 60 * 1000; // 5 minutos
 /**
  * Obtiene precios actuales desde el API Lambda
  * 
+ * FIX-BATCH-001: El endpoint /v1/quotes tiene un límite de 50 símbolos por request
+ * (SEC-AUDIT-002: B-MED-06). Cuando hay más de 50 símbolos únicos, se dividen
+ * en batches secuenciales para obtener todos los precios.
+ * Sin este batching, los símbolos más allá del #50 se descartaban silenciosamente,
+ * causando que sus assets tuvieran precio=0 y rendimiento de -100%.
+ * 
  * @param {string[]} symbols - Lista de símbolos a consultar
  * @returns {Promise<Object[]>} Array de objetos con precios
  */
+const API_QUOTES_BATCH_SIZE = 50; // Matches SEC-AUDIT-002 limit in quotes.py
+
 async function getPricesFromApi(symbols) {
   if (!symbols || symbols.length === 0) {
     logger.info('No symbols to fetch prices for');
@@ -55,43 +63,61 @@ async function getPricesFromApi(symbols) {
   const uniqueSymbols = [...new Set(symbols)];
   
   try {
+    // FIX-BATCH-001: Split into batches of API_QUOTES_BATCH_SIZE
+    const batches = [];
+    for (let i = 0; i < uniqueSymbols.length; i += API_QUOTES_BATCH_SIZE) {
+      batches.push(uniqueSymbols.slice(i, i + API_QUOTES_BATCH_SIZE));
+    }
+
     logger.info('Fetching prices from API Lambda', {
       symbolCount: uniqueSymbols.length,
+      batches: batches.length,
       source: 'api-lambda'
     });
 
-    const symbolsString = uniqueSymbols.join(',');
-    const apiResponse = await getQuotes(symbolsString);
-    
-    if (!apiResponse) {
-      logger.warn('Empty response from API Lambda');
-      return [];
-    }
+    const allPrices = [];
 
-    // Normalizar respuesta (puede ser array u objeto)
-    const prices = [];
-    
-    if (Array.isArray(apiResponse)) {
-      apiResponse.forEach(quote => {
-        if (quote && quote.symbol) {
-          prices.push(normalizeQuote(quote));
-        }
-      });
-    } else if (typeof apiResponse === 'object') {
-      Object.entries(apiResponse).forEach(([symbol, quote]) => {
-        if (quote) {
-          prices.push(normalizeQuote({ ...quote, symbol }));
-        }
-      });
+    for (let batchIdx = 0; batchIdx < batches.length; batchIdx++) {
+      const batch = batches[batchIdx];
+      const symbolsString = batch.join(',');
+      
+      if (batches.length > 1) {
+        logger.info(`Fetching batch ${batchIdx + 1}/${batches.length}`, {
+          batchSize: batch.length
+        });
+      }
+
+      const apiResponse = await getQuotes(symbolsString);
+      
+      if (!apiResponse) {
+        logger.warn(`Empty response from API Lambda (batch ${batchIdx + 1})`);
+        continue;
+      }
+
+      // Normalizar respuesta (puede ser array u objeto)
+      if (Array.isArray(apiResponse)) {
+        apiResponse.forEach(quote => {
+          if (quote && quote.symbol) {
+            allPrices.push(normalizeQuote(quote));
+          }
+        });
+      } else if (typeof apiResponse === 'object') {
+        Object.entries(apiResponse).forEach(([symbol, quote]) => {
+          if (quote) {
+            allPrices.push(normalizeQuote({ ...quote, symbol }));
+          }
+        });
+      }
     }
 
     logger.info('Prices fetched successfully from API', {
       requested: uniqueSymbols.length,
-      received: prices.length,
+      received: allPrices.length,
+      batches: batches.length,
       source: 'api-lambda'
     });
 
-    return prices;
+    return allPrices;
 
   } catch (error) {
     logger.error('Error fetching prices from API Lambda', {

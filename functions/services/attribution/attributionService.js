@@ -34,19 +34,30 @@ const db = admin.firestore();
  * @param {string} period - Período ('YTD', '1M', '3M', etc.)
  * @param {string} currency - Moneda
  * @param {string} accountId - ID de cuenta o 'overall'
+ * @param {Object} [dateRange] - FEAT-UX-001: Rango de fechas explícito opcional
+ * @param {Date} [dateRange.startDate] - Fecha inicio
+ * @param {Date} [dateRange.endDate] - Fecha fin
  * @returns {Promise<{twr: number, hasData: boolean, docsCount: number}>}
  */
-async function calculatePeriodTWR(userId, period, currency, accountId = 'overall') {
-  const periodStartDate = getPeriodStartDate(period);
+async function calculatePeriodTWR(userId, period, currency, accountId = 'overall', dateRange) {
+  const periodStartDate = dateRange?.startDate || getPeriodStartDate(period);
   const periodStartStr = periodStartDate.toISOString().split('T')[0];
+  const periodEndStr = dateRange?.endDate ? dateRange.endDate.toISOString().split('T')[0] : null;
   
   // Obtener todos los documentos desde el inicio del período
   const path = accountId === 'overall'
     ? `portfolioPerformance/${userId}/dates`
     : `portfolioPerformance/${userId}/accounts/${accountId}/dates`;
   
-  const docsSnapshot = await db.collection(path)
-    .where('date', '>=', periodStartStr)
+  let queryRef = db.collection(path)
+    .where('date', '>=', periodStartStr);
+  
+  // FEAT-UX-001: Si hay fecha fin explícita, limitar el rango
+  if (periodEndStr) {
+    queryRef = queryRef.where('date', '<=', periodEndStr);
+  }
+  
+  const docsSnapshot = await queryRef
     .orderBy('date', 'asc')
     .get();
   
@@ -92,59 +103,66 @@ async function calculatePeriodTWR(userId, period, currency, accountId = 'overall
  * @param {string} period - Período
  * @param {string} currency - Moneda
  * @param {string[]} accountIds - IDs de cuentas
+ * @param {Object} [dateRange] - FEAT-UX-001: Rango de fechas explícito opcional
  * @returns {Promise<{twr: number, hasData: boolean}>}
  */
-async function calculateMultiAccountTWR(userId, period, currency, accountIds) {
+async function calculateMultiAccountTWR(userId, period, currency, accountIds, dateRange) {
   // Si es solo 'overall' o una cuenta, usar cálculo simple
   if (accountIds.length === 0 || 
       (accountIds.length === 1 && accountIds[0] === 'overall')) {
-    return calculatePeriodTWR(userId, period, currency, 'overall');
+    return calculatePeriodTWR(userId, period, currency, 'overall', dateRange);
   }
   
   if (accountIds.length === 1) {
-    return calculatePeriodTWR(userId, period, currency, accountIds[0]);
+    return calculatePeriodTWR(userId, period, currency, accountIds[0], dateRange);
   }
   
   // Para múltiples cuentas, calcular promedio ponderado por valor
   console.log(`[Attribution] Calculando TWR multi-cuenta para ${accountIds.length} cuentas`);
   
-  const periodStartDate = getPeriodStartDate(period);
+  const periodStartDate = dateRange?.startDate || getPeriodStartDate(period);
   const periodStartStr = periodStartDate.toISOString().split('T')[0];
+  const periodEndStr = dateRange?.endDate ? dateRange.endDate.toISOString().split('T')[0] : null;
   
-  // Recolectar datos de cada cuenta
-  const accountsData = [];
-  
-  for (const accountId of accountIds) {
-    if (accountId === 'overall') continue;
-    
-    const path = `portfolioPerformance/${userId}/accounts/${accountId}/dates`;
-    const docsSnapshot = await db.collection(path)
-      .where('date', '>=', periodStartStr)
-      .orderBy('date', 'asc')
-      .get();
-    
-    if (docsSnapshot.empty) continue;
-    
-    // Calcular TWR de esta cuenta
-    let compoundFactor = 1.0;
-    let lastValue = 0;
-    
-    for (const doc of docsSnapshot.docs) {
-      const data = doc.data();
-      const currencyData = data[currency] || data.USD || {};
-      const dailyChange = currencyData.adjustedDailyChangePercentage || 0;
+  // FIX-PERF-002: Paralelizar queries por cuenta con Promise.all
+  const accountPromises = accountIds
+    .filter(accountId => accountId !== 'overall')
+    .map(async (accountId) => {
+      const path = `portfolioPerformance/${userId}/accounts/${accountId}/dates`;
+      let queryRef = db.collection(path)
+        .where('date', '>=', periodStartStr);
       
-      if (dailyChange !== 0) {
-        compoundFactor *= (1 + dailyChange / 100);
+      if (periodEndStr) {
+        queryRef = queryRef.where('date', '<=', periodEndStr);
       }
       
-      // Guardar el último valor para ponderar
-      lastValue = currencyData.totalValue || 0;
-    }
-    
-    const twr = (compoundFactor - 1) * 100;
-    accountsData.push({ accountId, twr, value: lastValue });
-  }
+      const docsSnapshot = await queryRef
+        .orderBy('date', 'asc')
+        .get();
+      
+      if (docsSnapshot.empty) return null;
+      
+      let compoundFactor = 1.0;
+      let lastValue = 0;
+      
+      for (const doc of docsSnapshot.docs) {
+        const data = doc.data();
+        const currencyData = data[currency] || data.USD || {};
+        const dailyChange = currencyData.adjustedDailyChangePercentage || 0;
+        
+        if (dailyChange !== 0) {
+          compoundFactor *= (1 + dailyChange / 100);
+        }
+        
+        lastValue = currencyData.totalValue || 0;
+      }
+      
+      const twr = (compoundFactor - 1) * 100;
+      return { accountId, twr, value: lastValue };
+    });
+  
+  const results = await Promise.all(accountPromises);
+  const accountsData = results.filter(r => r !== null);
   
   if (accountsData.length === 0) {
     return { twr: 0, hasData: false, docsCount: 0 };
@@ -201,6 +219,7 @@ async function getPortfolioAttribution(params) {
     period = 'YTD',
     currency = 'USD',
     accountIds = ['overall'],
+    dateRange,
     options = {}
   } = params;
   
@@ -226,9 +245,24 @@ async function getPortfolioAttribution(params) {
       throw new Error('userId is required');
     }
     
+    // FEAT-UX-001: Si dateRange viene con fechas explícitas, omitir validación de period
     const validPeriods = ['1M', '3M', '6M', 'YTD', '1Y', '2Y', 'ALL'];
-    if (!validPeriods.includes(period)) {
+    if (!dateRange && !validPeriods.includes(period)) {
       throw new Error(`Invalid period: ${period}. Valid values: ${validPeriods.join(', ')}`);
+    }
+    
+    // FEAT-UX-001: Calcular startDate efectiva (dateRange tiene prioridad sobre period)
+    const effectiveStartDate = dateRange 
+      ? dateRange.startDate 
+      : getPeriodStartDate(period);
+    const effectiveEndDate = dateRange 
+      ? dateRange.endDate 
+      : new Date();
+    const effectiveStartStr = effectiveStartDate.toISOString().split('T')[0];
+    const effectiveEndStr = effectiveEndDate.toISOString().split('T')[0];
+    
+    if (dateRange) {
+      console.log(`[Attribution] FEAT-UX-001: Usando rango explícito ${effectiveStartStr} → ${effectiveEndStr}`);
     }
     
     // =========================================================================
@@ -251,7 +285,7 @@ async function getPortfolioAttribution(params) {
       console.log(`[Attribution] Usando TWR del frontend: ${periodTWR.toFixed(2)}%`);
     } else {
       promises.push(
-        calculateMultiAccountTWR(userId, period, currency, accountIds)
+        calculateMultiAccountTWR(userId, period, currency, accountIds, dateRange)
           .then(twrResult => {
             periodTWR = twrResult.twr || 0;
             historicalTWR = twrResult.twr || 0;
@@ -268,7 +302,12 @@ async function getPortfolioAttribution(params) {
     }
     
     // Promise para intraday performance (si está habilitado)
-    if (includeIntraday) {
+    // FIX-PERF-002: No calcular intraday para rangos de fechas pasadas (ej: Feb 2026 consultado en Mar 2026).
+    // El intraday usa precios de HOY, lo cual es semánticamente incorrecto para rangos cerrados.
+    const isDateRangeInPast = dateRange && dateRange.endDate < new Date(
+      new Date().getFullYear(), new Date().getMonth(), new Date().getDate()
+    );
+    if (includeIntraday && !isDateRangeInPast) {
       promises.push(
         calculateIntradayPerformance({
           userId,
@@ -346,7 +385,8 @@ async function getPortfolioAttribution(params) {
       userId,
       period,
       currency,
-      accountIds
+      accountIds,
+      dateRange
     );
     
     if (contributionResult.error) {
@@ -373,8 +413,12 @@ async function getPortfolioAttribution(params) {
     let totalIntradayContribution = 0;
     
     if (intradayApplied && intradayPerformance?.success) {
-      // Obtener los datos del último día para calcular contribuciones intraday
-      const latestData = await getLatestPerformanceData(userId, accountIds[0] || 'overall');
+      // FIX-PERF-002: Para multi-cuenta, obtener datos del último día de 'overall'
+      // en lugar de solo la primera cuenta (que solo tendría un subset de los activos).
+      const intradayAccountId = accountIds.includes('overall') || accountIds.length === 1
+        ? (accountIds[0] || 'overall')
+        : 'overall';
+      const latestData = await getLatestPerformanceData(userId, intradayAccountId);
       
       if (latestData) {
         const intradayContribResult = await calculateIntradayContributions({
@@ -505,9 +549,10 @@ async function getPortfolioAttribution(params) {
         processingTimeMs: Date.now() - startTime,
         dataSource: intradayPerformance ? 'assetPerformance + TWR + intraday' : 'assetPerformance + TWR',
         portfolioDate: contributionResult.latestDate,
-        periodStartDate: contributionResult.periodStartDate,
-        period,
-        periodLabel: getPeriodLabel(period),
+        periodStartDate: dateRange ? effectiveStartStr : contributionResult.periodStartDate,
+        periodEndDate: dateRange ? effectiveEndStr : undefined,
+        period: dateRange ? 'CUSTOM' : period,
+        periodLabel: dateRange ? `${effectiveStartStr} → ${effectiveEndStr}` : getPeriodLabel(period),
         currency,
         accountIds,
         // Info de diagnóstico

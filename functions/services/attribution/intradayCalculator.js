@@ -712,19 +712,37 @@ async function calculateIntradayContributions(params) {
     // Obtener precios de mercado actuales
     const quotes = await getQuotes(uniqueTickers.join(','));
     
-    // Crear mapa de precios con información de moneda
+    // FIX-PERF-002: Manejar tanto respuesta array como objeto de getQuotes
+    // (la misma lógica que calculateIntradayPerformance ya tiene)
     const marketData = {};
-    for (const quote of quotes) {
-      if (quote && quote.symbol) {
-        let price = quote.price;
-        if (typeof price === 'string') {
-          price = parseFloat(price.replace(/,/g, ''));
+    
+    if (Array.isArray(quotes)) {
+      for (const quote of quotes) {
+        if (quote && quote.symbol) {
+          let price = quote.price;
+          if (typeof price === 'string') {
+            price = parseFloat(price.replace(/,/g, ''));
+          }
+          if (typeof price === 'number' && !isNaN(price) && price > 0) {
+            marketData[quote.symbol] = {
+              price: price,
+              currency: quote.currency || 'USD'
+            };
+          }
         }
-        if (typeof price === 'number' && !isNaN(price) && price > 0) {
-          marketData[quote.symbol] = {
-            price: price,
-            currency: quote.currency || 'USD'
-          };
+      }
+    } else if (quotes && typeof quotes === 'object') {
+      for (const [symbol, data] of Object.entries(quotes)) {
+        if (data && (typeof data.price === 'number' || typeof data.price === 'string')) {
+          const price = typeof data.price === 'string' 
+            ? parseFloat(data.price.replace(/,/g, '')) 
+            : data.price;
+          if (!isNaN(price) && price > 0) {
+            marketData[symbol] = {
+              price: price,
+              currency: data.currency || 'USD'
+            };
+          }
         }
       }
     }

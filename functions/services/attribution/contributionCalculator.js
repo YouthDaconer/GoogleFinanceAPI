@@ -102,21 +102,28 @@ async function getSellTransactionsInPeriod(userId, startDate, endDate, accountId
     targetAccountIds = accountsSnapshot.docs.map(d => d.id);
   }
   
-  // Obtener TODAS las transacciones de venta y filtrar en memoria
-  // (Evita necesitar índice compuesto type+date)
-  const transactionsSnapshot = await db.collection('transactions')
-    .where('type', '==', 'sell')
-    .get();
+  // FIX-PERF-001: Query por cuenta en paralelo en vez de full-scan de TODAS las transacciones sell.
+  // La query anterior descargaba todas las ventas de todos los usuarios y filtraba en memoria,
+  // lo que causaba tiempos de ~14s y posibles timeouts (HTTP 500) para períodos largos como 1Y.
+  const accountQueries = targetAccountIds.map(accId =>
+    db.collection('transactions')
+      .where('portfolioAccountId', '==', accId)
+      .where('type', '==', 'sell')
+      .get()
+  );
   
-  // Filtrar por fecha y cuentas del usuario
-  const userSellTransactions = transactionsSnapshot.docs
-    .map(doc => ({ id: doc.id, ...doc.data() }))
-    .filter(t => {
-      // Filtrar por fecha
-      if (t.date < startDateStr || t.date > endDateStr) return false;
-      // Filtrar por cuentas del usuario
-      return targetAccountIds.includes(t.portfolioAccountId);
-    });
+  const snapshots = await Promise.all(accountQueries);
+  
+  // Filtrar por fecha en memoria (evita necesitar índice compuesto)
+  const userSellTransactions = [];
+  for (const snapshot of snapshots) {
+    for (const doc of snapshot.docs) {
+      const data = doc.data();
+      if (data.date >= startDateStr && data.date <= endDateStr) {
+        userSellTransactions.push({ id: doc.id, ...data });
+      }
+    }
+  }
   
   console.log(`[Attribution] Encontradas ${userSellTransactions.length} ventas en el período`);
   
@@ -160,7 +167,7 @@ async function getSellTransactionsInPeriod(userId, startDate, endDate, accountId
  * @param {string[]} accountIds - IDs de cuentas a incluir o ['overall']
  * @returns {Promise<Object>} Resultado con atribuciones calculadas
  */
-async function calculateContributions(userId, period, currency = 'USD', accountIds = ['overall']) {
+async function calculateContributions(userId, period, currency = 'USD', accountIds = ['overall'], dateRange) {
   // Determinar si usamos overall o cuentas específicas
   const useOverall = accountIds.length === 0 || accountIds.includes('overall');
   
@@ -194,15 +201,27 @@ async function calculateContributions(userId, period, currency = 'USD', accountI
     console.log(`[Attribution] FIX-MULTI-ACCOUNT-001: Agregando datos de ${accountIds.length} cuentas específicas`);
     
     const { getPeriodStartDate } = require('./types');
-    const periodStartDate = getPeriodStartDate(period);
+    const periodStartDate = dateRange?.startDate || getPeriodStartDate(period);
     const periodStartStr = periodStartDate.toISOString().split('T')[0];
+    const multiAccEndStr = dateRange?.endDate ? dateRange.endDate.toISOString().split('T')[0] : null;
     
-    // Obtener datos de cada cuenta y agregar
-    for (const accId of accountIds) {
+    // FIX-PERF-002: Paralelizar queries por cuenta con Promise.all
+    const accountDataPromises = accountIds.map(async (accId) => {
       console.log(`[Attribution] Procesando cuenta: ${accId}`);
       
-      // Obtener datos más recientes de esta cuenta
-      const accLatestData = await getLatestPerformanceData(userId, accId);
+      const accLatestData = multiAccEndStr
+        ? await findNearestPerformanceData(userId, multiAccEndStr, accId, 'desc')
+        : await getLatestPerformanceData(userId, accId);
+      
+      const accStartData = await findNearestPerformanceData(userId, periodStartStr, accId, 'asc');
+      
+      return { accId, accLatestData, accStartData };
+    });
+    
+    const accountResults = await Promise.all(accountDataPromises);
+    
+    // Agregar resultados de cada cuenta
+    for (const { accId, accLatestData, accStartData } of accountResults) {
       if (!accLatestData) {
         console.log(`[Attribution] Cuenta ${accId}: sin datos de performance`);
         continue;
@@ -238,8 +257,7 @@ async function calculateContributions(userId, period, currency = 'USD', accountI
         }
       }
       
-      // Obtener datos de inicio del período para esta cuenta
-      const accStartData = await findNearestPerformanceData(userId, periodStartStr, accId, 'asc');
+      // FIX-PERF-002: accStartData ya fue obtenida en paralelo arriba
       if (accStartData) {
         const accStartDate = accStartData.id || accStartData.date;
         if (!startDateUsed || accStartDate < startDateUsed) {
@@ -288,7 +306,7 @@ async function calculateContributions(userId, period, currency = 'USD', accountI
   
   // =========================================================================
   // FIX-GHOST-ASSETS: Obtener activos activos del usuario para validar fantasmas
-  // 
+  //
   // Esto nos permite detectar activos que aparecen en portfolioPerformance
   // pero no existen como activos activos (son datos corruptos/fantasmas).
   // =========================================================================
@@ -302,13 +320,17 @@ async function calculateContributions(userId, period, currency = 'USD', accountI
     
     const userAccountIds = accountsSnapshot.docs.map(doc => doc.id);
     
-    // Obtener todos los activos activos de esas cuentas
-    for (const accId of userAccountIds) {
-      const assetsSnapshot = await db.collection('assets')
+    // FIX-PERF-001: Consultar activos de todas las cuentas en paralelo
+    const assetQueries = userAccountIds.map(accId =>
+      db.collection('assets')
         .where('portfolioAccount', '==', accId)
         .where('isActive', '==', true)
-        .get();
-      
+        .get()
+    );
+    
+    const assetSnapshots = await Promise.all(assetQueries);
+    
+    for (const assetsSnapshot of assetSnapshots) {
       assetsSnapshot.docs.forEach(doc => {
         const asset = doc.data();
         if (asset.units > 0) {
@@ -333,9 +355,11 @@ async function calculateContributions(userId, period, currency = 'USD', accountI
   let latestDate;
   
   const { getPeriodStartDate } = require('./types');
-  const periodStartDate = getPeriodStartDate(period);
+  const periodStartDate = dateRange?.startDate || getPeriodStartDate(period);
   const periodStartStr = periodStartDate.toISOString().split('T')[0];
-  
+  const periodEndDate = dateRange?.endDate || new Date();
+  const periodEndStr = dateRange?.endDate ? dateRange.endDate.toISOString().split('T')[0] : null;
+
   if (!useOverall && allowedAssetKeys && Object.keys(aggregatedAssetPerformance).length > 0) {
     // CUENTAS ESPECÍFICAS: Usar datos agregados
     console.log(`[Attribution] Usando datos AGREGADOS de ${accountIds.length} cuentas`);
@@ -344,14 +368,17 @@ async function calculateContributions(userId, period, currency = 'USD', accountI
     startAssetPerformance = aggregatedStartAssetPerformance;
     totalPortfolioValue = aggregatedTotalValue;
     totalPortfolioInvestment = aggregatedTotalInvestment;
-    startTotalValue = aggregatedStartTotalValue || aggregatedTotalValue;
+    startTotalValue = aggregatedStartTotalValue > 0 ? aggregatedStartTotalValue : aggregatedTotalValue;
     latestDate = latestDateUsed;
     
   } else {
     // OVERALL: Usar documento overall (flujo original)
-    console.log(`[Attribution] Usando datos de documento 'overall'`);
+    // FEAT-UX-001: Si hay endDate, buscar datos en esa fecha, no la más reciente
+    console.log(`[Attribution] Usando datos de documento 'overall'${periodEndStr ? ` (hasta ${periodEndStr})` : ''}`);
     
-    const latestData = await getLatestPerformanceData(userId, 'overall');
+    const latestData = periodEndStr
+      ? await findNearestPerformanceData(userId, periodEndStr, 'overall', 'desc')
+      : await getLatestPerformanceData(userId, 'overall');
     if (!latestData) {
       return {
         attributions: [],
@@ -369,6 +396,10 @@ async function calculateContributions(userId, period, currency = 'USD', accountI
     totalPortfolioInvestment = currencyData.totalInvestment || 0;
     
     const startData = await findNearestPerformanceData(userId, periodStartStr, 'overall', 'asc');
+    // FIX-BENCH-004: Capture actual start date from Firestore (not the requested date)
+    if (startData) {
+      startDateUsed = startData.id || startData.date;
+    }
     const startCurrencyData = startData?.[currency] || startData?.USD || {};
     startAssetPerformance = startCurrencyData.assetPerformance || {};
     startTotalValue = startCurrencyData.totalValue || totalPortfolioValue;
@@ -382,7 +413,7 @@ async function calculateContributions(userId, period, currency = 'USD', accountI
   const sellsByAsset = await getSellTransactionsInPeriod(
     userId, 
     periodStartDate, 
-    new Date(), 
+    periodEndDate, 
     accountIds
   );
   
@@ -716,7 +747,9 @@ async function calculateContributions(userId, period, currency = 'USD', accountI
     totalPortfolioInvestment,
     portfolioReturn: portfolioROI,
     latestDate,
-    periodStartDate: periodStartStr,
+    // FIX-BENCH-004: Return actual data start date, not the theoretical request date.
+    // For ALL period, getPeriodStartDate returns 5y back but data may start much later.
+    periodStartDate: startDateUsed || periodStartStr,
     startTotalValue,
     sumOfContributions: normalized ? portfolioROI : sumOfContributions,
     discrepancy,
