@@ -512,8 +512,18 @@ async function getPortfolioAttribution(params) {
     
     // =========================================================================
     // 4. ENRIQUECER CON DATOS DE CURRENTPRICES
+    // FIX-TIMEOUT-001: Limitar a 10s para evitar que retries extiendan el request
+    // total más allá del timeout de Cloud Run. El enriquecimiento es optional
+    // (solo agrega nombres, sectores y logos).
     // =========================================================================
-    await enrichWithCurrentPrices(contributionResult.attributions);
+    try {
+      await Promise.race([
+        enrichWithCurrentPrices(contributionResult.attributions),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('enrichment timeout')), 10000))
+      ]);
+    } catch (enrichErr) {
+      console.warn(`[Attribution] Enrichment skipped: ${enrichErr.message}`);
+    }
     
     // =========================================================================
     // 5. GENERAR WATERFALL
