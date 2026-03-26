@@ -12,6 +12,15 @@ const NodeCache = require('node-cache');
 const admin = require('../firebaseAdmin');
 const { CACHE_KEYS, CACHE_TTL, DEFAULT_BENCHMARKS } = require('./types');
 
+// Lazy-load para evitar dependencia circular con financeQuery
+let _getQuotes = null;
+function getQuotesLazy() {
+  if (!_getQuotes) {
+    _getQuotes = require('../financeQuery').getQuotes;
+  }
+  return _getQuotes;
+}
+
 const db = admin.firestore();
 
 const cache = new NodeCache({
@@ -141,6 +150,76 @@ async function getRiskFreeRate() {
 }
 
 /**
+ * Obtiene la tasa libre de riesgo dinámica con fallback en cascada
+ * 
+ * 1. Cache en memoria (TTL: 6 horas)
+ * 2. Firestore: benchmarks/risk_free_rate (si updatedAt < 48h)
+ * 3. finance-query API: /quotes?symbols=^IRX (T-Bill 13 semanas)
+ * 4. Constante: DEFAULT_BENCHMARKS.RISK_FREE_RATE (último recurso)
+ * 
+ * @returns {Promise<{rate: number, source: string}>} Tasa como decimal y fuente
+ */
+async function getDynamicRiskFreeRate() {
+  const cacheKey = 'dynamic_risk_free_rate';
+  
+  // 1. Cache en memoria (6 horas)
+  const cached = cache.get(cacheKey);
+  if (cached !== undefined) {
+    return cached;
+  }
+  
+  // 2. Firestore (si reciente < 48h)
+  try {
+    const rateDoc = await db.collection('benchmarks').doc('risk_free_rate').get();
+    if (rateDoc.exists) {
+      const data = rateDoc.data();
+      const updatedAt = data.updatedAt || 0;
+      const isRecent = (Date.now() - updatedAt) < 48 * 60 * 60 * 1000;
+      if (isRecent && data.rate && data.rate > 0) {
+        const result = { rate: data.rate, source: data.source || 'firestore' };
+        cache.set(cacheKey, result, 21600); // 6h
+        console.log(`[benchmarkCache] RFR from Firestore: ${(data.rate * 100).toFixed(2)}%`);
+        return result;
+      }
+    }
+  } catch (error) {
+    console.warn('[benchmarkCache] Error reading RFR from Firestore:', error.message);
+  }
+  
+  // 3. API en tiempo real (^IRX = 13-Week Treasury Bill)
+  try {
+    const getQuotesFn = getQuotesLazy();
+    const quotes = await getQuotesFn('^IRX');
+    if (quotes && quotes.length > 0) {
+      const priceStr = String(quotes[0].price || '').replace(/[%,+]/g, '');
+      const ratePercent = parseFloat(priceStr);
+      if (!isNaN(ratePercent) && ratePercent > 0 && ratePercent < 20) {
+        const rate = ratePercent / 100;
+        const result = { rate, source: 'IRX_LIVE' };
+        cache.set(cacheKey, result, 21600);
+        console.log(`[benchmarkCache] RFR from ^IRX: ${ratePercent.toFixed(2)}%`);
+        // Persistir para otras instancias
+        db.collection('benchmarks').doc('risk_free_rate').set({
+          rate, source: 'IRX_LIVE', symbol: '^IRX',
+          updatedAt: Date.now(),
+          updatedDate: new Date().toISOString().split('T')[0],
+          description: '13-Week Treasury Bill Yield'
+        }, { merge: true }).catch(e => console.warn('[benchmarkCache] Error persisting RFR:', e.message));
+        return result;
+      }
+    }
+  } catch (error) {
+    console.warn('[benchmarkCache] Error fetching ^IRX:', error.message);
+  }
+  
+  // 4. Fallback
+  console.warn('[benchmarkCache] Using hardcoded RFR as last resort');
+  const result = { rate: DEFAULT_BENCHMARKS.RISK_FREE_RATE, source: 'HARDCODED_FALLBACK' };
+  cache.set(cacheKey, result, 3600); // 1h (más corto para reintentar pronto)
+  return result;
+}
+
+/**
  * Invalida una entrada específica del cache
  * @param {string} key - Clave a invalidar
  */
@@ -172,6 +251,7 @@ module.exports = {
   getMarketReturns,
   getSectorWeights,
   getRiskFreeRate,
+  getDynamicRiskFreeRate,
   invalidateCache,
   clearAllCache,
   getCacheStats

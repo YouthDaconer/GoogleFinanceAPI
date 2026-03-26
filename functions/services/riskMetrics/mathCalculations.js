@@ -44,7 +44,11 @@ function calculateStdDev(returns, mean) {
 }
 
 /**
- * Calcula la desviación estándar solo de retornos negativos (downside deviation)
+ * Calcula la downside deviation (desviación de retornos negativos)
+ * 
+ * Fórmula estándar Sortino & Price (1994): usa TODOS los retornos,
+ * aplica min(r - threshold, 0)² y divide por N_total.
+ * 
  * @param {number[]} returns - Array de retornos
  * @param {number} [threshold=0] - Umbral de retorno (default: 0)
  * @returns {number} Downside deviation
@@ -52,11 +56,13 @@ function calculateStdDev(returns, mean) {
 function calculateDownsideDeviation(returns, threshold = 0) {
   if (!returns || returns.length === 0) return 0;
   
-  const negativeReturns = returns.filter(r => r < threshold);
-  if (negativeReturns.length === 0) return 0;
-  
-  const squaredDiffs = negativeReturns.map(r => Math.pow(r - threshold, 2));
-  return Math.sqrt(squaredDiffs.reduce((sum, d) => sum + d, 0) / negativeReturns.length);
+  const squaredDiffs = returns.map(r => {
+    const diff = r - threshold;
+    return diff < 0 ? diff * diff : 0;
+  });
+  const sumSquared = squaredDiffs.reduce((sum, d) => sum + d, 0);
+  if (sumSquared === 0) return 0;
+  return Math.sqrt(sumSquared / returns.length);
 }
 
 /**
@@ -241,6 +247,82 @@ function findMaxDrawdown(drawdowns) {
 }
 
 /**
+ * Calcula el porcentaje de semanas rentables a partir de retornos diarios
+ * Agrupa retornos consecutivos en semanas de 5 días de trading y cuenta las positivas
+ * 
+ * @param {number[]} dailyReturns - Retornos diarios como decimales
+ * @returns {number} Porcentaje de semanas rentables (0-100)
+ */
+function calculateWeeklyProfitability(dailyReturns) {
+  if (!dailyReturns || dailyReturns.length < 5) return 50;
+  
+  const weeklyReturns = [];
+  for (let i = 0; i < dailyReturns.length; i += 5) {
+    const weekSlice = dailyReturns.slice(i, i + 5);
+    if (weekSlice.length >= 3) {
+      const weekReturn = weekSlice.reduce((acc, r) => acc * (1 + r), 1) - 1;
+      weeklyReturns.push(weekReturn);
+    }
+  }
+  
+  if (weeklyReturns.length === 0) return 50;
+  
+  const profitable = weeklyReturns.filter(r => r > 0).length;
+  return (profitable / weeklyReturns.length) * 100;
+}
+
+/**
+ * Calcula métricas de riesgo del benchmark (S&P 500) para el mismo período
+ * Reutiliza las funciones de cálculo del portafolio para garantizar consistencia
+ * 
+ * @param {number[]} marketReturns - Retornos diarios del mercado (todos, sin alinear)
+ * @param {Object} options - { riskFreeRate: decimal, ej. 0.043 }
+ * @returns {Object} Métricas del benchmark
+ */
+function calculateBenchmarkMetrics(marketReturns, options = {}) {
+  const { riskFreeRate = DEFAULT_BENCHMARKS.RISK_FREE_RATE } = options;
+  
+  if (!marketReturns || marketReturns.length === 0) {
+    return {
+      sharpeRatio: 0, sortinoRatio: 0, volatility: 0,
+      annualizedReturn: 0, maxDrawdown: 0, totalReturn: 0,
+      profitableWeeks: 0, dataPoints: 0
+    };
+  }
+  
+  const meanReturn = calculateMeanReturn(marketReturns);
+  const stdDev = calculateStdDev(marketReturns, meanReturn);
+  const downsideDev = calculateDownsideDeviation(marketReturns);
+  
+  const totalReturn = marketReturns.reduce((acc, r) => acc * (1 + r), 1) - 1;
+  const tradingDays = marketReturns.length;
+  const annualizedReturn = (Math.pow(1 + totalReturn, TRADING_DAYS_PER_YEAR / tradingDays) - 1) * 100;
+  
+  const annualizedVol = annualizeVolatility(stdDev);
+  const annualizedDownside = annualizeVolatility(downsideDev);
+  
+  const sharpeRatio = calculateSharpeRatio(annualizedReturn, annualizedVol, riskFreeRate * 100);
+  const sortinoRatio = calculateSortinoRatio(annualizedReturn, annualizedDownside, riskFreeRate * 100);
+  
+  const drawdownInput = marketReturns.map((r, i) => ({ date: `day-${i}`, dailyReturn: r }));
+  const drawdownHistory = calculateDrawdownHistory(drawdownInput);
+  const maxDrawdown = findMaxDrawdown(drawdownHistory);
+  
+  const profitableWeeks = calculateWeeklyProfitability(marketReturns);
+  
+  return {
+    sharpeRatio: parseFloat(sharpeRatio.toFixed(2)),
+    sortinoRatio: parseFloat(sortinoRatio.toFixed(2)),
+    volatility: parseFloat(annualizedVol.toFixed(1)),
+    annualizedReturn: parseFloat(annualizedReturn.toFixed(1)),
+    maxDrawdown: parseFloat(maxDrawdown.toFixed(1)),
+    totalReturn: parseFloat((totalReturn * 100).toFixed(1)),
+    profitableWeeks: parseFloat(profitableWeeks.toFixed(0)),
+    dataPoints: marketReturns.length
+  };
+}
+
+/**
  * Calcula todas las métricas de riesgo a partir de datos de retorno
  * @param {number[]} portfolioReturns - Retornos diarios del portafolio
  * @param {number[]} marketReturns - Retornos diarios del mercado
@@ -315,5 +397,7 @@ module.exports = {
   calculateVaR95,
   calculateDrawdownHistory,
   findMaxDrawdown,
+  calculateWeeklyProfitability,
+  calculateBenchmarkMetrics,
   calculateAllMetrics
 };

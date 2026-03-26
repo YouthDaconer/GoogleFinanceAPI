@@ -434,10 +434,92 @@ const saveSectorsSnapshot = onSchedule({
 });
 
 // ============================================================================
+// SCHEDULED FUNCTION: updateRiskFreeRate
+// ============================================================================
+
+/**
+ * Actualiza la tasa libre de riesgo desde ^IRX (13-Week T-Bill) y ^TNX (10Y Treasury)
+ * 
+ * Schedule: 1x/día — 17:00 ET (después del cierre, Lunes-Viernes)
+ * Escribe en: benchmarks/risk_free_rate
+ * 
+ * Esto asegura que getDynamicRiskFreeRate() en benchmarkCache.js
+ * encuentre datos frescos en Firestore sin necesidad de llamar a la API.
+ * 
+ * @see docs/architecture/RISK-METRICS-DYNAMIC-BENCHMARKS-analysis.md
+ */
+const updateRiskFreeRate = onSchedule({
+  schedule: '0 17 * * 1-5',
+  timeZone: 'America/New_York',
+  retryCount: 2,
+  memory: '256MiB',
+  secrets: [cfServiceToken],
+  labels: {
+    status: 'active',
+    purpose: 'risk-free-rate-update',
+    updated: '2026-03-26'
+  }
+}, async (event) => {
+  const startTime = Date.now();
+  console.log('[updateRiskFreeRate] Starting daily update');
+  
+  try {
+    const response = await axios.get(
+      `${FINANCE_QUERY_API_URL}/quotes`,
+      {
+        headers: getServiceHeaders(),
+        params: { symbols: '^IRX,^TNX' },
+        timeout: 15000
+      }
+    );
+    
+    const quotes = response.data || [];
+    const irx = quotes.find(q => q.symbol === '^IRX');
+    const tnx = quotes.find(q => q.symbol === '^TNX');
+    
+    // Preferir ^IRX (T-Bill 13 semanas), fallback a ^TNX (Treasury 10Y)
+    const source = irx || tnx;
+    if (!source || !source.price) {
+      console.warn('[updateRiskFreeRate] No rate data from ^IRX or ^TNX');
+      return null;
+    }
+    
+    const priceStr = String(source.price).replace(/[%,+]/g, '');
+    const ratePercent = parseFloat(priceStr);
+    
+    if (isNaN(ratePercent) || ratePercent <= 0 || ratePercent >= 20) {
+      console.warn(`[updateRiskFreeRate] Invalid rate: ${source.price} → ${ratePercent}`);
+      return null;
+    }
+    
+    const rate = ratePercent / 100;
+    
+    await admin.firestore().collection('benchmarks').doc('risk_free_rate').set({
+      rate,
+      ratePercent,
+      source: irx ? 'IRX' : 'TNX',
+      symbol: source.symbol,
+      rawPrice: source.price,
+      updatedAt: Date.now(),
+      updatedDate: new Date().toISOString().split('T')[0],
+      description: irx ? '13-Week Treasury Bill Yield' : '10-Year Treasury Note Yield'
+    });
+    
+    const duration = Date.now() - startTime;
+    console.log(`[updateRiskFreeRate] ✅ Updated: ${ratePercent.toFixed(2)}% from ${source.symbol} in ${duration}ms`);
+  } catch (error) {
+    console.error('[updateRiskFreeRate] Error:', error.message);
+  }
+  
+  return null;
+});
+
+// ============================================================================
 // EXPORTS
 // ============================================================================
 
 module.exports = {
   saveIndicesHistoryData,
-  saveSectorsSnapshot
+  saveSectorsSnapshot,
+  updateRiskFreeRate
 };

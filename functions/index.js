@@ -23,7 +23,8 @@ const marketStatusService = require('./services/marketStatusService');
 // COST-OPT-004: Funciones optimizadas para datos de mercado (reemplazan saveAllIndicesAndSectorsHistoryData)
 const { 
   saveIndicesHistoryData, 
-  saveSectorsSnapshot 
+  saveSectorsSnapshot,
+  updateRiskFreeRate
 } = require("./services/marketDataScheduled");
 
 // RBAC-001: Auth Triggers para asignar Custom Claims a nuevos usuarios
@@ -141,6 +142,13 @@ exports.saveIndicesHistoryData = saveIndicesHistoryData;
  * @see docs/architecture/firebase-cost-analysis-detailed.md
  */
 exports.saveSectorsSnapshot = saveSectorsSnapshot;
+
+/**
+ * Actualiza la tasa libre de riesgo desde ^IRX / ^TNX
+ * Schedule: 1x/día — 17:00 ET (L-V)
+ * @see docs/architecture/RISK-METRICS-DYNAMIC-BENCHMARKS-analysis.md
+ */
+exports.updateRiskFreeRate = updateRiskFreeRate;
 
 // DEPRECATED: Función legacy reemplazada por saveIndicesHistoryData + saveSectorsSnapshot
 // exports.saveAllIndicesAndSectorsHistoryDataV2 = saveAllIndicesAndSectorsHistoryData;

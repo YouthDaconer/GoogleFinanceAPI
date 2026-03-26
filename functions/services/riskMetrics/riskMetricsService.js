@@ -12,9 +12,10 @@
 const { 
   calculateAllMetrics, 
   calculateDrawdownHistory, 
-  findMaxDrawdown 
+  findMaxDrawdown,
+  calculateBenchmarkMetrics
 } = require('./mathCalculations');
-const { getMarketReturns, getRiskFreeRate } = require('./benchmarkCache');
+const { getMarketReturns, getDynamicRiskFreeRate } = require('./benchmarkCache');
 const { aggregateMultiAccountData, determineStrategy } = require('./multiAccountAggregator');
 const { MIN_DAYS_FOR_METRICS, TRADING_DAYS_PER_YEAR } = require('./types');
 
@@ -141,11 +142,14 @@ async function calculateRiskMetrics(userId, options = {}) {
     const startDate = getPeriodStartDate(period);
     const endDate = formatDateToISO(new Date());
     
-    const [portfolioData, marketData, riskFreeRate] = await Promise.all([
+    const [portfolioData, marketData, riskFreeRateResult] = await Promise.all([
       aggregateMultiAccountData(userId, accountIds, startDate, endDate, currency),
       getMarketReturns(startDate, endDate),
-      getRiskFreeRate()
+      getDynamicRiskFreeRate()
     ]);
+    
+    const riskFreeRate = riskFreeRateResult.rate;
+    const riskFreeRateSource = riskFreeRateResult.source;
     
     const dataPoints = portfolioData.dailyReturns.length;
     const dataQuality = getDataQuality(dataPoints);
@@ -190,6 +194,12 @@ async function calculateRiskMetrics(userId, options = {}) {
       { riskFreeRate }
     );
     
+    // Calcular métricas del benchmark (S&P 500) con los MISMOS retornos del mercado
+    const allMarketReturns = marketData.map(d => d.dailyReturn);
+    const benchmarkMetrics = calculateBenchmarkMetrics(allMarketReturns, { riskFreeRate });
+    
+    console.log(`[riskMetricsService] Benchmark: S&P500 ${benchmarkMetrics.dataPoints} days, Sharpe=${benchmarkMetrics.sharpeRatio}, Return=${benchmarkMetrics.annualizedReturn}%`);
+    
     // Mapear dailyData al formato esperado por calculateDrawdownHistory
     // dailyData tiene {date, return, value} pero la función espera {date, dailyReturn}
     const drawdownInputData = portfolioData.dailyData.map(d => ({
@@ -218,6 +228,16 @@ async function calculateRiskMetrics(userId, options = {}) {
       correlation: parseFloat(metrics.correlation.toFixed(2)),
       profitableWeeks: parseFloat(profitableWeeks.toFixed(0)),
       
+      // Métricas del benchmark (S&P 500) calculadas dinámicamente
+      benchmarkMetrics: {
+        name: 'S&P 500',
+        symbol: 'GSPC',
+        ...benchmarkMetrics
+      },
+      
+      // Tasa libre de riesgo usada (transparencia)
+      riskFreeRateUsed: parseFloat((riskFreeRate * 100).toFixed(2)),
+      
       drawdownHistory: drawdownHistory.map(d => ({
         date: d.date,
         drawdown: parseFloat(d.drawdownPercent.toFixed(2)),
@@ -240,6 +260,12 @@ async function calculateRiskMetrics(userId, options = {}) {
         accountsIncluded: portfolioData.metadata.accountsIncluded,
         accountsRequested: portfolioData.accountsRequested,
         accountsProcessed: portfolioData.accountsProcessed,
+        riskFreeRateSource,
+        benchmarkDataPoints: allMarketReturns.length,
+        betaCalculationInfo: {
+          alignedDays: commonDates.length,
+          isFallback: metrics.beta === 1 && commonDates.length < 10
+        },
         requestId,
         durationMs: Date.now() - startTime
       }
