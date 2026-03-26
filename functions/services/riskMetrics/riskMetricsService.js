@@ -47,7 +47,7 @@ function getPeriodStartDate(period) {
       startDate = new Date(now.getFullYear() - 2, now.getMonth(), now.getDate());
       break;
     case 'ALL':
-      startDate = new Date(2000, 0, 1);
+      startDate = new Date(now.getFullYear() - 5, now.getMonth(), now.getDate());
       break;
     default:
       startDate = new Date(now.getFullYear(), 0, 1);

@@ -264,6 +264,7 @@ function calculateAllMetrics(allPortfolioReturns, alignedPortfolioReturns, marke
       sortinoRatio: 0,
       beta: 1,
       volatility: 0,
+      annualizedReturn: 0,
       valueAtRisk95: 0,
       correlation: 0
     };
