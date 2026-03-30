@@ -83,6 +83,14 @@ service cloud.firestore {
       allow write: if false;
     }
     
+    // ---- MARKETS ----
+    // Lectura: Cualquier usuario autenticado (datos de estado de mercado)
+    // Escritura: SOLO backend (marketStatusService)
+    match /markets/{marketId} {
+      allow read: if isAuthenticated();
+      allow write: if false;
+    }
+    
     // ---- CURRENCIES ----
     // Lectura: Pública - requerido para registro de usuarios
     // Escritura: 🔒 RBAC-001 - Solo admins via Custom Claims
@@ -94,9 +102,16 @@ service cloud.firestore {
     }
     
     // ---- USER DATA ----
-    // Lectura/Escritura: Solo el propietario
+    // Lectura: Solo el propietario
+    // Create: Solo el propietario, sin campo 'subscription' (lo asigna admin SDK)
+    // Update: Solo el propietario, NO puede modificar campo 'subscription'
+    // GATE-006: Protección contra escalación de privilegios client-side
     match /userData/{userId} {
-      allow read, write: if isOwner(userId);
+      allow read: if isOwner(userId);
+      allow create: if isOwner(userId)
+        && !request.resource.data.keys().hasAny(['subscription']);
+      allow update: if isOwner(userId)
+        && !request.resource.data.diff(resource.data).affectedKeys().hasAny(['subscription']);
     }
     
     // ---- PORTFOLIO PERFORMANCE ----
@@ -191,9 +206,12 @@ service cloud.firestore {
     }
     
     // ---- ETF ANALYSES (Usuario puede guardar sus análisis) ----
+    // GATE-006: create requiere subscription.features.hasSimulators == true
     match /etfAnalyses/{analysisId} {
       allow read: if isAuthenticated();
-      allow create: if isAuthenticated();
+      allow create: if isAuthenticated()
+                    && get(/databases/$(database)/documents/userData/$(request.auth.uid))
+                        .data.subscription.features.hasSimulators == true;
       allow update, delete: if isOwner(resource.data.userId);
     }
     
@@ -262,6 +280,64 @@ service cloud.firestore {
           allow write: if false;
         }
       }
+    }
+
+    // ============================================================
+    // FEAT-ALERT: Sistema de Alertas de Precio
+    // @see docs/stories/ALERT-001.story.md
+    // ============================================================
+
+    // ---- PRICE ALERTS ----
+    // CRUD completo para el propietario con validaciones en create
+    // GATE-006: create requiere subscription.features.hasAlerts == true
+    match /priceAlerts/{alertId} {
+      allow read: if isAuthenticated() && isOwner(resource.data.userId);
+      allow create: if isAuthenticated()
+                    && request.resource.data.userId == request.auth.uid
+                    && request.resource.data.targetPrice is number
+                    && request.resource.data.targetPrice > 0
+                    && request.resource.data.condition in [">=" , "<=", "cross_above", "cross_below"]
+                    && get(/databases/$(database)/documents/userData/$(request.auth.uid))
+                        .data.subscription.features.hasAlerts == true;
+      allow update, delete: if isAuthenticated() && isOwner(resource.data.userId);
+    }
+
+    // ---- ALERT HISTORY ----
+    // Solo lectura para el propietario — escritura exclusiva de backend admin
+    match /alertHistory/{entryId} {
+      allow read: if isAuthenticated() && isOwner(resource.data.userId);
+      allow write: if false;
+    }
+
+    // ---- USER NOTIFICATIONS ----
+    // Lectura para el propietario — update solo campo isRead — escritura desde backend admin
+    match /userNotifications/{notifId} {
+      allow read: if isAuthenticated() && isOwner(resource.data.userId);
+      allow update: if isAuthenticated()
+                    && isOwner(resource.data.userId)
+                    && request.resource.data.diff(resource.data).affectedKeys().hasOnly(["isRead"]);
+      allow create, delete: if false;
+    }
+
+    // ---- USER WATCHLIST ----
+    // CRUD completo para el propietario
+    match /userWatchlist/{itemId} {
+      allow read, delete: if isAuthenticated() && isOwner(resource.data.userId);
+      allow create: if isAuthenticated()
+                    && request.resource.data.userId == request.auth.uid;
+      allow update: if isAuthenticated() && isOwner(resource.data.userId);
+    }
+
+    // ============================================================
+    // FEAT-BRIEFING: Briefings Diarios Personalizados
+    // @see docs/stories/BRIEF-001.story.md
+    // ============================================================
+
+    // ---- BRIEFING HISTORY ----
+    // Solo lectura para el propietario — escritura exclusiva de backend admin
+    match /briefingHistory/{entryId} {
+      allow read: if isAuthenticated() && isOwner(resource.data.userId);
+      allow write: if false;
     }
   }
 }

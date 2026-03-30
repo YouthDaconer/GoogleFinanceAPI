@@ -13,6 +13,9 @@ const { onCall, HttpsError } = require("firebase-functions/v2/https");
 const { defineSecret } = require("firebase-functions/params");
 const admin = require('../firebaseAdmin');
 
+// GATE-006: Validación de features por plan
+const { validateFeatureAccess } = require('../helpers/subscriptionValidator');
+
 const { resolveAssets, normalizeTicker } = require('./services/assetResolver');
 const { enrichTransactions } = require('./services/transactionEnricher');
 const { detectDuplicates } = require('./services/duplicateDetector');
@@ -93,6 +96,9 @@ const importTransactionBatch = onCall(FUNCTION_CONFIG, async (request) => {
   
   const userId = auth.uid;
   console.log(`[importTransactionBatch] User: ${userId}`);
+
+  // GATE-006: Validar acceso a import según plan
+  await validateFeatureAccess(userId, 'hasImport');
   
   // =========================================================================
   // PAYLOAD VALIDATION

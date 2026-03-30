@@ -13,6 +13,8 @@ const { getFirestore, FieldValue } = require("firebase-admin/firestore");
 
 // Importar invalidación de cache de distribución
 const { invalidateDistributionCache } = require('../portfolioDistributionService');
+// GATE-006: Validación de límites por plan de suscripción
+const { validateQuantityLimit } = require('../helpers/subscriptionValidator');
 
 const db = getFirestore();
 
@@ -38,6 +40,9 @@ async function addPortfolioAccount(context, payload) {
   if (!name || typeof name !== "string" || name.trim().length === 0) {
     throw new HttpsError("invalid-argument", "El nombre de la cuenta es requerido");
   }
+
+  // GATE-006: Validar límite de cuentas según plan
+  await validateQuantityLimit(userId, "maxAccounts", "portfolioAccounts", { isActive: true });
 
   try {
     const newAccount = {

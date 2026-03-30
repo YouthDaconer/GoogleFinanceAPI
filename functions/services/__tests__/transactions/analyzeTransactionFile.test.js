@@ -34,6 +34,12 @@ jest.mock('../../financeQuery', () => ({
   }),
 }));
 
+// GATE-006: Mock subscription validation (tests existentes deben seguir pasando)
+jest.mock('../../helpers/subscriptionValidator', () => ({
+  validateFeatureAccess: jest.fn().mockResolvedValue(undefined),
+  validateQuantityLimit: jest.fn().mockResolvedValue(undefined),
+}));
+
 const { analyzeTransactionFile } = require('../../transactions/analyzeTransactionFile');
 const { HttpsError } = require('firebase-functions/v2/https');
 
@@ -451,5 +457,43 @@ describe('Edge Cases', () => {
     expect(result.success).toBe(true);
     expect(result.missingRequiredFields.length).toBeGreaterThan(0);
     expect(result.overallConfidence).toBeLessThan(0.5);
+  });
+});
+
+// ============================================================================
+// GATE-006: Import Feature Gate Tests (AC-12, AC-21)
+// ============================================================================
+
+describe('GATE-006: Import Feature Gate', () => {
+  const { validateFeatureAccess } = require('../../helpers/subscriptionValidator');
+
+  afterEach(() => {
+    validateFeatureAccess.mockResolvedValue(undefined);
+  });
+
+  test('Free user es rechazado con permission-denied', async () => {
+    validateFeatureAccess.mockRejectedValue(
+      new HttpsError('permission-denied', 'Esta funcionalidad requiere un plan Pro activo.')
+    );
+
+    await expect(callFunction({
+      sampleData: GENERIC_SAMPLE,
+      fileName: 'test.xlsx',
+      hasHeader: true,
+    })).rejects.toMatchObject({ code: 'permission-denied' });
+
+    expect(validateFeatureAccess).toHaveBeenCalledWith('test-user-123', 'hasImport');
+  });
+
+  test('Pro user puede analizar archivo', async () => {
+    validateFeatureAccess.mockResolvedValue(undefined);
+
+    const result = await callFunction({
+      sampleData: GENERIC_SAMPLE,
+      fileName: 'test.xlsx',
+      hasHeader: true,
+    });
+
+    expect(result.success).toBe(true);
   });
 });

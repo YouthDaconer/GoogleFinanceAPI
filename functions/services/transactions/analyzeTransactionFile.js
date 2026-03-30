@@ -17,6 +17,9 @@
 const { onCall, HttpsError } = require("firebase-functions/v2/https");
 const { defineSecret } = require("firebase-functions/params");
 
+// GATE-006: Validación de features por plan
+const { validateFeatureAccess } = require('../helpers/subscriptionValidator');
+
 // Import services
 const { detectBrokerFormat, getBrokerMappings } = require('./services/brokerPatterns');
 const { detectColumnsGeneric, detectHasHeader } = require('./services/columnDetector');
@@ -91,6 +94,9 @@ const analyzeTransactionFile = onCall(
     
     const userId = auth.uid;
     console.log(`[analyzeTransactionFile] Start - userId: ${userId}, file: ${data?.fileName}`);
+
+    // GATE-006: Validar acceso a import según plan
+    await validateFeatureAccess(userId, 'hasImport');
     
     // ─────────────────────────────────────────────────────────────────────
     // 2. PAYLOAD VALIDATION (AC-003, AC-004)

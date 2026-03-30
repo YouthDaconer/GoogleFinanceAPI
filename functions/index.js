@@ -720,3 +720,16 @@ exports.analyzeTransactionFile = analyzeTransactionFile;
  * @see docs/architecture/FEAT-IMPORT-001-smart-transaction-import-design.md
  */
 exports.importTransactionBatch = importTransactionBatch;
+
+// ============================================================================
+// GATE-001: Mock Subscription Provider (Feature Gating)
+// ============================================================================
+
+/**
+ * Cloud Function Callable para cambiar plan de suscripción en desarrollo.
+ * Protegida por variable PAYMENT_MOCK_ENABLED — NO habilitar en producción.
+ *
+ * @see docs/architecture/FEAT-GATE-001-feature-gating-subscription-plans-design.md
+ */
+const { mockSetSubscription } = require("./services/payment/mockSubscriptionService");
+exports.mockSetSubscription = mockSetSubscription;

@@ -59,6 +59,12 @@ jest.mock('../../financeQuery', () => ({
   }),
 }));
 
+// GATE-006: Mock subscription validation
+jest.mock('../../helpers/subscriptionValidator', () => ({
+  validateFeatureAccess: jest.fn().mockResolvedValue(undefined),
+  validateQuantityLimit: jest.fn().mockResolvedValue(undefined),
+}));
+
 // Mock firebase-functions
 jest.mock('firebase-functions/v2/https', () => ({
   onCall: jest.fn((config, handler) => handler),
