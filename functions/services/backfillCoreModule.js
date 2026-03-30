@@ -772,6 +772,79 @@ function aggregateOverallPerformance(accountsPerformance, date) {
 }
 
 /**
+ * SCALE-003: Capture existing performance documents before overwriting
+ */
+async function capturePreBackfillSnapshot(userId, accounts, tradingDays) {
+  const firstDay = tradingDays[0];
+  const lastDay = tradingDays[tradingDays.length - 1];
+  let totalDocs = 0;
+
+  const accountsData = {};
+
+  for (const account of accounts) {
+    const snapshot = await db.collection('portfolioPerformance')
+      .doc(userId)
+      .collection('accounts').doc(account.id)
+      .collection('dates')
+      .where('date', '>=', firstDay)
+      .where('date', '<=', lastDay)
+      .get();
+
+    if (!snapshot.empty) {
+      accountsData[account.id] = {};
+      snapshot.docs.forEach(doc => {
+        accountsData[account.id][doc.id] = doc.data();
+        totalDocs++;
+      });
+    }
+  }
+
+  const overallSnapshot = await db.collection('portfolioPerformance')
+    .doc(userId)
+    .collection('dates')
+    .where('date', '>=', firstDay)
+    .where('date', '<=', lastDay)
+    .get();
+
+  const overallData = {};
+  if (!overallSnapshot.empty) {
+    overallSnapshot.docs.forEach(doc => {
+      overallData[doc.id] = doc.data();
+      totalDocs++;
+    });
+  }
+
+  if (totalDocs === 0) return null;
+
+  const AVG_DOC_SIZE_BYTES = 12 * 1024;
+  const estimatedSize = totalDocs * AVG_DOC_SIZE_BYTES;
+  if (estimatedSize > 800 * 1024) {
+    console.warn(`[backfillCore] Snapshot too large (~${(estimatedSize / 1024).toFixed(0)} KB for ${totalDocs} docs), saving OVERALL only`);
+    return {
+      userId,
+      tradingDays,
+      snapshotAt: new Date().toISOString(),
+      source: 'reconcileStalePerformance',
+      totalDocs: Object.keys(overallData).length,
+      truncated: true,
+      affectedAccounts: accounts.map(a => a.id),
+      accounts: {},
+      overall: overallData
+    };
+  }
+
+  return {
+    userId,
+    tradingDays,
+    snapshotAt: new Date().toISOString(),
+    source: 'reconcileStalePerformance',
+    totalDocs,
+    accounts: accountsData,
+    overall: overallData
+  };
+}
+
+/**
  * Recalculate performance for a user over a range of trading days
  * 
  * ATOMIC BACKFILL: Writes to both:
@@ -877,6 +950,23 @@ async function backfillUserPerformance(userId, tradingDays) {
       }
       
       console.log(`[backfillCore] Loaded baseline data for ${previousDayByAccount.size} accounts`);
+    }
+    
+    // SCALE-003: Capture snapshot before overwriting
+    try {
+      const snapshotData = await capturePreBackfillSnapshot(userId, accounts, tradingDays);
+      if (snapshotData) {
+        const snapshotId = `${userId}_${tradingDays[0]}`;
+        const ttlExpiry = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+        
+        await db.collection('_backfillSnapshots').doc(snapshotId).set({
+          ...snapshotData,
+          ttlExpiry
+        });
+        console.log(`[backfillCore] Snapshot saved: _backfillSnapshots/${snapshotId} (${snapshotData.totalDocs} docs)`);
+      }
+    } catch (snapshotError) {
+      console.warn(`[backfillCore] Could not save pre-backfill snapshot: ${snapshotError.message}`);
     }
     
     for (const date of tradingDays) {
@@ -1003,6 +1093,9 @@ module.exports = {
   // Performance calculation helpers
   calculateAccountDayPerformance,
   aggregateOverallPerformance,
+  
+  // Snapshot (SCALE-003)
+  capturePreBackfillSnapshot,
   
   // Main backfill
   backfillUserPerformance,

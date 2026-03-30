@@ -257,6 +257,40 @@ describe('periodConsolidation', () => {
       expect(result.USD.endFactor).toBeCloseTo(1.0201, 3);
       expect(result.COP.endFactor).toBeCloseTo(1.01002, 3);
     });
+    
+    // SCALE-002: Tests para _meta checkpointing
+    it('should include _meta with status success', () => {
+      const dailyDocs = generateDailyDocs('2025-12', 20, { dailyChangePercent: 0.5 });
+      
+      const result = consolidatePeriod(dailyDocs, '2025-12', 'month');
+      
+      expect(result._meta).toBeDefined();
+      expect(result._meta.status).toBe('success');
+      expect(result._meta.docsSourceCount).toBe(20);
+      expect(result._meta.schemaVersion).toBe(CONSOLIDATED_SCHEMA_VERSION);
+      expect(result._meta.consolidatedAt).toBeDefined();
+    });
+    
+    it('should preserve existing fields unchanged when _meta is added', () => {
+      const dailyDocs = generateDailyDocs('2025-12', 20, { dailyChangePercent: 0.5 });
+      
+      const result = consolidatePeriod(dailyDocs, '2025-12', 'month');
+      
+      // AC-10: campos existentes no cambian
+      expect(result.periodType).toBe('month');
+      expect(result.periodKey).toBe('2025-12');
+      expect(result.docsCount).toBe(20);
+      expect(result.version).toBe(CONSOLIDATED_SCHEMA_VERSION);
+      expect(result.startDate).toBeDefined();
+      expect(result.endDate).toBeDefined();
+      expect(result.lastUpdated).toBeDefined();
+      
+      // AC-11: campos de moneda no cambian
+      expect(result.USD).toBeDefined();
+      expect(result.USD.startFactor).toBeDefined();
+      expect(result.USD.endFactor).toBeDefined();
+      expect(result.USD.periodReturn).toBeDefined();
+    });
   });
   
   describe('extractCurrenciesFromDocs', () => {
@@ -281,6 +315,21 @@ describe('periodConsolidation', () => {
       const currencies = extractCurrenciesFromDocs(docs);
       
       expect(currencies.has('date')).toBe(false);
+    });
+    
+    // SCALE-002: _meta must not be extracted as currency
+    it('should not extract _meta as currency', () => {
+      const docs = [{
+        date: '2025-01-01',
+        USD: { totalValue: 100 },
+        _meta: { status: 'success', docsSourceCount: 20, schemaVersion: 1 }
+      }];
+      
+      const currencies = extractCurrenciesFromDocs(docs);
+      
+      expect(currencies.has('_meta')).toBe(false);
+      expect(currencies.has('USD')).toBe(true);
+      expect(currencies.size).toBe(1);
     });
   });
   

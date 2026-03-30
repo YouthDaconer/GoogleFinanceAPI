@@ -34,6 +34,8 @@
  */
 
 const admin = require('firebase-admin');
+const fs = require('fs');
+const path = require('path');
 // Usar fetch nativo de Node.js 18+ (node-fetch ya no es necesario)
 // const fetch = require('node-fetch');
 
@@ -368,6 +370,26 @@ async function getExistingPerformance(userId, accountId, startDate, endDate) {
   });
   
   return existing;
+}
+
+/**
+ * SCALE-003: Lee documentos existentes de performance con path completo para snapshot pre-backfill
+ */
+async function getExistingPerformanceDocs(userId, accountId, startDate, endDate) {
+  const collectionPath = accountId
+    ? `portfolioPerformance/${userId}/accounts/${accountId}/dates`
+    : `portfolioPerformance/${userId}/dates`;
+
+  const snapshot = await db.collection(collectionPath)
+    .where('date', '>=', startDate)
+    .where('date', '<=', endDate)
+    .orderBy('date', 'asc')
+    .get();
+
+  return snapshot.docs.map(doc => ({
+    path: doc.ref.path,
+    data: doc.data()
+  }));
 }
 
 /**
@@ -1193,6 +1215,56 @@ async function main() {
     daysSkipped: 0,
     errors: [],
   };
+
+  // SCALE-003: Guardar snapshot pre-backfill antes de cualquier escritura
+  if (options.mode === 'fix') {
+    log('PROGRESS', 'Guardando snapshot pre-backfill...');
+    try {
+      const snapshotDocs = [];
+
+      for (const account of targetAccounts) {
+        const existing = await getExistingPerformanceDocs(
+          options.userId, account.id, options.startDate, options.endDate
+        );
+        snapshotDocs.push(...existing);
+      }
+
+      const existingOverall = await getExistingPerformanceDocs(
+        options.userId, null, options.startDate, options.endDate
+      );
+      snapshotDocs.push(...existingOverall);
+
+      if (snapshotDocs.length > 0) {
+        const backupsDir = path.join(__dirname, 'backups');
+        if (!fs.existsSync(backupsDir)) {
+          fs.mkdirSync(backupsDir, { recursive: true });
+        }
+
+        const snapshotPath = path.join(
+          backupsDir,
+          `backfill-${options.userId}-${Date.now()}.json`
+        );
+
+        const snapshot = {
+          userId: options.userId,
+          startDate: options.startDate,
+          endDate: options.endDate,
+          timestamp: new Date().toISOString(),
+          documentsCount: snapshotDocs.length,
+          documents: snapshotDocs
+        };
+
+        fs.writeFileSync(snapshotPath, JSON.stringify(snapshot, null, 2));
+        log('SUCCESS', `Snapshot guardado: ${snapshotPath} (${snapshotDocs.length} docs)`);
+      } else {
+        log('INFO', 'No hay documentos existentes que respaldar (rango vacío)');
+      }
+    } catch (snapshotError) {
+      log('ERROR', `Error guardando snapshot pre-backfill: ${snapshotError.message}`);
+      log('ERROR', 'Abortando backfill — no se escribirá sin red de seguridad');
+      process.exit(1);
+    }
+  }
   
   for (const account of targetAccounts) {
     console.log('');

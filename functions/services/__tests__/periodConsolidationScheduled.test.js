@@ -410,4 +410,134 @@ describe('edge cases', () => {
       expect(result.USD.periodReturn).toBeLessThan(0);
     });
   });
+  
+  // ============================================================================
+  // SCALE-002: Tests para _meta checkpointing en consolidateMonthsToYear
+  // ============================================================================
+  
+  describe('consolidateMonthsToYear _meta checkpointing', () => {
+    
+    it('should include _meta.status success when all 12 months present', () => {
+      const monthlyDocs = generateMonthlyConsolidatedDocs('2025', 12);
+      
+      const result = consolidateMonthsToYear(monthlyDocs, '2025');
+      
+      expect(result._meta).toBeDefined();
+      expect(result._meta.status).toBe('success');
+      expect(result._meta.monthsExpected).toBe(12);
+      expect(result._meta.monthsFound).toBe(12);
+      expect(result._meta.missingMonths).toEqual([]);
+      expect(result._meta.schemaVersion).toBe(1);
+      expect(result._meta.consolidatedAt).toBeDefined();
+    });
+    
+    it('should include _meta.status partial when months missing', () => {
+      const monthlyDocs = generateMonthlyConsolidatedDocs('2025', 10); // solo ene-oct
+      
+      const result = consolidateMonthsToYear(monthlyDocs, '2025');
+      
+      expect(result._meta.status).toBe('partial');
+      expect(result._meta.monthsExpected).toBe(12);
+      expect(result._meta.monthsFound).toBe(10);
+      expect(result._meta.missingMonths).toEqual(['2025-11', '2025-12']);
+    });
+    
+    it('should respect firstMonthWithData for mid-year start', () => {
+      // Usuario que inició en julio: meses 7-12 presentes
+      const monthlyDocs = [];
+      for (let month = 7; month <= 12; month++) {
+        const monthStr = month.toString().padStart(2, '0');
+        monthlyDocs.push({
+          data: () => ({
+            periodType: 'month',
+            periodKey: `2025-${monthStr}`,
+            startDate: `2025-${monthStr}-01`,
+            endDate: `2025-${monthStr}-28`,
+            docsCount: 20,
+            USD: { startFactor: 1, endFactor: 1.02, startTotalValue: 10000, endTotalValue: 10200, totalCashFlow: 0 }
+          })
+        });
+      }
+      
+      const result = consolidateMonthsToYear(monthlyDocs, '2025', { firstMonthWithData: 7 });
+      
+      expect(result._meta.status).toBe('success');
+      expect(result._meta.monthsExpected).toBe(6); // jul-dic = 6
+      expect(result._meta.monthsFound).toBe(6);
+      expect(result._meta.missingMonths).toEqual([]);
+    });
+    
+    it('should detect gaps for mid-year start', () => {
+      // Usuario inició en julio, falta agosto
+      const months = [7, 9, 10, 11, 12]; // falta 8
+      const monthlyDocs = months.map(month => {
+        const monthStr = month.toString().padStart(2, '0');
+        return {
+          data: () => ({
+            periodType: 'month',
+            periodKey: `2025-${monthStr}`,
+            startDate: `2025-${monthStr}-01`,
+            endDate: `2025-${monthStr}-28`,
+            docsCount: 20,
+            USD: { startFactor: 1, endFactor: 1.01, startTotalValue: 10000, endTotalValue: 10100, totalCashFlow: 0 }
+          })
+        };
+      });
+      
+      const result = consolidateMonthsToYear(monthlyDocs, '2025', { firstMonthWithData: 7 });
+      
+      expect(result._meta.status).toBe('partial');
+      expect(result._meta.monthsExpected).toBe(6);
+      expect(result._meta.monthsFound).toBe(5);
+      expect(result._meta.missingMonths).toEqual(['2025-08']);
+    });
+    
+    it('should preserve currency fields unchanged when _meta is added', () => {
+      const monthlyDocs = [
+        {
+          data: () => ({
+            periodType: 'month',
+            periodKey: '2025-01',
+            startDate: '2025-01-01',
+            endDate: '2025-01-31',
+            docsCount: 20,
+            USD: { startFactor: 1, endFactor: 1.05, startTotalValue: 10000, endTotalValue: 10500, totalCashFlow: 0 }
+          })
+        },
+        {
+          data: () => ({
+            periodType: 'month',
+            periodKey: '2025-02',
+            startDate: '2025-02-01',
+            endDate: '2025-02-28',
+            docsCount: 19,
+            USD: { startFactor: 1, endFactor: 1.03, startTotalValue: 10500, endTotalValue: 10815, totalCashFlow: 0 }
+          })
+        }
+      ];
+      
+      const result = consolidateMonthsToYear(monthlyDocs, '2025');
+      
+      // Currency fields unchanged
+      const expectedFactor = 1.05 * 1.03;
+      expect(result.USD.endFactor).toBeCloseTo(expectedFactor, 4);
+      expect(result.USD.periodReturn).toBeCloseTo((expectedFactor - 1) * 100, 2);
+      expect(result.periodType).toBe('year');
+      expect(result.periodKey).toBe('2025');
+      expect(result.version).toBe(1);
+    });
+    
+    it('should not include _meta as a currency when iterating keys', () => {
+      const monthlyDocs = generateMonthlyConsolidatedDocs('2025', 3);
+      
+      const result = consolidateMonthsToYear(monthlyDocs, '2025');
+      
+      // _meta should exist as metadata, not as currency data
+      expect(result._meta).toBeDefined();
+      expect(result._meta.status).toBeDefined();
+      // _meta should NOT have currency-like fields
+      expect(result._meta.startFactor).toBeUndefined();
+      expect(result._meta.endFactor).toBeUndefined();
+    });
+  });
 });

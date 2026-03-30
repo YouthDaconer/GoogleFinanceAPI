@@ -2,3 +2,4 @@ node_modules/
 *.local
 key.json
 .cache/
+scripts/diagnostics/gold/backups/

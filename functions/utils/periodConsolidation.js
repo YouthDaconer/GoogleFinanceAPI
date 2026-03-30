@@ -37,7 +37,7 @@ const CONSOLIDATED_SCHEMA_VERSION = 1;
  */
 const NON_CURRENCY_FIELDS = [
   'periodType', 'periodKey', 'startDate', 'endDate', 
-  'docsCount', 'version', 'lastUpdated'
+  'docsCount', 'version', 'lastUpdated', '_meta'
 ];
 
 /**
@@ -97,7 +97,14 @@ function consolidatePeriod(dailyDocs, periodKey, periodType) {
     endDate: lastData.date,
     docsCount: sortedDocs.length,
     version: CONSOLIDATED_SCHEMA_VERSION,
-    lastUpdated: new Date().toISOString()
+    lastUpdated: new Date().toISOString(),
+    // SCALE-002: Checkpointing metadata
+    _meta: {
+      status: 'success',
+      docsSourceCount: sortedDocs.length,
+      consolidatedAt: new Date().toISOString(),
+      schemaVersion: CONSOLIDATED_SCHEMA_VERSION
+    }
   };
   
   // Procesar cada moneda

@@ -25,7 +25,7 @@ const LIMITS = {
   MAX_USERS_PER_RUN: 20,
   
   /** Maximum trading days to recalculate per user */
-  MAX_TRADING_DAYS: 30,
+  MAX_TRADING_DAYS: 60,
   
   /** Maximum retry attempts before skipping user */
   MAX_RETRY_COUNT: 3,
