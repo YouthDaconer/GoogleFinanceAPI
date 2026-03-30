@@ -6,9 +6,19 @@ const { calculateAccountPerformance, convertCurrency } = require('../utils/portf
 const { calculatePortfolioRisk } = require('./calculatePortfolioRisk');
 const { invalidatePerformanceCacheBatch } = require('./cacheInvalidationService');
 const { DateTime } = require('luxon');
+const pLimit = require("p-limit");
 
 // Importar generador de logos
 const { generateLogoUrl } = require('../utils/logoGenerator');
+
+/**
+ * SCALE-001: Máximo de usuarios procesados en paralelo.
+ * Calibrado para no exceder throughput de Firestore (~500 writes/sec).
+ * 5 usuarios × ~8 writes/usuario = ~40 writes simultáneos.
+ *
+ * @see docs/architecture/SCALE-PERF-001-consolidation-sustainability-diagnosis.md §6.1
+ */
+const MAX_PARALLEL_USERS = 5;
 
 /**
  * SEC-TOKEN-001: Secret para autenticación server-to-server con API finance-query
@@ -504,6 +514,316 @@ class PerformanceDataCache {
 }
 
 /**
+ * SCALE-001: Procesa el rendimiento de un solo usuario.
+ * Aislado para paralelización. Atómico por WriteBatch local.
+ *
+ * @param {Object} params
+ * @param {FirebaseFirestore.Firestore} params.db
+ * @param {string} params.userId
+ * @param {Array} params.accounts - Cuentas activas del usuario
+ * @param {Array} params.currentPrices
+ * @param {Array} params.currencies
+ * @param {PerformanceDataCache} params.cache
+ * @param {Array} params.allAssets
+ * @param {Array} params.assetsToInclude
+ * @param {Array} params.sellTransactions
+ * @param {Object} params.sellTransactionsByAccount
+ * @param {Array} params.inactiveAssets
+ * @param {Array} params.activeAssets
+ * @param {Array} params.todaysTransactions
+ * @param {string} params.formattedDate
+ * @returns {Promise<{userId: string, success: boolean, error?: string}>}
+ * @see docs/architecture/SCALE-PERF-001-consolidation-sustainability-diagnosis.md §6.1
+ */
+async function processUserPerformance({
+  db, userId, accounts, currentPrices, currencies,
+  cache, allAssets, assetsToInclude, sellTransactions,
+  sellTransactionsByAccount, inactiveAssets, activeAssets,
+  todaysTransactions, formattedDate
+}) {
+  const startMs = Date.now();
+  try {
+    logDebug(`👤 Procesando usuario ${userId} con ${accounts.length} cuentas`);
+    const lastOverallTotalValue = cache.getUserLastPerformance(userId, currencies);
+
+    const allUserAssets = assetsToInclude.filter(asset =>
+      accounts.some(account => account.id === asset.portfolioAccount)
+    );
+
+    const userTransactions = todaysTransactions.filter(t =>
+      accounts.some(account => account.id === t.portfolioAccountId)
+    );
+
+    const overallPerformance = calculateAccountPerformance(
+      allUserAssets,
+      currentPrices,
+      currencies,
+      lastOverallTotalValue,
+      userTransactions
+    );
+
+    // Calcular doneProfitAndLoss para cada moneda
+    const userDoneProfitAndLossByCurrency = {};
+    const userSellTransactions = sellTransactions.filter(t =>
+      accounts.some(account => account.id === t.portfolioAccountId)
+    );
+
+    for (const currency of currencies) {
+      let totalDoneProfitAndLoss = 0;
+      const assetDoneProfitAndLoss = {};
+
+      userSellTransactions.forEach(sellTx => {
+        if (sellTx.assetId) {
+          const asset = allAssets.find(a => a.id === sellTx.assetId);
+          if (asset) {
+            const assetKey = `${asset.name}_${asset.assetType}`;
+            if (!assetDoneProfitAndLoss[assetKey]) {
+              assetDoneProfitAndLoss[assetKey] = 0;
+            }
+
+            let profitAndLoss = 0;
+
+            if (sellTx.valuePnL !== undefined && sellTx.valuePnL !== null) {
+              profitAndLoss = convertCurrency(
+                sellTx.valuePnL,
+                sellTx.currency,
+                currency.code,
+                currencies,
+                sellTx.defaultCurrencyForAdquisitionDollar,
+                parseFloat(sellTx.dollarPriceToDate.toString())
+              );
+            } else {
+              const sellAmountConverted = convertCurrency(
+                sellTx.amount * sellTx.price,
+                sellTx.currency,
+                currency.code,
+                currencies,
+                sellTx.defaultCurrencyForAdquisitionDollar,
+                parseFloat(sellTx.dollarPriceToDate.toString())
+              );
+
+              const buyTxsForAsset = cache.getBuyTransactionsForAsset(sellTx.assetId);
+
+              if (buyTxsForAsset.length > 0) {
+                let totalBuyCost = 0;
+                let totalBuyUnits = 0;
+
+                buyTxsForAsset.forEach(buyTx => {
+                  totalBuyCost += buyTx.amount * buyTx.price;
+                  totalBuyUnits += buyTx.amount;
+                });
+
+                const avgCostPerUnit = totalBuyCost / totalBuyUnits;
+                const costOfSoldUnits = sellTx.amount * avgCostPerUnit;
+
+                const costOfSoldUnitsConverted = convertCurrency(
+                  costOfSoldUnits,
+                  sellTx.currency,
+                  currency.code,
+                  currencies,
+                  sellTx.defaultCurrencyForAdquisitionDollar,
+                  parseFloat(sellTx.dollarPriceToDate.toString())
+                );
+
+                profitAndLoss = sellAmountConverted - costOfSoldUnitsConverted;
+              }
+            }
+
+            assetDoneProfitAndLoss[assetKey] += profitAndLoss;
+            totalDoneProfitAndLoss += profitAndLoss;
+          }
+        }
+      });
+
+      userDoneProfitAndLossByCurrency[currency.code] = {
+        doneProfitAndLoss: totalDoneProfitAndLoss,
+        assetDoneProfitAndLoss
+      };
+    }
+
+    // Agregar doneProfitAndLoss a overallPerformance
+    for (const [currencyCode, data] of Object.entries(userDoneProfitAndLossByCurrency)) {
+      if (overallPerformance[currencyCode]) {
+        overallPerformance[currencyCode].doneProfitAndLoss = data.doneProfitAndLoss;
+
+        const unrealizedProfitAndLoss = overallPerformance[currencyCode].totalValue - overallPerformance[currencyCode].totalInvestment;
+        overallPerformance[currencyCode].unrealizedProfitAndLoss = unrealizedProfitAndLoss;
+
+        if (overallPerformance[currencyCode].assetPerformance) {
+          for (const [assetKey, pnl] of Object.entries(data.assetDoneProfitAndLoss)) {
+            if (overallPerformance[currencyCode].assetPerformance[assetKey]) {
+              overallPerformance[currencyCode].assetPerformance[assetKey].doneProfitAndLoss = pnl;
+            }
+          }
+
+          for (const [assetKey, assetData] of Object.entries(overallPerformance[currencyCode].assetPerformance)) {
+            const assetTotalValue = assetData.totalValue || 0;
+            const assetTotalInvestment = assetData.totalInvestment || 0;
+            const assetUnrealizedPnL = assetTotalValue - assetTotalInvestment;
+
+            overallPerformance[currencyCode].assetPerformance[assetKey].unrealizedProfitAndLoss = assetUnrealizedPnL;
+          }
+        }
+      }
+    }
+
+    // SCALE-001: WriteBatch local — atómico por usuario
+    const batch = db.batch();
+
+    const userPerformanceRef = db.collection("portfolioPerformance").doc(userId);
+    batch.set(userPerformanceRef, { userId }, { merge: true });
+
+    const userOverallPerformanceRef = userPerformanceRef.collection("dates").doc(formattedDate);
+    batch.set(userOverallPerformanceRef, {
+      date: formattedDate,
+      ...overallPerformance
+    });
+
+    // Procesar cada cuenta del usuario
+    for (const account of accounts) {
+      const accountSellTransactions = sellTransactionsByAccount[account.id] || [];
+      const inactiveAccountAssetsWithSells = inactiveAssets.filter(asset =>
+        asset.portfolioAccount === account.id &&
+        accountSellTransactions.some(t => t.assetId === asset.id)
+      );
+
+      const accountAssets = [
+        ...activeAssets.filter(asset => asset.portfolioAccount === account.id),
+        ...inactiveAccountAssetsWithSells
+      ];
+
+      const lastAccountTotalValue = cache.getAccountLastPerformance(account.id, currencies);
+
+      const accountTransactions = userTransactions.filter(t => t.portfolioAccountId === account.id);
+      const accountPerformance = calculateAccountPerformance(
+        accountAssets,
+        currentPrices,
+        currencies,
+        lastAccountTotalValue,
+        accountTransactions
+      );
+
+      // Calcular doneProfitAndLoss para la cuenta
+      const accountDoneProfitAndLossByCurrency = {};
+
+      for (const currency of currencies) {
+        let accountDoneProfitAndLoss = 0;
+        const accountAssetDoneProfitAndLoss = {};
+
+        accountSellTransactions.forEach(sellTx => {
+          if (sellTx.assetId) {
+            const asset = allAssets.find(a => a.id === sellTx.assetId);
+            if (asset) {
+              const assetKey = `${asset.name}_${asset.assetType}`;
+              if (!accountAssetDoneProfitAndLoss[assetKey]) {
+                accountAssetDoneProfitAndLoss[assetKey] = 0;
+              }
+
+              let profitAndLoss = 0;
+
+              if (sellTx.valuePnL !== undefined && sellTx.valuePnL !== null) {
+                profitAndLoss = convertCurrency(
+                  sellTx.valuePnL,
+                  sellTx.currency,
+                  currency.code,
+                  currencies,
+                  sellTx.defaultCurrencyForAdquisitionDollar,
+                  parseFloat(sellTx.dollarPriceToDate.toString())
+                );
+              } else {
+                const sellAmountConverted = convertCurrency(
+                  sellTx.amount * sellTx.price,
+                  sellTx.currency,
+                  currency.code,
+                  currencies,
+                  sellTx.defaultCurrencyForAdquisitionDollar,
+                  parseFloat(sellTx.dollarPriceToDate.toString())
+                );
+
+                const buyTxsForAsset = cache.getBuyTransactionsForAsset(sellTx.assetId);
+
+                if (buyTxsForAsset.length > 0) {
+                  let totalBuyCost = 0;
+                  let totalBuyUnits = 0;
+
+                  buyTxsForAsset.forEach(buyTx => {
+                    totalBuyCost += buyTx.amount * buyTx.price;
+                    totalBuyUnits += buyTx.amount;
+                  });
+
+                  const avgCostPerUnit = totalBuyCost / totalBuyUnits;
+                  const costOfSoldUnits = sellTx.amount * avgCostPerUnit;
+
+                  const costOfSoldUnitsConverted = convertCurrency(
+                    costOfSoldUnits,
+                    sellTx.currency,
+                    currency.code,
+                    currencies,
+                    sellTx.defaultCurrencyForAdquisitionDollar,
+                    parseFloat(sellTx.dollarPriceToDate.toString())
+                  );
+
+                  profitAndLoss = sellAmountConverted - costOfSoldUnitsConverted;
+                }
+              }
+
+              accountAssetDoneProfitAndLoss[assetKey] += profitAndLoss;
+              accountDoneProfitAndLoss += profitAndLoss;
+            }
+          }
+        });
+
+        accountDoneProfitAndLossByCurrency[currency.code] = {
+          doneProfitAndLoss: accountDoneProfitAndLoss,
+          assetDoneProfitAndLoss: accountAssetDoneProfitAndLoss
+        };
+      }
+
+      // Agregar doneProfitAndLoss a accountPerformance
+      for (const [currencyCode, data] of Object.entries(accountDoneProfitAndLossByCurrency)) {
+        if (accountPerformance[currencyCode]) {
+          accountPerformance[currencyCode].doneProfitAndLoss = data.doneProfitAndLoss;
+
+          const accountUnrealizedPnL = accountPerformance[currencyCode].totalValue - accountPerformance[currencyCode].totalInvestment;
+          accountPerformance[currencyCode].unrealizedProfitAndLoss = accountUnrealizedPnL;
+
+          if (accountPerformance[currencyCode].assetPerformance) {
+            for (const [assetKey, pnl] of Object.entries(data.assetDoneProfitAndLoss)) {
+              if (accountPerformance[currencyCode].assetPerformance[assetKey]) {
+                accountPerformance[currencyCode].assetPerformance[assetKey].doneProfitAndLoss = pnl;
+              }
+            }
+
+            for (const [assetKey, assetData] of Object.entries(accountPerformance[currencyCode].assetPerformance)) {
+              const accountAssetTotalValue = assetData.totalValue || 0;
+              const accountAssetTotalInvestment = assetData.totalInvestment || 0;
+              const accountAssetUnrealizedPnL = accountAssetTotalValue - accountAssetTotalInvestment;
+
+              accountPerformance[currencyCode].assetPerformance[assetKey].unrealizedProfitAndLoss = accountAssetUnrealizedPnL;
+            }
+          }
+        }
+      }
+
+      const accountRef = userPerformanceRef.collection("accounts").doc(account.id);
+      batch.set(accountRef, { accountId: account.id }, { merge: true });
+
+      const accountPerformanceRef = accountRef.collection("dates").doc(formattedDate);
+      batch.set(accountPerformanceRef, {
+        date: formattedDate,
+        ...accountPerformance
+      });
+    }
+
+    await batch.commit();
+    return { userId, success: true, durationMs: Date.now() - startMs };
+  } catch (error) {
+    logError(`Error procesando usuario ${userId} (${Date.now() - startMs}ms)`, error);
+    return { userId, success: false, error: error.message, durationMs: Date.now() - startMs };
+  }
+}
+
+/**
  * OPT-DEMAND-CLEANUP: Calcula el rendimiento diario del portafolio.
  * 
  * Modificada para recibir precios y currencies como parámetros
@@ -526,8 +846,6 @@ async function calculateDailyPortfolioPerformance(db, currentPrices, currencies)
   // FIX-TIMESTAMP-002: Rango de fechas para soportar campo date con timestamp completo
   const dateRangeStart = `${formattedDate}T00:00:00.000Z`;
   const dateRangeEnd = `${formattedDate}T23:59:59.999Z`;
-  
-  let calculationsCount = 0;
   
   logDebug(`📅 Fecha de cálculo (día anterior): ${formattedDate}`);
   logDebug(`📅 Hora actual de ejecución (NY): ${now.toISO()}`);
@@ -630,324 +948,67 @@ async function calculateDailyPortfolioPerformance(db, currentPrices, currencies)
     // TODO: En futuras versiones, considerar auto-reparación o skip de usuarios inconsistentes
   }
 
-  // ✨ OPTIMIZACIÓN: Batch único para todas las operaciones
-  const BATCH_SIZE = 450;
-  let batch = db.batch();
-  let batchCount = 0;
-  let totalBatchesCommitted = 0;
+  const perfStartMs = Date.now();
 
-  // 🚀 OPTIMIZACIÓN: Log consolidado de procesamiento
+  // 🚀 SCALE-001: Log consolidado de procesamiento
   const userCount = Object.keys(userPortfolios).length;
   const totalAccounts = Object.values(userPortfolios).flat().length;
-  logInfo(`👥 Procesando ${userCount} usuarios con ${totalAccounts} cuentas activas`);
-  
-  for (const [userId, accounts] of Object.entries(userPortfolios)) {
-    logDebug(`👤 Procesando usuario ${userId} con ${accounts.length} cuentas`);
-    // ✨ OPTIMIZACIÓN: Usar datos del caché en lugar de consultas individuales
-    const lastOverallTotalValue = cache.getUserLastPerformance(userId, currencies);
+  logInfo(`👥 Procesando ${userCount} usuarios con ${totalAccounts} cuentas activas (paralelo, max ${MAX_PARALLEL_USERS})`);
 
-    const allUserAssets = assetsToInclude.filter(asset => 
-      accounts.some(account => account.id === asset.portfolioAccount)
-    );
-    
-    const userTransactions = todaysTransactions.filter(t => 
-      accounts.some(account => account.id === t.portfolioAccountId)
-    );
+  // SCALE-001: Procesar usuarios en paralelo controlado
+  const limit = pLimit(MAX_PARALLEL_USERS);
+  const results = await Promise.allSettled(
+    Object.entries(userPortfolios).map(([userId, accounts]) =>
+      limit(() => processUserPerformance({
+        db, userId, accounts, currentPrices, currencies,
+        cache, allAssets, assetsToInclude, sellTransactions,
+        sellTransactionsByAccount, inactiveAssets, activeAssets,
+        todaysTransactions, formattedDate
+      }))
+    )
+  );
 
-    const overallPerformance = calculateAccountPerformance(
-      allUserAssets,
-      currentPrices,
-      currencies,
-      lastOverallTotalValue,
-      userTransactions
-    );
-
-    // Calcular doneProfitAndLoss para cada moneda
-    const userDoneProfitAndLossByCurrency = {};
-    const userSellTransactions = sellTransactions.filter(t => 
-      accounts.some(account => account.id === t.portfolioAccountId)
-    );
-    
-    for (const currency of currencies) {
-      let totalDoneProfitAndLoss = 0;
-      const assetDoneProfitAndLoss = {};
-      
-      userSellTransactions.forEach(sellTx => {
-        if (sellTx.assetId) {
-          const asset = allAssets.find(a => a.id === sellTx.assetId);
-          if (asset) {
-            const assetKey = `${asset.name}_${asset.assetType}`;
-            if (!assetDoneProfitAndLoss[assetKey]) {
-              assetDoneProfitAndLoss[assetKey] = 0;
-            }
-            
-            let profitAndLoss = 0;
-            
-            // ✨ OPTIMIZACIÓN: Usar valuePnL si está disponible
-            if (sellTx.valuePnL !== undefined && sellTx.valuePnL !== null) {
-              // Usar PnL precalculada y convertir a moneda objetivo
-              profitAndLoss = convertCurrency(
-                sellTx.valuePnL,
-                sellTx.currency,
-                currency.code,
-                currencies,
-                sellTx.defaultCurrencyForAdquisitionDollar,
-                parseFloat(sellTx.dollarPriceToDate.toString())
-              );
-            } else {
-              // Fallback: calcular PnL manualmente (método anterior)
-              const sellAmountConverted = convertCurrency(
-                sellTx.amount * sellTx.price,
-                sellTx.currency,
-                currency.code,
-                currencies,
-                sellTx.defaultCurrencyForAdquisitionDollar,
-                parseFloat(sellTx.dollarPriceToDate.toString())
-              );
-              
-              const buyTxsForAsset = cache.getBuyTransactionsForAsset(sellTx.assetId);
-              
-              if (buyTxsForAsset.length > 0) {
-                let totalBuyCost = 0;
-                let totalBuyUnits = 0;
-                
-                buyTxsForAsset.forEach(buyTx => {
-                  totalBuyCost += buyTx.amount * buyTx.price;
-                  totalBuyUnits += buyTx.amount;
-                });
-                
-                const avgCostPerUnit = totalBuyCost / totalBuyUnits;
-                const costOfSoldUnits = sellTx.amount * avgCostPerUnit;
-                
-                const costOfSoldUnitsConverted = convertCurrency(
-                  costOfSoldUnits,
-                  sellTx.currency,
-                  currency.code,
-                  currencies,
-                  sellTx.defaultCurrencyForAdquisitionDollar,
-                  parseFloat(sellTx.dollarPriceToDate.toString())
-                );
-                
-                profitAndLoss = sellAmountConverted - costOfSoldUnitsConverted;
-              }
-            }
-            
-            assetDoneProfitAndLoss[assetKey] += profitAndLoss;
-            totalDoneProfitAndLoss += profitAndLoss;
-          }
-        }
-      });
-      
-      userDoneProfitAndLossByCurrency[currency.code] = { 
-        doneProfitAndLoss: totalDoneProfitAndLoss,
-        assetDoneProfitAndLoss
-      };
+  // SCALE-001: Agregar resultados
+  const successResults = results.filter(r => r.status === "fulfilled" && r.value.success);
+  const failedResults = results.filter(r => r.status === "rejected" || (r.status === "fulfilled" && !r.value.success));
+  const successUserIds = successResults.map(r => r.value.userId);
+  const failedUserIds = failedResults.map(r => {
+    if (r.status === "rejected") {
+      logWarn("SCALE-001: Promise rejected inesperadamente", r.reason);
+      return null;
     }
+    return r.value.userId;
+  }).filter(Boolean);
 
-    // Agregar doneProfitAndLoss a overallPerformance
-    for (const [currencyCode, data] of Object.entries(userDoneProfitAndLossByCurrency)) {
-      if (overallPerformance[currencyCode]) {
-        overallPerformance[currencyCode].doneProfitAndLoss = data.doneProfitAndLoss;
-        
-        const unrealizedProfitAndLoss = overallPerformance[currencyCode].totalValue - overallPerformance[currencyCode].totalInvestment;
-        overallPerformance[currencyCode].unrealizedProfitAndLoss = unrealizedProfitAndLoss;
-        
-        if (overallPerformance[currencyCode].assetPerformance) {
-          for (const [assetKey, pnl] of Object.entries(data.assetDoneProfitAndLoss)) {
-            if (overallPerformance[currencyCode].assetPerformance[assetKey]) {
-              overallPerformance[currencyCode].assetPerformance[assetKey].doneProfitAndLoss = pnl;
-            }
+  // SCALE-001: Marcar usuarios fallidos como _stale para reconciliación automática
+  if (failedUserIds.length > 0) {
+    logWarn(`⚠️ SCALE-001: ${failedUserIds.length} usuarios fallaron, marcando como _stale`);
+    for (const failedUserId of failedUserIds) {
+      try {
+        await db.collection("portfolioPerformance").doc(failedUserId).set({
+          _stale: {
+            since: formattedDate,
+            reason: "eod-parallel-processing-failure",
+            source: "unifiedMarketDataUpdate",
+            retryCount: 0,
+            lastAttempt: new Date().toISOString()
           }
-          
-          for (const [assetKey, assetData] of Object.entries(overallPerformance[currencyCode].assetPerformance)) {
-            const assetTotalValue = assetData.totalValue || 0;
-            const assetTotalInvestment = assetData.totalInvestment || 0;
-            const assetUnrealizedPnL = assetTotalValue - assetTotalInvestment;
-            
-            overallPerformance[currencyCode].assetPerformance[assetKey].unrealizedProfitAndLoss = assetUnrealizedPnL;
-          }
-        }
+        }, { merge: true });
+      } catch (staleError) {
+        logError(`Error marcando usuario ${failedUserId} como stale`, staleError);
       }
     }
-
-    // ✨ OPTIMIZACIÓN: Asegurar documento de usuario (idempotente)
-    const userPerformanceRef = db.collection('portfolioPerformance').doc(userId);
-    batch.set(userPerformanceRef, { userId }, { merge: true });
-    batchCount++;
-
-    // Guardar rendimiento general del usuario
-    const userOverallPerformanceRef = userPerformanceRef.collection('dates').doc(formattedDate);
-    batch.set(userOverallPerformanceRef, {
-      date: formattedDate,
-      ...overallPerformance
-    });
-    batchCount++;
-
-    // Procesar cada cuenta del usuario
-    for (const account of accounts) {
-      const accountSellTransactions = sellTransactionsByAccount[account.id] || [];
-      const inactiveAccountAssetsWithSells = inactiveAssets.filter(asset => 
-        asset.portfolioAccount === account.id && 
-        accountSellTransactions.some(t => t.assetId === asset.id)
-      );
-      
-      const accountAssets = [
-        ...activeAssets.filter(asset => asset.portfolioAccount === account.id),
-        ...inactiveAccountAssetsWithSells
-      ];
-
-      // ✨ OPTIMIZACIÓN: Usar datos del caché para la cuenta
-      const lastAccountTotalValue = cache.getAccountLastPerformance(account.id, currencies);
-
-      const accountTransactions = userTransactions.filter(t => t.portfolioAccountId === account.id);
-      const accountPerformance = calculateAccountPerformance(
-        accountAssets,
-        currentPrices,
-        currencies,
-        lastAccountTotalValue,
-        accountTransactions
-      );
-
-      // Calcular doneProfitAndLoss para la cuenta (similar al usuario)
-      const accountDoneProfitAndLossByCurrency = {};
-      
-      for (const currency of currencies) {
-        let accountDoneProfitAndLoss = 0;
-        const accountAssetDoneProfitAndLoss = {};
-        
-        accountSellTransactions.forEach(sellTx => {
-          if (sellTx.assetId) {
-            const asset = allAssets.find(a => a.id === sellTx.assetId);
-            if (asset) {
-              const assetKey = `${asset.name}_${asset.assetType}`;
-              if (!accountAssetDoneProfitAndLoss[assetKey]) {
-                accountAssetDoneProfitAndLoss[assetKey] = 0;
-              }
-              
-              let profitAndLoss = 0;
-              
-              // ✨ OPTIMIZACIÓN: Usar valuePnL si está disponible
-              if (sellTx.valuePnL !== undefined && sellTx.valuePnL !== null) {
-                // Usar PnL precalculada y convertir a moneda objetivo
-                profitAndLoss = convertCurrency(
-                  sellTx.valuePnL,
-                  sellTx.currency,
-                  currency.code,
-                  currencies,
-                  sellTx.defaultCurrencyForAdquisitionDollar,
-                  parseFloat(sellTx.dollarPriceToDate.toString())
-                );
-              } else {
-                // Fallback: calcular PnL manualmente (método anterior)
-                const sellAmountConverted = convertCurrency(
-                  sellTx.amount * sellTx.price,
-                  sellTx.currency,
-                  currency.code,
-                  currencies,
-                  sellTx.defaultCurrencyForAdquisitionDollar,
-                  parseFloat(sellTx.dollarPriceToDate.toString())
-                );
-                
-                const buyTxsForAsset = cache.getBuyTransactionsForAsset(sellTx.assetId);
-                
-                if (buyTxsForAsset.length > 0) {
-                  let totalBuyCost = 0;
-                  let totalBuyUnits = 0;
-                  
-                  buyTxsForAsset.forEach(buyTx => {
-                    totalBuyCost += buyTx.amount * buyTx.price;
-                    totalBuyUnits += buyTx.amount;
-                  });
-                  
-                  const avgCostPerUnit = totalBuyCost / totalBuyUnits;
-                  const costOfSoldUnits = sellTx.amount * avgCostPerUnit;
-                  
-                  const costOfSoldUnitsConverted = convertCurrency(
-                    costOfSoldUnits,
-                    sellTx.currency,
-                    currency.code,
-                    currencies,
-                    sellTx.defaultCurrencyForAdquisitionDollar,
-                    parseFloat(sellTx.dollarPriceToDate.toString())
-                  );
-                  
-                  profitAndLoss = sellAmountConverted - costOfSoldUnitsConverted;
-                }
-              }
-              
-              accountAssetDoneProfitAndLoss[assetKey] += profitAndLoss;
-              accountDoneProfitAndLoss += profitAndLoss;
-            }
-          }
-        });
-        
-        accountDoneProfitAndLossByCurrency[currency.code] = { 
-          doneProfitAndLoss: accountDoneProfitAndLoss,
-          assetDoneProfitAndLoss: accountAssetDoneProfitAndLoss
-        };
-      }
-
-      // Agregar doneProfitAndLoss a accountPerformance
-      for (const [currencyCode, data] of Object.entries(accountDoneProfitAndLossByCurrency)) {
-        if (accountPerformance[currencyCode]) {
-          accountPerformance[currencyCode].doneProfitAndLoss = data.doneProfitAndLoss;
-          
-          const accountUnrealizedPnL = accountPerformance[currencyCode].totalValue - accountPerformance[currencyCode].totalInvestment;
-          accountPerformance[currencyCode].unrealizedProfitAndLoss = accountUnrealizedPnL;
-          
-          if (accountPerformance[currencyCode].assetPerformance) {
-            for (const [assetKey, pnl] of Object.entries(data.assetDoneProfitAndLoss)) {
-              if (accountPerformance[currencyCode].assetPerformance[assetKey]) {
-                accountPerformance[currencyCode].assetPerformance[assetKey].doneProfitAndLoss = pnl;
-              }
-            }
-            
-            for (const [assetKey, assetData] of Object.entries(accountPerformance[currencyCode].assetPerformance)) {
-              const accountAssetTotalValue = assetData.totalValue || 0;
-              const accountAssetTotalInvestment = assetData.totalInvestment || 0;
-              const accountAssetUnrealizedPnL = accountAssetTotalValue - accountAssetTotalInvestment;
-              
-              accountPerformance[currencyCode].assetPerformance[assetKey].unrealizedProfitAndLoss = accountAssetUnrealizedPnL;
-            }
-          }
-        }
-      }
-
-      // ✨ OPTIMIZACIÓN: Asegurar documento de cuenta (idempotente)
-      const accountRef = userPerformanceRef.collection('accounts').doc(account.id);
-      batch.set(accountRef, { accountId: account.id }, { merge: true });
-      batchCount++;
-
-      // Guardar rendimiento de la cuenta
-      const accountPerformanceRef = accountRef.collection('dates').doc(formattedDate);
-      batch.set(accountPerformanceRef, {
-        date: formattedDate,
-        ...accountPerformance
-      });
-      batchCount++;
-
-      // ✨ Commit batch si se acerca al límite
-      if (batchCount >= BATCH_SIZE) {
-        await batch.commit();
-        totalBatchesCommitted++;
-        logDebug(`📦 Batch ${totalBatchesCommitted} de ${batchCount} operaciones completado`);
-        batch = db.batch();
-        batchCount = 0;
-      }
-    }
-
-    calculationsCount++;
   }
 
-  // ✨ Commit final del batch
-  if (batchCount > 0) {
-    await batch.commit();
-    totalBatchesCommitted++;
-    logDebug(`📦 Batch final ${totalBatchesCommitted} de ${batchCount} operaciones completado`);
-  }
-
-  logInfo(`✅ Rendimiento calculado para ${calculationsCount} usuarios (${totalBatchesCommitted} batches)`);
-  return { count: calculationsCount, userIds: Object.keys(userPortfolios) };
+  const totalDurationMs = Date.now() - perfStartMs;
+  logInfo(`✅ Rendimiento calculado para ${successUserIds.length} usuarios (${failedUserIds.length} fallidos) en ${totalDurationMs}ms`);
+  return {
+    count: successUserIds.length,
+    userIds: successUserIds,
+    failedCount: failedUserIds.length,
+    failedUserIds,
+    totalDurationMs
+  };
 }
 
 /**
@@ -1054,10 +1115,11 @@ exports.unifiedMarketDataUpdate = onSchedule({
     // Paso 3: Calcular performance del portafolio
     const perfOp = logger.startOperation('calculateDailyPortfolioPerformance');
     const portfolioResult = await calculateDailyPortfolioPerformance(db, currentPrices, currencies);
-    perfOp.success({ portfoliosCalculated: portfolioResult.count });
+    perfOp.success({ portfoliosCalculated: portfolioResult.count, failed: portfolioResult.failedCount || 0 });
     
     logger.info('📈 Portfolio performance calculated', {
       users: portfolioResult.count,
+      failed: portfolioResult.failedCount || 0,
       userIds: portfolioResult.userIds?.length || 0
     });
     
@@ -1086,12 +1148,13 @@ exports.unifiedMarketDataUpdate = onSchedule({
     try {
       await db.collection('systemStatus').doc('marketData').set({
         lastCompleteUpdate: admin.firestore.FieldValue.serverTimestamp(),
-        lastUpdateDate: DateTime.now().toISO(),  // FIX: Date nativo no tiene .toISO(), usar Luxon DateTime
-        source: 'api-lambda',  // OPT-DEMAND-CLEANUP: Indicar fuente de datos
+        lastUpdateDate: DateTime.now().toISO(),
+        source: 'api-lambda',
         performanceCalculated: portfolioResult.count,
+        failedUsers: portfolioResult.failedCount || 0,
         cachesInvalidated: cacheInvalidationResult.cachesDeleted,
         executionTimeMs: Math.round(executionTime * 1000),
-        marketOpen: false  // EOD = mercado cerrado
+        marketOpen: false
       }, { merge: true });
     } catch (signalError) {
       logger.warn('SystemStatus update failed (non-critical)', { error: signalError.message });
@@ -1117,3 +1180,13 @@ exports.unifiedMarketDataUpdate = onSchedule({
     throw error;
   }
 });
+
+// SCALE-001: Exportar para testing
+if (process.env.NODE_ENV === "test" || process.env.FUNCTIONS_EMULATOR) {
+  exports._testExports = {
+    processUserPerformance,
+    calculateDailyPortfolioPerformance,
+    PerformanceDataCache,
+    MAX_PARALLEL_USERS
+  };
+}
