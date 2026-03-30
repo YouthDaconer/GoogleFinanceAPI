@@ -733,3 +733,7 @@ exports.importTransactionBatch = importTransactionBatch;
  */
 const { mockSetSubscription } = require("./services/payment/mockSubscriptionService");
 exports.mockSetSubscription = mockSetSubscription;
+
+// GATE-008: Cancel/Downgrade Subscription
+const { cancelSubscription } = require("./services/payment/cancelSubscriptionService");
+exports.cancelSubscription = cancelSubscription;
