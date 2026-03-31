@@ -12,6 +12,7 @@ const mockBatchCommit = jest.fn().mockResolvedValue(undefined);
 const mockBatch = { set: mockBatchSet, commit: mockBatchCommit };
 
 const mockDocSet = jest.fn().mockResolvedValue(undefined);
+const mockDocGet = jest.fn().mockResolvedValue({ exists: true, data: () => ({}) });
 const mockSubCollectionDoc = jest.fn(() => ({
   collection: jest.fn(() => ({
     doc: jest.fn(() => ({
@@ -24,6 +25,7 @@ const mockSubCollectionDoc = jest.fn(() => ({
 
 const mockCollectionDoc = jest.fn((docId) => ({
   set: mockDocSet,
+  get: mockDocGet,
   collection: jest.fn((subColName) => ({
     doc: jest.fn((subDocId) => ({
       collection: jest.fn((subSubColName) => ({
@@ -125,7 +127,7 @@ jest.mock("../../utils/logger", () => ({
 
 process.env.NODE_ENV = "test";
 const { _testExports } = require("../unifiedMarketDataUpdate");
-const { processUserPerformance, MAX_PARALLEL_USERS } = _testExports;
+const { processUserPerformance, MAX_PARALLEL_USERS, markInconsistentUsersAsStale } = _testExports;
 
 // === Test Fixtures ===
 
@@ -503,5 +505,91 @@ describe("SCALE-001: _stale marker structure", () => {
       }),
       { merge: true }
     );
+  });
+});
+
+/**
+ * SCALE-004: Tests para auto-reparación de consistencia
+ *
+ * @see docs/stories/SCALE-004.story.md
+ * @see docs/architecture/SCALE-PERF-001-consolidation-sustainability-diagnosis.md §6.6
+ */
+describe("SCALE-004: markInconsistentUsersAsStale", () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockDocSet.mockResolvedValue(undefined);
+    mockDocGet.mockResolvedValue({ exists: true, data: () => ({}) });
+  });
+
+  it("should mark user with gap=2 and no existing _stale as stale", async () => {
+    const inconsistentUsers = [{
+      userId: "user-1",
+      gap: 2,
+      minAccountDate: "2026-03-28",
+      maxAccountDate: "2026-03-29",
+      userDate: "2026-03-30"
+    }];
+
+    const result = await markInconsistentUsersAsStale(mockDb, inconsistentUsers);
+
+    expect(result).toBe(1);
+    expect(mockDocGet).toHaveBeenCalledTimes(1);
+    expect(mockDocSet).toHaveBeenCalledWith(
+      {
+        _stale: {
+          since: "2026-03-28",
+          reason: "auto-detected-inconsistency",
+          source: "consistency-monitor",
+          retryCount: 0,
+          lastAttempt: expect.any(String)
+        }
+      },
+      { merge: true }
+    );
+  });
+
+  it("should NOT re-mark user with gap=2 that already has _stale", async () => {
+    mockDocGet.mockResolvedValue({
+      exists: true,
+      data: () => ({ _stale: { since: "2026-03-27", retryCount: 1 } })
+    });
+
+    const inconsistentUsers = [{
+      userId: "user-1",
+      gap: 2,
+      minAccountDate: "2026-03-28",
+      maxAccountDate: "2026-03-29",
+      userDate: "2026-03-30"
+    }];
+
+    const result = await markInconsistentUsersAsStale(mockDb, inconsistentUsers);
+
+    expect(result).toBe(0);
+    expect(mockDocGet).toHaveBeenCalledTimes(1);
+    expect(mockDocSet).not.toHaveBeenCalled();
+  });
+
+  it("should NOT mark user with gap=1 as stale", async () => {
+    const inconsistentUsers = [{
+      userId: "user-1",
+      gap: 1,
+      minAccountDate: "2026-03-29",
+      maxAccountDate: "2026-03-29",
+      userDate: "2026-03-30"
+    }];
+
+    const result = await markInconsistentUsersAsStale(mockDb, inconsistentUsers);
+
+    expect(result).toBe(0);
+    expect(mockDocGet).not.toHaveBeenCalled();
+    expect(mockDocSet).not.toHaveBeenCalled();
+  });
+
+  it("should return 0 and take no action for empty array", async () => {
+    const result = await markInconsistentUsersAsStale(mockDb, []);
+
+    expect(result).toBe(0);
+    expect(mockDocGet).not.toHaveBeenCalled();
+    expect(mockDocSet).not.toHaveBeenCalled();
   });
 });

@@ -364,9 +364,30 @@ function invalidateCurrencyRatesCache() {
   logger.info('Currency rates cache invalidated');
 }
 
+/**
+ * SCALE-005: Normaliza una tasa de cambio a la convención "1 USD = X unidades".
+ * 
+ * EUR/GBP/AUD/NZD se cotizan inversamente en Yahoo Finance:
+ *   EUR=X → ~1.09 significa "1 EUR = 1.09 USD" → invertir a 0.917 = "1 USD = 0.917 EUR"
+ * COP/MXN/BRL/CAD se cotizan directamente:
+ *   COP=X → ~4285 ya es "1 USD = 4285 COP"
+ */
+function normalizeToUsdBase(currencyCode, rawRate) {
+  if (currencyCode === 'USD') return 1;
+  if (!rawRate || rawRate <= 0) return rawRate;
+
+  const invertCurrencies = ['EUR', 'GBP', 'AUD', 'NZD'];
+  if (invertCurrencies.includes(currencyCode) && rawRate > 1) {
+    return 1 / rawRate;
+  }
+
+  return rawRate;
+}
+
 module.exports = {
   getPricesFromApi,
   getCurrencyRatesFromApi,
   normalizeQuote,
   invalidateCurrencyRatesCache,
+  normalizeToUsdBase,
 };

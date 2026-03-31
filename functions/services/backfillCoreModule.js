@@ -145,6 +145,17 @@ function sleep(ms) {
 }
 
 /**
+ * SCALE-005: Split array into chunks of max size
+ */
+function chunkArray(array, size) {
+  const chunks = [];
+  for (let i = 0; i < array.length; i += size) {
+    chunks.push(array.slice(i, i + size));
+  }
+  return chunks;
+}
+
+/**
  * Extract date part (YYYY-MM-DD) from a date string
  */
 function getDatePart(dateString) {
@@ -844,6 +855,152 @@ async function capturePreBackfillSnapshot(userId, accounts, tradingDays) {
   };
 }
 
+// ============================================================================
+// SCALE-005: HISTORICAL EXCHANGE RATES CACHE
+// ============================================================================
+
+/**
+ * SCALE-005: Get rate for a currency on a specific date with multi-level fallback.
+ * 
+ * Fallback chain:
+ * 1. Exact date in cache → 2. Previous day (-1 to -5 calendar days) →
+ * 3. Firestore currencies/{code}.exchangeRate (stale) → 4. null + warning
+ */
+async function getRateWithFallback(date, currency) {
+  if (currency === 'USD') return 1;
+
+  const exactDoc = await db.doc(`historicalExchangeRates/${date}`).get();
+  if (exactDoc.exists && exactDoc.data().rates?.[currency] !== undefined) {
+    return exactDoc.data().rates[currency];
+  }
+
+  for (let i = 1; i <= 5; i++) {
+    const d = new Date(date + 'T12:00:00Z');
+    d.setDate(d.getDate() - i);
+    const fallbackDate = d.toISOString().substring(0, 10);
+    const fallbackDoc = await db.doc(`historicalExchangeRates/${fallbackDate}`).get();
+    if (fallbackDoc.exists && fallbackDoc.data().rates?.[currency] !== undefined) {
+      console.log(`[backfillCore] RATE-FALLBACK: Using rate from ${fallbackDate} for ${currency} on ${date} (delta: ${i} days)`);
+      return fallbackDoc.data().rates[currency];
+    }
+  }
+
+  const currencyDoc = await db.doc(`currencies/${currency}`).get();
+  if (currencyDoc.exists && currencyDoc.data().exchangeRate) {
+    console.warn(`[backfillCore] RATE-STALE-FALLBACK: Using stale Firestore rate for ${currency} on ${date}`);
+    return currencyDoc.data().exchangeRate;
+  }
+
+  console.warn(`[backfillCore] RATE-MISS: No rate found for ${currency} on ${date} or ±5 calendar days`);
+  return null;
+}
+
+/**
+ * SCALE-005: Obtain exchange rates for a range of trading days using cache-first strategy.
+ * 
+ * Strategy: Read from historicalExchangeRates Firestore collection first (batch read),
+ * then fall back to Yahoo Finance for cache misses with write-through persistence.
+ * 
+ * @param {string[]} tradingDays - Array of dates (YYYY-MM-DD)
+ * @returns {Promise<Object>} ratesByDate - { "YYYY-MM-DD": { USD: 1, COP: N, EUR: N, ... } }
+ */
+async function getExchangeRatesForDates(tradingDays) {
+  const FieldValue = admin.firestore.FieldValue;
+  const ratesByDate = {};
+  const missingDates = [];
+  const activeCurrencies = await getActiveCurrencies();
+
+  // STEP 1: Batch read from Firestore cache (db.getAll accepts up to 100 refs)
+  const refs = tradingDays.map(d => db.doc(`historicalExchangeRates/${d}`));
+  const chunks = chunkArray(refs, 100);
+
+  for (const chunk of chunks) {
+    const snapshots = await db.getAll(...chunk);
+    for (const snap of snapshots) {
+      if (snap.exists) {
+        const data = snap.data();
+        const cachedRates = data.rates || {};
+
+        const missingCurrencies = activeCurrencies.filter(
+          c => c !== 'USD' && cachedRates[c] === undefined
+        );
+
+        if (missingCurrencies.length === 0) {
+          // CACHE HIT — complete
+          ratesByDate[data.date] = cachedRates;
+        } else {
+          // CACHE HIT — partial (new currency added after caching)
+          ratesByDate[data.date] = { ...cachedRates };
+          const patchData = {};
+          for (const currency of missingCurrencies) {
+            let rate = await fetchHistoricalExchangeRate(currency, new Date(data.date + 'T12:00:00Z'));
+            if (rate === null) {
+              rate = await getRateWithFallback(data.date, currency);
+            }
+            if (rate !== null) {
+              ratesByDate[data.date][currency] = rate;
+              patchData[`rates.${currency}`] = rate;
+            }
+            await sleep(CONFIG.API_DELAY_MS / 2);
+          }
+          if (Object.keys(patchData).length > 0) {
+            patchData['_meta.currencyCount'] = Object.keys(ratesByDate[data.date]).length;
+            patchData['_meta.lastPatchedAt'] = FieldValue.serverTimestamp();
+            await snap.ref.update(patchData);
+            console.log(`[backfillCore] RATE-PATCH: Added ${missingCurrencies.join(',')} to ${data.date}`);
+          }
+        }
+      } else {
+        missingDates.push(snap.id);
+      }
+    }
+  }
+
+  // STEP 2: Fetch from Yahoo Finance for cache misses + write-through
+  if (missingDates.length > 0) {
+    for (const date of missingDates) {
+      ratesByDate[date] = { USD: 1 };
+      let fetchedCount = 0;
+
+      for (const currency of activeCurrencies) {
+        if (currency === 'USD') continue;
+        let rate = await fetchHistoricalExchangeRate(currency, new Date(date + 'T12:00:00Z'));
+        if (rate === null) {
+          rate = await getRateWithFallback(date, currency);
+        }
+        if (rate !== null) {
+          ratesByDate[date][currency] = rate;
+          fetchedCount++;
+        }
+        await sleep(CONFIG.API_DELAY_MS / 2);
+      }
+
+      // Write-through: persist for future use
+      if (fetchedCount > 0) {
+        const rateDocRef = db.doc(`historicalExchangeRates/${date}`);
+        const existing = await rateDocRef.get();
+        if (!existing.exists) {
+          await rateDocRef.set({
+            date,
+            rates: ratesByDate[date],
+            _meta: {
+              source: 'backfill-yahoo',
+              fetchedAt: FieldValue.serverTimestamp(),
+              currencyCount: Object.keys(ratesByDate[date]).length,
+              version: 1
+            }
+          });
+        }
+      }
+    }
+  }
+
+  const cacheHits = tradingDays.length - missingDates.length;
+  console.log(`[backfillCore] RATES-CACHE: ${cacheHits} cache hits, ${missingDates.length} cache misses`);
+
+  return ratesByDate;
+}
+
 /**
  * Recalculate performance for a user over a range of trading days
  * 
@@ -903,19 +1060,9 @@ async function backfillUserPerformance(userId, tradingDays) {
       await sleep(CONFIG.API_DELAY_MS);
     }
     
-    // 4. Fetch exchange rates for all target dates
-    const activeCurrencies = await getActiveCurrencies();
-    console.log(`[backfillCore] Fetching exchange rates for ${activeCurrencies.length} currencies...`);
-    const ratesByDate = {};
-    for (const date of tradingDays) {
-      ratesByDate[date] = { USD: 1 };
-      for (const currency of activeCurrencies) {
-        if (currency === 'USD') continue;
-        const rate = await fetchHistoricalExchangeRate(currency, new Date(date + 'T12:00:00Z'));
-        if (rate) ratesByDate[date][currency] = rate;
-        await sleep(CONFIG.API_DELAY_MS / 2);
-      }
-    }
+    // 4. SCALE-005: Fetch exchange rates with cache-first strategy
+    console.log(`[backfillCore] Loading exchange rates for ${tradingDays.length} trading days...`);
+    const ratesByDate = await getExchangeRatesForDates(tradingDays);
     
     // 5. Process each account for each trading day
     // Track previous day data per account for daily change calculation
@@ -1096,6 +1243,11 @@ module.exports = {
   
   // Snapshot (SCALE-003)
   capturePreBackfillSnapshot,
+  
+  // Exchange rate cache (SCALE-005)
+  getExchangeRatesForDates,
+  getRateWithFallback,
+  chunkArray,
   
   // Main backfill
   backfillUserPerformance,

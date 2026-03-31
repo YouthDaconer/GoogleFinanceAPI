@@ -32,7 +32,7 @@ const cfServiceToken = defineSecret('CF_SERVICE_TOKEN');
 const { StructuredLogger } = require('../utils/logger');
 
 // OPT-DEMAND-CLEANUP: Importar helper para obtener precios y currencies del API Lambda
-const { getPricesFromApi, getCurrencyRatesFromApi } = require('./marketDataHelper');
+const { getPricesFromApi, getCurrencyRatesFromApi, normalizeToUsdBase } = require('./marketDataHelper');
 
 /**
  * End-of-Day Portfolio Update
@@ -824,6 +824,58 @@ async function processUserPerformance({
 }
 
 /**
+ * SCALE-004: Marca usuarios con inconsistencias de datos (gap > 1 día) como _stale
+ * para que reconcileStalePerformance los recalcule automáticamente.
+ *
+ * @param {FirebaseFirestore.Firestore} db
+ * @param {Array<{userId: string, gap: number, minAccountDate: string, maxAccountDate: string, userDate: string|null}>} inconsistentUsers
+ * @returns {Promise<number>} Número de usuarios marcados como _stale
+ * @see docs/architecture/SCALE-PERF-001-consolidation-sustainability-diagnosis.md §6.6
+ */
+async function markInconsistentUsersAsStale(db, inconsistentUsers) {
+  let consistencyStaleMarked = 0;
+
+  if (inconsistentUsers.length === 0) {
+    return consistencyStaleMarked;
+  }
+
+  logWarn(`⚠️ SCALE-004: Detectados ${inconsistentUsers.length} usuarios con datos inconsistentes`);
+
+  for (const user of inconsistentUsers) {
+    logWarn(`   Usuario ${user.userId}: overall=${user.userDate}, min=${user.minAccountDate}, max=${user.maxAccountDate}, gap=${user.gap} días`);
+
+    if (user.gap <= 1) {
+      continue;
+    }
+
+    try {
+      const perfDoc = await db.collection("portfolioPerformance").doc(user.userId).get();
+      const existingStale = perfDoc.data()?._stale;
+
+      if (existingStale) {
+        logInfo(`   ↳ ${user.userId}: Ya tiene _stale (since=${existingStale.since}), omitiendo re-marca`);
+      } else {
+        await db.collection("portfolioPerformance").doc(user.userId).set({
+          _stale: {
+            since: user.minAccountDate,
+            reason: "auto-detected-inconsistency",
+            source: "consistency-monitor",
+            retryCount: 0,
+            lastAttempt: new Date().toISOString()
+          }
+        }, { merge: true });
+        consistencyStaleMarked++;
+        logWarn(`   ↳ ${user.userId}: Marcado como _stale (since=${user.minAccountDate}) para reconciliación automática`);
+      }
+    } catch (staleError) {
+      logError(`   ↳ Error marcando ${user.userId} como stale`, staleError);
+    }
+  }
+
+  return consistencyStaleMarked;
+}
+
+/**
  * OPT-DEMAND-CLEANUP: Calcula el rendimiento diario del portafolio.
  * 
  * Modificada para recibir precios y currencies como parámetros
@@ -940,13 +992,8 @@ async function calculateDailyPortfolioPerformance(db, currentPrices, currencies)
     }
   }
   
-  if (inconsistentUsers.length > 0) {
-    logWarn(`⚠️ OPT-DEMAND-500: Detectados ${inconsistentUsers.length} usuarios con datos inconsistentes`);
-    for (const user of inconsistentUsers) {
-      logWarn(`   Usuario ${user.userId}: overall=${user.userDate}, cuentas min=${user.minAccountDate}, max=${user.maxAccountDate}, gap=${user.gap} días`);
-    }
-    // TODO: En futuras versiones, considerar auto-reparación o skip de usuarios inconsistentes
-  }
+  // SCALE-004: Auto-reparación de inconsistencias detectadas
+  const consistencyStaleMarked = await markInconsistentUsersAsStale(db, inconsistentUsers);
 
   const perfStartMs = Date.now();
 
@@ -1007,6 +1054,7 @@ async function calculateDailyPortfolioPerformance(db, currentPrices, currencies)
     userIds: successUserIds,
     failedCount: failedUserIds.length,
     failedUserIds,
+    consistencyStaleMarked,
     totalDurationMs
   };
 }
@@ -1112,6 +1160,34 @@ exports.unifiedMarketDataUpdate = onSchedule({
       source: 'api-lambda'
     });
     
+    // SCALE-005: Persist historical exchange rates for cache
+    try {
+      const rateDate = yesterday.toISODate();
+      const ratesMap = { USD: 1 };
+      currencies.forEach(c => {
+        if (c.code && c.code !== 'USD' && c.exchangeRate) {
+          ratesMap[c.code] = normalizeToUsdBase(c.code, c.exchangeRate);
+        }
+      });
+      const rateDocRef = db.doc(`historicalExchangeRates/${rateDate}`);
+      const existingRateDoc = await rateDocRef.get();
+      if (!existingRateDoc.exists) {
+        await rateDocRef.set({
+          date: rateDate,
+          rates: ratesMap,
+          _meta: {
+            source: 'eod-pipeline',
+            fetchedAt: admin.firestore.FieldValue.serverTimestamp(),
+            currencyCount: Object.keys(ratesMap).length,
+            version: 1
+          }
+        });
+        logger.info('SCALE-005: Historical rates persisted', { date: rateDate, currencies: Object.keys(ratesMap).length });
+      }
+    } catch (ratesCacheError) {
+      logger.warn('SCALE-005: Could not persist historical rates', { error: ratesCacheError.message });
+    }
+    
     // Paso 3: Calcular performance del portafolio
     const perfOp = logger.startOperation('calculateDailyPortfolioPerformance');
     const portfolioResult = await calculateDailyPortfolioPerformance(db, currentPrices, currencies);
@@ -1187,6 +1263,7 @@ if (process.env.NODE_ENV === "test" || process.env.FUNCTIONS_EMULATOR) {
     processUserPerformance,
     calculateDailyPortfolioPerformance,
     PerformanceDataCache,
-    MAX_PARALLEL_USERS
+    MAX_PARALLEL_USERS,
+    markInconsistentUsersAsStale
   };
 }
