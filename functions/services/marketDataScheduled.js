@@ -313,6 +313,25 @@ const saveIndicesHistoryData = onSchedule({
       count++;
     });
 
+    // OPT-FS-202: Escribir documento resumen consolidado con todos los índices
+    // El frontend lee 1 doc en vez de N+1 queries (1 parent collection + N subcollection)
+    const summaryDocRef = admin.firestore()
+      .collection('indexHistories')
+      .doc('_summary');
+
+    batch.set(summaryDocRef, {
+      indices: indices.map(index => ({
+        code: index.code,
+        name: index.name,
+        region: index.region,
+        score: index.value,
+        change: index.change,
+        percentChange: normalizeNumber(index.percentChange),
+      })),
+      date: formattedDate,
+      lastUpdated: Date.now(),
+    });
+
     await batch.commit();
     
     // OPT-CACHE-001: Invalidar cache de índices para que el frontend reciba datos frescos
@@ -324,7 +343,7 @@ const saveIndicesHistoryData = onSchedule({
     }
     
     const duration = Date.now() - startTime;
-    console.log(`[saveIndicesHistoryData] ✅ Guardados ${count} índices para ${formattedDate} en ${duration}ms`);
+    console.log(`[saveIndicesHistoryData] ✅ Guardados ${count} índices + summary para ${formattedDate} en ${duration}ms`);
 
   } catch (error) {
     console.error('[saveIndicesHistoryData] Error:', error.message);
