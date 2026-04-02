@@ -358,8 +358,12 @@ async function getMultiAccountHistoricalReturns(context, payload) {
     
     const accountSnapshots = await Promise.all(accountDataPromises);
 
+    // OPT-FS-211: Log detallado de docs por cuenta para monitoreo
+    const totalDocs = accountSnapshots.reduce((sum, snap) => sum + snap.size, 0);
+    const docsDetail = accountSnapshots.map((snap, i) => `${accountIds[i].substring(0, 8)}...:${snap.size}`).join(', ');
+    console.log(`[queryHandlers][getMultiAccountHistoricalReturns] Docs por cuenta: [${docsDetail}], Total: ${totalDocs}`);
+
     // Verificar si hay datos
-    const totalDocs = accountSnapshots.reduce((sum, snap) => sum.size + snap.size, 0);
     if (totalDocs === 0) {
       console.log(`[queryHandlers][getMultiAccountHistoricalReturns] Sin datos de performance`);
       return {
