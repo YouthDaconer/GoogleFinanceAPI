@@ -59,27 +59,29 @@ async function invalidatePerformanceCacheBatch(userIds) {
   let totalDeleted = 0;
 
   // Consultar todos los caches en paralelo
+  // OPT-FS-201-FIX: Sin limit — borrar TODOS los cache entries por usuario.
+  // El limit(20) anterior dejaba cache entries multi-cuenta sin invalidar,
+  // causando que los charts mostraran datos stale cuando >20 entries existían.
   const cachePromises = userIds.map(async (userId) => {
     const cacheCollection = db.collection(`userData/${userId}/performanceCache`);
-    const snapshot = await cacheCollection.limit(20).get();
+    const snapshot = await cacheCollection.get();
     return { userId, docs: snapshot.docs };
   });
   
   const results = await Promise.all(cachePromises);
   
-  // Agrupar todas las eliminaciones en un solo batch
-  const deleteBatch = db.batch();
+  // Agrupar todas las eliminaciones en batches de hasta 500 (límite de Firestore)
+  const allDocs = results.flatMap(({ docs }) => docs);
+  const BATCH_SIZE = 500;
   
-  for (const { docs } of results) {
-    for (const doc of docs) {
+  for (let i = 0; i < allDocs.length; i += BATCH_SIZE) {
+    const chunk = allDocs.slice(i, i + BATCH_SIZE);
+    const deleteBatch = db.batch();
+    for (const doc of chunk) {
       deleteBatch.delete(doc.ref);
-      totalDeleted++;
     }
-  }
-  
-  // Solo commit si hay documentos que eliminar
-  if (totalDeleted > 0) {
     await deleteBatch.commit();
+    totalDeleted += chunk.length;
   }
 
   console.log(`[invalidatePerformanceCacheBatch] Eliminados ${totalDeleted} caches para ${userIds.length} usuarios`);
