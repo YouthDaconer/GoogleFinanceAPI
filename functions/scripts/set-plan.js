@@ -3,11 +3,11 @@
 /**
  * CLI Script — Cambiar plan de suscripción de un usuario en Firestore
  *
- * Uso: node scripts/set-plan.js <userId> <planId> [interval] [status]
+ * Uso: node scripts/set-plan.js <userId> <planId> [interval] [status] [origin]
  *
  * Ejemplos:
- *   node scripts/set-plan.js abc123 pro month
- *   node scripts/set-plan.js abc123 lifetime lifetime
+ *   node scripts/set-plan.js abc123 pro month active mock_checkout
+ *   node scripts/set-plan.js abc123 lifetime lifetime active mock_checkout
  *   node scripts/set-plan.js abc123 free
  *
  * @see docs/architecture/FEAT-GATE-001-feature-gating-subscription-plans-design.md
@@ -21,13 +21,14 @@ if (process.env.PAYMENT_MOCK_ENABLED !== "true") {
   process.exit(1);
 }
 
-const [,, userId, planId, interval = "month", status = "active"] = process.argv;
+const [,, userId, planId, interval = "month", status = "active", origin = "mock_checkout"] = process.argv;
 
 if (!userId || !planId) {
-  console.error("Usage: node scripts/set-plan.js <userId> <planId> [interval] [status]");
+  console.error("Usage: node scripts/set-plan.js <userId> <planId> [interval] [status] [origin]");
   console.error(`  planId: ${VALID_PLANS.join(" | ")}`);
   console.error(`  interval: ${VALID_INTERVALS.join(" | ")} (default: month)`);
   console.error("  status: active | past_due | canceled (default: active)");
+  console.error("  origin: trial | mock_checkout | checkout (default: mock_checkout)");
   process.exit(1);
 }
 
@@ -42,7 +43,7 @@ if (!VALID_INTERVALS.includes(interval)) {
 }
 
 async function main() {
-  const subscription = buildSubscriptionData(planId, interval, status);
+  const subscription = buildSubscriptionData(planId, interval, status, origin);
   const db = admin.firestore();
 
   await db.collection("userData").doc(userId).set({ subscription }, { merge: true });

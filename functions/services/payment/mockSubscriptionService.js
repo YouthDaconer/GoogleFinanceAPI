@@ -36,9 +36,27 @@ const mockSetSubscription = onCall(
     }
 
     const userId = request.auth.uid;
-    const subscription = buildSubscriptionData(planId, interval, status);
-
     const db = admin.firestore();
+
+    // BUG-GATE-002: Determinar origin según el flujo
+    // Free → Pro: trial (30 días de prueba gratuita)
+    // Free → Lifetime / cualquier otro: mock_checkout (compra directa)
+    // El caller puede forzar origin para DevPanel u otros flujos administrativos
+    const forceOrigin = request.data?.origin;
+    let origin;
+    if (forceOrigin) {
+      origin = forceOrigin;
+    } else if (planId === "pro") {
+      const userDoc = await db.collection("userData").doc(userId).get();
+      const currentPlan = userDoc.data()?.subscription?.planId || "free";
+      // Solo trial si viene de Free. Re-subscripciones post-cancelación = mock_checkout
+      origin = currentPlan === "free" ? "trial" : "mock_checkout";
+    } else {
+      origin = "mock_checkout";
+    }
+
+    const subscription = buildSubscriptionData(planId, interval, status, origin);
+
     await db.collection("userData").doc(userId).set({ subscription }, { merge: true });
 
     return {

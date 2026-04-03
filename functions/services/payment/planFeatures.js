@@ -73,9 +73,10 @@ const VALID_INTERVALS = ["month", "year", "lifetime"];
  * @param {string} planId - "free" | "pro" | "lifetime"
  * @param {string} interval - "month" | "year" | "lifetime"
  * @param {string} [status="active"] - Estado de la suscripción
+ * @param {string} [origin="trial"] - Origen: "trial" | "mock_checkout" | "checkout"
  * @returns {object} Objeto de suscripción listo para Firestore
  */
-function buildSubscriptionData(planId, interval, status = "active") {
+function buildSubscriptionData(planId, interval, status = "active", origin = "trial") {
   const resolvedPlan = VALID_PLANS.includes(planId) ? planId : "free";
   const features = { ...PLAN_FEATURES[resolvedPlan] };
   const now = new Date();
@@ -90,6 +91,7 @@ function buildSubscriptionData(planId, interval, status = "active") {
     cancelAtPeriodEnd: false,
     features,
     updatedAt: now.toISOString(),
+    subscriptionOrigin: origin,
   };
 
   if (resolvedPlan === "lifetime") {
