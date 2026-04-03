@@ -289,7 +289,8 @@ service cloud.firestore {
 
     // ---- PRICE ALERTS ----
     // CRUD completo para el propietario con validaciones en create
-    // GATE-006: create requiere subscription.features.hasAlerts == true
+    // GATE-006 + FEAT-PRICING-RESTRUCTURE-001: hasAlerts is true for ALL plans
+    // (Free users may not have subscription.features in Firestore yet)
     match /priceAlerts/{alertId} {
       allow read: if isAuthenticated() && isOwner(resource.data.userId);
       allow create: if isAuthenticated()
@@ -297,8 +298,13 @@ service cloud.firestore {
                     && request.resource.data.targetPrice is number
                     && request.resource.data.targetPrice > 0
                     && request.resource.data.condition in [">=" , "<=", "cross_above", "cross_below"]
-                    && get(/databases/$(database)/documents/userData/$(request.auth.uid))
-                        .data.subscription.features.hasAlerts == true;
+                    && (
+                      // Case 1: subscription.features.hasAlerts exists and is true
+                      get(/databases/$(database)/documents/userData/$(request.auth.uid))
+                          .data.subscription.features.hasAlerts == true
+                      // Case 2: no subscription field (Free user without stored data)
+                      || !('subscription' in get(/databases/$(database)/documents/userData/$(request.auth.uid)).data)
+                    );
       allow update, delete: if isAuthenticated() && isOwner(resource.data.userId);
     }
 
