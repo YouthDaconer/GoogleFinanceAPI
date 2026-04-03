@@ -1,27 +1,33 @@
 const { PLAN_FEATURES, VALID_PLANS, UNLIMITED, buildSubscriptionData } = require("../../payment/planFeatures");
 
 describe("PLAN_FEATURES", () => {
-  test("free plan has restricted features", () => {
+  test("free plan has restricted features with FEAT-PRICING-RESTRUCTURE-001 values", () => {
     const free = PLAN_FEATURES.free;
     expect(free.hasRiskMetrics).toBe(false);
     expect(free.maxAccounts).toBe(2);
-    expect(free.historyDays).toBe(90);
-    expect(free.hasAlerts).toBe(false);
-    expect(free.alertLimit).toBe(0);
+    expect(free.historyDays).toBe(365);       // CAMBIO: 90 → 365
+    expect(free.hasAlerts).toBe(true);         // CAMBIO: false → true
+    expect(free.alertLimit).toBe(1);           // CAMBIO: 0 → 1
     expect(free.hasSimulators).toBe(false);
     expect(free.hasAttribution).toBe(false);
     expect(free.hasIntelligence).toBe(false);
     expect(free.hasBacktesting).toBe(false);
-    expect(free.hasImport).toBe(false);
+    expect(free.hasImport).toBe(true);         // CAMBIO: false → true
     expect(free.hasExportCsv).toBe(false);
     expect(free.hasExportPdf).toBe(false);
     expect(free.hasTaxReports).toBe(false);
     expect(free.hasAiInsights).toBe(false);
     expect(free.maxAssets).toBe(UNLIMITED);
     expect(free.supportLevel).toBe("community");
+    // Nuevos keys (FEAT-PRICING-RESTRUCTURE-001)
+    expect(free.hasRealtimeStreaming).toBe(false);
+    expect(free.maxWatchlist).toBe(3);
+    expect(free.hasDividendProjections).toBe(false);
+    expect(free.hasBriefings).toBe(false);
+    expect(free.hasEtfAnalyzer).toBe(false);
   });
 
-  test("pro plan has all features enabled", () => {
+  test("pro plan has all features enabled including new keys", () => {
     const pro = PLAN_FEATURES.pro;
     expect(pro.hasRiskMetrics).toBe(true);
     expect(pro.maxAccounts).toBe(UNLIMITED);
@@ -35,6 +41,12 @@ describe("PLAN_FEATURES", () => {
     expect(pro.hasTaxReports).toBe(true);
     expect(pro.hasAiInsights).toBe(true);
     expect(pro.supportLevel).toBe("email");
+    // Nuevos keys habilitados en Pro
+    expect(pro.hasRealtimeStreaming).toBe(true);
+    expect(pro.maxWatchlist).toBe(UNLIMITED);
+    expect(pro.hasDividendProjections).toBe(true);
+    expect(pro.hasBriefings).toBe(true);
+    expect(pro.hasEtfAnalyzer).toBe(true);
   });
 
   test("lifetime plan has priority support", () => {
@@ -47,10 +59,16 @@ describe("PLAN_FEATURES", () => {
     expect(lifetimeRest).toEqual(proRest);
   });
 
-  test("each plan has exactly 16 feature keys", () => {
+  test("each plan has exactly 21 feature keys", () => {
     for (const planId of VALID_PLANS) {
-      expect(Object.keys(PLAN_FEATURES[planId])).toHaveLength(16);
+      expect(Object.keys(PLAN_FEATURES[planId])).toHaveLength(21);
     }
+  });
+
+  test("free plan has the same keys as BASE_FEATURES (no drift)", () => {
+    const baseKeys = Object.keys(PLAN_FEATURES.pro).sort();
+    const freeKeys = Object.keys(PLAN_FEATURES.free).sort();
+    expect(freeKeys).toEqual(baseKeys);
   });
 });
 
@@ -101,7 +119,8 @@ describe("buildSubscriptionData", () => {
     expect(result.currentPeriodEnd).toBeNull();
     expect(result.features.hasRiskMetrics).toBe(false);
     expect(result.features.maxAccounts).toBe(2);
-    expect(result.features.historyDays).toBe(90);
+    expect(result.features.historyDays).toBe(365);  // CAMBIO: 90 → 365
+    expect(Object.keys(result.features)).toHaveLength(21);
   });
 
   test("invalid planId defaults to free features", () => {

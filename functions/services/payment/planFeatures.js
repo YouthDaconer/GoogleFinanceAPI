@@ -27,26 +27,38 @@ const BASE_FEATURES = {
   hasAiInsights: true,
   maxAssets: UNLIMITED,
   supportLevel: "email",
+  // ── NUEVOS (5) — FEAT-PRICING-RESTRUCTURE-001 ──
+  hasRealtimeStreaming: true,
+  maxWatchlist: UNLIMITED,
+  hasDividendProjections: true,
+  hasBriefings: true,
+  hasEtfAnalyzer: true,
 };
 
 const PLAN_FEATURES = {
   free: {
     maxAccounts: 2,
-    historyDays: 90,
-    hasAlerts: false,
-    alertLimit: 0,
+    historyDays: 365,              // CAMBIO: 90 → 365 (FEAT-PRICING-RESTRUCTURE-001)
+    hasAlerts: true,               // CAMBIO: false → true
+    alertLimit: 1,                 // CAMBIO: 0 → 1
     hasSimulators: false,
     hasRiskMetrics: false,
     hasAttribution: false,
     hasIntelligence: false,
     hasBacktesting: false,
-    hasImport: false,
+    hasImport: true,               // CAMBIO: false → true
     hasExportCsv: false,
     hasExportPdf: false,
     hasTaxReports: false,
     hasAiInsights: false,
     maxAssets: UNLIMITED,
     supportLevel: "community",
+    // ── NUEVOS (5) — FEAT-PRICING-RESTRUCTURE-001 ──
+    hasRealtimeStreaming: false,
+    maxWatchlist: 3,
+    hasDividendProjections: false,
+    hasBriefings: false,
+    hasEtfAnalyzer: false,
   },
   pro: { ...BASE_FEATURES },
   lifetime: { ...BASE_FEATURES, supportLevel: "priority" },
