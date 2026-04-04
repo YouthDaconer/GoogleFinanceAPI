@@ -3,7 +3,7 @@
  *
  * Permite a un usuario cancelar/degradar su suscripción Pro.
  * - Mock mode: Degrada a Free inmediatamente via buildSubscriptionData
- * - Real mode (futuro): Marca cancelAtPeriodEnd=true, delega a pasarela
+ * - Real mode: Comunica cancelación a LS vía provider + circuit breaker
  *
  * Rechaza si el usuario es Free (nada que cancelar) o Lifetime (no cancelable).
  *
@@ -12,11 +12,16 @@
  */
 
 const { onCall, HttpsError } = require("firebase-functions/v2/https");
+const { defineSecret } = require("firebase-functions/params");
 const admin = require("../firebaseAdmin");
 const { buildSubscriptionData } = require("./planFeatures");
+const { getPaymentProvider } = require("./providerFactory");
+const { getCircuit } = require("../../utils/circuitBreaker");
+
+const lsApiKey = defineSecret("LEMONSQUEEZY_API_KEY");
 
 const cancelSubscription = onCall(
-  { cors: true, memory: "256MiB", timeoutSeconds: 30 },
+  { cors: true, memory: "256MiB", timeoutSeconds: 30, secrets: [lsApiKey] },
   async (request) => {
     if (!request.auth?.uid) {
       throw new HttpsError("unauthenticated", "Authentication required");
@@ -48,7 +53,7 @@ const cancelSubscription = onCall(
 
     if (isMockMode) {
       // Mock mode: degradar a Free inmediatamente
-      const freeSubscription = buildSubscriptionData("free", "month");
+      const freeSubscription = await buildSubscriptionData("free", "month");
       await db
         .collection("userData")
         .doc(userId)
@@ -62,7 +67,32 @@ const cancelSubscription = onCall(
       };
     }
 
-    // Real mode (futuro): marcar cancelAtPeriodEnd sin borrar features
+    // Real mode: cancelar vía provider + circuit breaker, fallback a Firestore-only
+    const subscriptionId = subscription.subscriptionId;
+    if (!subscriptionId) {
+      throw new HttpsError(
+        "failed-precondition",
+        "No subscription ID found — cannot cancel with payment provider"
+      );
+    }
+
+    const provider = getPaymentProvider();
+    const lsCircuit = getCircuit("lemonSqueezy");
+
+    let providerSuccess = false;
+    try {
+      const result = await lsCircuit.execute(
+        () => provider.cancelSubscription(subscriptionId),
+        () => {
+          console.warn("[Cancel] LS circuit open — fallback to Firestore-only");
+          return { success: false, fallback: true };
+        }
+      );
+      providerSuccess = result.success && !result.fallback;
+    } catch (err) {
+      console.warn("[Cancel] LS API error — fallback:", err.message);
+    }
+
     const effectiveDate = subscription.currentPeriodEnd || new Date().toISOString();
     await db
       .collection("userData")
@@ -76,6 +106,11 @@ const cancelSubscription = onCall(
         },
         { merge: true }
       );
+
+    const logMsg = providerSuccess
+      ? "[Cancel] LS API confirmed cancel"
+      : "[Cancel] Firestore-only cancel (LS API failed or unavailable)";
+    console.log(logMsg);
 
     return {
       success: true,

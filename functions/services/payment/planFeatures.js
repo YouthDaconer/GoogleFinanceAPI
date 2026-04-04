@@ -1,14 +1,17 @@
 /**
  * Plan Features — Definición de features por plan de suscripción
  *
- * Módulo compartido entre Mock Provider (GATE-001) y futuro Payment Provider (STRIPE-001).
- * NO importa ningún SDK de pasarela de pagos.
+ * PAY-008: Features se leen de Firestore planDefinitions con cache in-memory (TTL 5 min).
+ * Fallback a constantes hardcodeadas si Firestore no disponible.
  *
- * @see docs/architecture/FEAT-GATE-001-feature-gating-subscription-plans-design.md
+ * @see docs/stories/PAY-008.story.md
  * @module services/payment/planFeatures
  */
 
+const admin = require("../firebaseAdmin");
+
 const UNLIMITED = 999999;
+const CACHE_TTL_MS = 5 * 60 * 1000;
 
 const BASE_FEATURES = {
   maxAccounts: UNLIMITED,
@@ -27,7 +30,6 @@ const BASE_FEATURES = {
   hasAiInsights: true,
   maxAssets: UNLIMITED,
   supportLevel: "email",
-  // ── NUEVOS (5) — FEAT-PRICING-RESTRUCTURE-001 ──
   hasRealtimeStreaming: true,
   maxWatchlist: UNLIMITED,
   hasDividendProjections: true,
@@ -35,25 +37,24 @@ const BASE_FEATURES = {
   hasEtfAnalyzer: true,
 };
 
-const PLAN_FEATURES = {
+const PLAN_FEATURES_FALLBACK = {
   free: {
     maxAccounts: 2,
-    historyDays: 365,              // CAMBIO: 90 → 365 (FEAT-PRICING-RESTRUCTURE-001)
-    hasAlerts: true,               // CAMBIO: false → true
-    alertLimit: 1,                 // CAMBIO: 0 → 1
+    historyDays: 365,
+    hasAlerts: true,
+    alertLimit: 1,
     hasSimulators: false,
     hasRiskMetrics: false,
     hasAttribution: false,
     hasIntelligence: false,
     hasBacktesting: false,
-    hasImport: true,               // CAMBIO: false → true
+    hasImport: true,
     hasExportCsv: false,
     hasExportPdf: false,
     hasTaxReports: false,
     hasAiInsights: false,
     maxAssets: UNLIMITED,
     supportLevel: "community",
-    // ── NUEVOS (5) — FEAT-PRICING-RESTRUCTURE-001 ──
     hasRealtimeStreaming: false,
     maxWatchlist: 3,
     hasDividendProjections: false,
@@ -64,21 +65,79 @@ const PLAN_FEATURES = {
   lifetime: { ...BASE_FEATURES, supportLevel: "priority" },
 };
 
-const VALID_PLANS = Object.keys(PLAN_FEATURES);
+// Backward compatibility alias
+const PLAN_FEATURES = PLAN_FEATURES_FALLBACK;
+
+const VALID_PLANS = Object.keys(PLAN_FEATURES_FALLBACK);
 const VALID_INTERVALS = ["month", "year", "lifetime"];
 
+let cache = { data: null, timestamp: 0 };
+let fetchPromise = null;
+
+async function loadPlanDefinitions() {
+  const db = admin.firestore();
+  const snapshot = await db.collection("planDefinitions").get();
+  const plans = {};
+  snapshot.forEach((doc) => {
+    const data = doc.data();
+    if (data.features) {
+      plans[doc.id] = data.features;
+    }
+  });
+  return plans;
+}
+
 /**
- * Construye el objeto de suscripción completo para escribir en Firestore.
+ * Returns all plan features from Firestore with in-memory cache (TTL 5 min).
+ * Uses promise coalescing to prevent multiple concurrent Firestore reads on cache miss.
+ * Falls back to PLAN_FEATURES_FALLBACK if Firestore is unavailable.
+ *
+ * @returns {Promise<Record<string, object>>} Plan features keyed by planId
+ */
+async function getAllPlanFeatures() {
+  const now = Date.now();
+  if (cache.data && now - cache.timestamp < CACHE_TTL_MS) {
+    return cache.data;
+  }
+
+  if (fetchPromise) {
+    return fetchPromise;
+  }
+
+  fetchPromise = (async () => {
+    try {
+      const plans = await loadPlanDefinitions();
+      if (Object.keys(plans).length >= 3) {
+        cache = { data: plans, timestamp: Date.now() };
+        return plans;
+      }
+      console.warn("[planFeatures] planDefinitions incomplete — using fallback");
+      return PLAN_FEATURES_FALLBACK;
+    } catch (err) {
+      console.warn("[planFeatures] Firestore read failed — using fallback:", err.message);
+      return PLAN_FEATURES_FALLBACK;
+    } finally {
+      fetchPromise = null;
+    }
+  })();
+
+  return fetchPromise;
+}
+
+/**
+ * Returns features for a specific plan from cache or Firestore.
  *
  * @param {string} planId - "free" | "pro" | "lifetime"
- * @param {string} interval - "month" | "year" | "lifetime"
- * @param {string} [status="active"] - Estado de la suscripción
- * @param {string} [origin="trial"] - Origen: "trial" | "mock_checkout" | "checkout"
- * @returns {object} Objeto de suscripción listo para Firestore
+ * @returns {Promise<object>} Feature flags for the requested plan
  */
-function buildSubscriptionData(planId, interval, status = "active", origin = "trial") {
+async function getPlanFeatures(planId) {
+  const plans = await getAllPlanFeatures();
+  return plans[planId] || plans.free || PLAN_FEATURES_FALLBACK.free;
+}
+
+async function buildSubscriptionData(planId, interval, status = "active", origin = "trial") {
   const resolvedPlan = VALID_PLANS.includes(planId) ? planId : "free";
-  const features = { ...PLAN_FEATURES[resolvedPlan] };
+  const features = { ...(await getPlanFeatures(resolvedPlan)) };
   const now = new Date();
 
   const subscription = {
@@ -106,4 +165,15 @@ function buildSubscriptionData(planId, interval, status = "active", origin = "tr
   return subscription;
 }
 
-module.exports = { PLAN_FEATURES, VALID_PLANS, VALID_INTERVALS, UNLIMITED, buildSubscriptionData };
+module.exports = {
+  PLAN_FEATURES,
+  PLAN_FEATURES_FALLBACK,
+  VALID_PLANS,
+  VALID_INTERVALS,
+  UNLIMITED,
+  buildSubscriptionData,
+  getPlanFeatures,
+  getAllPlanFeatures,
+  // PAY-008: exposed for test cache manipulation
+  _resetCache: () => { cache = { data: null, timestamp: 0 }; fetchPromise = null; },
+};

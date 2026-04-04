@@ -232,6 +232,7 @@ describe('getRateLimitConfig', () => {
       'updateDefaultCurrency', 'updateUserCountry', 'updateUserDisplayName',
       'addPortfolioAccount', 'updatePortfolioAccount', 
       'deletePortfolioAccount', 'updatePortfolioAccountBalance',
+      'createCheckoutSession', 'createPortalSession',
     ];
     
     expectedFunctions.forEach(fn => {
@@ -240,6 +241,6 @@ describe('getRateLimitConfig', () => {
       expect(RATE_LIMITS[fn].windowMs).toBe(60000);
     });
     
-    expect(Object.keys(RATE_LIMITS).length).toBe(22);
+    expect(Object.keys(RATE_LIMITS).length).toBe(25);
   });
 });

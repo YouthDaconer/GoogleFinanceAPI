@@ -15,6 +15,7 @@ const { buildSubscriptionData, VALID_PLANS } = require("./planFeatures");
 const mockSetSubscription = onCall(
   { cors: true, memory: "256MiB", timeoutSeconds: 30 },
   async (request) => {
+    // F0-02: Defensa en profundidad — requiere PAYMENT_MOCK_ENABLED=true Y Custom Claim admin
     if (process.env.PAYMENT_MOCK_ENABLED !== "true") {
       throw new HttpsError(
         "failed-precondition",
@@ -24,6 +25,17 @@ const mockSetSubscription = onCall(
 
     if (!request.auth?.uid) {
       throw new HttpsError("unauthenticated", "Authentication required");
+    }
+
+    // F0-02: Solo administradores pueden usar mock en producción
+    // En emulador/dev, el Custom Claim puede no existir — se permite si NODE_ENV no es production
+    const isAdmin = request.auth.token?.admin === true;
+    const isProduction = process.env.NODE_ENV === "production" || process.env.K_SERVICE;
+    if (isProduction && !isAdmin) {
+      throw new HttpsError(
+        "permission-denied",
+        "Mock subscription requires admin privileges in production"
+      );
     }
 
     const { planId, interval = "month", status = "active" } = request.data || {};
@@ -38,6 +50,20 @@ const mockSetSubscription = onCall(
     const userId = request.auth.uid;
     const db = admin.firestore();
 
+    // F0-03: Downgrade guard server-side — impide upgrades fraudulentos
+    const PLAN_RANK = { free: 0, pro: 1, lifetime: 2 };
+    const userDoc = await db.collection("userData").doc(userId).get();
+    const currentPlan = userDoc.data()?.subscription?.planId || "free";
+    const currentRank = PLAN_RANK[currentPlan] ?? 0;
+    const targetRank = PLAN_RANK[planId] ?? 0;
+
+    if (targetRank > currentRank && currentPlan !== "free") {
+      throw new HttpsError(
+        "failed-precondition",
+        `Cannot upgrade from ${currentPlan} to ${planId} via mock. Use the payment gateway.`
+      );
+    }
+
     // BUG-GATE-002: Determinar origin según el flujo
     // Free → Pro: trial (30 días de prueba gratuita)
     // Free → Lifetime / cualquier otro: mock_checkout (compra directa)
@@ -47,15 +73,13 @@ const mockSetSubscription = onCall(
     if (forceOrigin) {
       origin = forceOrigin;
     } else if (planId === "pro") {
-      const userDoc = await db.collection("userData").doc(userId).get();
-      const currentPlan = userDoc.data()?.subscription?.planId || "free";
       // Solo trial si viene de Free. Re-subscripciones post-cancelación = mock_checkout
       origin = currentPlan === "free" ? "trial" : "mock_checkout";
     } else {
       origin = "mock_checkout";
     }
 
-    const subscription = buildSubscriptionData(planId, interval, status, origin);
+    const subscription = await buildSubscriptionData(planId, interval, status, origin);
 
     await db.collection("userData").doc(userId).set({ subscription }, { merge: true });
 

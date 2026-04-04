@@ -345,5 +345,30 @@ service cloud.firestore {
       allow read: if isAuthenticated() && isOwner(resource.data.userId);
       allow write: if false;
     }
+
+    // ============================================================
+    // PAY-004: Idempotencia de webhooks + Audit log de suscripciones
+    // @see docs/stories/PAY-004.story.md
+    // ============================================================
+
+    // ---- SUBSCRIPTION EVENTS ----
+    // Audit log de webhooks procesados — solo Admin SDK (Cloud Functions)
+    match /subscriptionEvents/{eventId} {
+      allow read: if false;
+      allow write: if false;
+    }
+
+    // ============================================================
+    // PAY-008: Plan Definitions — Parametrización de planes
+    // @see docs/stories/PAY-008.story.md
+    // ============================================================
+
+    // ---- PLAN DEFINITIONS ----
+    // Definiciones de features por plan — lectura para usuarios autenticados
+    // Escritura exclusiva de Admin SDK (seed scripts, Cloud Functions)
+    match /planDefinitions/{planId} {
+      allow read: if isAuthenticated();
+      allow write: if false;
+    }
   }
 }

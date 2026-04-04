@@ -1,9 +1,11 @@
-const { PLAN_FEATURES } = require("../../payment/planFeatures");
+const { PLAN_FEATURES, _resetCache } = require("../../payment/planFeatures");
 
 // Mock firebaseAdmin before requiring the module under test
 const mockSet = jest.fn().mockResolvedValue();
-const mockDoc = jest.fn(() => ({ set: mockSet }));
-const mockCollection = jest.fn(() => ({ doc: mockDoc }));
+const mockGet = jest.fn().mockResolvedValue({ data: () => ({}) });
+const mockCollectionGet = jest.fn().mockResolvedValue({ forEach: jest.fn() });
+const mockDoc = jest.fn(() => ({ set: mockSet, get: mockGet }));
+const mockCollection = jest.fn(() => ({ doc: mockDoc, get: mockCollectionGet }));
 
 jest.mock("../../firebaseAdmin", () => ({
   firestore: () => ({ collection: mockCollection }),
@@ -33,6 +35,8 @@ describe("mockSetSubscription", () => {
   beforeEach(() => {
     jest.clearAllMocks();
     process.env = { ...originalEnv, PAYMENT_MOCK_ENABLED: "true" };
+    _resetCache();
+    mockCollectionGet.mockResolvedValue({ forEach: jest.fn() });
   });
 
   afterAll(() => {
@@ -81,7 +85,7 @@ describe("mockSetSubscription", () => {
 
   test("writes subscription to Firestore for pro plan", async () => {
     const result = await capturedHandler({
-      auth: { uid: "user123" },
+      auth: { uid: "user123", token: {} },
       data: { planId: "pro", interval: "month" },
     });
 
@@ -102,7 +106,7 @@ describe("mockSetSubscription", () => {
 
   test("writes subscription to Firestore for free plan", async () => {
     const result = await capturedHandler({
-      auth: { uid: "user456" },
+      auth: { uid: "user456", token: {} },
       data: { planId: "free" },
     });
 
@@ -113,12 +117,92 @@ describe("mockSetSubscription", () => {
 
   test("defaults interval to month and status to active", async () => {
     await capturedHandler({
-      auth: { uid: "user1" },
+      auth: { uid: "user1", token: {} },
       data: { planId: "pro" },
     });
 
     const writtenSubscription = mockSet.mock.calls[0][0].subscription;
     expect(writtenSubscription.interval).toBe("month");
     expect(writtenSubscription.status).toBe("active");
+  });
+
+  // F0-02: Admin guard in production
+  describe("admin guard (F0-02)", () => {
+    test("rejects non-admin in production (K_SERVICE set)", async () => {
+      process.env.K_SERVICE = "mockSetSubscription";
+
+      await expect(
+        capturedHandler({ auth: { uid: "user1", token: {} }, data: { planId: "pro" } })
+      ).rejects.toMatchObject({ code: "permission-denied" });
+
+      delete process.env.K_SERVICE;
+    });
+
+    test("rejects non-admin when NODE_ENV is production", async () => {
+      process.env.NODE_ENV = "production";
+
+      await expect(
+        capturedHandler({ auth: { uid: "user1", token: {} }, data: { planId: "pro" } })
+      ).rejects.toMatchObject({ code: "permission-denied" });
+
+      delete process.env.NODE_ENV;
+    });
+
+    test("allows admin in production", async () => {
+      process.env.K_SERVICE = "mockSetSubscription";
+
+      const result = await capturedHandler({
+        auth: { uid: "admin1", token: { admin: true } },
+        data: { planId: "pro" },
+      });
+
+      expect(result.success).toBe(true);
+      delete process.env.K_SERVICE;
+    });
+
+    test("allows non-admin in development (no K_SERVICE, no NODE_ENV=production)", async () => {
+      delete process.env.K_SERVICE;
+      delete process.env.NODE_ENV;
+
+      const result = await capturedHandler({
+        auth: { uid: "dev1", token: {} },
+        data: { planId: "pro" },
+      });
+
+      expect(result.success).toBe(true);
+    });
+  });
+
+  // F0-03: Downgrade guard server-side
+  describe("downgrade guard (F0-03)", () => {
+    test("rejects upgrade from pro to lifetime via mock", async () => {
+      mockGet.mockResolvedValueOnce({ data: () => ({ subscription: { planId: "pro" } }) });
+
+      await expect(
+        capturedHandler({ auth: { uid: "user1", token: {} }, data: { planId: "lifetime" } })
+      ).rejects.toMatchObject({ code: "failed-precondition" });
+    });
+
+    test("allows downgrade from pro to free", async () => {
+      mockGet.mockResolvedValueOnce({ data: () => ({ subscription: { planId: "pro" } }) });
+
+      const result = await capturedHandler({
+        auth: { uid: "user1", token: {} },
+        data: { planId: "free" },
+      });
+
+      expect(result.success).toBe(true);
+    });
+
+    test("allows upgrade from free to any plan", async () => {
+      mockGet.mockResolvedValueOnce({ data: () => ({ subscription: { planId: "free" } }) });
+
+      const result = await capturedHandler({
+        auth: { uid: "user1", token: {} },
+        data: { planId: "lifetime" },
+      });
+
+      expect(result.success).toBe(true);
+    });
   });
 });

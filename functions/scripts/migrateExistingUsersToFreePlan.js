@@ -43,7 +43,7 @@ async function migrateUsersToFreePlan() {
   }
 
   let migratedCount = 0;
-  const subscription = buildSubscriptionData("free", "month", "active");
+  const subscription = await buildSubscriptionData("free", "month", "active");
 
   for (let i = 0; i < usersWithoutSubscription.length; i += BATCH_LIMIT) {
     const chunk = usersWithoutSubscription.slice(i, i + BATCH_LIMIT);

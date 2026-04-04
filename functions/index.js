@@ -737,3 +737,53 @@ exports.mockSetSubscription = mockSetSubscription;
 // GATE-008: Cancel/Downgrade Subscription
 const { cancelSubscription } = require("./services/payment/cancelSubscriptionService");
 exports.cancelSubscription = cancelSubscription;
+
+// ============================================================================
+// STRIPE-001: Payment & Subscription Management
+// ============================================================================
+const subscriptionService = require("./services/payment/subscriptionService");
+const { handleWebhook } = require("./services/payment/webhookHandler");
+
+const lsApiKey = defineSecret("LEMONSQUEEZY_API_KEY");
+const lsWebhookSecret = defineSecret("LEMONSQUEEZY_WEBHOOK_SECRET");
+
+exports.createCheckoutSession = onCall(
+  { cors: true, memory: "256MiB", timeoutSeconds: 30, minInstances: 0,
+    secrets: [lsApiKey] },
+  withRateLimit('createCheckoutSession')(async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "Autenticación requerida");
+    }
+    const { planId, interval } = request.data || {};
+    if (!["pro", "lifetime"].includes(planId)) {
+      throw new HttpsError("invalid-argument", "Plan no válido. Usa: pro o lifetime");
+    }
+    if (planId === "pro" && !["month", "year"].includes(interval)) {
+      throw new HttpsError("invalid-argument", "Intervalo no válido para Pro. Usa: month o year");
+    }
+    return await subscriptionService.initiateCheckout(
+      request.auth.uid, request.auth.token.email, planId, interval || "lifetime"
+    );
+  })
+);
+
+exports.createPortalSession = onCall(
+  { cors: true, memory: "256MiB", timeoutSeconds: 30, minInstances: 0,
+    secrets: [lsApiKey] },
+  withRateLimit('createPortalSession')(async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "Autenticación requerida");
+    }
+    return await subscriptionService.createPortalSession(request.auth.uid);
+  })
+);
+
+exports.handlePaymentWebhook = onRequest(
+  { cors: false, memory: "256MiB", timeoutSeconds: 60, minInstances: 0,
+    secrets: [lsApiKey, lsWebhookSecret] },
+  handleWebhook
+);
+
+// PAY-005: Reconciliación automática de suscripciones vencidas
+const { reconcileSubscriptions } = require("./services/payment/reconcileSubscriptions");
+exports.reconcileSubscriptions = reconcileSubscriptions;

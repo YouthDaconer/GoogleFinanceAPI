@@ -60,6 +60,12 @@ const RATE_LIMITS = {
   updatePortfolioAccount: { limit: 20, windowMs: 60000 },
   deletePortfolioAccount: { limit: 5, windowMs: 60000 },
   updatePortfolioAccountBalance: { limit: 30, windowMs: 60000 },
+
+  // ═══════════════════════════════════════════════════════════════
+  // 💳 Payment Functions (PAY-005 F5-02)
+  // ═══════════════════════════════════════════════════════════════
+  createCheckoutSession: { limit: 3, windowMs: 60000 },
+  createPortalSession: { limit: 5, windowMs: 60000 },
 };
 
 const DEFAULT_LIMIT = { limit: 30, windowMs: 60000 };

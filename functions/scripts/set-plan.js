@@ -43,7 +43,7 @@ if (!VALID_INTERVALS.includes(interval)) {
 }
 
 async function main() {
-  const subscription = buildSubscriptionData(planId, interval, status, origin);
+  const subscription = await buildSubscriptionData(planId, interval, status, origin);
   const db = admin.firestore();
 
   await db.collection("userData").doc(userId).set({ subscription }, { merge: true });

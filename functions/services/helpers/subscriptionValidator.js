@@ -9,15 +9,17 @@
 
 const { getFirestore } = require("firebase-admin/firestore");
 const { HttpsError } = require("firebase-functions/v2/https");
-const { PLAN_FEATURES } = require("../payment/planFeatures");
+const { getPlanFeatures } = require("../payment/planFeatures");
 
 const db = getFirestore();
 
 async function validateFeatureAccess(userId, featureKey) {
   const userDoc = await db.collection("userData").doc(userId).get();
-  const features = userDoc.data()?.subscription?.features ?? PLAN_FEATURES.free;
+  const features = userDoc.data()?.subscription?.features;
 
-  if (!features[featureKey]) {
+  const effectiveFeatures = features || (await getPlanFeatures("free"));
+
+  if (!effectiveFeatures[featureKey]) {
     throw new HttpsError(
       "permission-denied",
       "Esta funcionalidad requiere un plan Pro activo."
@@ -27,7 +29,9 @@ async function validateFeatureAccess(userId, featureKey) {
 
 async function validateQuantityLimit(userId, featureKey, collection, countFilters = {}) {
   const userDoc = await db.collection("userData").doc(userId).get();
-  const limit = userDoc.data()?.subscription?.features?.[featureKey] ?? PLAN_FEATURES.free[featureKey];
+  const userLimit = userDoc.data()?.subscription?.features?.[featureKey];
+  const freeFeatures = await getPlanFeatures("free");
+  const limit = userLimit ?? freeFeatures[featureKey];
 
   let query = db.collection(collection).where("userId", "==", userId);
   for (const [key, value] of Object.entries(countFilters)) {
