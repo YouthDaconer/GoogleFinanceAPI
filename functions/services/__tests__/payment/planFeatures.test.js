@@ -211,6 +211,30 @@ describe("buildSubscriptionData", () => {
     const result = await buildSubscriptionData("free", "month");
     expect(result.purchasedAt).toBeUndefined();
   });
+
+  // PAY-009: Trial fields
+  test("origin=trial sets hasUsedTrial and trialStartedAt", async () => {
+    const result = await buildSubscriptionData("pro", "month", "active", "trial");
+
+    expect(result.hasUsedTrial).toBe(true);
+    expect(result.trialStartedAt).toBe("2026-03-29T12:00:00.000Z");
+    expect(result.subscriptionOrigin).toBe("trial");
+  });
+
+  test("origin=checkout does NOT set hasUsedTrial or trialStartedAt", async () => {
+    const result = await buildSubscriptionData("pro", "month", "active", "checkout");
+
+    expect(result.hasUsedTrial).toBeUndefined();
+    expect(result.trialStartedAt).toBeUndefined();
+    expect(result.subscriptionOrigin).toBe("checkout");
+  });
+
+  test("origin=mock_checkout does NOT set hasUsedTrial or trialStartedAt", async () => {
+    const result = await buildSubscriptionData("pro", "month", "active", "mock_checkout");
+
+    expect(result.hasUsedTrial).toBeUndefined();
+    expect(result.trialStartedAt).toBeUndefined();
+  });
 });
 
 // ============================================================================

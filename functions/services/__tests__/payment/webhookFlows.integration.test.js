@@ -30,6 +30,7 @@ beforeEach(() => {
   _resetCache();
   mockCollectionGet.mockResolvedValue({ forEach: jest.fn() });
   mockSet.mockResolvedValue();
+  mockGet.mockResolvedValue({ data: () => ({ subscription: {} }) });
 });
 
 afterEach(() => {

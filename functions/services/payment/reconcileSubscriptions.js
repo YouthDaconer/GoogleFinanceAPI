@@ -12,9 +12,23 @@ const LIMITS = {
 };
 
 async function degradeToFree(userRef, userId, reason, counters) {
+  const userDoc = await userRef.get();
+  const currentSub = userDoc.data()?.subscription;
+
   const freeData = await buildSubscriptionData("free", "month");
   freeData.subscriptionId = null;
   freeData.providerCustomerId = null;
+
+  // PAY-009: Preservar trial history (campos sticky)
+  if (currentSub?.hasUsedTrial) {
+    freeData.hasUsedTrial = true;
+  }
+  if (currentSub?.trialStartedAt) {
+    freeData.trialStartedAt = currentSub.trialStartedAt;
+  }
+  if (currentSub?.subscriptionOrigin === "trial") {
+    freeData.trialEndedAt = new Date().toISOString();
+  }
 
   const batch = db.batch();
   batch.set(userRef, { subscription: freeData }, { merge: true });

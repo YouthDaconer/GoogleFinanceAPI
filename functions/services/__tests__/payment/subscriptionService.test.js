@@ -288,7 +288,9 @@ describe("processWebhookEvent", () => {
   describe("transaction support (PAY-004)", () => {
     test("uses transaction.set when transaction is provided", async () => {
       const mockTransactionSet = jest.fn();
-      const mockTransactionGet = jest.fn();
+      const mockTransactionGet = jest.fn().mockResolvedValue({
+        data: () => ({ subscription: {} }),
+      });
       const mockTransaction = { set: mockTransactionSet, get: mockTransactionGet };
 
       await processWebhookEvent(
@@ -351,7 +353,10 @@ describe("processWebhookEvent", () => {
 
     test("SUBSCRIPTION_CANCELED uses transaction.set when transaction provided", async () => {
       const mockTransactionSet = jest.fn();
-      const mockTransaction = { set: mockTransactionSet, get: jest.fn() };
+      const mockTransaction = {
+        set: mockTransactionSet,
+        get: jest.fn().mockResolvedValue({ data: () => ({ subscription: {} }) }),
+      };
 
       await processWebhookEvent(
         {
@@ -437,5 +442,83 @@ describe("Circuit Breaker (PAY-005 F5-01)", () => {
       // (it was cleared in beforeEach, and processWebhookEvent doesn't call it)
       expect(mockCircuitExecute).not.toHaveBeenCalled();
     });
+  });
+});
+
+// PAY-009: Trial field preservation in webhook handlers
+describe("trial field preservation (PAY-009)", () => {
+  const baseWebhookResult = {
+    userId: "uid-trial",
+    subscriptionId: "sub-100",
+    customerId: "cust-200",
+    rawData: {},
+  };
+
+  test("CHECKOUT_COMPLETED preserves hasUsedTrial from existing snapshot", async () => {
+    mockGet.mockResolvedValue({
+      data: () => ({
+        subscription: {
+          hasUsedTrial: true,
+          trialStartedAt: "2026-03-01T00:00:00.000Z",
+          trialEndedAt: "2026-03-15T00:00:00.000Z",
+        },
+      }),
+    });
+
+    await processWebhookEvent({
+      ...baseWebhookResult,
+      type: PAYMENT_EVENT_TYPES.CHECKOUT_COMPLETED,
+      planId: "pro",
+      interval: "month",
+    });
+
+    const writtenSub = mockSet.mock.calls[0][0].subscription;
+    expect(writtenSub.hasUsedTrial).toBe(true);
+    expect(writtenSub.trialStartedAt).toBe("2026-03-01T00:00:00.000Z");
+    expect(writtenSub.trialEndedAt).toBe("2026-03-15T00:00:00.000Z");
+    expect(writtenSub.subscriptionOrigin).toBe("checkout");
+  });
+
+  test("CHECKOUT_COMPLETED without prior trial does NOT add trial fields", async () => {
+    mockGet.mockResolvedValue({
+      data: () => ({ subscription: {} }),
+    });
+
+    await processWebhookEvent({
+      ...baseWebhookResult,
+      type: PAYMENT_EVENT_TYPES.CHECKOUT_COMPLETED,
+      planId: "pro",
+      interval: "month",
+    });
+
+    const writtenSub = mockSet.mock.calls[0][0].subscription;
+    expect(writtenSub.hasUsedTrial).toBeUndefined();
+    expect(writtenSub.trialStartedAt).toBeUndefined();
+  });
+
+  test("SUBSCRIPTION_CANCELED preserves hasUsedTrial in Free snapshot", async () => {
+    mockGet.mockResolvedValue({
+      data: () => ({
+        subscription: {
+          planId: "pro",
+          subscriptionOrigin: "trial",
+          hasUsedTrial: true,
+          trialStartedAt: "2026-03-01T00:00:00.000Z",
+        },
+      }),
+    });
+
+    await processWebhookEvent({
+      ...baseWebhookResult,
+      type: PAYMENT_EVENT_TYPES.SUBSCRIPTION_CANCELED,
+      planId: "pro",
+      interval: "month",
+    });
+
+    const writtenSub = mockSet.mock.calls[0][0].subscription;
+    expect(writtenSub.planId).toBe("free");
+    expect(writtenSub.hasUsedTrial).toBe(true);
+    expect(writtenSub.trialStartedAt).toBe("2026-03-01T00:00:00.000Z");
+    expect(writtenSub.trialEndedAt).toBeDefined();
   });
 });

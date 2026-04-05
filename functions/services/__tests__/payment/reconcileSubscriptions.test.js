@@ -67,10 +67,14 @@ beforeEach(() => {
 });
 
 function createUserDoc(id, subscription) {
+  const docData = { subscription };
   return {
     id,
-    ref: { set: mockSet },
-    data: () => ({ subscription }),
+    ref: {
+      set: mockSet,
+      get: jest.fn().mockResolvedValue({ data: () => docData }),
+    },
+    data: () => docData,
   };
 }
 
@@ -330,5 +334,51 @@ describe("LIMITS", () => {
 
   test("PAST_DUE_TIMEOUT_DAYS is 30", () => {
     expect(LIMITS.PAST_DUE_TIMEOUT_DAYS).toBe(30);
+  });
+});
+
+// PAY-009: Trial field preservation in degradeToFree
+describe("trial field preservation (PAY-009)", () => {
+  const { degradeToFree } = require("../../payment/reconcileSubscriptions");
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    buildQueryChain();
+  });
+
+  test("preserves hasUsedTrial and trialStartedAt when degrading trial subscription", async () => {
+    const doc = createUserDoc("uid-trial-expire", {
+      status: "active",
+      planId: "pro",
+      subscriptionOrigin: "trial",
+      hasUsedTrial: true,
+      trialStartedAt: "2026-03-01T00:00:00.000Z",
+    });
+
+    const counters = { period_expired: 0, errors: 0 };
+    await degradeToFree(doc.ref, doc.id, "period_expired", counters);
+
+    expect(counters.period_expired).toBe(1);
+    const writtenSub = mockBatchSet.mock.calls[0][1].subscription;
+    expect(writtenSub.hasUsedTrial).toBe(true);
+    expect(writtenSub.trialStartedAt).toBe("2026-03-01T00:00:00.000Z");
+    expect(writtenSub.trialEndedAt).toBeDefined();
+  });
+
+  test("does NOT set trialEndedAt for non-trial subscriptions", async () => {
+    const doc = createUserDoc("uid-checkout-expire", {
+      status: "active",
+      planId: "pro",
+      subscriptionOrigin: "checkout",
+      hasUsedTrial: true,
+      trialStartedAt: "2026-02-01T00:00:00.000Z",
+    });
+
+    const counters = { period_expired: 0, errors: 0 };
+    await degradeToFree(doc.ref, doc.id, "period_expired", counters);
+
+    const writtenSub = mockBatchSet.mock.calls[0][1].subscription;
+    expect(writtenSub.hasUsedTrial).toBe(true);
+    expect(writtenSub.trialEndedAt).toBeUndefined();
   });
 });

@@ -205,4 +205,65 @@ describe("mockSetSubscription", () => {
       expect(result.success).toBe(true);
     });
   });
+
+  // PAY-009: Trial eligibility guard
+  describe("trial eligibility guard (PAY-009)", () => {
+    test("grants trial to Free user without prior trial", async () => {
+      mockGet.mockResolvedValueOnce({ data: () => ({ subscription: { planId: "free" } }) });
+
+      await capturedHandler({
+        auth: { uid: "new-user", token: {} },
+        data: { planId: "pro", interval: "month" },
+      });
+
+      const writtenSub = mockSet.mock.calls[0][0].subscription;
+      expect(writtenSub.subscriptionOrigin).toBe("trial");
+      expect(writtenSub.hasUsedTrial).toBe(true);
+      expect(writtenSub.trialStartedAt).toBeDefined();
+    });
+
+    test("denies trial to Free user who already used trial (hasUsedTrial=true)", async () => {
+      mockGet.mockResolvedValueOnce({
+        data: () => ({ subscription: { planId: "free", hasUsedTrial: true } }),
+      });
+
+      await capturedHandler({
+        auth: { uid: "returning-user", token: {} },
+        data: { planId: "pro", interval: "month" },
+      });
+
+      const writtenSub = mockSet.mock.calls[0][0].subscription;
+      expect(writtenSub.subscriptionOrigin).toBe("mock_checkout");
+      expect(writtenSub.hasUsedTrial).toBeUndefined();
+    });
+
+    test("grants trial when hasUsedTrial is undefined (backward compat)", async () => {
+      mockGet.mockResolvedValueOnce({
+        data: () => ({ subscription: { planId: "free" } }),
+      });
+
+      await capturedHandler({
+        auth: { uid: "legacy-user", token: {} },
+        data: { planId: "pro" },
+      });
+
+      const writtenSub = mockSet.mock.calls[0][0].subscription;
+      expect(writtenSub.subscriptionOrigin).toBe("trial");
+      expect(writtenSub.hasUsedTrial).toBe(true);
+    });
+
+    test("forceOrigin overrides trial eligibility guard", async () => {
+      mockGet.mockResolvedValueOnce({
+        data: () => ({ subscription: { planId: "free", hasUsedTrial: true } }),
+      });
+
+      await capturedHandler({
+        auth: { uid: "admin-user", token: {} },
+        data: { planId: "pro", origin: "trial" },
+      });
+
+      const writtenSub = mockSet.mock.calls[0][0].subscription;
+      expect(writtenSub.subscriptionOrigin).toBe("trial");
+    });
+  });
 });

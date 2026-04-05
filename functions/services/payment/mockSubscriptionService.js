@@ -64,17 +64,19 @@ const mockSetSubscription = onCall(
       );
     }
 
-    // BUG-GATE-002: Determinar origin según el flujo
-    // Free → Pro: trial (30 días de prueba gratuita)
+    // BUG-GATE-002 + PAY-009: Determinar origin según el flujo
+    // Free → Pro (sin trial previo): trial (30 días de prueba gratuita)
+    // Free → Pro (con trial previo): mock_checkout (compra directa, sin trial)
     // Free → Lifetime / cualquier otro: mock_checkout (compra directa)
-    // El caller puede forzar origin para DevPanel u otros flujos administrativos
-    const forceOrigin = request.data?.origin;
+    const VALID_ORIGINS = ["trial", "mock_checkout", "checkout"];
+    const rawForceOrigin = request.data?.origin;
+    const forceOrigin = VALID_ORIGINS.includes(rawForceOrigin) ? rawForceOrigin : null;
+    const hasUsedTrial = userDoc.data()?.subscription?.hasUsedTrial === true;
     let origin;
     if (forceOrigin) {
       origin = forceOrigin;
     } else if (planId === "pro") {
-      // Solo trial si viene de Free. Re-subscripciones post-cancelación = mock_checkout
-      origin = currentPlan === "free" ? "trial" : "mock_checkout";
+      origin = (currentPlan === "free" && !hasUsedTrial) ? "trial" : "mock_checkout";
     } else {
       origin = "mock_checkout";
     }

@@ -54,6 +54,18 @@ const cancelSubscription = onCall(
     if (isMockMode) {
       // Mock mode: degradar a Free inmediatamente
       const freeSubscription = await buildSubscriptionData("free", "month");
+
+      // PAY-009: Preservar trial history (campos sticky)
+      if (subscription.hasUsedTrial) {
+        freeSubscription.hasUsedTrial = true;
+      }
+      if (subscription.trialStartedAt) {
+        freeSubscription.trialStartedAt = subscription.trialStartedAt;
+      }
+      if (subscription.subscriptionOrigin === "trial") {
+        freeSubscription.trialEndedAt = new Date().toISOString();
+      }
+
       await db
         .collection("userData")
         .doc(userId)

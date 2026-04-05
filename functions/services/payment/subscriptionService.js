@@ -97,9 +97,24 @@ async function processWebhookEvent(webhookResult, transaction = null) {
   switch (type) {
     case PAYMENT_EVENT_TYPES.CHECKOUT_COMPLETED:
     case PAYMENT_EVENT_TYPES.SUBSCRIPTION_CREATED: {
+      // PAY-009: Read existing snapshot to preserve trial history
+      const existingUserDoc = await readUser();
+      const existingSub = existingUserDoc.data()?.subscription;
+
       const subscriptionData = await buildSubscriptionData(planId, interval, "active", "checkout");
       subscriptionData.subscriptionId = subscriptionId;
       subscriptionData.providerCustomerId = customerId;
+
+      // PAY-009: Preserve sticky trial fields
+      if (existingSub?.hasUsedTrial) {
+        subscriptionData.hasUsedTrial = true;
+      }
+      if (existingSub?.trialStartedAt) {
+        subscriptionData.trialStartedAt = existingSub.trialStartedAt;
+      }
+      if (existingSub?.trialEndedAt) {
+        subscriptionData.trialEndedAt = existingSub.trialEndedAt;
+      }
 
       if (planId === "lifetime") {
         subscriptionData.currentPeriodEnd = null;
@@ -122,9 +137,27 @@ async function processWebhookEvent(webhookResult, transaction = null) {
     }
 
     case PAYMENT_EVENT_TYPES.SUBSCRIPTION_CANCELED: {
+      // PAY-009: Read existing snapshot to preserve trial history
+      const existingCancelDoc = await readUser();
+      const existingCancelSub = existingCancelDoc.data()?.subscription;
+
       const freeData = await buildSubscriptionData("free", "month", "canceled");
       freeData.subscriptionId = null;
       freeData.providerCustomerId = null;
+
+      // PAY-009: Preserve sticky trial fields
+      if (existingCancelSub?.hasUsedTrial) {
+        freeData.hasUsedTrial = true;
+      }
+      if (existingCancelSub?.trialStartedAt) {
+        freeData.trialStartedAt = existingCancelSub.trialStartedAt;
+      }
+      if (existingCancelSub?.subscriptionOrigin === "trial") {
+        freeData.trialEndedAt = new Date().toISOString();
+      } else if (existingCancelSub?.trialEndedAt) {
+        freeData.trialEndedAt = existingCancelSub.trialEndedAt;
+      }
+
       await writeToUser({ subscription: freeData });
       break;
     }

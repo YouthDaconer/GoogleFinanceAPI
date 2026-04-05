@@ -162,6 +162,11 @@ async function buildSubscriptionData(planId, interval, status = "active", origin
     subscription.currentPeriodEnd = periodEnd.toISOString();
   }
 
+  if (origin === "trial") {
+    subscription.trialStartedAt = now.toISOString();
+    subscription.hasUsedTrial = true;
+  }
+
   return subscription;
 }
 

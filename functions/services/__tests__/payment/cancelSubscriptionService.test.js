@@ -247,4 +247,54 @@ describe("cancelSubscriptionService", () => {
       logSpy.mockRestore();
     });
   });
+
+  // PAY-009: Trial field preservation in mock cancel
+  describe("trial field preservation (PAY-009)", () => {
+    beforeEach(() => {
+      process.env.PAYMENT_MOCK_ENABLED = "true";
+    });
+
+    test("preserves hasUsedTrial and sets trialEndedAt when canceling trial subscription", async () => {
+      mockGet.mockResolvedValue({
+        data: () => ({
+          subscription: {
+            planId: "pro",
+            subscriptionOrigin: "trial",
+            hasUsedTrial: true,
+            trialStartedAt: "2026-03-01T00:00:00.000Z",
+          },
+        }),
+      });
+
+      const result = await capturedHandler({ auth: { uid: "trial-user" }, data: {} });
+
+      expect(result.success).toBe(true);
+      const writtenSub = mockSet.mock.calls[0][0].subscription;
+      expect(writtenSub.planId).toBe("free");
+      expect(writtenSub.hasUsedTrial).toBe(true);
+      expect(writtenSub.trialStartedAt).toBe("2026-03-01T00:00:00.000Z");
+      expect(writtenSub.trialEndedAt).toBeDefined();
+    });
+
+    test("preserves hasUsedTrial when canceling mock_checkout subscription", async () => {
+      mockGet.mockResolvedValue({
+        data: () => ({
+          subscription: {
+            planId: "pro",
+            subscriptionOrigin: "mock_checkout",
+            hasUsedTrial: true,
+            trialStartedAt: "2026-02-01T00:00:00.000Z",
+          },
+        }),
+      });
+
+      const result = await capturedHandler({ auth: { uid: "repeat-user" }, data: {} });
+
+      expect(result.success).toBe(true);
+      const writtenSub = mockSet.mock.calls[0][0].subscription;
+      expect(writtenSub.hasUsedTrial).toBe(true);
+      expect(writtenSub.trialStartedAt).toBe("2026-02-01T00:00:00.000Z");
+      expect(writtenSub.trialEndedAt).toBeUndefined();
+    });
+  });
 });
