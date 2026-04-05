@@ -738,6 +738,10 @@ exports.mockSetSubscription = mockSetSubscription;
 const { cancelSubscription } = require("./services/payment/cancelSubscriptionService");
 exports.cancelSubscription = cancelSubscription;
 
+// PAY-REACT-001: Reactivate Subscription (undo pending cancellation)
+const { reactivateSubscription } = require("./services/payment/reactivateSubscriptionService");
+exports.reactivateSubscription = reactivateSubscription;
+
 // ============================================================================
 // STRIPE-001: Payment & Subscription Management
 // ============================================================================
@@ -780,10 +784,18 @@ exports.createPortalSession = onCall(
 
 exports.handlePaymentWebhook = onRequest(
   { cors: false, memory: "256MiB", timeoutSeconds: 60, minInstances: 0,
-    secrets: [lsApiKey, lsWebhookSecret] },
+    secrets: [lsApiKey, lsWebhookSecret, "AWS_SES_ACCESS_KEY_ID", "AWS_SES_SECRET_ACCESS_KEY"] },
   handleWebhook
 );
 
 // PAY-005: Reconciliación automática de suscripciones vencidas
 const { reconcileSubscriptions } = require("./services/payment/reconcileSubscriptions");
 exports.reconcileSubscriptions = reconcileSubscriptions;
+
+// PAY-BILLING-001: Invoice History
+const { getSubscriptionInvoices } = require("./services/payment/invoiceService");
+exports.getSubscriptionInvoices = getSubscriptionInvoices;
+
+// PAY-PAYMENT-001: Payment Method Info
+const { getPaymentMethod } = require("./services/payment/paymentMethodService");
+exports.getPaymentMethod = getPaymentMethod;

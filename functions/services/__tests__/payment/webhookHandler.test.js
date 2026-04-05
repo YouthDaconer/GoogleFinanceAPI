@@ -32,6 +32,17 @@ jest.mock("../../payment/subscriptionService", () => ({
   processWebhookEvent: jest.fn(),
 }));
 
+const mockSendTransactionalEmail = jest.fn().mockResolvedValue("ses-msg-wh");
+jest.mock("../../payment/emailService", () => ({
+  sendTransactionalEmail: (...args) => mockSendTransactionalEmail(...args),
+  EMAIL_TEMPLATES: Object.freeze({
+    TRIAL_EXPIRING: "trial_expiring",
+    PAYMENT_FAILED: "payment_failed",
+    SUBSCRIPTION_CANCELLED: "subscription_cancelled",
+    PAYMENT_RENEWED: "payment_renewed",
+  }),
+}));
+
 const { handleWebhook, extractEventId, deriveAfterState } = require("../../payment/webhookHandler");
 const { processWebhookEvent } = require("../../payment/subscriptionService");
 
@@ -72,7 +83,12 @@ beforeEach(() => {
     return Promise.resolve({ exists: false });
   });
   mockDoc.mockReturnValue({ id: "test-event-id" });
-  mockCollectionDoc.mockImplementation(() => ({ _isUserRef: true }));
+  mockCollectionDoc.mockImplementation(() => ({
+    _isUserRef: true,
+    get: jest.fn().mockResolvedValue({
+      data: () => ({ email: "user@test.com", displayName: "TestUser" }),
+    }),
+  }));
 });
 
 describe("extractEventId", () => {
@@ -358,5 +374,113 @@ describe("deriveAfterState", () => {
       .toEqual({ planId: null, status: "active" });
     expect(deriveAfterState({ type: "unknown_event" }))
       .toEqual({ planId: null, status: null });
+  });
+});
+
+// --------------------------------------------------------------------------
+// PAY-EMAIL-001: Email notifications from webhook events
+// --------------------------------------------------------------------------
+
+describe("Email notifications (PAY-EMAIL-001)", () => {
+  test("PAYMENT_FAILED webhook sends payment_failed email", async () => {
+    const webhookResult = {
+      type: "payment_failed",
+      userId: "uid-fail",
+      rawData: { meta: { webhook_event_id: "evt-pf" } },
+    };
+    mockProvider.parseWebhook.mockResolvedValue(webhookResult);
+
+    const req = { headers: { "x-signature": "valid-sig" }, rawBody: '{"meta": {}}' };
+    const res = createMockRes();
+
+    await handleWebhook(req, res);
+
+    expect(mockSendTransactionalEmail).toHaveBeenCalledWith(
+      "payment_failed",
+      "user@test.com",
+      expect.objectContaining({ userName: "TestUser" }),
+      { maxRetries: 0, timeoutMs: 5000 }
+    );
+    expect(res.status).toHaveBeenCalledWith(200);
+  });
+
+  test("PAYMENT_SUCCEEDED webhook sends payment_renewed email", async () => {
+    const webhookResult = {
+      type: "payment_succeeded",
+      userId: "uid-success",
+      rawData: {
+        meta: { webhook_event_id: "evt-ps" },
+        data: { attributes: { total_formatted: "$9.99" } },
+      },
+    };
+    mockProvider.parseWebhook.mockResolvedValue(webhookResult);
+
+    const req = { headers: { "x-signature": "valid-sig" }, rawBody: '{"meta": {}}' };
+    const res = createMockRes();
+
+    await handleWebhook(req, res);
+
+    expect(mockSendTransactionalEmail).toHaveBeenCalledWith(
+      "payment_renewed",
+      "user@test.com",
+      expect.objectContaining({ userName: "TestUser", planName: "Pro", amount: "$9.99" }),
+      { maxRetries: 0, timeoutMs: 5000 }
+    );
+    expect(res.status).toHaveBeenCalledWith(200);
+  });
+
+  test("deduplicated webhook does NOT send email", async () => {
+    mockTransactionGet.mockResolvedValue({ exists: true });
+
+    const webhookResult = {
+      type: "payment_failed",
+      userId: "uid-dup",
+      rawData: { meta: { webhook_event_id: "evt-dup-email" } },
+    };
+    mockProvider.parseWebhook.mockResolvedValue(webhookResult);
+
+    const req = { headers: { "x-signature": "valid-sig" }, rawBody: '{"meta": {}}' };
+    const res = createMockRes();
+
+    await handleWebhook(req, res);
+
+    expect(mockSendTransactionalEmail).not.toHaveBeenCalled();
+    expect(res.status).toHaveBeenCalledWith(200);
+  });
+
+  test("webhook without userId does NOT send email", async () => {
+    const webhookResult = {
+      type: "payment_failed",
+      rawData: { meta: { webhook_event_id: "evt-no-uid" } },
+    };
+    mockProvider.parseWebhook.mockResolvedValue(webhookResult);
+
+    const req = { headers: { "x-signature": "valid-sig" }, rawBody: '{"meta": {}}' };
+    const res = createMockRes();
+
+    await handleWebhook(req, res);
+
+    expect(mockSendTransactionalEmail).not.toHaveBeenCalled();
+    expect(res.status).toHaveBeenCalledWith(200);
+  });
+
+  test("email error does NOT prevent 200 response", async () => {
+    const errorSpy = jest.spyOn(console, "error").mockImplementation();
+    mockSendTransactionalEmail.mockRejectedValueOnce(new Error("SES down"));
+
+    const webhookResult = {
+      type: "payment_failed",
+      userId: "uid-email-err",
+      rawData: { meta: { webhook_event_id: "evt-email-err" } },
+    };
+    mockProvider.parseWebhook.mockResolvedValue(webhookResult);
+
+    const req = { headers: { "x-signature": "valid-sig" }, rawBody: '{"meta": {}}' };
+    const res = createMockRes();
+
+    await handleWebhook(req, res);
+
+    expect(res.status).toHaveBeenCalledWith(200);
+    errorSpy.mockRestore();
   });
 });

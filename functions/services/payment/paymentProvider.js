@@ -62,11 +62,25 @@
  */
 
 /**
+ * @typedef {Object} NormalizedInvoice
+ * @property {string} id - Invoice ID (stringified)
+ * @property {string} createdAt - ISO date of invoice creation
+ * @property {number} total - Amount in cents
+ * @property {string} totalFormatted - Formatted amount (e.g. "$9.99")
+ * @property {string} currency - Currency code (e.g. "USD")
+ * @property {string} status - "paid" | "pending" | "refunded" | "void"
+ * @property {string|null} invoiceUrl - URL to invoice PDF
+ * @property {string|null} cardBrand - Card brand (e.g. "visa")
+ * @property {string|null} cardLastFour - Last four digits of card
+ */
+
+/**
  * @typedef {Object} PaymentProvider
  * @property {function(CreateCheckoutOptions): Promise<CheckoutResult>} createCheckoutSession
  * @property {function(string): Promise<PortalResult>} createPortalSession
  * @property {function(string): Promise<NormalizedSubscription>} getSubscription
  * @property {function(string): Promise<CancelSubscriptionResult>} cancelSubscription
+ * @property {function(string): Promise<NormalizedInvoice[]>} getSubscriptionInvoices
  * @property {function(string, string): Promise<WebhookResult>} parseWebhook
  */
 

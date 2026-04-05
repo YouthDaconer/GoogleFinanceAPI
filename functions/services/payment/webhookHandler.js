@@ -15,6 +15,7 @@ const admin = require("../firebaseAdmin");
 const { getPaymentProvider } = require("./providerFactory");
 const { processWebhookEvent } = require("./subscriptionService");
 const { PAYMENT_EVENT_TYPES } = require("./paymentProvider");
+const { sendTransactionalEmail, EMAIL_TEMPLATES } = require("./emailService");
 
 const db = admin.firestore();
 
@@ -124,6 +125,36 @@ async function handleWebhook(req, res) {
 
     const logPrefix = result.deduplicated ? "Deduplicado" : "Procesado OK";
     console.log(`[Webhook] ${logPrefix}: ${webhookResult.type} eventId=${eventId}`);
+
+    if (webhookResult.userId && !result.deduplicated) {
+      try {
+        const userDoc = await db.collection("userData").doc(webhookResult.userId).get();
+        const email = userDoc.data()?.email;
+
+        if (email) {
+          const emailOpts = { maxRetries: 0, timeoutMs: 5000 };
+          switch (webhookResult.type) {
+            case PAYMENT_EVENT_TYPES.PAYMENT_FAILED:
+              await sendTransactionalEmail(EMAIL_TEMPLATES.PAYMENT_FAILED, email, {
+                userName: userDoc.data()?.displayName || email.split("@")[0],
+                updatePaymentUrl: `${process.env.APP_URL || "https://portastock.net"}/settings`,
+              }, emailOpts);
+              break;
+
+            case PAYMENT_EVENT_TYPES.PAYMENT_SUCCEEDED:
+              await sendTransactionalEmail(EMAIL_TEMPLATES.PAYMENT_RENEWED, email, {
+                userName: userDoc.data()?.displayName || email.split("@")[0],
+                planName: "Pro",
+                amount: webhookResult.rawData?.data?.attributes?.total_formatted || null,
+              }, emailOpts);
+              break;
+          }
+        }
+      } catch (emailErr) {
+        console.error("[Webhook] Email side-effect failed:", emailErr.message);
+      }
+    }
+
     res.status(200).json({ received: true });
   } catch (err) {
     console.error("[Webhook] Error procesando:", err.message);

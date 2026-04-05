@@ -14,6 +14,7 @@ const {
   getSubscription: lsGetSubscription,
   updateSubscription: lsUpdateSubscription,
   getCustomer,
+  listSubscriptionInvoices,
 } = require("@lemonsqueezy/lemonsqueezy.js");
 const crypto = require("crypto");
 const { PAYMENT_EVENT_TYPES } = require("./paymentProvider");
@@ -91,6 +92,8 @@ function createLemonSqueezyProvider() {
       interval: attrs.billing_anchor === 0 ? "lifetime" : attrs.variant_id ? "month" : "year",
       currentPeriodEnd: attrs.renews_at || null,
       cancelAtPeriodEnd: attrs.cancelled,
+      cardBrand: attrs.card_brand || null,
+      cardLastFour: attrs.card_last_four || null,
     };
   }
 
@@ -145,11 +148,54 @@ function createLemonSqueezyProvider() {
     };
   }
 
+  async function reactivateSubscription(subscriptionId) {
+    const { data, error } = await lsUpdateSubscription(subscriptionId, {
+      cancelled: false,
+    });
+
+    if (error) {
+      throw new Error(`LS reactivate failed: ${error.message}`);
+    }
+
+    const attrs = data?.data?.attributes || {};
+    return {
+      success: attrs.status === "active",
+      providerStatus: attrs.status,
+    };
+  }
+
+  async function getSubscriptionInvoices(subscriptionId) {
+    const { data, error } = await listSubscriptionInvoices({
+      filter: { subscriptionId },
+      page: { size: 20 },
+    });
+
+    if (error) {
+      throw new Error(`LS listSubscriptionInvoices failed: ${error.message}`);
+    }
+
+    if (!data?.data) return [];
+
+    return data.data.map((inv) => ({
+      id: String(inv.id),
+      createdAt: inv.attributes.created_at,
+      total: inv.attributes.total,
+      totalFormatted: inv.attributes.total_formatted,
+      currency: inv.attributes.currency,
+      status: inv.attributes.status,
+      invoiceUrl: inv.attributes.urls?.invoice_url || null,
+      cardBrand: inv.attributes.card_brand || null,
+      cardLastFour: inv.attributes.card_last_four || null,
+    }));
+  }
+
   return {
     createCheckoutSession,
     createPortalSession,
     getSubscription: getSubscriptionDetails,
     cancelSubscription,
+    reactivateSubscription,
+    getSubscriptionInvoices,
     parseWebhook,
   };
 }

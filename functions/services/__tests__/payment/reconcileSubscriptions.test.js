@@ -47,11 +47,23 @@ jest.mock("../../../utils/circuitBreaker", () => ({
   getCircuit: jest.fn(() => ({ execute: mockCircuitExecute })),
 }));
 
+const mockSendTransactionalEmail = jest.fn().mockResolvedValue("ses-msg-rec");
+jest.mock("../../payment/emailService", () => ({
+  sendTransactionalEmail: (...args) => mockSendTransactionalEmail(...args),
+  EMAIL_TEMPLATES: Object.freeze({
+    TRIAL_EXPIRING: "trial_expiring",
+    PAYMENT_FAILED: "payment_failed",
+    SUBSCRIPTION_CANCELLED: "subscription_cancelled",
+    PAYMENT_RENEWED: "payment_renewed",
+  }),
+}));
+
 jest.mock("firebase-functions/v2/scheduler", () => ({
   onSchedule: jest.fn((_opts, handler) => handler),
 }));
 
 const {
+  processTrialWarnings,
   processExpiredActive,
   processPendingCancel,
   processStalePastDue,
@@ -66,8 +78,8 @@ beforeEach(() => {
   delete process.env.RECONCILE_WITH_PROVIDER;
 });
 
-function createUserDoc(id, subscription) {
-  const docData = { subscription };
+function createUserDoc(id, subscription, extra = {}) {
+  const docData = { subscription, ...extra };
   return {
     id,
     ref: {
@@ -334,6 +346,135 @@ describe("LIMITS", () => {
 
   test("PAST_DUE_TIMEOUT_DAYS is 30", () => {
     expect(LIMITS.PAST_DUE_TIMEOUT_DAYS).toBe(30);
+  });
+
+  test("MAX_TRIAL_WARNINGS is 20", () => {
+    expect(LIMITS.MAX_TRIAL_WARNINGS).toBe(20);
+  });
+});
+
+// --------------------------------------------------------------------------
+// PAY-EMAIL-001: Trial expiring email warnings
+// --------------------------------------------------------------------------
+
+describe("processTrialWarnings (PAY-EMAIL-001)", () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    buildQueryChain();
+  });
+
+  test("sends email and marks flag for trial expiring in 3 days", async () => {
+    const now = new Date("2026-04-04T03:00:00.000Z");
+    const doc = createUserDoc(
+      "uid-trial-warn",
+      {
+        status: "active",
+        subscriptionOrigin: "trial",
+        currentPeriodEnd: "2026-04-07T00:00:00.000Z",
+        planId: "pro",
+      },
+      { email: "trial@test.com", displayName: "TrialUser" }
+    );
+    mockGet.mockResolvedValue({ docs: [doc] });
+
+    const counters = { trial_warnings: 0 };
+    await processTrialWarnings(now, counters);
+
+    expect(counters.trial_warnings).toBe(1);
+    expect(mockSendTransactionalEmail).toHaveBeenCalledWith(
+      "trial_expiring",
+      "trial@test.com",
+      expect.objectContaining({ userName: "TrialUser", daysLeft: 3 }),
+      { maxRetries: 0, timeoutMs: 3000 }
+    );
+    expect(mockSet).toHaveBeenCalledWith(
+      { subscription: { trialWarningEmailSent: true } },
+      { merge: true }
+    );
+  });
+
+  test("skips user with trialWarningEmailSent=true (idempotency)", async () => {
+    const now = new Date("2026-04-04T03:00:00.000Z");
+    const doc = createUserDoc(
+      "uid-trial-already",
+      {
+        status: "active",
+        subscriptionOrigin: "trial",
+        currentPeriodEnd: "2026-04-07T00:00:00.000Z",
+        planId: "pro",
+        trialWarningEmailSent: true,
+      },
+      { email: "already@test.com" }
+    );
+    mockGet.mockResolvedValue({ docs: [doc] });
+
+    const counters = { trial_warnings: 0 };
+    await processTrialWarnings(now, counters);
+
+    expect(counters.trial_warnings).toBe(0);
+    expect(mockSendTransactionalEmail).not.toHaveBeenCalled();
+  });
+
+  test("skips user without email", async () => {
+    const now = new Date("2026-04-04T03:00:00.000Z");
+    const doc = createUserDoc("uid-no-email", {
+      status: "active",
+      subscriptionOrigin: "trial",
+      currentPeriodEnd: "2026-04-07T00:00:00.000Z",
+      planId: "pro",
+    });
+    mockGet.mockResolvedValue({ docs: [doc] });
+
+    const counters = { trial_warnings: 0 };
+    await processTrialWarnings(now, counters);
+
+    expect(counters.trial_warnings).toBe(0);
+    expect(mockSendTransactionalEmail).not.toHaveBeenCalled();
+  });
+
+  test("skips lifetime plans", async () => {
+    const now = new Date("2026-04-04T03:00:00.000Z");
+    const doc = createUserDoc(
+      "uid-lifetime-trial",
+      {
+        status: "active",
+        subscriptionOrigin: "trial",
+        currentPeriodEnd: "2026-04-07T00:00:00.000Z",
+        planId: "lifetime",
+      },
+      { email: "life@test.com" }
+    );
+    mockGet.mockResolvedValue({ docs: [doc] });
+
+    const counters = { trial_warnings: 0 };
+    await processTrialWarnings(now, counters);
+
+    expect(counters.trial_warnings).toBe(0);
+    expect(mockSendTransactionalEmail).not.toHaveBeenCalled();
+  });
+
+  test("email error continues without crashing", async () => {
+    const errorSpy = jest.spyOn(console, "error").mockImplementation();
+    mockSendTransactionalEmail.mockRejectedValueOnce(new Error("SES timeout"));
+
+    const now = new Date("2026-04-04T03:00:00.000Z");
+    const doc = createUserDoc(
+      "uid-trial-err",
+      {
+        status: "active",
+        subscriptionOrigin: "trial",
+        currentPeriodEnd: "2026-04-07T00:00:00.000Z",
+        planId: "pro",
+      },
+      { email: "err@test.com" }
+    );
+    mockGet.mockResolvedValue({ docs: [doc] });
+
+    const counters = { trial_warnings: 0 };
+    await processTrialWarnings(now, counters);
+
+    expect(counters.trial_warnings).toBe(0);
+    errorSpy.mockRestore();
   });
 });
 

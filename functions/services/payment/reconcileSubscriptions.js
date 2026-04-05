@@ -3,12 +3,14 @@ const admin = require("../firebaseAdmin");
 const { buildSubscriptionData } = require("./planFeatures");
 const { getPaymentProvider } = require("./providerFactory");
 const { getCircuit } = require("../../utils/circuitBreaker");
+const { sendTransactionalEmail, EMAIL_TEMPLATES } = require("./emailService");
 
 const db = admin.firestore();
 
 const LIMITS = {
   MAX_USERS_PER_RUN: 50,
   PAST_DUE_TIMEOUT_DAYS: 30,
+  MAX_TRIAL_WARNINGS: 20,
 };
 
 async function degradeToFree(userRef, userId, reason, counters) {
@@ -41,6 +43,52 @@ async function degradeToFree(userRef, userId, reason, counters) {
   await batch.commit();
 
   counters[reason] = (counters[reason] || 0) + 1;
+}
+
+async function processTrialWarnings(now, counters) {
+  const warningCutoff = new Date(now);
+  warningCutoff.setDate(warningCutoff.getDate() + 5);
+
+  const snapshot = await db
+    .collection("userData")
+    .where("subscription.status", "==", "active")
+    .where("subscription.subscriptionOrigin", "==", "trial")
+    .where("subscription.currentPeriodEnd", "<=", warningCutoff.toISOString())
+    .where("subscription.currentPeriodEnd", ">", now.toISOString())
+    .limit(LIMITS.MAX_TRIAL_WARNINGS)
+    .get();
+
+  for (const doc of snapshot.docs) {
+    const userData = doc.data();
+    const sub = userData?.subscription;
+    if (!sub || sub.planId === "lifetime") continue;
+    if (sub.trialWarningEmailSent) continue;
+
+    const email = userData?.email;
+    if (!email) continue;
+
+    const daysLeft = Math.ceil(
+      (new Date(sub.currentPeriodEnd).getTime() - now.getTime()) / (1000 * 60 * 60 * 24)
+    );
+
+    try {
+      await sendTransactionalEmail(EMAIL_TEMPLATES.TRIAL_EXPIRING, email, {
+        userName: userData?.displayName || email.split("@")[0],
+        daysLeft,
+        expiryDate: sub.currentPeriodEnd,
+        pricingUrl: `${process.env.APP_URL || "https://portastock.net"}/pricing`,
+      }, { maxRetries: 0, timeoutMs: 3000 });
+
+      await doc.ref.set(
+        { subscription: { trialWarningEmailSent: true } },
+        { merge: true }
+      );
+
+      counters.trial_warnings = (counters.trial_warnings || 0) + 1;
+    } catch (err) {
+      console.error(`[reconcile-subs] Trial warning email failed for ${doc.id}:`, err.message);
+    }
+  }
 }
 
 async function processExpiredActive(now, counters) {
@@ -163,20 +211,22 @@ const reconcileSubscriptions = onSchedule(
     memory: "512MiB",
     timeoutSeconds: 300,
     maxInstances: 1,
+    secrets: ["AWS_SES_ACCESS_KEY_ID", "AWS_SES_SECRET_ACCESS_KEY"],
     labels: { component: "payment", purpose: "reconcile-subscriptions" },
   },
   async () => {
     console.log("[reconcile-subs] Starting subscription reconciliation...");
     const now = new Date();
-    const counters = { period_expired: 0, cancel_at_period_end: 0, past_due_timeout: 0, errors: 0 };
+    const counters = { trial_warnings: 0, period_expired: 0, cancel_at_period_end: 0, past_due_timeout: 0, errors: 0 };
 
+    await processTrialWarnings(now, counters);
     await processExpiredActive(now, counters);
     await processPendingCancel(now, counters);
     await processStalePastDue(now, counters);
     await reconcileWithProvider(counters);
 
     console.log(
-      `[reconcile-subs] DONE: ${counters.period_expired} expired, ${counters.cancel_at_period_end} canceled, ${counters.past_due_timeout} past_due_timeout, ${counters.errors} errors`
+      `[reconcile-subs] DONE: ${counters.trial_warnings} trial_warnings, ${counters.period_expired} expired, ${counters.cancel_at_period_end} canceled, ${counters.past_due_timeout} past_due_timeout, ${counters.errors} errors`
     );
   }
 );
@@ -185,6 +235,7 @@ module.exports = {
   reconcileSubscriptions,
   LIMITS,
   // Exported for testing
+  processTrialWarnings,
   processExpiredActive,
   processPendingCancel,
   processStalePastDue,
