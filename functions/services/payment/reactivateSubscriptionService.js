@@ -40,6 +40,12 @@ const reactivateSubscription = onCall(
       updatedAt: new Date().toISOString(),
     };
 
+    // BUG-CANCEL-001: Restore original period end if saved during mock scheduled cancel
+    if (subscription._originalPeriodEnd) {
+      reactivationFields.currentPeriodEnd = subscription._originalPeriodEnd;
+      reactivationFields._originalPeriodEnd = admin.firestore.FieldValue.delete();
+    }
+
     const isMockMode = process.env.PAYMENT_MOCK_ENABLED === "true";
 
     if (isMockMode) {

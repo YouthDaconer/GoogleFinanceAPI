@@ -87,11 +87,15 @@ const cancelSubscription = onCall(
           Date.now() + mockGracePeriodSeconds * 1000
         ).toISOString();
 
+        // BUG-CANCEL-001: Preserve original period end for restore on reactivation
+        const originalPeriodEnd = subscription.currentPeriodEnd || null;
+
         await db.collection("userData").doc(userId).set(
           {
             subscription: {
               cancelAtPeriodEnd: true,
               currentPeriodEnd: gracePeriodEnd,
+              _originalPeriodEnd: originalPeriodEnd,
               updatedAt: new Date().toISOString(),
               ...(validatedReason && {
                 cancellationReason: validatedReason,
