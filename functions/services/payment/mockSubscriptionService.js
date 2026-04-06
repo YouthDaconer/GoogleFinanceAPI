@@ -50,21 +50,41 @@ const mockSetSubscription = onCall(
     const userId = request.auth.uid;
     const db = admin.firestore();
 
-    // F0-03: Downgrade guard server-side — impide upgrades fraudulentos
+    // F0-03: Downgrade guard server-side — impide cambios fraudulentos
     const PLAN_RANK = { free: 0, pro: 1, lifetime: 2 };
+    const INTERVAL_RANK = { month: 0, year: 1, lifetime: 2 };
     const userDoc = await db.collection("userData").doc(userId).get();
-    const currentPlan = userDoc.data()?.subscription?.planId || "free";
+    const currentSub = userDoc.data()?.subscription || {};
+    const currentPlan = currentSub.planId || "free";
+    const currentInterval = currentSub.interval || "month";
     const currentRank = PLAN_RANK[currentPlan] ?? 0;
     const targetRank = PLAN_RANK[planId] ?? 0;
 
-    // Block upgrades from paid plans AND same-plan re-subscription
-    // Exception: trial users haven't paid — they can subscribe to any plan
-    const isOnTrial = userDoc.data()?.subscription?.subscriptionOrigin === "trial";
-    if (currentPlan !== "free" && targetRank >= currentRank && !isOnTrial) {
-      throw new HttpsError(
-        "failed-precondition",
-        `Cannot ${targetRank === currentRank ? 're-subscribe to' : 'upgrade from'} ${currentPlan} to ${planId} via mock. Use the payment gateway.`
-      );
+    const isOnTrial = currentSub.subscriptionOrigin === "trial";
+    const forceOverride = request.data?.force === true;
+
+    // Determine change type for same-plan interval changes
+    const isSamePlan = currentPlan === planId;
+    const isIntervalUpgrade = isSamePlan && (INTERVAL_RANK[interval] ?? 0) > (INTERVAL_RANK[currentInterval] ?? 0);
+    const isIntervalDowngrade = isSamePlan && (INTERVAL_RANK[interval] ?? 0) < (INTERVAL_RANK[currentInterval] ?? 0);
+
+    if (!forceOverride) {
+      // Block interval downgrade (e.g. Annual → Monthly) — only allowed at end of period via portal
+      if (isIntervalDowngrade) {
+        throw new HttpsError(
+          "failed-precondition",
+          `Cannot downgrade interval from ${currentInterval} to ${interval}. This change takes effect at the end of the current billing period.`
+        );
+      }
+
+      // Block re-subscription and plan downgrades for paid (non-trial) users
+      // Exception: same-plan interval upgrade (Month → Year) is allowed
+      if (currentPlan !== "free" && targetRank >= currentRank && !isOnTrial && !isIntervalUpgrade) {
+        throw new HttpsError(
+          "failed-precondition",
+          `Cannot ${targetRank === currentRank ? 're-subscribe to' : 'upgrade from'} ${currentPlan} to ${planId} via mock. Use the payment gateway.`
+        );
+      }
     }
 
     // BUG-GATE-002 + PAY-009 + BUG-TRIAL-001: Determinar origin según el flujo
@@ -75,7 +95,7 @@ const mockSetSubscription = onCall(
     const VALID_ORIGINS = ["trial", "mock_checkout", "checkout"];
     const rawForceOrigin = request.data?.origin;
     const forceOrigin = VALID_ORIGINS.includes(rawForceOrigin) ? rawForceOrigin : null;
-    const hasUsedTrial = userDoc.data()?.subscription?.hasUsedTrial === true;
+    const hasUsedTrial = currentSub.hasUsedTrial === true;
     let origin;
     if (forceOrigin) {
       origin = forceOrigin;
@@ -88,7 +108,7 @@ const mockSetSubscription = onCall(
     const subscription = await buildSubscriptionData(planId, interval, status, origin);
 
     // PAY-009: Preserve sticky trial fields when converting trial → paid
-    const previousSubscription = userDoc.data()?.subscription;
+    const previousSubscription = currentSub;
     if (previousSubscription?.hasUsedTrial) {
       subscription.hasUsedTrial = true;
     }
@@ -102,6 +122,18 @@ const mockSetSubscription = onCall(
     }
 
     await db.collection("userData").doc(userId).set({ subscription }, { merge: true });
+
+    // BUG-11: Log subscription event for BillingHistory visibility
+    const eventType = origin === "trial" ? "SUBSCRIPTION_TRIAL_STARTED" : "SUBSCRIPTION_CREATED";
+    await db.collection("subscriptionEvents").doc().set({
+      type: eventType,
+      userId,
+      planId,
+      interval,
+      origin,
+      mode: "mock",
+      processedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
 
     return {
       success: true,

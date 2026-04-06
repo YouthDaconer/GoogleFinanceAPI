@@ -8,7 +8,9 @@ const mockDoc = jest.fn(() => ({ set: mockSet, get: mockGet }));
 const mockCollection = jest.fn(() => ({ doc: mockDoc, get: mockCollectionGet }));
 
 jest.mock("../../firebaseAdmin", () => ({
-  firestore: () => ({ collection: mockCollection }),
+  firestore: Object.assign(() => ({ collection: mockCollection }), {
+    FieldValue: { serverTimestamp: () => "MOCK_SERVER_TIMESTAMP" },
+  }),
 }));
 
 // Mock firebase-functions/v2/https — capture the handler
@@ -345,6 +347,71 @@ describe("mockSetSubscription", () => {
 
       const writtenSub = mockSet.mock.calls[0][0].subscription;
       expect(writtenSub.subscriptionOrigin).toBe("trial");
+    });
+  });
+
+  // Interval change guards
+  describe("interval change guards", () => {
+    test("allows Pro Monthly → Pro Annual (interval upgrade)", async () => {
+      mockGet.mockResolvedValueOnce({
+        data: () => ({
+          subscription: { planId: "pro", interval: "month", subscriptionOrigin: "mock_checkout" },
+        }),
+      });
+
+      const result = await capturedHandler({
+        auth: { uid: "upgrade-interval", token: {} },
+        data: { planId: "pro", interval: "year" },
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.plan).toBe("pro");
+    });
+
+    test("blocks Pro Annual → Pro Monthly (interval downgrade)", async () => {
+      mockGet.mockResolvedValueOnce({
+        data: () => ({
+          subscription: { planId: "pro", interval: "year", subscriptionOrigin: "mock_checkout" },
+        }),
+      });
+
+      await expect(
+        capturedHandler({
+          auth: { uid: "downgrade-interval", token: {} },
+          data: { planId: "pro", interval: "month" },
+        })
+      ).rejects.toMatchObject({ code: "failed-precondition" });
+    });
+
+    test("force flag bypasses interval downgrade guard", async () => {
+      mockGet.mockResolvedValueOnce({
+        data: () => ({
+          subscription: { planId: "pro", interval: "year", subscriptionOrigin: "mock_checkout" },
+        }),
+      });
+
+      const result = await capturedHandler({
+        auth: { uid: "dev-panel", token: {} },
+        data: { planId: "pro", interval: "month", force: true },
+      });
+
+      expect(result.success).toBe(true);
+    });
+
+    test("force flag bypasses plan downgrade guard (Lifetime → Free)", async () => {
+      mockGet.mockResolvedValueOnce({
+        data: () => ({
+          subscription: { planId: "lifetime", interval: "lifetime", subscriptionOrigin: "mock_checkout" },
+        }),
+      });
+
+      const result = await capturedHandler({
+        auth: { uid: "dev-panel", token: {} },
+        data: { planId: "free", interval: "month", force: true },
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.plan).toBe("free");
     });
   });
 });
