@@ -13,6 +13,16 @@ const admin = require("../firebaseAdmin");
 const UNLIMITED = 999999;
 const CACHE_TTL_MS = 5 * 60 * 1000;
 
+/**
+ * BUG-TRIAL-001: Configuración centralizada de trial.
+ * Single Source of Truth para elegibilidad, duración e intervalo.
+ */
+const TRIAL_CONFIG = {
+  PERIOD_DAYS: 30,
+  ELIGIBLE_PLAN: "pro",
+  ELIGIBLE_INTERVAL: "month",
+};
+
 const BASE_FEATURES = {
   maxAccounts: UNLIMITED,
   historyDays: UNLIMITED,
@@ -140,6 +150,11 @@ async function buildSubscriptionData(planId, interval, status = "active", origin
   const features = { ...(await getPlanFeatures(resolvedPlan)) };
   const now = new Date();
 
+  // BUG-TRIAL-001: Defensa en profundidad — trial solo válido para plan+interval elegible
+  if (origin === "trial" && (resolvedPlan !== TRIAL_CONFIG.ELIGIBLE_PLAN || interval !== TRIAL_CONFIG.ELIGIBLE_INTERVAL)) {
+    origin = "mock_checkout";
+  }
+
   const subscription = {
     planId: resolvedPlan,
     status,
@@ -157,7 +172,9 @@ async function buildSubscriptionData(planId, interval, status = "active", origin
     subscription.purchasedAt = now.toISOString();
   } else if (resolvedPlan === "pro") {
     const periodEnd = new Date(now);
-    const days = interval === "year" ? 365 : 30;
+    const days = origin === "trial"
+      ? TRIAL_CONFIG.PERIOD_DAYS
+      : (interval === "year" ? 365 : 30);
     periodEnd.setDate(periodEnd.getDate() + days);
     subscription.currentPeriodEnd = periodEnd.toISOString();
   }
@@ -176,6 +193,7 @@ module.exports = {
   VALID_PLANS,
   VALID_INTERVALS,
   UNLIMITED,
+  TRIAL_CONFIG,
   buildSubscriptionData,
   getPlanFeatures,
   getAllPlanFeatures,

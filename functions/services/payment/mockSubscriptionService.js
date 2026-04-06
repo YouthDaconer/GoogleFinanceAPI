@@ -10,7 +10,7 @@
 
 const { onCall, HttpsError } = require("firebase-functions/v2/https");
 const admin = require("../firebaseAdmin");
-const { buildSubscriptionData, VALID_PLANS } = require("./planFeatures");
+const { buildSubscriptionData, VALID_PLANS, TRIAL_CONFIG } = require("./planFeatures");
 
 const mockSetSubscription = onCall(
   { cors: true, memory: "256MiB", timeoutSeconds: 30 },
@@ -57,15 +57,19 @@ const mockSetSubscription = onCall(
     const currentRank = PLAN_RANK[currentPlan] ?? 0;
     const targetRank = PLAN_RANK[planId] ?? 0;
 
-    if (targetRank > currentRank && currentPlan !== "free") {
+    // Block upgrades from paid plans AND same-plan re-subscription
+    // Exception: trial users haven't paid — they can subscribe to any plan
+    const isOnTrial = userDoc.data()?.subscription?.subscriptionOrigin === "trial";
+    if (currentPlan !== "free" && targetRank >= currentRank && !isOnTrial) {
       throw new HttpsError(
         "failed-precondition",
-        `Cannot upgrade from ${currentPlan} to ${planId} via mock. Use the payment gateway.`
+        `Cannot ${targetRank === currentRank ? 're-subscribe to' : 'upgrade from'} ${currentPlan} to ${planId} via mock. Use the payment gateway.`
       );
     }
 
-    // BUG-GATE-002 + PAY-009: Determinar origin según el flujo
-    // Free → Pro (sin trial previo): trial (30 días de prueba gratuita)
+    // BUG-GATE-002 + PAY-009 + BUG-TRIAL-001: Determinar origin según el flujo
+    // Free → Pro Monthly (sin trial previo): trial (30 días de prueba gratuita)
+    // Free → Pro Annual (sin trial previo): mock_checkout (compra directa, sin trial)
     // Free → Pro (con trial previo): mock_checkout (compra directa, sin trial)
     // Free → Lifetime / cualquier otro: mock_checkout (compra directa)
     const VALID_ORIGINS = ["trial", "mock_checkout", "checkout"];
@@ -75,13 +79,27 @@ const mockSetSubscription = onCall(
     let origin;
     if (forceOrigin) {
       origin = forceOrigin;
-    } else if (planId === "pro") {
+    } else if (planId === TRIAL_CONFIG.ELIGIBLE_PLAN && interval === TRIAL_CONFIG.ELIGIBLE_INTERVAL) {
       origin = (currentPlan === "free" && !hasUsedTrial) ? "trial" : "mock_checkout";
     } else {
       origin = "mock_checkout";
     }
 
     const subscription = await buildSubscriptionData(planId, interval, status, origin);
+
+    // PAY-009: Preserve sticky trial fields when converting trial → paid
+    const previousSubscription = userDoc.data()?.subscription;
+    if (previousSubscription?.hasUsedTrial) {
+      subscription.hasUsedTrial = true;
+    }
+    if (previousSubscription?.trialStartedAt) {
+      subscription.trialStartedAt = previousSubscription.trialStartedAt;
+    }
+    if (previousSubscription?.subscriptionOrigin === "trial" && origin !== "trial") {
+      subscription.trialEndedAt = new Date().toISOString();
+    } else if (previousSubscription?.trialEndedAt) {
+      subscription.trialEndedAt = previousSubscription.trialEndedAt;
+    }
 
     await db.collection("userData").doc(userId).set({ subscription }, { merge: true });
 

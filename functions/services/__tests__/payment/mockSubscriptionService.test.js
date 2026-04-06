@@ -204,11 +204,77 @@ describe("mockSetSubscription", () => {
 
       expect(result.success).toBe(true);
     });
+
+    test("rejects same-plan re-subscription (pro → pro) when not on trial", async () => {
+      mockGet.mockResolvedValueOnce({ data: () => ({ subscription: { planId: "pro", subscriptionOrigin: "mock_checkout" } }) });
+
+      await expect(
+        capturedHandler({ auth: { uid: "user1", token: {} }, data: { planId: "pro" } })
+      ).rejects.toMatchObject({ code: "failed-precondition" });
+    });
+
+    test("rejects same-plan re-subscription (lifetime → lifetime)", async () => {
+      mockGet.mockResolvedValueOnce({ data: () => ({ subscription: { planId: "lifetime" } }) });
+
+      await expect(
+        capturedHandler({ auth: { uid: "user1", token: {} }, data: { planId: "lifetime" } })
+      ).rejects.toMatchObject({ code: "failed-precondition" });
+    });
+
+    test("allows trial user to convert pro(trial) → pro(paid)", async () => {
+      mockGet.mockResolvedValueOnce({
+        data: () => ({
+          subscription: {
+            planId: "pro",
+            subscriptionOrigin: "trial",
+            hasUsedTrial: true,
+            trialStartedAt: "2026-03-06T00:00:00.000Z",
+          },
+        }),
+      });
+
+      const result = await capturedHandler({
+        auth: { uid: "trial-convert", token: {} },
+        data: { planId: "pro", interval: "month" },
+      });
+
+      expect(result.success).toBe(true);
+      const writtenSub = mockSet.mock.calls[0][0].subscription;
+      expect(writtenSub.subscriptionOrigin).toBe("mock_checkout");
+      expect(writtenSub.hasUsedTrial).toBe(true);
+      expect(writtenSub.trialStartedAt).toBe("2026-03-06T00:00:00.000Z");
+      expect(writtenSub.trialEndedAt).toBeDefined();
+    });
+
+    test("allows trial user to upgrade pro(trial) → lifetime", async () => {
+      mockGet.mockResolvedValueOnce({
+        data: () => ({
+          subscription: {
+            planId: "pro",
+            subscriptionOrigin: "trial",
+            hasUsedTrial: true,
+            trialStartedAt: "2026-03-06T00:00:00.000Z",
+          },
+        }),
+      });
+
+      const result = await capturedHandler({
+        auth: { uid: "trial-upgrade", token: {} },
+        data: { planId: "lifetime" },
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.plan).toBe("lifetime");
+      const writtenSub = mockSet.mock.calls[0][0].subscription;
+      expect(writtenSub.planId).toBe("lifetime");
+      expect(writtenSub.hasUsedTrial).toBe(true);
+      expect(writtenSub.trialEndedAt).toBeDefined();
+    });
   });
 
   // PAY-009: Trial eligibility guard
   describe("trial eligibility guard (PAY-009)", () => {
-    test("grants trial to Free user without prior trial", async () => {
+    test("grants trial to Free user without prior trial (monthly)", async () => {
       mockGet.mockResolvedValueOnce({ data: () => ({ subscription: { planId: "free" } }) });
 
       await capturedHandler({
@@ -220,6 +286,21 @@ describe("mockSetSubscription", () => {
       expect(writtenSub.subscriptionOrigin).toBe("trial");
       expect(writtenSub.hasUsedTrial).toBe(true);
       expect(writtenSub.trialStartedAt).toBeDefined();
+    });
+
+    // BUG-TRIAL-001: Trial solo para Pro Monthly, nunca Annual
+    test("denies trial to Free user subscribing to Pro Annual (interval=year)", async () => {
+      mockGet.mockResolvedValueOnce({ data: () => ({ subscription: { planId: "free" } }) });
+
+      await capturedHandler({
+        auth: { uid: "new-user-annual", token: {} },
+        data: { planId: "pro", interval: "year" },
+      });
+
+      const writtenSub = mockSet.mock.calls[0][0].subscription;
+      expect(writtenSub.subscriptionOrigin).toBe("mock_checkout");
+      expect(writtenSub.hasUsedTrial).toBeUndefined();
+      expect(writtenSub.trialStartedAt).toBeUndefined();
     });
 
     test("denies trial to Free user who already used trial (hasUsedTrial=true)", async () => {
@@ -234,7 +315,7 @@ describe("mockSetSubscription", () => {
 
       const writtenSub = mockSet.mock.calls[0][0].subscription;
       expect(writtenSub.subscriptionOrigin).toBe("mock_checkout");
-      expect(writtenSub.hasUsedTrial).toBeUndefined();
+      expect(writtenSub.hasUsedTrial).toBe(true);
     });
 
     test("grants trial when hasUsedTrial is undefined (backward compat)", async () => {

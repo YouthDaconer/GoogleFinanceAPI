@@ -235,6 +235,36 @@ describe("buildSubscriptionData", () => {
     expect(result.hasUsedTrial).toBeUndefined();
     expect(result.trialStartedAt).toBeUndefined();
   });
+
+  // BUG-TRIAL-001: Guard defensivo — trial solo válido para pro + month
+  test("guard corrects origin=trial to mock_checkout when interval=year", async () => {
+    const result = await buildSubscriptionData("pro", "year", "active", "trial");
+
+    expect(result.subscriptionOrigin).toBe("mock_checkout");
+    expect(result.hasUsedTrial).toBeUndefined();
+    expect(result.trialStartedAt).toBeUndefined();
+    const periodEnd = new Date(result.currentPeriodEnd);
+    const diffDays = (periodEnd - new Date("2026-03-29T12:00:00.000Z")) / (1000 * 60 * 60 * 24);
+    expect(diffDays).toBe(365);
+  });
+
+  test("guard corrects origin=trial to mock_checkout for non-pro plan", async () => {
+    const result = await buildSubscriptionData("lifetime", "lifetime", "active", "trial");
+
+    expect(result.subscriptionOrigin).toBe("mock_checkout");
+    expect(result.hasUsedTrial).toBeUndefined();
+  });
+
+  test("trial is allowed for pro monthly (eligible combination)", async () => {
+    const result = await buildSubscriptionData("pro", "month", "active", "trial");
+
+    expect(result.subscriptionOrigin).toBe("trial");
+    expect(result.hasUsedTrial).toBe(true);
+    expect(result.trialStartedAt).toBeDefined();
+    const periodEnd = new Date(result.currentPeriodEnd);
+    const diffDays = (periodEnd - new Date("2026-03-29T12:00:00.000Z")) / (1000 * 60 * 60 * 24);
+    expect(diffDays).toBe(30);
+  });
 });
 
 // ============================================================================

@@ -57,28 +57,33 @@ const getSubscriptionInvoices = onCall(
       }
     }
 
-    const eventsSnapshot = await db
-      .collection("subscriptionEvents")
-      .where("userId", "==", userId)
-      .orderBy("processedAt", "desc")
-      .limit(20)
-      .get();
+    try {
+      const eventsSnapshot = await db
+        .collection("subscriptionEvents")
+        .where("userId", "==", userId)
+        .orderBy("processedAt", "desc")
+        .limit(20)
+        .get();
 
-    const events = eventsSnapshot.docs.map((doc) => {
-      const data = doc.data();
-      return {
-        id: doc.id,
-        date: data.processedAt?.toDate?.()?.toISOString() || null,
-        type: data.type,
-        amount: null,
-        amountFormatted: null,
-        currency: null,
-        status: "processed",
-        invoiceUrl: null,
-      };
-    });
+      const events = eventsSnapshot.docs.map((doc) => {
+        const data = doc.data();
+        return {
+          id: doc.id,
+          date: data.processedAt?.toDate?.()?.toISOString() || null,
+          type: data.type,
+          amount: null,
+          amountFormatted: null,
+          currency: null,
+          status: "processed",
+          invoiceUrl: null,
+        };
+      });
 
-    return { invoices: events, source: "events" };
+      return { invoices: events, source: "events" };
+    } catch (err) {
+      console.warn("[Invoices] subscriptionEvents query failed (missing composite index?):", err.message);
+      return { invoices: [], source: "none" };
+    }
   }
 );
 
