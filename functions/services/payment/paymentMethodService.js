@@ -1,15 +1,15 @@
 const { onCall, HttpsError } = require("firebase-functions/v2/https");
-const { defineSecret } = require("firebase-functions/params");
 const admin = require("../firebaseAdmin");
 const { getPaymentProvider } = require("./providerFactory");
 const { getCircuit } = require("../../utils/circuitBreaker");
 
-const lsApiKey = defineSecret("LEMONSQUEEZY_API_KEY");
+// WHOP-005: Whop secrets wired via onCall secrets option
 
 const db = admin.firestore();
 
 const getPaymentMethod = onCall(
-  { cors: true, memory: "256MiB", timeoutSeconds: 15, secrets: [lsApiKey] },
+  { cors: true, memory: "256MiB", timeoutSeconds: 15,
+    secrets: ["WHOP_API_KEY", "WHOP_WEBHOOK_SECRET", "WHOP_COMPANY_ID"] },
   async (request) => {
     if (!request.auth?.uid) {
       throw new HttpsError("unauthenticated", "Authentication required");
@@ -28,11 +28,11 @@ const getPaymentMethod = onCall(
     }
 
     const provider = getPaymentProvider();
-    const lsCircuit = getCircuit("lemonSqueezy");
+    const paymentCircuit = getCircuit("whop");
 
     try {
-      const details = await lsCircuit.execute(
-        () => provider.getSubscription(subscription.subscriptionId),
+      const details = await paymentCircuit.execute(
+        () => provider.getPaymentMethod(subscription.subscriptionId),
         () => null
       );
 

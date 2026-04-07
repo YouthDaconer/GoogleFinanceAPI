@@ -221,7 +221,7 @@ describe("reactivateSubscriptionService", () => {
 
       expect(result.success).toBe(true);
       expect(mockGetPaymentProvider).toHaveBeenCalled();
-      expect(mockGetCircuit).toHaveBeenCalledWith("lemonSqueezy");
+      expect(mockGetCircuit).toHaveBeenCalledWith("whop");
       expect(mockReactivateSubscription).toHaveBeenCalledWith("sub-123");
       expect(mockSet).toHaveBeenCalledWith(
         {
@@ -296,7 +296,7 @@ describe("reactivateSubscriptionService", () => {
         { merge: true }
       );
       expect(warnSpy).toHaveBeenCalledWith(
-        "[Reactivate] LS API error — fallback:",
+        "[Reactivate] Payment API error — fallback:",
         "Network timeout"
       );
 

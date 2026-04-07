@@ -1,13 +1,14 @@
 /**
- * Webhook Handler — HTTP endpoint for Lemon Squeezy webhook events
+ * Webhook Handler — HTTP endpoint for Whop Standard Webhooks
  *
- * Validates HMAC signature, deduplicates via subscriptionEvents/{eventId}
- * Firestore transaction, and delegates processing to subscriptionService.
+ * Validates Standard Webhooks signature via provider.parseWebhook(),
+ * deduplicates via subscriptionEvents/{eventId} check, resolves Firebase UID
+ * via metadata or email fallback, and delegates to processWebhookEvent().
  *
- * Idempotency: db.runTransaction() atomizes check + process + register.
- * Error strategy: 400 for HMAC failures (no retry), 500 for transient errors (LS retries 72h).
+ * Idempotency: check .get() → process → .set() (no transaction needed —
+ * eventId is deterministic from Standard Webhooks `webhook-id`).
  *
- * @see docs/architecture/AUDIT-SUBSCRIPTION-PAYMENT-SYSTEM-2026-04-03.md § 8.3
+ * @see docs/architecture/MIGRATION-WHOP-PAYMENT-GATEWAY-2026-04-06.md § 4.5
  * @module services/payment/webhookHandler
  */
 
@@ -19,147 +20,144 @@ const { sendTransactionalEmail, EMAIL_TEMPLATES } = require("./emailService");
 
 const db = admin.firestore();
 
-function extractEventId(webhookResult) {
-  return webhookResult.eventId
-    || webhookResult.rawData?.meta?.webhook_event_id
-    || null;
-}
+const FIREBASE_UID_REGEX = /^[a-zA-Z0-9]{20,128}$/;
 
-function deriveAfterState(webhookResult) {
-  switch (webhookResult.type) {
-    case PAYMENT_EVENT_TYPES.CHECKOUT_COMPLETED:
-    case PAYMENT_EVENT_TYPES.SUBSCRIPTION_CREATED:
-      return { planId: webhookResult.planId || "pro", status: "active" };
-    case PAYMENT_EVENT_TYPES.SUBSCRIPTION_UPDATED:
-      return { planId: null, status: "active" };
-    case PAYMENT_EVENT_TYPES.SUBSCRIPTION_CANCELED:
-      return { planId: "free", status: "canceled" };
-    case PAYMENT_EVENT_TYPES.PAYMENT_FAILED:
-      return { planId: null, status: "past_due" };
-    case PAYMENT_EVENT_TYPES.PAYMENT_SUCCEEDED:
-      return { planId: null, status: "active" };
-    default:
-      return { planId: null, status: null };
+async function resolveFirebaseUid(data) {
+  const metadataUid = data?.metadata?.firebase_uid;
+  if (metadataUid) {
+    if (!FIREBASE_UID_REGEX.test(metadataUid)) {
+      console.warn("[Webhook] Invalid firebase_uid format:", metadataUid?.slice(0, 32));
+      return null;
+    }
+    return metadataUid;
   }
+
+  const email = data?.user?.email;
+  if (email) {
+    try {
+      const userRecord = await admin.auth().getUserByEmail(email);
+      return userRecord.uid;
+    } catch (err) {
+      console.warn("[Webhook] resolveFirebaseUid email fallback failed:", err.message);
+    }
+  }
+
+  return null;
 }
 
 async function handleWebhook(req, res) {
-  const signature = req.headers["x-signature"];
-  if (!signature) {
-    res.status(400).json({ error: "Missing x-signature header" });
+  const provider = getPaymentProvider();
+  if (!provider) {
+    res.status(200).json({ received: true, mode: "mock" });
     return;
   }
 
-  const provider = getPaymentProvider();
-  if (!provider) {
-    res.status(500).json({ error: "Payment provider is not configured" });
-    return;
-  }
+  const headers = {
+    "webhook-id": req.headers["webhook-id"],
+    "webhook-signature": req.headers["webhook-signature"],
+    "webhook-timestamp": req.headers["webhook-timestamp"],
+  };
 
   let webhookResult;
   try {
-    webhookResult = await provider.parseWebhook(req.rawBody, signature);
+    const rawBody = req.rawBody.toString("utf8");
+    webhookResult = await provider.parseWebhook(rawBody, headers);
   } catch (err) {
-    console.error("[Webhook] Firma inválida:", err.message);
+    console.error("[Webhook] Invalid signature:", err.message);
     res.status(400).json({ error: "Invalid webhook signature" });
     return;
   }
 
-  if (webhookResult.type === "unknown") {
-    console.log(`[Webhook] Evento no mapeado: ${webhookResult.rawData?.meta?.event_name}`);
+  const { type, data, rawType } = webhookResult;
+  const eventId = webhookResult.eventId
+    ? String(webhookResult.eventId).replace(/[\/\\.]/g, "_").slice(0, 128)
+    : null;
+
+  if (type.startsWith("UNKNOWN_")) {
+    console.log(`[Webhook] Unmapped event: ${rawType}`);
     res.status(200).json({ received: true, processed: false });
     return;
   }
 
-  const rawEventId = extractEventId(webhookResult);
-  const eventId = rawEventId
-    ? String(rawEventId).replace(/[\/\\]/g, "_").slice(0, 128)
-    : null;
-
   try {
-    if (!eventId) {
-      console.warn("[Webhook] Sin eventId — procesando sin idempotencia");
-      await processWebhookEvent(webhookResult);
-      res.status(200).json({ received: true });
+    if (eventId) {
+      const eventRef = db.collection("subscriptionEvents").doc(eventId);
+      const eventDoc = await eventRef.get();
+      if (eventDoc.exists) {
+        console.log(`[Webhook] Duplicate: ${eventId} (${type})`);
+        res.status(200).json({ received: true, duplicate: true });
+        return;
+      }
+    }
+
+    const userId = await resolveFirebaseUid(data);
+
+    if (!userId) {
+      console.warn(`[Webhook] No Firebase UID for event ${eventId} (${type})`);
+      if (eventId) {
+        await db.collection("subscriptionEvents").doc(eventId).set({
+          type,
+          rawType,
+          userId: null,
+          provider: "whop",
+          timestamp: new Date().toISOString(),
+          processedAt: new Date().toISOString(),
+          result: "skipped",
+          reason: "no_uid",
+        });
+      }
+      res.status(200).json({ received: true, skipped: "no_firebase_uid" });
       return;
     }
 
-    const result = await db.runTransaction(async (transaction) => {
-      const eventRef = db.doc(`subscriptionEvents/${eventId}`);
-      const eventDoc = await transaction.get(eventRef);
+    await processWebhookEvent({ type, data, userId, eventId });
 
-      if (eventDoc.exists) {
-        console.log(`[Webhook] Deduplicado: ${eventId} (${webhookResult.type})`);
-        return { deduplicated: true };
-      }
-
-      const userRef = webhookResult.userId
-        ? db.collection("userData").doc(webhookResult.userId)
-        : null;
-      let beforeState = { planId: null, status: null };
-      if (userRef) {
-        const userDoc = await transaction.get(userRef);
-        const sub = userDoc.exists ? userDoc.data()?.subscription : null;
-        beforeState = {
-          planId: sub?.planId || null,
-          status: sub?.status || null,
-        };
-      }
-
-      await processWebhookEvent(webhookResult, transaction);
-
-      const afterState = deriveAfterState(webhookResult);
-
-      transaction.set(eventRef, {
-        eventId,
-        type: webhookResult.type,
-        userId: webhookResult.userId || null,
-        processedAt: admin.firestore.FieldValue.serverTimestamp(),
-        raw: { meta: webhookResult.rawData?.meta || {} },
-        before: beforeState,
-        after: afterState,
+    if (eventId) {
+      await db.collection("subscriptionEvents").doc(eventId).set({
+        type,
+        rawType,
+        userId,
+        provider: "whop",
+        timestamp: new Date().toISOString(),
+        processedAt: new Date().toISOString(),
+        result: "success",
       });
+    }
 
-      return { deduplicated: false };
-    });
+    console.log(`[Webhook] Processed: ${type} eventId=${eventId} userId=${userId}`);
 
-    const logPrefix = result.deduplicated ? "Deduplicado" : "Procesado OK";
-    console.log(`[Webhook] ${logPrefix}: ${webhookResult.type} eventId=${eventId}`);
+    try {
+      const userDoc = await db.collection("userData").doc(userId).get();
+      const email = userDoc.data()?.email;
 
-    if (webhookResult.userId && !result.deduplicated) {
-      try {
-        const userDoc = await db.collection("userData").doc(webhookResult.userId).get();
-        const email = userDoc.data()?.email;
+      if (email) {
+        const emailOpts = { maxRetries: 0, timeoutMs: 5000 };
+        switch (type) {
+          case PAYMENT_EVENT_TYPES.PAYMENT_FAILED:
+            await sendTransactionalEmail(EMAIL_TEMPLATES.PAYMENT_FAILED, email, {
+              userName: userDoc.data()?.displayName || email.split("@")[0],
+              updatePaymentUrl: `${process.env.APP_URL || "https://portastock.net"}/settings`,
+            }, emailOpts);
+            break;
 
-        if (email) {
-          const emailOpts = { maxRetries: 0, timeoutMs: 5000 };
-          switch (webhookResult.type) {
-            case PAYMENT_EVENT_TYPES.PAYMENT_FAILED:
-              await sendTransactionalEmail(EMAIL_TEMPLATES.PAYMENT_FAILED, email, {
-                userName: userDoc.data()?.displayName || email.split("@")[0],
-                updatePaymentUrl: `${process.env.APP_URL || "https://portastock.net"}/settings`,
-              }, emailOpts);
-              break;
-
-            case PAYMENT_EVENT_TYPES.PAYMENT_SUCCEEDED:
-              await sendTransactionalEmail(EMAIL_TEMPLATES.PAYMENT_RENEWED, email, {
-                userName: userDoc.data()?.displayName || email.split("@")[0],
-                planName: "Pro",
-                amount: webhookResult.rawData?.data?.attributes?.total_formatted || null,
-              }, emailOpts);
-              break;
-          }
+          case PAYMENT_EVENT_TYPES.PAYMENT_SUCCEEDED:
+            await sendTransactionalEmail(EMAIL_TEMPLATES.PAYMENT_RENEWED, email, {
+              userName: userDoc.data()?.displayName || email.split("@")[0],
+              planName: "Pro",
+              amount: null,
+            }, emailOpts);
+            break;
         }
-      } catch (emailErr) {
-        console.error("[Webhook] Email side-effect failed:", emailErr.message);
       }
+    } catch (emailErr) {
+      console.error("[Webhook] Email side-effect failed:", emailErr.message);
     }
 
     res.status(200).json({ received: true });
   } catch (err) {
-    console.error("[Webhook] Error procesando:", err.message);
-    res.status(500).json({ error: "Webhook processing failed" });
+    console.error("[Webhook] Processing error:", err.message);
+    res.status(500).json({ error: "processing_failed" });
   }
 }
 
-module.exports = { handleWebhook, extractEventId, deriveAfterState };
+module.exports = { handleWebhook, resolveFirebaseUid };

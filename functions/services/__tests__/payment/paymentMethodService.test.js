@@ -11,9 +11,9 @@ jest.mock("../../firebaseAdmin", () => ({
   firestore: mockFirestore,
 }));
 
-const mockGetSubscription = jest.fn();
+const mockGetPaymentMethod = jest.fn();
 const mockGetPaymentProvider = jest.fn(() => ({
-  getSubscription: mockGetSubscription,
+  getPaymentMethod: mockGetPaymentMethod,
 }));
 
 jest.mock("../../payment/providerFactory", () => ({
@@ -107,7 +107,7 @@ describe("paymentMethodService", () => {
     expect(mockGetPaymentProvider).not.toHaveBeenCalled();
   });
 
-  test("returns card info from LS provider", async () => {
+  test("returns card info from Whop provider", async () => {
     process.env.PAYMENT_MOCK_ENABLED = "false";
     mockGet.mockResolvedValue({
       data: () => ({
@@ -116,7 +116,7 @@ describe("paymentMethodService", () => {
     });
 
     mockExecute.mockImplementation(async (primaryFn) => primaryFn());
-    mockGetSubscription.mockResolvedValue({
+    mockGetPaymentMethod.mockResolvedValue({
       cardBrand: "visa",
       cardLastFour: "4242",
     });
@@ -126,7 +126,7 @@ describe("paymentMethodService", () => {
     expect(result).toEqual({
       paymentMethod: { cardBrand: "visa", cardLastFour: "4242" },
     });
-    expect(mockGetCircuit).toHaveBeenCalledWith("lemonSqueezy");
+    expect(mockGetCircuit).toHaveBeenCalledWith("whop");
   });
 
   test("returns null when circuit breaker fallback returns null", async () => {

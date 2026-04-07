@@ -1,13 +1,12 @@
 const { onCall, HttpsError } = require("firebase-functions/v2/https");
-const { defineSecret } = require("firebase-functions/params");
 const admin = require("../firebaseAdmin");
 const { getPaymentProvider } = require("./providerFactory");
 const { getCircuit } = require("../../utils/circuitBreaker");
 
-const lsApiKey = defineSecret("LEMONSQUEEZY_API_KEY");
-
+// WHOP-005: Whop secrets wired via onCall secrets option
 const getSubscriptionInvoices = onCall(
-  { cors: true, memory: "256MiB", timeoutSeconds: 30, secrets: [lsApiKey] },
+  { cors: true, memory: "256MiB", timeoutSeconds: 30,
+    secrets: ["WHOP_API_KEY", "WHOP_WEBHOOK_SECRET", "WHOP_COMPANY_ID"] },
   async (request) => {
     if (!request.auth?.uid) {
       throw new HttpsError("unauthenticated", "Authentication required");
@@ -27,17 +26,17 @@ const getSubscriptionInvoices = onCall(
       try {
         const provider = getPaymentProvider();
         if (provider) {
-          const lsCircuit = getCircuit("lemonSqueezy");
+          const paymentCircuit = getCircuit("whop");
 
-          const lsInvoices = await lsCircuit.execute(
+          const providerInvoices = await paymentCircuit.execute(
             () => provider.getSubscriptionInvoices(subscriptionId),
             () => null
           );
 
-          if (lsInvoices && lsInvoices.length > 0) {
-            console.log(`[Invoices] LS API returned ${lsInvoices.length} invoices for sub ${subscriptionId}`);
+          if (providerInvoices && providerInvoices.length > 0) {
+            console.log(`[Invoices] Provider API returned ${providerInvoices.length} invoices for sub ${subscriptionId}`);
             return {
-              invoices: lsInvoices.map((inv) => ({
+              invoices: providerInvoices.map((inv) => ({
                 id: inv.id,
                 date: inv.createdAt,
                 amount: inv.total,
@@ -53,7 +52,7 @@ const getSubscriptionInvoices = onCall(
           }
         }
       } catch (err) {
-        console.warn("[Invoices] LS API failed — falling back to events:", err.message);
+        console.warn("[Invoices] Provider API failed — falling back to events:", err.message);
       }
     }
 

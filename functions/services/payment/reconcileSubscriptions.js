@@ -162,7 +162,7 @@ async function reconcileWithProvider(counters) {
   const provider = getPaymentProvider();
   if (!provider) return;
 
-  const lsCircuit = getCircuit("lemonSqueezy", {
+  const paymentCircuit = getCircuit("whop", {
     failureThreshold: 3,
     resetTimeout: 30000,
     halfOpenRequests: 1,
@@ -175,31 +175,40 @@ async function reconcileWithProvider(counters) {
     .limit(LIMITS.MAX_USERS_PER_RUN)
     .get();
 
-  for (const doc of activeWithSub.docs) {
-    const sub = doc.data()?.subscription;
-    if (!sub?.subscriptionId) continue;
+  const BATCH_SIZE = 10;
+  const BATCH_DELAY_MS = 1000;
+  const docs = activeWithSub.docs;
 
-    try {
-      const providerSub = await lsCircuit.execute(
-        () => provider.getSubscription(sub.subscriptionId),
-        () => null
-      );
+  for (let i = 0; i < docs.length; i += BATCH_SIZE) {
+    if (i > 0) await new Promise((r) => setTimeout(r, BATCH_DELAY_MS));
 
-      if (!providerSub) continue;
+    const batch = docs.slice(i, i + BATCH_SIZE);
+    for (const doc of batch) {
+      const sub = doc.data()?.subscription;
+      if (!sub?.subscriptionId) continue;
 
-      const providerStatus = providerSub.status;
-      if (
-        (providerStatus === "cancelled" || providerStatus === "expired") &&
-        sub.status === "active"
-      ) {
-        console.warn(
-          `[reconcile-subs] Discrepancy: user ${doc.id} LS=${providerStatus} Firestore=${sub.status}. Correcting.`
+      try {
+        const providerSub = await paymentCircuit.execute(
+          () => provider.getSubscription(sub.subscriptionId),
+          () => null
         );
-        await degradeToFree(doc.ref, doc.id, "provider_discrepancy", counters);
+
+        if (!providerSub) continue;
+
+        const providerStatus = providerSub.status;
+        if (
+          (providerStatus === "cancelled" || providerStatus === "expired") &&
+          sub.status === "active"
+        ) {
+          console.warn(
+            `[reconcile-subs] Discrepancy: user ${doc.id} Whop=${providerStatus} Firestore=${sub.status}. Correcting.`
+          );
+          await degradeToFree(doc.ref, doc.id, "provider_discrepancy", counters);
+        }
+      } catch (err) {
+        console.error(`[reconcile-subs] Provider check failed for ${doc.id}:`, err.message);
+        counters.errors++;
       }
-    } catch (err) {
-      console.error(`[reconcile-subs] Provider check failed for ${doc.id}:`, err.message);
-      counters.errors++;
     }
   }
 }
@@ -211,7 +220,7 @@ const reconcileSubscriptions = onSchedule(
     memory: "512MiB",
     timeoutSeconds: 300,
     maxInstances: 1,
-    secrets: ["AWS_SES_ACCESS_KEY_ID", "AWS_SES_SECRET_ACCESS_KEY"],
+    secrets: ["AWS_SES_ACCESS_KEY_ID", "AWS_SES_SECRET_ACCESS_KEY", "WHOP_API_KEY", "WHOP_WEBHOOK_SECRET", "WHOP_COMPANY_ID"],
     labels: { component: "payment", purpose: "reconcile-subscriptions" },
   },
   async () => {

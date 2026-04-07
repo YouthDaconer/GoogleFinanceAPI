@@ -175,7 +175,7 @@ describe("cancelSubscriptionService", () => {
       expect(result.success).toBe(true);
       expect(result.effectiveDate).toBe("2026-05-01T00:00:00.000Z");
       expect(mockGetPaymentProvider).toHaveBeenCalled();
-      expect(mockGetCircuit).toHaveBeenCalledWith("lemonSqueezy");
+      expect(mockGetCircuit).toHaveBeenCalledWith("whop");
       expect(mockCancelSubscription).toHaveBeenCalledWith("sub-123");
       expect(mockSet).toHaveBeenCalledWith(
         {
@@ -255,7 +255,7 @@ describe("cancelSubscriptionService", () => {
         { merge: true }
       );
       expect(warnSpy).toHaveBeenCalledWith(
-        "[Cancel] LS API error — fallback:",
+        "[Cancel] Payment API error — fallback:",
         "Network timeout"
       );
 

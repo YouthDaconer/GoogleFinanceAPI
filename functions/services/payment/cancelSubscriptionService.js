@@ -3,7 +3,7 @@
  *
  * Permite a un usuario cancelar/degradar su suscripción Pro.
  * - Mock mode: Degrada a Free inmediatamente via buildSubscriptionData
- * - Real mode: Comunica cancelación a LS vía provider + circuit breaker
+ * - Real mode: Comunica cancelación al provider vía adapter + circuit breaker
  *
  * Rechaza si el usuario es Free (nada que cancelar) o Lifetime (no cancelable).
  *
@@ -12,14 +12,11 @@
  */
 
 const { onCall, HttpsError } = require("firebase-functions/v2/https");
-const { defineSecret } = require("firebase-functions/params");
 const admin = require("../firebaseAdmin");
 const { buildSubscriptionData } = require("./planFeatures");
 const { getPaymentProvider } = require("./providerFactory");
 const { getCircuit } = require("../../utils/circuitBreaker");
 const { sendTransactionalEmail, EMAIL_TEMPLATES } = require("./emailService");
-
-const lsApiKey = defineSecret("LEMONSQUEEZY_API_KEY");
 
 // PAY-CANCEL-001: Closed enum for cancellation reasons
 const VALID_REASONS = [
@@ -28,8 +25,10 @@ const VALID_REASONS = [
 ];
 const MAX_COMMENT_LENGTH = 500;
 
+// WHOP-004: Whop secrets wired via index.js CF declarations
 const cancelSubscription = onCall(
-  { cors: true, memory: "256MiB", timeoutSeconds: 30, secrets: [lsApiKey, "AWS_SES_ACCESS_KEY_ID", "AWS_SES_SECRET_ACCESS_KEY"] },
+  { cors: true, memory: "256MiB", timeoutSeconds: 30,
+    secrets: ["AWS_SES_ACCESS_KEY_ID", "AWS_SES_SECRET_ACCESS_KEY", "WHOP_API_KEY", "WHOP_WEBHOOK_SECRET", "WHOP_COMPANY_ID"] },
   async (request) => {
     if (!request.auth?.uid) {
       throw new HttpsError("unauthenticated", "Authentication required");
@@ -215,20 +214,20 @@ const cancelSubscription = onCall(
     }
 
     const provider = getPaymentProvider();
-    const lsCircuit = getCircuit("lemonSqueezy");
+    const paymentCircuit = getCircuit("whop");
 
     let providerSuccess = false;
     try {
-      const result = await lsCircuit.execute(
+      const result = await paymentCircuit.execute(
         () => provider.cancelSubscription(subscriptionId),
         () => {
-          console.warn("[Cancel] LS circuit open — fallback to Firestore-only");
+          console.warn("[Cancel] Payment circuit open — fallback to Firestore-only");
           return { success: false, fallback: true };
         }
       );
       providerSuccess = result.success && !result.fallback;
     } catch (err) {
-      console.warn("[Cancel] LS API error — fallback:", err.message);
+      console.warn("[Cancel] Payment API error — fallback:", err.message);
     }
 
     const effectiveDate = subscription.currentPeriodEnd || new Date().toISOString();
@@ -265,8 +264,8 @@ const cancelSubscription = onCall(
     }
 
     const logMsg = providerSuccess
-      ? "[Cancel] LS API confirmed cancel"
-      : "[Cancel] Firestore-only cancel (LS API failed or unavailable)";
+      ? "[Cancel] Whop API confirmed cancel"
+      : "[Cancel] Firestore-only cancel (Whop API failed or unavailable)";
     console.log(logMsg);
 
     try {

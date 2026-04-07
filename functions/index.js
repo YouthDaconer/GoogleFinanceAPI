@@ -743,17 +743,17 @@ const { reactivateSubscription } = require("./services/payment/reactivateSubscri
 exports.reactivateSubscription = reactivateSubscription;
 
 // ============================================================================
-// STRIPE-001: Payment & Subscription Management
+// WHOP: Payment & Subscription Management
+// WHOP-005: Whop secrets wired via string references in CF options
 // ============================================================================
 const subscriptionService = require("./services/payment/subscriptionService");
 const { handleWebhook } = require("./services/payment/webhookHandler");
 
-const lsApiKey = defineSecret("LEMONSQUEEZY_API_KEY");
-const lsWebhookSecret = defineSecret("LEMONSQUEEZY_WEBHOOK_SECRET");
+const PLAN_RANKS = { free: 0, trial: 0, pro: 1, lifetime: 2 };
 
 exports.createCheckoutSession = onCall(
   { cors: true, memory: "256MiB", timeoutSeconds: 30, minInstances: 0,
-    secrets: [lsApiKey] },
+    secrets: ["WHOP_API_KEY", "WHOP_WEBHOOK_SECRET", "WHOP_COMPANY_ID"] },
   withRateLimit('createCheckoutSession')(async (request) => {
     if (!request.auth) {
       throw new HttpsError("unauthenticated", "Autenticación requerida");
@@ -765,6 +765,16 @@ exports.createCheckoutSession = onCall(
     if (planId === "pro" && !["month", "year"].includes(interval)) {
       throw new HttpsError("invalid-argument", "Intervalo no válido para Pro. Usa: month o year");
     }
+
+    // WHOP-005 AC-13: PLAN_RANK guard — reject downgrade or same-plan checkout
+    const userDoc = await admin.firestore().collection("userData").doc(request.auth.uid).get();
+    const currentPlan = userDoc.data()?.subscription?.planId || "free";
+    const currentRank = PLAN_RANKS[currentPlan] ?? 0;
+    const targetRank = PLAN_RANKS[planId] ?? 0;
+    if (currentRank >= targetRank) {
+      throw new HttpsError("failed-precondition", "No puedes hacer downgrade ni renovar el mismo plan desde checkout");
+    }
+
     return await subscriptionService.initiateCheckout(
       request.auth.uid, request.auth.token.email, planId, interval || "lifetime"
     );
@@ -773,7 +783,7 @@ exports.createCheckoutSession = onCall(
 
 exports.createPortalSession = onCall(
   { cors: true, memory: "256MiB", timeoutSeconds: 30, minInstances: 0,
-    secrets: [lsApiKey] },
+    secrets: ["WHOP_API_KEY", "WHOP_WEBHOOK_SECRET", "WHOP_COMPANY_ID"] },
   withRateLimit('createPortalSession')(async (request) => {
     if (!request.auth) {
       throw new HttpsError("unauthenticated", "Autenticación requerida");
@@ -784,7 +794,7 @@ exports.createPortalSession = onCall(
 
 exports.handlePaymentWebhook = onRequest(
   { cors: false, memory: "256MiB", timeoutSeconds: 60, minInstances: 0,
-    secrets: [lsApiKey, lsWebhookSecret, "AWS_SES_ACCESS_KEY_ID", "AWS_SES_SECRET_ACCESS_KEY"] },
+    secrets: ["AWS_SES_ACCESS_KEY_ID", "AWS_SES_SECRET_ACCESS_KEY", "WHOP_API_KEY", "WHOP_WEBHOOK_SECRET", "WHOP_COMPANY_ID"] },
   handleWebhook
 );
 

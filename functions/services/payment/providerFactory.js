@@ -4,11 +4,11 @@
  * Resolves PAYMENT_PROVIDER env var to a concrete adapter instance.
  * Uses singleton pattern: one provider instance per Cloud Function lifecycle.
  *
- * @see docs/architecture/STRIPE-001-payment-subscription-integration-design.md
+ * @see docs/architecture/MIGRATION-WHOP-PAYMENT-GATEWAY-2026-04-06.md
  * @module services/payment/providerFactory
  */
 
-const { createLemonSqueezyProvider } = require("./lemonSqueezyProvider");
+const { createWhopProvider } = require("./whopProvider");
 
 let cachedProvider = null;
 let cachedProviderName = null;
@@ -21,8 +21,12 @@ function getPaymentProvider() {
   }
 
   switch (providerName) {
-    case "lemonsqueezy":
-      cachedProvider = createLemonSqueezyProvider();
+    case "whop":
+      cachedProvider = createWhopProvider({
+        apiKey: process.env.WHOP_API_KEY,
+        webhookSecret: process.env.WHOP_WEBHOOK_SECRET,
+        companyId: process.env.WHOP_COMPANY_ID,
+      });
       cachedProviderName = providerName;
       return cachedProvider;
 
@@ -33,7 +37,7 @@ function getPaymentProvider() {
 
     default:
       throw new Error(
-        `Unknown PAYMENT_PROVIDER: "${providerName}". Must be "lemonsqueezy" or "mock".`
+        `Unknown PAYMENT_PROVIDER: "${providerName}". Must be "whop" or "mock".`
       );
   }
 }

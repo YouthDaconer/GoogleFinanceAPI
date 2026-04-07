@@ -97,14 +97,14 @@ describe("getSubscriptionInvoices", () => {
       process.env.PAYMENT_MOCK_ENABLED = "false";
     });
 
-    test("returns invoices from LS API with source provider", async () => {
+    test("returns invoices from provider API with source provider", async () => {
       mockGet.mockResolvedValue({
         data: () => ({
           subscription: { planId: "pro", subscriptionId: "sub-123" },
         }),
       });
 
-      const lsInvoices = [
+      const providerInvoices = [
         {
           id: "inv-1",
           createdAt: "2026-03-01T10:00:00Z",
@@ -112,14 +112,14 @@ describe("getSubscriptionInvoices", () => {
           totalFormatted: "$9.99",
           currency: "USD",
           status: "paid",
-          invoiceUrl: "https://app.lemonsqueezy.com/invoice/1",
+          invoiceUrl: "https://example.com/invoice/1",
           cardBrand: "visa",
           cardLastFour: "4242",
         },
       ];
 
       mockExecute.mockImplementation(async (primaryFn) => primaryFn());
-      mockGetSubscriptionInvoices.mockResolvedValue(lsInvoices);
+      mockGetSubscriptionInvoices.mockResolvedValue(providerInvoices);
 
       const result = await capturedHandler({ auth: { uid: "user1" }, data: {} });
 
@@ -132,14 +132,14 @@ describe("getSubscriptionInvoices", () => {
         amountFormatted: "$9.99",
         currency: "USD",
         status: "paid",
-        invoiceUrl: "https://app.lemonsqueezy.com/invoice/1",
+        invoiceUrl: "https://example.com/invoice/1",
         cardBrand: "visa",
         cardLastFour: "4242",
       });
-      expect(mockGetCircuit).toHaveBeenCalledWith("lemonSqueezy");
+      expect(mockGetCircuit).toHaveBeenCalledWith("whop");
     });
 
-    test("falls back to events when LS API returns empty array", async () => {
+    test("falls back to events when provider API returns empty array", async () => {
       mockGet.mockResolvedValue({
         data: () => ({
           subscription: { planId: "pro", subscriptionId: "sub-123" },
@@ -222,7 +222,7 @@ describe("getSubscriptionInvoices", () => {
       process.env.PAYMENT_MOCK_ENABLED = "true";
     });
 
-    test("skips LS API and falls back to subscriptionEvents", async () => {
+    test("skips provider API and falls back to subscriptionEvents", async () => {
       mockGet.mockResolvedValue({
         data: () => ({
           subscription: { planId: "pro", subscriptionId: "sub-123" },

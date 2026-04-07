@@ -1,13 +1,12 @@
 const { onCall, HttpsError } = require("firebase-functions/v2/https");
-const { defineSecret } = require("firebase-functions/params");
 const admin = require("../firebaseAdmin");
 const { getPaymentProvider } = require("./providerFactory");
 const { getCircuit } = require("../../utils/circuitBreaker");
 
-const lsApiKey = defineSecret("LEMONSQUEEZY_API_KEY");
-
+// WHOP-004: Whop secrets wired via index.js CF declarations
 const reactivateSubscription = onCall(
-  { cors: true, memory: "256MiB", timeoutSeconds: 30, secrets: [lsApiKey] },
+  { cors: true, memory: "256MiB", timeoutSeconds: 30,
+    secrets: ["WHOP_API_KEY", "WHOP_WEBHOOK_SECRET", "WHOP_COMPANY_ID"] },
   async (request) => {
     if (!request.auth?.uid) {
       throw new HttpsError("unauthenticated", "Authentication required");
@@ -83,20 +82,20 @@ const reactivateSubscription = onCall(
     }
 
     const provider = getPaymentProvider();
-    const lsCircuit = getCircuit("lemonSqueezy");
+    const paymentCircuit = getCircuit("whop");
 
     let providerSuccess = false;
     try {
-      const result = await lsCircuit.execute(
+      const result = await paymentCircuit.execute(
         () => provider.reactivateSubscription(subscriptionId),
         () => {
-          console.warn("[Reactivate] LS circuit open — fallback to Firestore-only");
+          console.warn("[Reactivate] Payment circuit open — fallback to Firestore-only");
           return { success: false, fallback: true };
         }
       );
       providerSuccess = result.success && !result.fallback;
     } catch (err) {
-      console.warn("[Reactivate] LS API error — fallback:", err.message);
+      console.warn("[Reactivate] Payment API error — fallback:", err.message);
     }
 
     await db.collection("userData").doc(userId).set(
@@ -118,8 +117,8 @@ const reactivateSubscription = onCall(
     }
 
     const logMsg = providerSuccess
-      ? "[Reactivate] LS API confirmed reactivation"
-      : "[Reactivate] Firestore-only reactivation (LS API failed or unavailable)";
+      ? "[Reactivate] Whop API confirmed reactivation"
+      : "[Reactivate] Firestore-only reactivation (Whop API failed or unavailable)";
     console.log(logMsg);
 
     return {

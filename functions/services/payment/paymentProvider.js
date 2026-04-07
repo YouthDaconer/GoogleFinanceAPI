@@ -2,9 +2,9 @@
  * Payment Provider — Interface contract, JSDoc types and event constants
  *
  * Defines the abstract interface for payment provider adapters.
- * Concrete implementations (lemonSqueezyProvider) implement this contract.
+ * Concrete implementations (whopProvider) implement this contract.
  *
- * @see docs/architecture/STRIPE-001-payment-subscription-integration-design.md
+ * @see docs/architecture/MIGRATION-WHOP-PAYMENT-GATEWAY-2026-04-06.md
  * @module services/payment/paymentProvider
  */
 
@@ -91,6 +91,9 @@ const PAYMENT_EVENT_TYPES = Object.freeze({
   SUBSCRIPTION_CREATED: "subscription_created",
   PAYMENT_FAILED: "payment_failed",
   PAYMENT_SUCCEEDED: "payment_succeeded",
+  MEMBERSHIP_ACTIVATED: "membership_activated",
+  MEMBERSHIP_DEACTIVATED: "membership_deactivated",
+  CANCEL_AT_PERIOD_END_CHANGED: "cancel_at_period_end_changed",
 });
 
 module.exports = { PAYMENT_EVENT_TYPES };

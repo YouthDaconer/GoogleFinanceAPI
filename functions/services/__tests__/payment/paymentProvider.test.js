@@ -1,8 +1,8 @@
 const { PAYMENT_EVENT_TYPES } = require("../../payment/paymentProvider");
 
 describe("PAYMENT_EVENT_TYPES", () => {
-  test("exports exactly 6 event constants", () => {
-    expect(Object.keys(PAYMENT_EVENT_TYPES)).toHaveLength(6);
+  test("exports exactly 9 event constants", () => {
+    expect(Object.keys(PAYMENT_EVENT_TYPES)).toHaveLength(9);
   });
 
   test("exports CHECKOUT_COMPLETED", () => {
@@ -27,6 +27,18 @@ describe("PAYMENT_EVENT_TYPES", () => {
 
   test("exports PAYMENT_SUCCEEDED", () => {
     expect(PAYMENT_EVENT_TYPES.PAYMENT_SUCCEEDED).toBe("payment_succeeded");
+  });
+
+  test("exports MEMBERSHIP_ACTIVATED", () => {
+    expect(PAYMENT_EVENT_TYPES.MEMBERSHIP_ACTIVATED).toBe("membership_activated");
+  });
+
+  test("exports MEMBERSHIP_DEACTIVATED", () => {
+    expect(PAYMENT_EVENT_TYPES.MEMBERSHIP_DEACTIVATED).toBe("membership_deactivated");
+  });
+
+  test("exports CANCEL_AT_PERIOD_END_CHANGED", () => {
+    expect(PAYMENT_EVENT_TYPES.CANCEL_AT_PERIOD_END_CHANGED).toBe("cancel_at_period_end_changed");
   });
 
   test("is frozen (immutable)", () => {

@@ -19,8 +19,8 @@
   "main": "index.js",
   "dependencies": {
     "@aws-sdk/client-ses": "^3.1024.0",
-    "@lemonsqueezy/lemonsqueezy.js": "^4.0.0",
     "@types/markdown-it": "^12.2.3",
+    "@whop/sdk": "0.0.35",
     "ajv": "^8.12.0",
     "ajv-formats": "^2.1.1",
     "axios": "^1.8.4",
