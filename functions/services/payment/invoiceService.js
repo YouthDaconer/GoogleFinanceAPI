@@ -66,9 +66,11 @@ const getSubscriptionInvoices = onCall(
 
       const events = eventsSnapshot.docs.map((doc) => {
         const data = doc.data();
+        const rawDate = data.processedAt || data.timestamp || null;
+        const date = rawDate?.toDate ? rawDate.toDate().toISOString() : rawDate;
         return {
           id: doc.id,
-          date: data.processedAt?.toDate?.()?.toISOString() || null,
+          date,
           type: data.type,
           amount: null,
           amountFormatted: null,

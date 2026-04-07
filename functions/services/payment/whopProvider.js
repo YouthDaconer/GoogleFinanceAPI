@@ -102,9 +102,20 @@ function mapPaymentToInvoice(payment) {
 function createWhopProvider({ apiKey, webhookSecret, companyId }) {
   const { Whop } = require("@whop/sdk");
 
+  // CRITICAL: trim whitespace/newlines that may be present in Secret Manager values
+  const cleanSecret = webhookSecret ? webhookSecret.trim() : null;
+
+  // Standard Webhooks: SDK expects the secret base64-encoded.
+  // See https://docs.whop.com/developer/guides/webhooks → btoa(secret)
+  let webhookKey = null;
+  if (cleanSecret) {
+    webhookKey = Buffer.from(cleanSecret).toString("base64");
+    console.log("[whopProvider] webhookKey configured, secret length:", cleanSecret.length);
+  }
+
   const client = new Whop({
     apiKey,
-    webhookKey: Buffer.from(webhookSecret || "").toString("base64"),
+    webhookKey,
   });
 
   // --- Checkout (AC-03, AC-04, AC-05) ---
@@ -119,7 +130,6 @@ function createWhopProvider({ apiKey, webhookSecret, companyId }) {
     const whopPlanId = resolveWhopPlanId(planId, interval);
 
     const config = await client.checkoutConfigurations.create({
-      company_id: companyId,
       plan_id: whopPlanId,
       metadata: {
         firebase_uid: userId,

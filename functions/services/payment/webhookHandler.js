@@ -64,6 +64,11 @@ async function handleWebhook(req, res) {
     webhookResult = await provider.parseWebhook(rawBody, headers);
   } catch (err) {
     console.error("[Webhook] Invalid signature:", err.message);
+    console.error("[Webhook] Headers received:", JSON.stringify({
+      "webhook-id": headers["webhook-id"]?.slice(0, 20),
+      "webhook-signature": headers["webhook-signature"]?.slice(0, 30),
+      "webhook-timestamp": headers["webhook-timestamp"],
+    }));
     res.status(400).json({ error: "Invalid webhook signature" });
     return;
   }

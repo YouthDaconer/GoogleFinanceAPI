@@ -35,8 +35,12 @@ async function initiateCheckout(userId, email, planId, interval) {
     throw new Error("Payment provider is not configured (mock mode)");
   }
 
+  const appUrl = process.env.APP_URL || 'https://portastock.net';
+  const successUrl = `${appUrl}/settings/subscription?checkout=success`;
+  const cancelUrl = `${appUrl}/pricing`;
+
   const result = await paymentCircuit.execute(
-    () => provider.createCheckoutSession({ userId, email, planId, interval }),
+    () => provider.createCheckoutSession({ userId, email, planId, interval, successUrl, cancelUrl }),
     paymentCircuitFallback
   );
 
