@@ -11,11 +11,16 @@ jest.mock("../../payment/webhookHandler", () => ({
   handleWebhook: jest.fn(),
 }));
 
+let mockUserSubscription = {};
+const mockFirestoreGet = jest.fn(() =>
+  Promise.resolve({ data: () => ({ subscription: mockUserSubscription }) })
+);
+
 jest.mock("../../firebaseAdmin", () => ({
   firestore: () => ({
     collection: jest.fn(() => ({
       doc: jest.fn(() => ({
-        get: jest.fn().mockResolvedValue({ data: () => ({}) }),
+        get: (...args) => mockFirestoreGet(...args),
         set: jest.fn().mockResolvedValue(),
       })),
     })),
@@ -89,6 +94,7 @@ beforeAll(() => {
 describe("STRIPE-001: Payment Cloud Functions (index.js)", () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    mockUserSubscription = {};
   });
 
   describe("createCheckoutSession", () => {
@@ -133,7 +139,7 @@ describe("STRIPE-001: Payment Cloud Functions (index.js)", () => {
         data: { planId: "lifetime" },
       });
 
-      expect(mockInitiateCheckout).toHaveBeenCalledWith("uid-1", "a@b.com", "lifetime", "lifetime");
+      expect(mockInitiateCheckout).toHaveBeenCalledWith("uid-1", "a@b.com", "lifetime", "lifetime", { trialDays: 0 });
       expect(result).toEqual({ url: "https://checkout.example.com" });
     });
 
@@ -145,8 +151,69 @@ describe("STRIPE-001: Payment Cloud Functions (index.js)", () => {
         data: { planId: "pro", interval: "month" },
       });
 
-      expect(mockInitiateCheckout).toHaveBeenCalledWith("uid-1", "a@b.com", "pro", "month");
+      expect(mockInitiateCheckout).toHaveBeenCalledWith("uid-1", "a@b.com", "pro", "month", { trialDays: 0 });
       expect(result).toEqual({ url: "https://checkout.example.com/pro" });
+    });
+  });
+
+  describe("WHOP-010: Trial checkout", () => {
+    test("trial=true for eligible Free user passes trialDays=30", async () => {
+      mockUserSubscription = {};
+      mockInitiateCheckout.mockResolvedValue({ url: "https://checkout.example.com/trial" });
+
+      const result = await indexModule.createCheckoutSession({
+        auth: { uid: "uid-1", token: { email: "a@b.com" } },
+        data: { planId: "pro", interval: "month", trial: true },
+      });
+
+      expect(mockInitiateCheckout).toHaveBeenCalledWith("uid-1", "a@b.com", "pro", "month", { trialDays: 30 });
+      expect(result).toEqual({ url: "https://checkout.example.com/trial" });
+    });
+
+    test("trial=true rejected when hasUsedTrial=true", async () => {
+      mockUserSubscription = { planId: "free", hasUsedTrial: true };
+
+      await expect(
+        indexModule.createCheckoutSession({
+          auth: { uid: "uid-1", token: { email: "a@b.com" } },
+          data: { planId: "pro", interval: "month", trial: true },
+        })
+      ).rejects.toMatchObject({ code: "failed-precondition" });
+    });
+
+    test("trial=true rejected for Pro Annual", async () => {
+      mockUserSubscription = {};
+
+      await expect(
+        indexModule.createCheckoutSession({
+          auth: { uid: "uid-1", token: { email: "a@b.com" } },
+          data: { planId: "pro", interval: "year", trial: true },
+        })
+      ).rejects.toMatchObject({ code: "failed-precondition" });
+    });
+
+    test("trial=true rejected for non-Free user", async () => {
+      mockUserSubscription = { planId: "pro", subscriptionOrigin: "checkout" };
+
+      await expect(
+        indexModule.createCheckoutSession({
+          auth: { uid: "uid-1", token: { email: "a@b.com" } },
+          data: { planId: "pro", interval: "month", trial: true },
+        })
+      ).rejects.toMatchObject({ code: "failed-precondition" });
+    });
+
+    test("rank guard allows trial→paid conversion (same plan, origin=trial)", async () => {
+      mockUserSubscription = { planId: "pro", subscriptionOrigin: "trial" };
+      mockInitiateCheckout.mockResolvedValue({ url: "https://checkout.example.com/convert" });
+
+      const result = await indexModule.createCheckoutSession({
+        auth: { uid: "uid-1", token: { email: "a@b.com" } },
+        data: { planId: "pro", interval: "month" },
+      });
+
+      expect(mockInitiateCheckout).toHaveBeenCalledWith("uid-1", "a@b.com", "pro", "month", { trialDays: 0 });
+      expect(result).toEqual({ url: "https://checkout.example.com/convert" });
     });
   });
 

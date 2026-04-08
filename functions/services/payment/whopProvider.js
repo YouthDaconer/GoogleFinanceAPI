@@ -126,10 +126,11 @@ function createWhopProvider({ apiKey, webhookSecret, companyId }) {
     email,
     successUrl,
     cancelUrl,
+    trialDays = 0,
   }) {
     const whopPlanId = resolveWhopPlanId(planId, interval);
 
-    const config = await client.checkoutConfigurations.create({
+    const checkoutParams = {
       plan_id: whopPlanId,
       metadata: {
         firebase_uid: userId,
@@ -138,7 +139,13 @@ function createWhopProvider({ apiKey, webhookSecret, companyId }) {
       },
       redirect_url: successUrl || undefined,
       source_url: cancelUrl || undefined,
-    });
+    };
+
+    if (trialDays > 0) {
+      checkoutParams.trial_period_days = trialDays;
+    }
+
+    const config = await client.checkoutConfigurations.create(checkoutParams);
 
     return { checkoutUrl: config.purchase_url, sessionId: config.id };
   }

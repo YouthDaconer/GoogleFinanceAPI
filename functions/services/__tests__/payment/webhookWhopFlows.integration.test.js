@@ -553,3 +553,179 @@ describe("all Whop event writes use merge: true", () => {
     }
   });
 });
+
+// ============================================================================
+// WHOP-010: Trial Lifecycle Integration Tests
+// ============================================================================
+
+describe("WHOP-010: Trial lifecycle", () => {
+  describe("PAYMENT_SUCCEEDED with membership.status=trialing", () => {
+    test("writes origin=trial, hasUsedTrial=true, trialStartedAt", async () => {
+      mockGet.mockResolvedValue({ data: () => ({ subscription: {} }) });
+
+      const payload = {
+        plan: { id: "plan_pro_monthly" },
+        membership: { id: "mem_trial", status: "trialing" },
+        user: { id: "user_trial" },
+      };
+
+      await processWebhookEvent({
+        type: PAYMENT_EVENT_TYPES.PAYMENT_SUCCEEDED,
+        data: payload,
+        userId: "test-uid",
+        eventId: "evt-trial-1",
+      });
+
+      expect(mockSet).toHaveBeenCalledTimes(1);
+      const writtenData = mockSet.mock.calls[0][0].subscription;
+      expect(writtenData.planId).toBe("pro");
+      expect(writtenData.interval).toBe("month");
+      expect(writtenData.subscriptionOrigin).toBe("trial");
+      expect(writtenData.hasUsedTrial).toBe(true);
+      expect(writtenData.trialStartedAt).toBe("2026-04-06T12:00:00.000Z");
+      expect(Object.keys(writtenData.features)).toHaveLength(21);
+      expect(mockSet.mock.calls[0][1]).toEqual({ merge: true });
+    });
+  });
+
+  describe("PAYMENT_SUCCEEDED trial→paid transition", () => {
+    test("stamps trialEndedAt and sets origin=checkout when user was on trial", async () => {
+      mockGet.mockResolvedValue({
+        data: () => ({
+          subscription: {
+            planId: "pro",
+            subscriptionOrigin: "trial",
+            hasUsedTrial: true,
+            trialStartedAt: "2026-03-07T12:00:00.000Z",
+          },
+        }),
+      });
+
+      const payload = {
+        plan: { id: "plan_pro_monthly" },
+        membership: { id: "mem_paid", status: "active" },
+        user: { id: "user_trial" },
+      };
+
+      await processWebhookEvent({
+        type: PAYMENT_EVENT_TYPES.PAYMENT_SUCCEEDED,
+        data: payload,
+        userId: "test-uid",
+        eventId: "evt-trial-paid-1",
+      });
+
+      expect(mockSet).toHaveBeenCalledTimes(1);
+      const writtenData = mockSet.mock.calls[0][0].subscription;
+      expect(writtenData.subscriptionOrigin).toBe("checkout");
+      expect(writtenData.trialEndedAt).toBe("2026-04-06T12:00:00.000Z");
+      expect(writtenData.hasUsedTrial).toBe(true);
+      expect(writtenData.trialStartedAt).toBe("2026-03-07T12:00:00.000Z");
+    });
+  });
+
+  describe("MEMBERSHIP_ACTIVATED with status=trialing — safety net", () => {
+    test("materializes full trial for Free user", async () => {
+      mockGet.mockResolvedValue({
+        data: () => ({ subscription: { planId: "free" } }),
+      });
+
+      const payload = {
+        id: "mem_trial_2",
+        user: { id: "user_trial_2" },
+        manage_url: "https://whop.com/billing/manage/mem_trial_2",
+        renewal_period_end: "2026-05-06T00:00:00Z",
+        status: "trialing",
+        plan: { id: "plan_pro_monthly" },
+      };
+
+      await processWebhookEvent({
+        type: PAYMENT_EVENT_TYPES.MEMBERSHIP_ACTIVATED,
+        data: payload,
+        userId: "test-uid",
+        eventId: "evt-trial-safety-1",
+      });
+
+      expect(mockSet).toHaveBeenCalledTimes(1);
+      const writtenData = mockSet.mock.calls[0][0].subscription;
+      expect(writtenData.planId).toBe("pro");
+      expect(writtenData.subscriptionOrigin).toBe("trial");
+      expect(writtenData.hasUsedTrial).toBe(true);
+      expect(writtenData.trialStartedAt).toBe("2026-04-06T12:00:00.000Z");
+      expect(Object.keys(writtenData.features)).toHaveLength(21);
+      expect(mockSet.mock.calls[0][1]).toEqual({ merge: true });
+    });
+
+    test("does not overwrite existing Pro subscription (only partial update)", async () => {
+      mockGet.mockResolvedValue({
+        data: () => ({
+          subscription: {
+            planId: "pro",
+            subscriptionOrigin: "trial",
+            hasUsedTrial: true,
+            trialStartedAt: "2026-03-07T12:00:00.000Z",
+          },
+        }),
+      });
+
+      const payload = {
+        id: "mem_trial_3",
+        user: { id: "user_trial_3" },
+        manage_url: "https://whop.com/billing/manage/mem_trial_3",
+        renewal_period_end: "2026-05-06T00:00:00Z",
+        status: "trialing",
+        plan: { id: "plan_pro_monthly" },
+      };
+
+      await processWebhookEvent({
+        type: PAYMENT_EVENT_TYPES.MEMBERSHIP_ACTIVATED,
+        data: payload,
+        userId: "test-uid",
+        eventId: "evt-trial-safety-2",
+      });
+
+      expect(mockSet).toHaveBeenCalledTimes(1);
+      const writtenData = mockSet.mock.calls[0][0].subscription;
+      // Should only be partial metadata update, not full plan overwrite
+      expect(writtenData.subscriptionId).toBe("mem_trial_3");
+      expect(writtenData.hasUsedTrial).toBe(true);
+      expect(writtenData.trialStartedAt).toBe("2026-03-07T12:00:00.000Z");
+    });
+  });
+
+  describe("MEMBERSHIP_ACTIVATED with unknown plan — safety net fallback", () => {
+    test("uses pro/month fallback and logs warning when plan resolution fails", async () => {
+      mockGet.mockResolvedValue({
+        data: () => ({ subscription: {} }),
+      });
+
+      const consoleSpy = jest.spyOn(console, "warn").mockImplementation();
+
+      const payload = {
+        id: "mem_trial_unknown",
+        user: { id: "user_unknown" },
+        manage_url: "https://whop.com/billing/manage/mem_trial_unknown",
+        renewal_period_end: "2026-05-06T00:00:00Z",
+        status: "trialing",
+        plan: { id: "plan_UNKNOWN_xyz" },
+      };
+
+      await processWebhookEvent({
+        type: PAYMENT_EVENT_TYPES.MEMBERSHIP_ACTIVATED,
+        data: payload,
+        userId: "test-uid",
+        eventId: "evt-trial-fallback-1",
+      });
+
+      expect(mockSet).toHaveBeenCalledTimes(1);
+      const writtenData = mockSet.mock.calls[0][0].subscription;
+      expect(writtenData.planId).toBe("pro");
+      expect(writtenData.interval).toBe("month");
+      expect(writtenData.subscriptionOrigin).toBe("trial");
+      expect(consoleSpy).toHaveBeenCalledWith(
+        expect.stringContaining("unknown plan")
+      );
+
+      consoleSpy.mockRestore();
+    });
+  });
+});

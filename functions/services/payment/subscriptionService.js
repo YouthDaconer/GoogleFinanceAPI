@@ -29,7 +29,8 @@ function paymentCircuitFallback() {
   );
 }
 
-async function initiateCheckout(userId, email, planId, interval) {
+async function initiateCheckout(userId, email, planId, interval, options = {}) {
+  const { trialDays = 0 } = options;
   const provider = getPaymentProvider();
   if (!provider) {
     throw new Error("Payment provider is not configured (mock mode)");
@@ -40,7 +41,7 @@ async function initiateCheckout(userId, email, planId, interval) {
   const cancelUrl = `${appUrl}/pricing`;
 
   const result = await paymentCircuit.execute(
-    () => provider.createCheckoutSession({ userId, email, planId, interval, successUrl, cancelUrl }),
+    () => provider.createCheckoutSession({ userId, email, planId, interval, successUrl, cancelUrl, trialDays }),
     paymentCircuitFallback
   );
 
@@ -124,6 +125,19 @@ async function handlePaymentSucceeded(userRef, userId, data) {
   if (current.hasUsedTrial) subscriptionData.hasUsedTrial = true;
   if (current.trialStartedAt) subscriptionData.trialStartedAt = current.trialStartedAt;
 
+  // WHOP-010: Trial→paid transition — stamp trialEndedAt when converting
+  if (current.subscriptionOrigin === "trial" && origin === "checkout") {
+    subscriptionData.trialEndedAt = new Date().toISOString();
+  }
+
+  // WHOP-010: New trial activation — stamp hasUsedTrial and trialStartedAt
+  if (origin === "trial") {
+    subscriptionData.hasUsedTrial = true;
+    if (!current.trialStartedAt) {
+      subscriptionData.trialStartedAt = new Date().toISOString();
+    }
+  }
+
   if (planId === "lifetime") {
     subscriptionData.currentPeriodEnd = null;
     subscriptionData.purchasedAt = new Date().toISOString();
@@ -134,6 +148,8 @@ async function handlePaymentSucceeded(userRef, userId, data) {
 }
 
 async function handleMembershipActivated(userRef, userId, data) {
+  const current = (await userRef.get()).data()?.subscription || {};
+
   const partialUpdate = {
     subscriptionId: data.id || null,
     providerCustomerId: data.user?.id || null,
@@ -141,6 +157,28 @@ async function handleMembershipActivated(userRef, userId, data) {
     currentPeriodEnd: data.renewal_period_end || null,
     updatedAt: new Date().toISOString(),
   };
+
+  // WHOP-010: Safety net — materialize trial if user is Free and membership is trialing
+  if (data.status === "trialing" && (!current.planId || current.planId === "free")) {
+    const planResult = resolvePortastockPlan(data.plan?.id);
+    if (planResult.planResolutionWarning) {
+      console.warn(`[Webhook] handleMembershipActivated: unknown plan "${data.plan?.id}" for user ${userId} — using pro/month fallback (safety net, non-blocking)`);
+    }
+    const { planId, interval } = planResult.planResolutionWarning
+      ? { planId: "pro", interval: "month" }
+      : planResult;
+
+    const trialData = await buildSubscriptionData(planId, interval, "active", "trial");
+    trialData.hasUsedTrial = true;
+    trialData.trialStartedAt = current.trialStartedAt || new Date().toISOString();
+    Object.assign(partialUpdate, trialData);
+  }
+
+  // Preserve sticky trial fields from existing subscription
+  if (current.hasUsedTrial) partialUpdate.hasUsedTrial = true;
+  if (current.trialStartedAt && !partialUpdate.trialStartedAt) {
+    partialUpdate.trialStartedAt = current.trialStartedAt;
+  }
 
   await userRef.set({ subscription: partialUpdate }, { merge: true });
 }
@@ -183,6 +221,14 @@ async function handleCancelAtPeriodEndChanged(userRef, userId, data) {
 }
 
 async function handlePaymentFailed(userRef, userId, data) {
+  // Only mark as past_due if user has an active paid subscription.
+  // Ignore payment.failed from checkout attempts that never completed.
+  const current = (await userRef.get()).data()?.subscription || {};
+  if (!current.planId || current.planId === "free") {
+    console.log(`[Webhook] payment.failed ignored for user ${userId} — no active paid subscription (planId=${current.planId})`);
+    return;
+  }
+
   await userRef.set({
     subscription: {
       status: "past_due",

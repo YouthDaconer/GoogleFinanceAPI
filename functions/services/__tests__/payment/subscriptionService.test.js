@@ -59,12 +59,32 @@ describe("initiateCheckout", () => {
     const result = await initiateCheckout("uid-1", "user@test.com", "pro", "month");
 
     expect(result).toEqual({ url: "https://checkout.example.com/abc" });
-    expect(mockProvider.createCheckoutSession).toHaveBeenCalledWith({
-      userId: "uid-1",
-      email: "user@test.com",
-      planId: "pro",
-      interval: "month",
+    expect(mockProvider.createCheckoutSession).toHaveBeenCalledWith(
+      expect.objectContaining({
+        userId: "uid-1",
+        email: "user@test.com",
+        planId: "pro",
+        interval: "month",
+        trialDays: 0,
+      })
+    );
+  });
+
+  test("WHOP-010: passes trialDays to provider when options.trialDays is set", async () => {
+    mockProvider.createCheckoutSession.mockResolvedValue({
+      checkoutUrl: "https://checkout.example.com/trial",
     });
+
+    const result = await initiateCheckout("uid-1", "user@test.com", "pro", "month", { trialDays: 30 });
+
+    expect(result).toEqual({ url: "https://checkout.example.com/trial" });
+    expect(mockProvider.createCheckoutSession).toHaveBeenCalledWith(
+      expect.objectContaining({
+        planId: "pro",
+        interval: "month",
+        trialDays: 30,
+      })
+    );
   });
 
   test("lifetime forces interval to 'lifetime'", async () => {

@@ -748,6 +748,7 @@ exports.reactivateSubscription = reactivateSubscription;
 // ============================================================================
 const subscriptionService = require("./services/payment/subscriptionService");
 const { handleWebhook } = require("./services/payment/webhookHandler");
+const { TRIAL_CONFIG } = require("./services/payment/planFeatures");
 
 const PLAN_RANKS = { free: 0, trial: 0, pro: 1, lifetime: 2 };
 
@@ -758,7 +759,7 @@ exports.createCheckoutSession = onCall(
     if (!request.auth) {
       throw new HttpsError("unauthenticated", "Autenticación requerida");
     }
-    const { planId, interval } = request.data || {};
+    const { planId, interval, trial } = request.data || {};
     if (!["pro", "lifetime"].includes(planId)) {
       throw new HttpsError("invalid-argument", "Plan no válido. Usa: pro o lifetime");
     }
@@ -766,17 +767,37 @@ exports.createCheckoutSession = onCall(
       throw new HttpsError("invalid-argument", "Intervalo no válido para Pro. Usa: month o year");
     }
 
-    // WHOP-005 AC-13: PLAN_RANK guard — reject downgrade or same-plan checkout
     const userDoc = await admin.firestore().collection("userData").doc(request.auth.uid).get();
-    const currentPlan = userDoc.data()?.subscription?.planId || "free";
+    const subscription = userDoc.data()?.subscription || {};
+    const currentPlan = subscription.planId || "free";
     const currentRank = PLAN_RANKS[currentPlan] ?? 0;
     const targetRank = PLAN_RANKS[planId] ?? 0;
-    if (currentRank >= targetRank) {
+
+    // WHOP-010: Trial validation
+    let trialDays = 0;
+    if (trial === true) {
+      if (planId !== "pro" || interval !== "month") {
+        throw new HttpsError("failed-precondition", "El trial solo está disponible para el Plan PRO mensual");
+      }
+      if (currentPlan !== "free") {
+        throw new HttpsError("failed-precondition", "El trial solo está disponible para usuarios Free");
+      }
+      if (subscription.hasUsedTrial) {
+        throw new HttpsError("failed-precondition", "Ya utilizaste tu periodo de prueba gratuito");
+      }
+      trialDays = TRIAL_CONFIG.PERIOD_DAYS;
+    }
+
+    // WHOP-010: Allow trial→paid conversion (same rank but different origin)
+    const isTrialConversion = currentPlan === planId && subscription.subscriptionOrigin === "trial";
+
+    // WHOP-005 AC-13: PLAN_RANK guard — reject downgrade or same-plan checkout
+    if (currentRank >= targetRank && !isTrialConversion) {
       throw new HttpsError("failed-precondition", "No puedes hacer downgrade ni renovar el mismo plan desde checkout");
     }
 
     return await subscriptionService.initiateCheckout(
-      request.auth.uid, request.auth.token.email, planId, interval || "lifetime"
+      request.auth.uid, request.auth.token.email, planId, interval || "lifetime", { trialDays }
     );
   })
 );
