@@ -156,7 +156,7 @@ describe("createCheckoutSession", () => {
     ).rejects.toThrow("Environment variable WHOP_PLAN_PRO_MONTHLY is not set");
   });
 
-  test("WHOP-010 AC-03: trialDays=30 passes trial_period_days to SDK", async () => {
+  test("WHOP-010 Plan B: trialDays param accepted but NOT sent to SDK (trial on plan)", async () => {
     mockCheckoutCreate.mockResolvedValue({
       purchase_url: "https://whop.com/checkout/trial",
       id: "ch_trial",
@@ -172,15 +172,12 @@ describe("createCheckoutSession", () => {
       trialDays: 30,
     });
 
-    expect(mockCheckoutCreate).toHaveBeenCalledWith(
-      expect.objectContaining({
-        plan_id: "plan_pro_m",
-        trial_period_days: 30,
-      })
-    );
+    const callArgs = mockCheckoutCreate.mock.calls[0][0];
+    expect(callArgs.plan_id).toBe("plan_pro_m");
+    expect(callArgs).not.toHaveProperty("trial_period_days");
   });
 
-  test("WHOP-010: checkout without trial does not include trial_period_days", async () => {
+  test("WHOP-010 Plan B: checkout without trial also does not include trial_period_days", async () => {
     mockCheckoutCreate.mockResolvedValue({
       purchase_url: "https://whop.com/checkout/abc",
       id: "ch_001",

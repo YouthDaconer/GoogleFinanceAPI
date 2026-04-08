@@ -141,9 +141,9 @@ function createWhopProvider({ apiKey, webhookSecret, companyId }) {
       source_url: cancelUrl || undefined,
     };
 
-    if (trialDays > 0) {
-      checkoutParams.trial_period_days = trialDays;
-    }
+    // Plan B: trial_period_days is NOT supported by Whop's checkoutConfigurations.create API.
+    // Trial is configured directly on the plan in Whop Dashboard (30 days).
+    // Eligibility control (one trial per user) is enforced by our callable.
 
     const config = await client.checkoutConfigurations.create(checkoutParams);
 
