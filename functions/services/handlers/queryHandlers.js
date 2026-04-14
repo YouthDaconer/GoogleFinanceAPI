@@ -294,10 +294,44 @@ function transformSnapshotToResponse(snapshot) {
     ? ((lastValue - firstValue) / firstValue) * 100
     : 0;
 
+  const isDailyTimeline = snapshot.timelineGranularity === 'daily';
+
+  // PERF-SNAP-025: Computar soldRanges y soldCompletelyDate desde timeline
+  let soldCompletelyDate = null;
+  const soldRanges = []; // Array de { from, to } — períodos sin posición
+  if (isDailyTimeline) {
+    const timeline = snapshot.timeline || [];
+    const lastEntry = timeline[timeline.length - 1];
+
+    // Detectar rangos vendidos: secuencias de entries con u<=0 seguidas de re-compra
+    let soldStart = null;
+    for (let i = 0; i < timeline.length; i++) {
+      const e = timeline[i];
+      if (e.u <= 0 && soldStart === null) {
+        soldStart = e.d;
+      } else if (e.u > 0 && soldStart !== null) {
+        soldRanges.push({ from: soldStart, to: e.d });
+        soldStart = null;
+      }
+    }
+    // Si termina vendido, es venta permanente
+    if (soldStart !== null) {
+      soldCompletelyDate = soldStart;
+    }
+  }
+
   return {
     returns: snapshot.returns || {},
     validDocsCountByPeriod: snapshot.validDocsCountByPeriod || {},
-    totalValueData: { dates, values, percentChanges, overallPercentChange },
+    totalValueData: {
+      dates,
+      values,
+      percentChanges,
+      overallPercentChange,
+      ...(isDailyTimeline && { timelineGranularity: 'daily' }),
+      ...(isDailyTimeline && { soldCompletelyDate }),
+      ...(isDailyTimeline && soldRanges.length > 0 && { soldRanges }),
+    },
     performanceByYear: snapshot.performanceByYear || {},
     monthlyCompoundData: snapshot.monthlyCompound || {},
     availableYears: snapshot.availableYears || [],

@@ -20,7 +20,7 @@ const DEFAULT_BATCH_SIZE = 5;
 
 async function backfillAllSnapshots(db, { dryRun = false, batchSize = DEFAULT_BATCH_SIZE } = {}) {
   const { getActiveCurrencies, getUserAccounts } = require('../services/backfillCoreModule');
-  const { generateAllSnapshots } = require('../services/snapshotGenerator');
+  const { generateAllSnapshots, generateAllAssetSnapshots, fetchLatestAssetPerformance } = require('../services/snapshotGenerator');
 
   const usersSnapshot = await db.collection('portfolioPerformance').get();
   const userIds = usersSnapshot.docs.map(doc => doc.id);
@@ -48,13 +48,32 @@ async function backfillAllSnapshots(db, { dryRun = false, batchSize = DEFAULT_BA
         if (dryRun) {
           const combos = currencies.length * (accountIds.length + 1);
           processed++;
-          console.log(`[DRY-RUN] [${processed}/${userIds.length}] ${userId}: ${currencies.length} monedas × ${accountIds.length + 1} cuentas = ${combos} snapshots`);
+          console.log(`[DRY-RUN] [${processed}/${userIds.length}] ${userId}: ${currencies.length} monedas × ${accountIds.length + 1} cuentas = ${combos} snapshots + asset snapshots`);
           return;
         }
 
         const result = await generateAllSnapshots(db, userId, currencies, accountIds);
+        console.log(`[${processed + 1}/${userIds.length}] ${userId}: portfolio ${result.success} OK, ${result.failed} fallidos`);
+
+        // PERF-SNAP-025: Generar asset snapshots v3 reutilizando dailyDocs (0 reads adicionales)
+        const dailyDocsOverall = result.dailyDocsByAccount?.get('overall');
+        if (dailyDocsOverall) {
+          for (const currency of currencies) {
+            try {
+              const latestAssetPerf = await fetchLatestAssetPerformance(db, userId, 'overall', currency);
+              if (Object.keys(latestAssetPerf).length > 0) {
+                const assetResult = await generateAllAssetSnapshots(db, userId, currency, latestAssetPerf, {
+                  dailyDocs: dailyDocsOverall,
+                });
+                console.log(`  → Asset snapshots ${userId}/${currency}: ${assetResult.success} OK, ${assetResult.failed} fallidos`);
+              }
+            } catch (assetErr) {
+              console.error(`  → Asset snapshot error ${userId}/${currency}: ${assetErr.message}`);
+            }
+          }
+        }
+
         processed++;
-        console.log(`[${processed}/${userIds.length}] ${userId}: ${result.success} OK, ${result.failed} fallidos`);
       } catch (error) {
         failed++;
         console.error(`[ERROR] [${processed + failed}/${userIds.length}] ${userId}: ${error.message}`);

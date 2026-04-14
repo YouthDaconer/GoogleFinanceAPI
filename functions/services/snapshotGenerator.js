@@ -11,9 +11,16 @@
  */
 
 const { getHistoricalReturnsV2 } = require('./consolidatedReturnsService');
+const { DateTime } = require('luxon');
+const {
+  calculatePeriodBoundaries,
+  initializePeriodFactors,
+  processDailyDocument,
+  buildReturnsResult,
+} = require('../utils/periodConsolidation');
 
 const SCHEMA_VERSION = 2;
-const ASSET_SCHEMA_VERSION = 2;
+const ASSET_SCHEMA_VERSION = 3;
 
 function buildSnapshotDocId(userId, accountId, currency, ticker, assetType) {
   if (ticker && assetType) {
@@ -169,30 +176,153 @@ async function generatePerformanceSnapshot(db, userId, accountId, currency, opti
   return true;
 }
 
-async function generateAssetSnapshot(db, userId, accountId, currency, ticker, assetType) {
-  const v2Result = await getHistoricalReturnsV2(userId, {
-    currency,
-    accountId,
-    ticker,
-    assetType,
-    fallbackToV1: true,
+// PERF-SNAP-025: Pre-filtrar docs que contienen data del activo específico
+function filterDocsForAsset(docs, currency, ticker, assetType) {
+  const assetKey = `${ticker}_${assetType}`;
+  return docs.filter(doc => {
+    const data = doc.data ? doc.data() : doc;
+    return data[currency]?.assetPerformance?.[assetKey] !== undefined;
   });
+}
 
-  if (!v2Result || !v2Result.returns) {
+// PERF-SNAP-025: Construir timeline diaria para un activo específico
+function buildAssetDailyTimeline(docs, currency, ticker, assetType) {
+  const assetKey = `${ticker}_${assetType}`;
+  const timeline = [];
+  let assetSeen = false;
+  let soldMarkerPushed = false;
+
+  for (const doc of docs) {
+    const data = doc.data ? doc.data() : doc;
+    const currencyData = data[currency];
+    if (!currencyData) continue;
+
+    const assetData = currencyData.assetPerformance?.[assetKey];
+
+    if (assetData) {
+      // Hallazgo 3: Si el activo reaparece después de venta (re-compra), reanudar
+      if (soldMarkerPushed) {
+        soldMarkerPushed = false;
+      }
+      assetSeen = true;
+      timeline.push({
+        d: data.date,
+        v: assetData.totalValue ?? 0,
+        c: assetData.adjustedDailyChangePercentage ?? assetData.dailyChangePercentage ?? 0,
+        u: assetData.units ?? 0,
+      });
+    } else if (assetSeen && !soldMarkerPushed) {
+      // Asset desapareció (vendido) — push UN solo marker, luego continue buscando re-entry
+      timeline.push({
+        d: data.date,
+        v: 0,
+        c: 0,
+        u: 0,
+      });
+      soldMarkerPushed = true;
+      // Hallazgo 3: NO break — continue para soportar re-compras
+    }
+  }
+
+  return timeline;
+}
+
+// PERF-SNAP-025: Computar returns desde daily docs pre-filtrados (reemplaza V2 calls)
+function computeAssetReturnsFromDailyDocs(docs, currency, ticker, assetType, now) {
+  const assetKey = `${ticker}_${assetType}`;
+  const effectiveNow = now || DateTime.now().setZone('America/New_York');
+  const boundaries = calculatePeriodBoundaries(effectiveNow);
+  const factors = initializePeriodFactors();
+
+  const totalValueDates = [];
+  const totalValueValues = [];
+  const percentChanges = [];
+  const monthlyReturns = {};
+  const monthlyFactors = {};
+  let firstDate = null;
+  let firstValue = 0;
+  let lastValue = 0;
+
+  for (const doc of docs) {
+    const data = doc.data ? doc.data() : doc;
+    const date = data.date;
+    const currencyData = data[currency];
+    if (!currencyData) continue;
+
+    const assetData = currencyData.assetPerformance?.[assetKey];
+    if (!assetData) continue;
+
+    // Period returns (TWR, MWR)
+    processDailyDocument(factors, boundaries, assetData, date);
+
+    // Chart data
+    const value = assetData.totalValue ?? 0;
+    const change = assetData.adjustedDailyChangePercentage ?? assetData.dailyChangePercentage ?? 0;
+
+    totalValueDates.push(date);
+    totalValueValues.push(value);
+    percentChanges.push(change);
+
+    if (!firstDate) { firstDate = date; firstValue = value; }
+    lastValue = value;
+
+    // Monthly grouping for performanceByYear
+    const monthKey = date.substring(0, 7);
+    if (!monthlyFactors[monthKey]) monthlyFactors[monthKey] = 1;
+    monthlyFactors[monthKey] *= (1 + change / 100);
+  }
+
+  if (totalValueDates.length === 0) {
+    return null;
+  }
+
+  // Convert monthly factors to monthlyReturns format
+  for (const [monthKey, factor] of Object.entries(monthlyFactors)) {
+    const [year, month] = monthKey.split('-');
+    if (!monthlyReturns[year]) monthlyReturns[year] = {};
+    monthlyReturns[year][parseInt(month, 10).toString()] = (factor - 1) * 100;
+  }
+
+  return buildReturnsResult(factors, {
+    totalValueDates,
+    totalValueValues,
+    percentChanges,
+    firstDate,
+    firstValue,
+    lastValue,
+    now: effectiveNow,
+    monthlyReturns,
+    yearlyReturns: {},
+  });
+}
+
+async function generateAssetSnapshot(db, userId, accountId, currency, ticker, assetType, options = {}) {
+  // PERF-SNAP-025: Usar daily docs en vez de V2
+  const dailyDocs = options.dailyDocs || await fetchAllDailyDocs(db, userId, accountId);
+
+  // Hallazgo 6: Pre-filtrar docs para este activo
+  const assetDocs = filterDocsForAsset(dailyDocs, currency, ticker, assetType);
+
+  // Computar returns desde daily docs pre-filtrados (0 calls a V2)
+  const now = DateTime.now().setZone('America/New_York');
+  const computedResult = computeAssetReturnsFromDailyDocs(assetDocs, currency, ticker, assetType, now);
+
+  if (!computedResult || !computedResult.returns) {
     console.log(`[snapshotGenerator] No asset data for ${ticker}_${assetType} userId=${userId} — skipping`);
     return false;
   }
 
-  const hasAnyData = v2Result.returns.hasYtdData ||
-    v2Result.returns.hasOneMonthData ||
-    v2Result.returns.hasThreeMonthData;
+  const hasAnyData = computedResult.returns.hasYtdData ||
+    computedResult.returns.hasOneMonthData ||
+    computedResult.returns.hasThreeMonthData;
 
   if (!hasAnyData) {
     console.log(`[snapshotGenerator] Empty asset result for ${ticker}_${assetType} userId=${userId} — skipping`);
     return false;
   }
 
-  const timeline = transformToCompactTimeline(v2Result.totalValueData);
+  // Timeline diaria completa (necesita todos los docs para detectar gaps/re-compras)
+  const timeline = buildAssetDailyTimeline(dailyDocs, currency, ticker, assetType);
 
   const snapshot = {
     userId,
@@ -204,25 +334,27 @@ async function generateAssetSnapshot(db, userId, accountId, currency, ticker, as
     lastUpdated: new Date().toISOString(),
     schemaVersion: ASSET_SCHEMA_VERSION,
 
-    returns: v2Result.returns,
+    timelineGranularity: 'daily',
+
+    returns: computedResult.returns,
     timeline,
 
-    performanceByYear: v2Result.performanceByYear || {},
-    monthlyCompound: v2Result.monthlyCompoundData || {},
+    performanceByYear: computedResult.performanceByYear || {},
+    monthlyCompound: computedResult.monthlyCompoundData || {},
 
-    validDocsCountByPeriod: v2Result.validDocsCountByPeriod || {},
-    availableYears: v2Result.availableYears || [],
-    startDate: v2Result.startDate || '',
+    validDocsCountByPeriod: computedResult.validDocsCountByPeriod || {},
+    availableYears: computedResult.availableYears || [],
+    startDate: computedResult.startDate || '',
   };
 
   const docId = buildSnapshotDocId(userId, accountId, currency, ticker, assetType);
-  console.log(`[snapshotGenerator] Writing asset snapshot ${docId} — timeline: ${timeline.length} points`);
+  console.log(`[snapshotGenerator] Writing asset snapshot ${docId} — timeline: ${timeline.length} points (daily)`);
 
   await db.collection('performanceSnapshots').doc(docId).set(snapshot);
   return true;
 }
 
-async function generateAllAssetSnapshots(db, userId, currency, latestAssetPerformance) {
+async function generateAllAssetSnapshots(db, userId, currency, latestAssetPerformance, options = {}) {
   const assetKeys = Object.keys(latestAssetPerformance || {});
   const total = assetKeys.length;
   let success = 0;
@@ -233,7 +365,10 @@ async function generateAllAssetSnapshots(db, userId, currency, latestAssetPerfor
     if (!ticker || !assetType) continue;
 
     try {
-      const wrote = await generateAssetSnapshot(db, userId, 'overall', currency, ticker, assetType);
+      // PERF-SNAP-025: Pasar dailyDocs compartidos
+      const wrote = await generateAssetSnapshot(db, userId, 'overall', currency, ticker, assetType, {
+        dailyDocs: options.dailyDocs,
+      });
       if (wrote) success++;
     } catch (error) {
       failed++;
@@ -250,10 +385,13 @@ async function generateAllSnapshots(db, userId, currencies, accountIds) {
   const total = allAccountIds.length * currencies.length;
   let success = 0;
   let failed = 0;
+  // PERF-SNAP-025: Retornar dailyDocs por cuenta para reutilización en asset snapshots
+  const dailyDocsByAccount = new Map();
 
   for (const accountId of allAccountIds) {
     // Pre-fetch daily docs once per account, reuse across all currencies
     const dailyDocs = await fetchAllDailyDocs(db, userId, accountId);
+    dailyDocsByAccount.set(accountId, dailyDocs);
 
     for (const currency of currencies) {
       try {
@@ -269,7 +407,7 @@ async function generateAllSnapshots(db, userId, currencies, accountIds) {
   }
 
   console.log(`[snapshotGenerator] User ${userId} done — success: ${success}, failed: ${failed}, total: ${total}`);
-  return { success, failed, total };
+  return { success, failed, total, dailyDocsByAccount };
 }
 
 module.exports = {
@@ -284,4 +422,8 @@ module.exports = {
   fetchAllDailyDocs,
   buildDailyTimeline,
   extractLatestAssetPerformanceFromDocs,
+  // PERF-SNAP-025
+  filterDocsForAsset,
+  buildAssetDailyTimeline,
+  computeAssetReturnsFromDailyDocs,
 };

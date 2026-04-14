@@ -828,26 +828,30 @@ async function processUserPerformance({
       const snapshotResult = await generateAllSnapshots(db, userId, currencyCodes, accountIds);
       logInfo(`[EOD][Snapshot] Snapshots generados para ${userId}: ${snapshotResult.success} OK, ${snapshotResult.failed} fallidos`);
 
-      // PERF-SNAP-024: Generar snapshots per-asset (best-effort)
-      try {
-        for (const currencyCode of currencyCodes) {
-          const latestAssetPerf = await fetchLatestAssetPerformance(db, userId, 'overall', currencyCode);
-          if (Object.keys(latestAssetPerf).length > 0) {
-            const assetResult = await generateAllAssetSnapshots(db, userId, currencyCode, latestAssetPerf);
-            logInfo(`[EOD][Snapshot] Asset snapshots para ${userId}/${currencyCode}: ${assetResult.success} OK, ${assetResult.failed} fallidos`);
-          }
-        }
-      } catch (assetSnapshotError) {
-        logWarn(`[EOD][Snapshot] Error generando asset snapshots para ${userId}: ${assetSnapshotError.message}`);
-      }
+      // PERF-SNAP-025: Reutilizar dailyDocs ya leídos (0 re-fetch)
+      const dailyDocsOverall = snapshotResult.dailyDocsByAccount?.get('overall');
 
+      // PERF-SNAP-024+025: Generar snapshots per-asset (best-effort)
+      if (dailyDocsOverall) {
+        try {
+          for (const currencyCode of currencyCodes) {
+            const latestAssetPerf = await fetchLatestAssetPerformance(db, userId, 'overall', currencyCode);
+            if (Object.keys(latestAssetPerf).length > 0) {
+              const assetResult = await generateAllAssetSnapshots(db, userId, currencyCode, latestAssetPerf, {
+                dailyDocs: dailyDocsOverall,
+              });
+              logInfo(`[EOD][Snapshot] Asset snapshots para ${userId}/${currencyCode}: ${assetResult.success} OK, ${assetResult.failed} fallidos`);
+            }
+          }
+        } catch (assetSnapshotError) {
+          logWarn(`[EOD][Snapshot] Error generando asset snapshots para ${userId}: ${assetSnapshotError.message}`);
+        }
+      }
     } catch (snapshotError) {
       logWarn(`[EOD][Snapshot] Error generando snapshots para ${userId}: ${snapshotError.message}`);
     }
 
-    // PERF-SNAP-023 / FIX-SNAP-001: Escribir timestamp de invalidación para cache multi-capa
     // IMPORTANTE: Fuera del try/catch de snapshots para que SIEMPRE se escriba,
-    // incluso si generateAllSnapshots falla. Esto permite al frontend invalidar
     // IndexedDB cache aunque los snapshots no se hayan regenerado.
     try {
       const lastSnapshotTs = new Date().toISOString();
