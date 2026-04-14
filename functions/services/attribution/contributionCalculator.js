@@ -167,7 +167,8 @@ async function getSellTransactionsInPeriod(userId, startDate, endDate, accountId
  * @param {string[]} accountIds - IDs de cuentas a incluir o ['overall']
  * @returns {Promise<Object>} Resultado con atribuciones calculadas
  */
-async function calculateContributions(userId, period, currency = 'USD', accountIds = ['overall'], dateRange) {
+async function calculateContributions(userId, period, currency = 'USD', accountIds = ['overall'], dateRange, options = {}) {
+  const { snapshot } = options;
   // Determinar si usamos overall o cuentas específicas
   const useOverall = accountIds.length === 0 || accountIds.includes('overall');
   
@@ -370,6 +371,27 @@ async function calculateContributions(userId, period, currency = 'USD', accountI
     totalPortfolioInvestment = aggregatedTotalInvestment;
     startTotalValue = aggregatedStartTotalValue > 0 ? aggregatedStartTotalValue : aggregatedTotalValue;
     latestDate = latestDateUsed;
+    
+  } else if (!periodEndStr && snapshot?.latestAssetPerformance && Object.keys(snapshot.latestAssetPerformance).length > 0) {
+    // PERF-SNAP-012: Overall sin dateRange — leer datos del snapshot (0 reads adicionales)
+    console.log(`[PERF] Attribution contributions from snapshot latestAssetPerformance`);
+    
+    const snapshotAssets = snapshot.latestAssetPerformance;
+    assetPerformance = mapSnapshotAssetPerformance(snapshotAssets);
+    
+    const timeline = snapshot.timeline || [];
+    const lastPoint = timeline.length > 0 ? timeline[timeline.length - 1] : null;
+    totalPortfolioValue = lastPoint ? lastPoint[1] : 0;
+    totalPortfolioInvestment = Object.values(snapshotAssets).reduce((sum, a) => sum + (a.totalInvestment || 0), 0);
+    latestDate = lastPoint ? lastPoint[0] : null;
+    
+    const startData = await findNearestPerformanceData(userId, periodStartStr, 'overall', 'asc');
+    if (startData) {
+      startDateUsed = startData.id || startData.date;
+    }
+    const startCurrencyData = startData?.[currency] || startData?.USD || {};
+    startAssetPerformance = startCurrencyData.assetPerformance || {};
+    startTotalValue = startCurrencyData.totalValue || totalPortfolioValue;
     
   } else {
     // OVERALL: Usar documento overall (flujo original)
@@ -826,11 +848,28 @@ async function enrichWithCurrentPrices(attributions) {
   return attributions;
 }
 
+/**
+ * PERF-SNAP-012: Mapea el schema compacto del snapshot al formato esperado por calculateContributions
+ * @param {Object} snapshotAssets - latestAssetPerformance del snapshot
+ * @returns {Object} assetPerformance con campos mapeados
+ */
+function mapSnapshotAssetPerformance(snapshotAssets) {
+  const mapped = {};
+  for (const [assetKey, data] of Object.entries(snapshotAssets)) {
+    mapped[assetKey] = {
+      ...data,
+      unrealizedProfitAndLoss: data.unrealizedPnL ?? data.unrealizedProfitAndLoss ?? 0,
+    };
+  }
+  return mapped;
+}
+
 module.exports = {
   calculateContributions,
   enrichWithCurrentPrices,
   getLatestPerformanceData,
   findNearestPerformanceData,
   getPerformanceDataForDate,
-  getSellTransactionsInPeriod
+  getSellTransactionsInPeriod,
+  mapSnapshotAssetPerformance
 };

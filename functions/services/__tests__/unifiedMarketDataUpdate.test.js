@@ -108,6 +108,17 @@ jest.mock("../../utils/logoGenerator", () => ({
   generateLogoUrl: jest.fn()
 }));
 
+// PERF-SNAP-004: Mock de snapshotGenerator
+const mockGenerateAllSnapshots = jest.fn().mockResolvedValue({ success: 3, failed: 0, total: 3 });
+// PERF-SNAP-024: Mocks para per-asset snapshots
+const mockGenerateAllAssetSnapshots = jest.fn().mockResolvedValue({ success: 2, failed: 0, total: 2 });
+const mockFetchLatestAssetPerformance = jest.fn().mockResolvedValue({ 'AAPL_stock': { totalValue: 18500 }, 'MSFT_stock': { totalValue: 12000 } });
+jest.mock("../snapshotGenerator", () => ({
+  generateAllSnapshots: (...args) => mockGenerateAllSnapshots(...args),
+  generateAllAssetSnapshots: (...args) => mockGenerateAllAssetSnapshots(...args),
+  fetchLatestAssetPerformance: (...args) => mockFetchLatestAssetPerformance(...args),
+}));
+
 jest.mock("../../utils/logger", () => ({
   StructuredLogger: {
     forScheduled: jest.fn(() => ({
@@ -591,5 +602,199 @@ describe("SCALE-004: markInconsistentUsersAsStale", () => {
     expect(result).toBe(0);
     expect(mockDocGet).not.toHaveBeenCalled();
     expect(mockDocSet).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * PERF-SNAP-004: Tests para generación de snapshots post-EOD
+ *
+ * @see docs/stories/PERF-SNAP-004.story.md
+ */
+describe("PERF-SNAP-004: Snapshot generation in processUserPerformance", () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockBatchCommit.mockResolvedValue(undefined);
+    mockGenerateAllSnapshots.mockResolvedValue({ success: 3, failed: 0, total: 3 });
+  });
+
+  it("should call generateAllSnapshots after successful batch.commit (AC1)", async () => {
+    const callOrder = [];
+    mockBatchCommit.mockImplementation(() => { callOrder.push("commit"); return Promise.resolve(); });
+    mockGenerateAllSnapshots.mockImplementation(() => { callOrder.push("snapshot"); return Promise.resolve({ success: 3, failed: 0, total: 3 }); });
+
+    const params = buildBaseParams();
+
+    const result = await processUserPerformance(params);
+
+    expect(result.success).toBe(true);
+    expect(mockGenerateAllSnapshots).toHaveBeenCalledTimes(1);
+    expect(callOrder).toEqual(["commit", "snapshot"]);
+  });
+
+  it("should pass currencies as array of strings, not objects (AC4)", async () => {
+    const params = buildBaseParams({
+      currencies: [
+        { code: "USD", rate: 1 },
+        { code: "COP", rate: 4200 },
+        { code: "EUR", rate: 0.92 }
+      ]
+    });
+
+    await processUserPerformance(params);
+
+    expect(mockGenerateAllSnapshots).toHaveBeenCalledWith(
+      mockDb,
+      "user-1",
+      ["USD", "COP", "EUR"],
+      expect.any(Array)
+    );
+  });
+
+  it("should pass account IDs from active accounts (AC5)", async () => {
+    const params = buildBaseParams({
+      accounts: [
+        { id: "acc-1", userId: "user-1" },
+        { id: "acc-2", userId: "user-1" },
+        { id: "acc-3", userId: "user-1" }
+      ]
+    });
+
+    await processUserPerformance(params);
+
+    expect(mockGenerateAllSnapshots).toHaveBeenCalledWith(
+      mockDb,
+      "user-1",
+      ["USD"],
+      ["acc-1", "acc-2", "acc-3"]
+    );
+  });
+
+  it("should return success:true even when generateAllSnapshots throws (AC2)", async () => {
+    mockGenerateAllSnapshots.mockRejectedValueOnce(new Error("Snapshot timeout"));
+    const params = buildBaseParams();
+
+    const result = await processUserPerformance(params);
+
+    expect(result.success).toBe(true);
+    expect(result.userId).toBe("user-1");
+    expect(mockGenerateAllSnapshots).toHaveBeenCalledTimes(1);
+  });
+
+  it("should NOT call generateAllSnapshots when batch.commit fails (AC3 - stale users)", async () => {
+    mockBatchCommit.mockRejectedValueOnce(new Error("Firestore unavailable"));
+    const params = buildBaseParams();
+
+    const result = await processUserPerformance(params);
+
+    expect(result.success).toBe(false);
+    expect(mockGenerateAllSnapshots).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * PERF-SNAP-023: Tests para lastSnapshotUpdate signal post-snapshots
+ *
+ * @see docs/stories/PERF-SNAP-023.story.md
+ */
+describe("PERF-SNAP-023: lastSnapshotUpdate signal in processUserPerformance", () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockBatchCommit.mockResolvedValue(undefined);
+    mockGenerateAllSnapshots.mockResolvedValue({ success: 3, failed: 0, total: 3 });
+    mockDocSet.mockResolvedValue(undefined);
+  });
+
+  it("should write lastSnapshotUpdate after successful generateAllSnapshots (AC1, AC4)", async () => {
+    const params = buildBaseParams();
+
+    const result = await processUserPerformance(params);
+
+    expect(result.success).toBe(true);
+    expect(mockDocSet).toHaveBeenCalledWith(
+      { lastSnapshotUpdate: expect.any(String) },
+      { merge: true }
+    );
+  });
+
+  it("should return success:true even when lastSnapshotUpdate write fails", async () => {
+    mockDocSet.mockRejectedValueOnce(new Error("Firestore write failed"));
+    const params = buildBaseParams();
+
+    const result = await processUserPerformance(params);
+
+    expect(result.success).toBe(true);
+    expect(result.userId).toBe("user-1");
+  });
+
+  it("should NOT write lastSnapshotUpdate when generateAllSnapshots throws", async () => {
+    mockGenerateAllSnapshots.mockRejectedValueOnce(new Error("Snapshot fatal error"));
+    mockDocSet.mockClear();
+    const params = buildBaseParams();
+
+    await processUserPerformance(params);
+
+    // mockDocSet is called for other things (batch.set delegates), so check specifically
+    // that no call included lastSnapshotUpdate
+    const lastSnapshotCalls = mockDocSet.mock.calls.filter(
+      call => call[0] && call[0].lastSnapshotUpdate
+    );
+    expect(lastSnapshotCalls).toHaveLength(0);
+  });
+});
+
+/**
+ * PERF-SNAP-024: Tests para generación de asset snapshots en EOD
+ *
+ * @see docs/stories/PERF-SNAP-024.story.md
+ */
+describe("PERF-SNAP-024: Asset snapshot generation in processUserPerformance", () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockBatchCommit.mockResolvedValue(undefined);
+    mockGenerateAllSnapshots.mockResolvedValue({ success: 3, failed: 0, total: 3 });
+    mockGenerateAllAssetSnapshots.mockResolvedValue({ success: 2, failed: 0, total: 2 });
+    mockFetchLatestAssetPerformance.mockResolvedValue({ 'AAPL_stock': { totalValue: 18500 }, 'MSFT_stock': { totalValue: 12000 } });
+    mockDocSet.mockResolvedValue(undefined);
+  });
+
+  it("should call generateAllAssetSnapshots after portfolio snapshots (AC3)", async () => {
+    const callOrder = [];
+    mockGenerateAllSnapshots.mockImplementation(() => { callOrder.push("portfolio"); return Promise.resolve({ success: 3, failed: 0, total: 3 }); });
+    mockGenerateAllAssetSnapshots.mockImplementation(() => { callOrder.push("asset"); return Promise.resolve({ success: 2, failed: 0, total: 2 }); });
+    const params = buildBaseParams();
+
+    await processUserPerformance(params);
+
+    expect(mockGenerateAllAssetSnapshots).toHaveBeenCalled();
+    expect(callOrder.indexOf("portfolio")).toBeLessThan(callOrder.indexOf("asset"));
+  });
+
+  it("should not fail pipeline if asset snapshot generation fails (best-effort)", async () => {
+    mockGenerateAllAssetSnapshots.mockRejectedValueOnce(new Error("Asset snapshot timeout"));
+    const params = buildBaseParams();
+
+    const result = await processUserPerformance(params);
+
+    expect(result.success).toBe(true);
+    expect(result.userId).toBe("user-1");
+  });
+
+  it("should call fetchLatestAssetPerformance for each currency", async () => {
+    const params = buildBaseParams();
+
+    await processUserPerformance(params);
+
+    expect(mockFetchLatestAssetPerformance).toHaveBeenCalledWith(
+      mockDb, "user-1", "overall", "USD"
+    );
+  });
+
+  it("should skip asset snapshots when no assets found", async () => {
+    mockFetchLatestAssetPerformance.mockResolvedValue({});
+    const params = buildBaseParams();
+
+    await processUserPerformance(params);
+
+    expect(mockGenerateAllAssetSnapshots).not.toHaveBeenCalled();
   });
 });

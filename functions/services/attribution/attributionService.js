@@ -22,9 +22,50 @@ const { getPeriodLabel, getPeriodStartDate } = require('./types');
 // INTRADAY-002: calculateIntradayContributions para contribuciones por activo
 const { calculateIntradayPerformance, calculateIntradayContributions, combineHistoricalWithIntraday } = require('./intradayCalculator');
 const { getQuotes } = require('../financeQuery');
+const { buildSnapshotDocId, generatePerformanceSnapshot } = require('../snapshotGenerator');
 
 const admin = require('../firebaseAdmin');
 const db = admin.firestore();
+
+// PERF-SNAP-010: Mapeo de períodos estándar a campos del snapshot pre-computado
+const PERIOD_TO_SNAPSHOT_FIELD = {
+  'YTD':  'ytdReturn',
+  '1M':   'oneMonthReturn',
+  '3M':   'threeMonthReturn',
+  '6M':   'sixMonthReturn',
+  '1Y':   'oneYearReturn',
+  '2Y':   'twoYearReturn',
+  'ALL':  'fiveYearReturn',
+  '5Y':   'fiveYearReturn',
+};
+
+// PERF-SNAP-013: Calcula TWR para rango custom iterando timeline del snapshot en memoria (0 Firestore reads)
+function calculateCustomRangeTWR(snapshot, startDate, endDate) {
+  if (!snapshot?.timeline?.length) {
+    return { twr: 0, hasData: false, docsCount: 0 };
+  }
+
+  const firstEntryDate = snapshot.timeline[0].d;
+  if (firstEntryDate > startDate) {
+    return null;
+  }
+
+  let compoundFactor = 1.0;
+  let validDaysCount = 0;
+
+  for (const entry of snapshot.timeline) {
+    const date = entry.d;
+    const dailyChange = entry.c;
+    if (date >= startDate && date <= endDate && dailyChange !== 0) {
+      compoundFactor *= (1 + dailyChange / 100);
+      validDaysCount++;
+    }
+  }
+
+  const twr = (compoundFactor - 1) * 100;
+  console.log(`[PERF] Attribution custom range TWR from snapshot timeline: ${startDate}-${endDate} = ${twr.toFixed(2)}%`);
+  return { twr, hasData: validDaysCount > 0, docsCount: 0 };
+}
 
 /**
  * Calcula el TWR (Time-Weighted Return) para un período específico
@@ -37,9 +78,33 @@ const db = admin.firestore();
  * @param {Object} [dateRange] - FEAT-UX-001: Rango de fechas explícito opcional
  * @param {Date} [dateRange.startDate] - Fecha inicio
  * @param {Date} [dateRange.endDate] - Fecha fin
+ * @param {Object} [options] - PERF-SNAP-010: Opciones adicionales
+ * @param {Object} [options.snapshot] - Snapshot pre-computado
  * @returns {Promise<{twr: number, hasData: boolean, docsCount: number}>}
  */
-async function calculatePeriodTWR(userId, period, currency, accountId = 'overall', dateRange) {
+async function calculatePeriodTWR(userId, period, currency, accountId = 'overall', dateRange, options = {}) {
+  const { snapshot } = options;
+
+  // PERF-SNAP-010: Si tenemos snapshot, no hay dateRange, y es período estándar → leer del snapshot
+  if (snapshot && !dateRange) {
+    const field = PERIOD_TO_SNAPSHOT_FIELD[period];
+    if (field && snapshot.returns?.[field] !== undefined) {
+      console.log(`[PERF] Attribution TWR from snapshot for ${period}: ${snapshot.returns[field].toFixed(2)}%`);
+      return { twr: snapshot.returns[field], hasData: true, docsCount: 0 };
+    }
+  }
+
+  // PERF-SNAP-013: Rango custom → calcular desde timeline del snapshot (0 reads adicionales)
+  if (snapshot && dateRange) {
+    const periodStartStr = dateRange.startDate.toISOString().split('T')[0];
+    const periodEndStr = dateRange.endDate.toISOString().split('T')[0];
+    const customResult = calculateCustomRangeTWR(snapshot, periodStartStr, periodEndStr);
+    if (customResult !== null) {
+      return customResult;
+    }
+  }
+
+  // Fallback: full-scan legacy
   const periodStartDate = dateRange?.startDate || getPeriodStartDate(period);
   const periodStartStr = periodStartDate.toISOString().split('T')[0];
   const periodEndStr = dateRange?.endDate ? dateRange.endDate.toISOString().split('T')[0] : null;
@@ -104,17 +169,71 @@ async function calculatePeriodTWR(userId, period, currency, accountId = 'overall
  * @param {string} currency - Moneda
  * @param {string[]} accountIds - IDs de cuentas
  * @param {Object} [dateRange] - FEAT-UX-001: Rango de fechas explícito opcional
+ * @param {Object} [options] - PERF-SNAP-010: Opciones adicionales
+ * @param {Object} [options.snapshot] - Snapshot pre-computado (para single/overall)
  * @returns {Promise<{twr: number, hasData: boolean}>}
  */
-async function calculateMultiAccountTWR(userId, period, currency, accountIds, dateRange) {
+async function calculateMultiAccountTWR(userId, period, currency, accountIds, dateRange, options = {}) {
   // Si es solo 'overall' o una cuenta, usar cálculo simple
   if (accountIds.length === 0 || 
       (accountIds.length === 1 && accountIds[0] === 'overall')) {
-    return calculatePeriodTWR(userId, period, currency, 'overall', dateRange);
+    return calculatePeriodTWR(userId, period, currency, 'overall', dateRange, options);
   }
   
   if (accountIds.length === 1) {
-    return calculatePeriodTWR(userId, period, currency, accountIds[0], dateRange);
+    return calculatePeriodTWR(userId, period, currency, accountIds[0], dateRange, options);
+  }
+
+  // PERF-SNAP-010: Multi-cuenta con snapshot — leer N snapshots individuales en paralelo
+  if (!dateRange) {
+    const field = PERIOD_TO_SNAPSHOT_FIELD[period];
+    if (field) {
+      const filteredAccountIds = accountIds.filter(id => id !== 'overall');
+      const snapshotPromises = filteredAccountIds.map(accId =>
+        db.doc(`performanceSnapshots/${buildSnapshotDocId(userId, accId, currency)}`).get()
+      );
+      const snapshotDocs = await Promise.all(snapshotPromises);
+
+      if (snapshotDocs.every(doc => doc.exists)) {
+        const accountsData = snapshotDocs.map((doc, i) => {
+          const snap = doc.data();
+          const twr = snap.returns?.[field] ?? null;
+          const timeline = snap.timeline || [];
+          const lastPoint = timeline.length > 0 ? timeline[timeline.length - 1] : null;
+          const totalValue = lastPoint ? lastPoint.v : 0;
+          return { accountId: filteredAccountIds[i], twr, value: totalValue };
+        });
+
+        const validAccounts = accountsData.filter(a => a.twr !== null);
+        if (validAccounts.length === accountsData.length) {
+          const totalValue = validAccounts.reduce((sum, a) => sum + a.value, 0);
+          let weightedTWR;
+          if (totalValue === 0) {
+            weightedTWR = validAccounts.reduce((sum, a) => sum + a.twr, 0) / validAccounts.length;
+          } else {
+            weightedTWR = validAccounts.reduce((sum, a) => sum + (a.twr * (a.value / totalValue)), 0);
+          }
+          console.log(`[PERF] Attribution multi-account TWR from ${validAccounts.length} snapshots: ${weightedTWR.toFixed(2)}%`);
+          return { twr: weightedTWR, hasData: true, docsCount: 0 };
+        }
+      }
+
+      // All-or-nothing: si algún snapshot falta → fallback completo a legacy
+      const missingIds = snapshotDocs
+        .map((doc, i) => doc.exists ? null : buildSnapshotDocId(userId, filteredAccountIds[i], currency))
+        .filter(Boolean);
+      console.log(`[PERF] Attribution multi-account snapshot miss for [${missingIds.join(', ')}], falling back to legacy`);
+
+      // Generación on-demand fire-and-forget para cuentas sin snapshot
+      const missingAccountIds = snapshotDocs
+        .map((doc, i) => doc.exists ? null : filteredAccountIds[i])
+        .filter(Boolean);
+      missingAccountIds.forEach(accId => {
+        generatePerformanceSnapshot(db, userId, accId, currency).catch(err =>
+          console.warn(`[PERF] On-demand snapshot generation failed for ${buildSnapshotDocId(userId, accId, currency)}: ${err.message}`)
+        );
+      });
+    }
   }
   
   // Para múltiples cuentas, calcular promedio ponderado por valor
@@ -266,6 +385,30 @@ async function getPortfolioAttribution(params) {
     }
     
     // =========================================================================
+    // 1.5 PERF-SNAP-010/013: LEER SNAPSHOT UNA VEZ (si aplica)
+    // PERF-SNAP-013: También leer snapshot cuando hay dateRange para usar timeline
+    // =========================================================================
+    let snapshot = null;
+    if (frontendTWR === undefined) {
+      const effectiveAccountId = (accountIds.length <= 1)
+        ? (accountIds[0] || 'overall')
+        : 'overall';
+      const snapshotDocId = buildSnapshotDocId(userId, effectiveAccountId, currency);
+      try {
+        const snapshotDoc = await db.doc(`performanceSnapshots/${snapshotDocId}`).get();
+        snapshot = snapshotDoc.exists ? snapshotDoc.data() : null;
+        console.log(`[PERF] Attribution snapshot ${snapshot ? 'hit' : 'miss'} for ${snapshotDocId}`);
+        if (!snapshot) {
+          generatePerformanceSnapshot(db, userId, effectiveAccountId, currency).catch(err =>
+            console.warn(`[PERF] On-demand snapshot generation failed for ${snapshotDocId}: ${err.message}`)
+          );
+        }
+      } catch (snapshotErr) {
+        console.warn(`[PERF] Attribution snapshot read failed: ${snapshotErr.message}`);
+      }
+    }
+
+    // =========================================================================
     // 2. OBTENER TWR DEL PERÍODO (HISTÓRICO) + INTRADAY EN PARALELO
     // =========================================================================
     // Calcular TWR histórico y performance intraday en paralelo para mejor performance
@@ -285,7 +428,7 @@ async function getPortfolioAttribution(params) {
       console.log(`[Attribution] Usando TWR del frontend: ${periodTWR.toFixed(2)}%`);
     } else {
       promises.push(
-        calculateMultiAccountTWR(userId, period, currency, accountIds, dateRange)
+        calculateMultiAccountTWR(userId, period, currency, accountIds, dateRange, { snapshot })
           .then(twrResult => {
             periodTWR = twrResult.twr || 0;
             historicalTWR = twrResult.twr || 0;
@@ -386,7 +529,8 @@ async function getPortfolioAttribution(params) {
       period,
       currency,
       accountIds,
-      dateRange
+      dateRange,
+      { snapshot }
     );
     
     if (contributionResult.error) {
@@ -691,5 +835,9 @@ async function checkAttributionAvailability(userId) {
 module.exports = {
   getPortfolioAttribution,
   getTopContributors,
-  checkAttributionAvailability
+  checkAttributionAvailability,
+  calculatePeriodTWR,
+  calculateMultiAccountTWR,
+  calculateCustomRangeTWR,
+  PERIOD_TO_SNAPSHOT_FIELD,
 };

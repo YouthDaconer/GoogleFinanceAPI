@@ -1411,6 +1411,7 @@ app.get("/attribution/check", async (req, res) => {
 // ============================================================================
 
 const { calculateRiskMetrics } = require('./services/riskMetrics');
+const { buildRiskCacheKey, getCachedRiskMetrics, setCachedRiskMetrics } = require('./services/riskMetrics/riskMetricsCache');
 
 /**
  * @swagger
@@ -1500,6 +1501,13 @@ app.get("/risk-metrics", async (req, res) => {
       ? accountIds.split(',').map(id => id.trim()).filter(Boolean)
       : [];
     
+    const cacheKey = buildRiskCacheKey(userId, period, currency, parsedAccountIds);
+    const cached = getCachedRiskMetrics(cacheKey);
+    if (cached) {
+      console.log(`[/risk-metrics] Cache hit: ${requestId}`);
+      return res.status(200).json(cached);
+    }
+    
     const result = await calculateRiskMetrics(userId, {
       period,
       currency,
@@ -1521,6 +1529,7 @@ app.get("/risk-metrics", async (req, res) => {
       return res.status(statusCode).json(result);
     }
     
+    setCachedRiskMetrics(cacheKey, result);
     res.status(200).json(result);
     
   } catch (error) {

@@ -11,6 +11,10 @@ const pLimit = require("p-limit");
 // Importar generador de logos
 const { generateLogoUrl } = require('../utils/logoGenerator');
 
+// PERF-SNAP-004: Importar generador de snapshots pre-computados
+// PERF-SNAP-024: Importar generador de snapshots per-asset
+const { generateAllSnapshots, generateAllAssetSnapshots, fetchLatestAssetPerformance } = require('./snapshotGenerator');
+
 /**
  * SCALE-001: Máximo de usuarios procesados en paralelo.
  * Calibrado para no exceder throughput de Firestore (~500 writes/sec).
@@ -816,6 +820,45 @@ async function processUserPerformance({
     }
 
     await batch.commit();
+
+    // PERF-SNAP-004: Generar snapshots pre-computados (best-effort, no bloquea pipeline)
+    try {
+      const currencyCodes = currencies.map(c => c.code);
+      const accountIds = accounts.map(a => a.id);
+      const snapshotResult = await generateAllSnapshots(db, userId, currencyCodes, accountIds);
+      logInfo(`[EOD][Snapshot] Snapshots generados para ${userId}: ${snapshotResult.success} OK, ${snapshotResult.failed} fallidos`);
+
+      // PERF-SNAP-024: Generar snapshots per-asset (best-effort)
+      try {
+        for (const currencyCode of currencyCodes) {
+          const latestAssetPerf = await fetchLatestAssetPerformance(db, userId, 'overall', currencyCode);
+          if (Object.keys(latestAssetPerf).length > 0) {
+            const assetResult = await generateAllAssetSnapshots(db, userId, currencyCode, latestAssetPerf);
+            logInfo(`[EOD][Snapshot] Asset snapshots para ${userId}/${currencyCode}: ${assetResult.success} OK, ${assetResult.failed} fallidos`);
+          }
+        }
+      } catch (assetSnapshotError) {
+        logWarn(`[EOD][Snapshot] Error generando asset snapshots para ${userId}: ${assetSnapshotError.message}`);
+      }
+
+    } catch (snapshotError) {
+      logWarn(`[EOD][Snapshot] Error generando snapshots para ${userId}: ${snapshotError.message}`);
+    }
+
+    // PERF-SNAP-023 / FIX-SNAP-001: Escribir timestamp de invalidación para cache multi-capa
+    // IMPORTANTE: Fuera del try/catch de snapshots para que SIEMPRE se escriba,
+    // incluso si generateAllSnapshots falla. Esto permite al frontend invalidar
+    // IndexedDB cache aunque los snapshots no se hayan regenerado.
+    try {
+      const lastSnapshotTs = new Date().toISOString();
+      await db.collection("portfolioPerformance").doc(userId).set({
+        lastSnapshotUpdate: lastSnapshotTs
+      }, { merge: true });
+      logInfo(`[EOD][Snapshot] lastSnapshotUpdate written for ${userId}: ${lastSnapshotTs}`);
+    } catch (signalError) {
+      logWarn(`[EOD][Snapshot] Error writing lastSnapshotUpdate for ${userId}: ${signalError.message}`);
+    }
+
     return { userId, success: true, durationMs: Date.now() - startMs };
   } catch (error) {
     logError(`Error procesando usuario ${userId} (${Date.now() - startMs}ms)`, error);
@@ -1264,6 +1307,9 @@ if (process.env.NODE_ENV === "test" || process.env.FUNCTIONS_EMULATOR) {
     calculateDailyPortfolioPerformance,
     PerformanceDataCache,
     MAX_PARALLEL_USERS,
-    markInconsistentUsersAsStale
+    markInconsistentUsersAsStale,
+    generateAllSnapshots,
+    generateAllAssetSnapshots,
+    fetchLatestAssetPerformance,
   };
 }
