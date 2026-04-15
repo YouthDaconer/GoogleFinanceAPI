@@ -631,7 +631,8 @@ describe("PERF-SNAP-004: Snapshot generation in processUserPerformance", () => {
     expect(callOrder).toEqual(["commit", "snapshot"]);
   });
 
-  it("should pass currencies as array of strings, not objects (AC4)", async () => {
+  it("should pass only smart currencies to generateAllSnapshots (AC4 + PERF-SNAP-026)", async () => {
+    mockDocGet.mockResolvedValueOnce({ exists: true, data: () => ({ defaultCurrency: 'COP' }) });
     const params = buildBaseParams({
       currencies: [
         { code: "USD", rate: 1 },
@@ -642,10 +643,11 @@ describe("PERF-SNAP-004: Snapshot generation in processUserPerformance", () => {
 
     await processUserPerformance(params);
 
+    // PERF-SNAP-026: Only USD + defaultCurrency, not all currencies
     expect(mockGenerateAllSnapshots).toHaveBeenCalledWith(
       mockDb,
       "user-1",
-      ["USD", "COP", "EUR"],
+      ["USD", "COP"],
       expect.any(Array)
     );
   });
@@ -751,7 +753,8 @@ describe("PERF-SNAP-024: Asset snapshot generation in processUserPerformance", (
   beforeEach(() => {
     jest.clearAllMocks();
     mockBatchCommit.mockResolvedValue(undefined);
-    mockGenerateAllSnapshots.mockResolvedValue({ success: 3, failed: 0, total: 3 });
+    const mockDailyDocsByAccount = new Map([['overall', [{ id: 'doc1', data: () => ({}) }]]]);
+    mockGenerateAllSnapshots.mockResolvedValue({ success: 3, failed: 0, total: 3, dailyDocsByAccount: mockDailyDocsByAccount });
     mockGenerateAllAssetSnapshots.mockResolvedValue({ success: 2, failed: 0, total: 2 });
     mockFetchLatestAssetPerformance.mockResolvedValue({ 'AAPL_stock': { totalValue: 18500 }, 'MSFT_stock': { totalValue: 12000 } });
     mockDocSet.mockResolvedValue(undefined);
@@ -759,7 +762,8 @@ describe("PERF-SNAP-024: Asset snapshot generation in processUserPerformance", (
 
   it("should call generateAllAssetSnapshots after portfolio snapshots (AC3)", async () => {
     const callOrder = [];
-    mockGenerateAllSnapshots.mockImplementation(() => { callOrder.push("portfolio"); return Promise.resolve({ success: 3, failed: 0, total: 3 }); });
+    const dailyDocsByAccount = new Map([['overall', [{ id: 'doc1', data: () => ({}) }]]]);
+    mockGenerateAllSnapshots.mockImplementation(() => { callOrder.push("portfolio"); return Promise.resolve({ success: 3, failed: 0, total: 3, dailyDocsByAccount }); });
     mockGenerateAllAssetSnapshots.mockImplementation(() => { callOrder.push("asset"); return Promise.resolve({ success: 2, failed: 0, total: 2 }); });
     const params = buildBaseParams();
 
@@ -796,5 +800,123 @@ describe("PERF-SNAP-024: Asset snapshot generation in processUserPerformance", (
     await processUserPerformance(params);
 
     expect(mockGenerateAllAssetSnapshots).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * PERF-SNAP-026: Tests para Smart Currency — solo USD + defaultCurrency en EOD
+ *
+ * @see docs/stories/PERF-SNAP-026.story.md
+ * @see docs/architecture/AUDIT-SNAPSHOT-SUSTAINABILITY-PLAN.md §4
+ */
+describe("PERF-SNAP-026: Smart Currency filtering in processUserPerformance", () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockBatchCommit.mockResolvedValue(undefined);
+    const mockDailyDocsByAccount = new Map([['overall', [{ id: 'doc1', data: () => ({}) }]]]);
+    mockGenerateAllSnapshots.mockResolvedValue({ success: 3, failed: 0, total: 3, dailyDocsByAccount: mockDailyDocsByAccount });
+    mockGenerateAllAssetSnapshots.mockResolvedValue({ success: 2, failed: 0, total: 2 });
+    mockFetchLatestAssetPerformance.mockResolvedValue({ 'AAPL_stock': { totalValue: 18500 } });
+    mockDocSet.mockResolvedValue(undefined);
+  });
+
+  it("should generate snapshots for USD + defaultCurrency when defaultCurrency is COP (AC1)", async () => {
+    mockDocGet.mockResolvedValueOnce({ exists: true, data: () => ({ defaultCurrency: 'COP' }) });
+    const params = buildBaseParams({
+      currencies: [
+        { code: "USD", rate: 1 },
+        { code: "COP", rate: 4200 },
+        { code: "EUR", rate: 0.92 }
+      ]
+    });
+
+    await processUserPerformance(params);
+
+    expect(mockGenerateAllSnapshots).toHaveBeenCalledWith(
+      mockDb, "user-1", ["USD", "COP"], expect.any(Array)
+    );
+  });
+
+  it("should generate snapshots only for USD when defaultCurrency is USD (AC2)", async () => {
+    mockDocGet.mockResolvedValueOnce({ exists: true, data: () => ({ defaultCurrency: 'USD' }) });
+    const params = buildBaseParams();
+
+    await processUserPerformance(params);
+
+    expect(mockGenerateAllSnapshots).toHaveBeenCalledWith(
+      mockDb, "user-1", ["USD"], expect.any(Array)
+    );
+  });
+
+  it("should fallback to USD only when defaultCurrency is null (AC3)", async () => {
+    mockDocGet.mockResolvedValueOnce({ exists: true, data: () => ({ defaultCurrency: null }) });
+    const params = buildBaseParams();
+
+    await processUserPerformance(params);
+
+    expect(mockGenerateAllSnapshots).toHaveBeenCalledWith(
+      mockDb, "user-1", ["USD"], expect.any(Array)
+    );
+  });
+
+  it("should fallback to USD only when defaultCurrency field is absent (AC3)", async () => {
+    mockDocGet.mockResolvedValueOnce({ exists: true, data: () => ({}) });
+    const params = buildBaseParams();
+
+    await processUserPerformance(params);
+
+    expect(mockGenerateAllSnapshots).toHaveBeenCalledWith(
+      mockDb, "user-1", ["USD"], expect.any(Array)
+    );
+  });
+
+  it("should fallback to USD only when userData document does not exist (AC6)", async () => {
+    mockDocGet.mockResolvedValueOnce({ exists: false });
+    const params = buildBaseParams();
+
+    await processUserPerformance(params);
+
+    expect(mockGenerateAllSnapshots).toHaveBeenCalledWith(
+      mockDb, "user-1", ["USD"], expect.any(Array)
+    );
+  });
+
+  it("should fallback to USD only and not fail pipeline when userData read throws (AC6)", async () => {
+    mockDocGet.mockRejectedValueOnce(new Error("Permission denied"));
+    const params = buildBaseParams();
+
+    const result = await processUserPerformance(params);
+
+    expect(result.success).toBe(true);
+    expect(mockGenerateAllSnapshots).toHaveBeenCalledWith(
+      mockDb, "user-1", ["USD"], expect.any(Array)
+    );
+  });
+
+  it("should use smart currencies for asset snapshots too (AC5)", async () => {
+    mockDocGet.mockResolvedValueOnce({ exists: true, data: () => ({ defaultCurrency: 'COP' }) });
+    const params = buildBaseParams({
+      currencies: [
+        { code: "USD", rate: 1 },
+        { code: "COP", rate: 4200 },
+        { code: "EUR", rate: 0.92 }
+      ]
+    });
+
+    await processUserPerformance(params);
+
+    expect(mockFetchLatestAssetPerformance).toHaveBeenCalledTimes(2);
+    expect(mockFetchLatestAssetPerformance).toHaveBeenCalledWith(mockDb, "user-1", "overall", "USD");
+    expect(mockFetchLatestAssetPerformance).toHaveBeenCalledWith(mockDb, "user-1", "overall", "COP");
+  });
+
+  it("should not duplicate USD when defaultCurrency is USD (AC2)", async () => {
+    mockDocGet.mockResolvedValueOnce({ exists: true, data: () => ({ defaultCurrency: 'USD' }) });
+    const params = buildBaseParams();
+
+    await processUserPerformance(params);
+
+    expect(mockFetchLatestAssetPerformance).toHaveBeenCalledTimes(1);
+    expect(mockFetchLatestAssetPerformance).toHaveBeenCalledWith(mockDb, "user-1", "overall", "USD");
   });
 });

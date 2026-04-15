@@ -248,6 +248,23 @@ async function deletePortfolioAccount(context, payload) {
     // 4. Eliminar la cuenta
     await accountRef.delete();
 
+    // PERF-SNAP-028: Best-effort cleanup de snapshots de la cuenta eliminada
+    try {
+      const accountSnapshots = await db.collection('performanceSnapshots')
+        .where('userId', '==', userId)
+        .where('accountId', '==', accountId)
+        .get();
+
+      if (!accountSnapshots.empty) {
+        const snapshotBatch = db.batch();
+        accountSnapshots.docs.forEach(doc => snapshotBatch.delete(doc.ref));
+        await snapshotBatch.commit();
+        console.log(`[accountHandlers][deletePortfolioAccount] Deleted ${accountSnapshots.size} snapshots for account ${accountId}`);
+      }
+    } catch (cleanupError) {
+      console.warn(`[accountHandlers][deletePortfolioAccount] Snapshot cleanup failed for account ${accountId}: ${cleanupError.message}`);
+    }
+
     // 5. Invalidar cache de distribución
     invalidateDistributionCache(userId);
 

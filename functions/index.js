@@ -9,6 +9,9 @@ const { unifiedMarketDataUpdate } = require('./services/unifiedMarketDataUpdate'
 // LATE-REG-003: Reconciliación automática de performance stale
 const { reconcileStalePerformance } = require('./services/reconcileStalePerformance');
 
+// PERF-SNAP-028: Snapshot lifecycle cleanup & archival
+const { scheduledSnapshotCleanup, scheduledSnapshotArchival } = require('./services/snapshotCleanup');
+
 /**
  * SEC-TOKEN-001: Secret para autenticación server-to-server con API finance-query
  * Usado por httpApi para endpoints /quotes, /simple-quotes, /search, etc.
@@ -174,6 +177,23 @@ exports.syncHolidaysHttpV2 = marketStatusService.syncHolidaysHttp;
  * @see docs/architecture/LATE-REGISTRATION-001-retroactive-transactions-analysis.md
  */
 exports.reconcileStalePerformance = reconcileStalePerformance;
+
+// ============================================================================
+// PERF-SNAP-028: Snapshot Lifecycle Cleanup & Archival
+// ============================================================================
+/**
+ * Deletes asset snapshots sold >365 days ago with no re-purchase.
+ * Schedule: Sunday 03:00 ET
+ * @see docs/stories/PERF-SNAP-028.story.md
+ */
+exports.scheduledSnapshotCleanup = scheduledSnapshotCleanup;
+
+/**
+ * Archives snapshots for users inactive >365 days to archivedSnapshots/.
+ * Schedule: 1st of each month, 04:00 ET
+ * @see docs/stories/PERF-SNAP-028.story.md
+ */
+exports.scheduledSnapshotArchival = scheduledSnapshotArchival;
 
 exports.weeklyProfitableWeeksCalculation = onSchedule({
   schedule: "every sunday 23:00",

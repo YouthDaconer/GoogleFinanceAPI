@@ -823,7 +823,19 @@ async function processUserPerformance({
 
     // PERF-SNAP-004: Generar snapshots pre-computados (best-effort, no bloquea pipeline)
     try {
-      const currencyCodes = currencies.map(c => c.code);
+      // PERF-SNAP-026: Smart Currency — solo USD + defaultCurrency del usuario
+      let snapshotCurrencies = ['USD'];
+      try {
+        const userDataDoc = await db.collection('userData').doc(userId).get();
+        const defaultCurrency = userDataDoc.exists ? userDataDoc.data()?.defaultCurrency : null;
+        if (defaultCurrency && defaultCurrency !== 'USD') {
+          snapshotCurrencies.push(defaultCurrency);
+        }
+        logInfo(`[EOD][Snapshot] Currencies for ${userId}: [${snapshotCurrencies.join(', ')}] (default: ${defaultCurrency || 'USD'})`);
+      } catch (currencyReadError) {
+        logWarn(`[EOD][Snapshot] Could not read defaultCurrency for ${userId}, using USD only: ${currencyReadError.message}`);
+      }
+      const currencyCodes = snapshotCurrencies;
       const accountIds = accounts.map(a => a.id);
       const snapshotResult = await generateAllSnapshots(db, userId, currencyCodes, accountIds);
       logInfo(`[EOD][Snapshot] Snapshots generados para ${userId}: ${snapshotResult.success} OK, ${snapshotResult.failed} fallidos`);
