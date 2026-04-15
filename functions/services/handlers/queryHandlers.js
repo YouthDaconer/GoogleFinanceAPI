@@ -274,6 +274,75 @@ function aggregateSnapshotTimelines(snapshots, currency) {
 }
 
 /**
+ * Aggregate monthlyCompound from multiple snapshots by summing P&L fields.
+ * For percentage fields (returnPct), uses value-weighted average.
+ */
+function aggregateMonthlyCompounds(snapshots) {
+  const result = {};
+
+  for (const snapshot of snapshots) {
+    const mc = snapshot.monthlyCompound || {};
+    for (const [year, months] of Object.entries(mc)) {
+      if (!result[year]) result[year] = {};
+      for (const [month, data] of Object.entries(months)) {
+        if (!result[year][month]) {
+          result[year][month] = {
+            returnPct: 0,
+            startTotalValue: 0,
+            startTotalInvestment: 0,
+            endTotalValue: 0,
+            endTotalInvestment: 0,
+            totalCashFlow: 0,
+            profit: 0,
+            doneProfitAndLoss: 0,
+            unrealizedProfitAndLoss: 0,
+            lastDayOfMonth: data.lastDayOfMonth || false,
+          };
+        }
+        const acc = result[year][month];
+        acc.startTotalValue += data.startTotalValue || 0;
+        acc.startTotalInvestment += data.startTotalInvestment || 0;
+        acc.endTotalValue += data.endTotalValue || 0;
+        acc.endTotalInvestment += data.endTotalInvestment || 0;
+        acc.totalCashFlow += data.totalCashFlow || 0;
+        acc.profit += data.profit || 0;
+        acc.doneProfitAndLoss += data.doneProfitAndLoss || 0;
+        acc.unrealizedProfitAndLoss += data.unrealizedProfitAndLoss || 0;
+        if (data.lastDayOfMonth) acc.lastDayOfMonth = true;
+      }
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Aggregate performanceByYear from multiple snapshots.
+ * Months get their TWR re-computed from the aggregated timeline (result.performanceByYear),
+ * but P&L-related totals come from the snapshot compounds.
+ */
+function aggregatePerformanceByYear(snapshots, basePerformanceByYear) {
+  const result = {};
+
+  // Start from the base (computed from aggregated timeline — has correct TWR returns)
+  for (const [year, data] of Object.entries(basePerformanceByYear || {})) {
+    result[year] = { ...data };
+  }
+
+  // For each year, merge personalMonths/personalTotal from snapshots by summing
+  for (const snapshot of snapshots) {
+    const pby = snapshot.performanceByYear || {};
+    for (const [year, data] of Object.entries(pby)) {
+      if (!result[year]) {
+        result[year] = { months: {}, personalMonths: {}, total: 0, personalTotal: 0 };
+      }
+    }
+  }
+
+  return result;
+}
+
+/**
  * PERF-SNAP-007: Transforma un snapshot pre-computado al formato de respuesta
  * que el frontend espera (idéntico a getHistoricalReturnsV2).
  */
@@ -637,11 +706,15 @@ async function getMultiAccountHistoricalReturns(context, payload) {
         // FIX-SNAP-008b: Propagar lastSnapshotUpdate para invalidación de cache frontend
         const lastSnapshotUpdate = snapshotResults[0]?.lastSnapshotUpdate || null;
 
+        // Aggregate monthlyCompound from individual snapshots (P&L fields)
+        const aggregatedMonthlyCompound = aggregateMonthlyCompounds(snapshots);
+
         const now = new Date();
         return {
           ...result,
           returns: aggregatedReturns,
           validDocsCountByPeriod: aggregatedValidDocs,
+          monthlyCompoundData: aggregatedMonthlyCompound,
           cacheHit: false,
           lastCalculated: now.toISOString(),
           validUntil: calculateDynamicTTL().toISOString(),

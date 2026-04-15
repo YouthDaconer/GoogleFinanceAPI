@@ -84,6 +84,99 @@ function extractLatestAssetPerformanceFromDocs(docs, currency) {
   return extractAssetPerformanceFields(assetPerf);
 }
 
+/**
+ * Build monthlyCompoundData from daily docs, extracting P&L fields that
+ * PortfolioPerformanceChartViewer tooltip needs.
+ *
+ * V2 consolidated returns left monthlyCompoundData as {} — this fills that gap
+ * by reading doneProfitAndLoss and unrealizedProfitAndLoss from the last daily
+ * doc of each month.
+ *
+ * @param {Array} docs - Daily docs (Firestore snapshots or plain objects), ordered by date asc
+ * @param {string} currency - Currency code (e.g., 'USD')
+ * @param {string} [ticker] - Asset ticker (for asset-level snapshots)
+ * @param {string} [assetType] - Asset type (for asset-level snapshots)
+ * @returns {Object} { "2026": { "1": { returnPct, profit, doneProfitAndLoss, ... } } }
+ */
+function buildMonthlyCompoundFromDailyDocs(docs, currency, ticker, assetType) {
+  if (!docs || docs.length === 0) return {};
+
+  const isAsset = !!(ticker && assetType);
+  const assetKey = isAsset ? `${ticker}_${assetType}` : null;
+
+  const now = DateTime.now().setZone('America/New_York');
+  const currentMonthKey = now.toFormat('yyyy-MM');
+
+  // Group daily docs by year-month, preserving insertion order
+  const monthGroups = new Map();
+
+  for (const doc of docs) {
+    const data = doc.data ? doc.data() : doc;
+    const date = data.date;
+    if (!date) continue;
+
+    const currencyData = data[currency];
+    if (!currencyData) continue;
+
+    const entryData = isAsset
+      ? currencyData.assetPerformance?.[assetKey]
+      : currencyData;
+    if (!entryData) continue;
+
+    const monthKey = date.substring(0, 7); // "2026-01"
+    if (!monthGroups.has(monthKey)) monthGroups.set(monthKey, []);
+    monthGroups.get(monthKey).push(entryData);
+  }
+
+  const result = {};
+
+  for (const [monthKey, entries] of monthGroups.entries()) {
+    const [yearStr, monthStr] = monthKey.split('-');
+    const monthNum = parseInt(monthStr, 10).toString();
+
+    if (!result[yearStr]) result[yearStr] = {};
+
+    // Entries are already in chronological order (docs ordered by date asc)
+    const first = entries[0];
+    const last = entries[entries.length - 1];
+
+    // Compose monthly TWR from daily changes
+    let monthFactor = 1;
+    for (const entry of entries) {
+      const change = entry.adjustedDailyChangePercentage ?? entry.dailyChangePercentage ?? 0;
+      monthFactor *= (1 + change / 100);
+    }
+
+    const isClosedMonth = monthKey < currentMonthKey;
+
+    // doneProfitAndLoss in each daily doc = realized P&L from sells on THAT day only.
+    // Must SUM across all days in the month to get monthly total.
+    let monthlyDonePnL = 0;
+    for (const entry of entries) {
+      monthlyDonePnL += entry.doneProfitAndLoss ?? 0;
+    }
+
+    // unrealizedProfitAndLoss = totalValue - totalInvestment (point-in-time snapshot).
+    // The LAST day of the month is the correct value for monthly display.
+    const unrealizedPnL = last.unrealizedProfitAndLoss ?? 0;
+
+    result[yearStr][monthNum] = {
+      returnPct: (monthFactor - 1) * 100,
+      startTotalValue: first.totalValue ?? 0,
+      startTotalInvestment: first.totalInvestment ?? 0,
+      endTotalValue: last.totalValue ?? 0,
+      endTotalInvestment: last.totalInvestment ?? 0,
+      totalCashFlow: last.totalCashFlow ?? 0,
+      profit: monthlyDonePnL + unrealizedPnL,
+      doneProfitAndLoss: monthlyDonePnL,
+      unrealizedProfitAndLoss: unrealizedPnL,
+      lastDayOfMonth: isClosedMonth,
+    };
+  }
+
+  return result;
+}
+
 const ASSET_PERF_FIELDS = ['totalValue', 'totalInvestment', 'units', 'unrealizedPnL', 'totalROI', 'dailyChangePercentage'];
 
 function extractAssetPerformanceFields(assetPerformance) {
@@ -159,7 +252,7 @@ async function generatePerformanceSnapshot(db, userId, accountId, currency, opti
     timeline,
 
     performanceByYear: v2Result.performanceByYear || {},
-    monthlyCompound: v2Result.monthlyCompoundData || {},
+    monthlyCompound: buildMonthlyCompoundFromDailyDocs(dailyDocs, currency),
 
     validDocsCountByPeriod: v2Result.validDocsCountByPeriod || {},
     availableYears: v2Result.availableYears || [],
@@ -340,7 +433,7 @@ async function generateAssetSnapshot(db, userId, accountId, currency, ticker, as
     timeline,
 
     performanceByYear: computedResult.performanceByYear || {},
-    monthlyCompound: computedResult.monthlyCompoundData || {},
+    monthlyCompound: buildMonthlyCompoundFromDailyDocs(assetDocs, currency, ticker, assetType),
 
     validDocsCountByPeriod: computedResult.validDocsCountByPeriod || {},
     availableYears: computedResult.availableYears || [],
@@ -426,4 +519,6 @@ module.exports = {
   filterDocsForAsset,
   buildAssetDailyTimeline,
   computeAssetReturnsFromDailyDocs,
+  // P&L monthlyCompound fix
+  buildMonthlyCompoundFromDailyDocs,
 };
