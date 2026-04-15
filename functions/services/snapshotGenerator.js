@@ -10,7 +10,6 @@
  * @see docs/architecture/AUDIT-PORTFOLIO-PERFORMANCE-ARCHITECTURE.md
  */
 
-const { getHistoricalReturnsV2 } = require('./consolidatedReturnsService');
 const { DateTime } = require('luxon');
 const {
   calculatePeriodBoundaries,
@@ -216,27 +215,26 @@ async function fetchLatestAssetPerformance(db, userId, accountId, currency) {
 }
 
 async function generatePerformanceSnapshot(db, userId, accountId, currency, options = {}) {
-  const v2Result = await getHistoricalReturnsV2(userId, {
-    currency,
-    accountId,
-    fallbackToV1: true,
-  });
+  // PERF-SNAP-030: Usar daily docs directamente (como PERF-SNAP-025 para assets)
+  const dailyDocs = options.dailyDocs || await fetchAllDailyDocs(db, userId, accountId);
 
-  if (!v2Result || !v2Result.returns) {
+  const now = DateTime.now().setZone('America/New_York');
+  const computedResult = computePortfolioReturnsFromDailyDocs(dailyDocs, currency, now);
+
+  if (!computedResult || !computedResult.returns) {
     console.log(`[snapshotGenerator] No data for userId=${userId}, accountId=${accountId}, currency=${currency} — skipping`);
     return false;
   }
 
-  const hasAnyData = v2Result.returns.hasYtdData ||
-    v2Result.returns.hasOneMonthData ||
-    v2Result.returns.hasThreeMonthData;
+  const hasAnyData = computedResult.returns.hasYtdData ||
+    computedResult.returns.hasOneMonthData ||
+    computedResult.returns.hasThreeMonthData;
 
   if (!hasAnyData) {
     console.log(`[snapshotGenerator] Empty result for userId=${userId}, accountId=${accountId}, currency=${currency} — skipping`);
     return false;
   }
 
-  const dailyDocs = options.dailyDocs || await fetchAllDailyDocs(db, userId, accountId);
   const timeline = buildDailyTimeline(dailyDocs, currency);
   const latestAssetPerformance = extractLatestAssetPerformanceFromDocs(dailyDocs, currency);
 
@@ -247,24 +245,21 @@ async function generatePerformanceSnapshot(db, userId, accountId, currency, opti
     lastUpdated: new Date().toISOString(),
     schemaVersion: SCHEMA_VERSION,
 
-    returns: v2Result.returns,
-
+    returns: computedResult.returns,
     timeline,
 
-    performanceByYear: v2Result.performanceByYear || {},
+    performanceByYear: computedResult.performanceByYear || {},
     monthlyCompound: buildMonthlyCompoundFromDailyDocs(dailyDocs, currency),
 
-    validDocsCountByPeriod: v2Result.validDocsCountByPeriod || {},
-    availableYears: v2Result.availableYears || [],
-    startDate: v2Result.startDate || '',
+    validDocsCountByPeriod: computedResult.validDocsCountByPeriod || {},
+    availableYears: computedResult.availableYears || [],
+    startDate: computedResult.startDate || '',
 
     latestAssetPerformance,
   };
 
   const docId = buildSnapshotDocId(userId, accountId, currency);
-
   console.log(`[snapshotGenerator] Writing snapshot ${docId} — timeline: ${timeline.length} points`);
-
   await db.collection('performanceSnapshots').doc(docId).set(snapshot);
   return true;
 }
@@ -370,6 +365,68 @@ function computeAssetReturnsFromDailyDocs(docs, currency, ticker, assetType, now
   }
 
   // Convert monthly factors to monthlyReturns format
+  for (const [monthKey, factor] of Object.entries(monthlyFactors)) {
+    const [year, month] = monthKey.split('-');
+    if (!monthlyReturns[year]) monthlyReturns[year] = {};
+    monthlyReturns[year][parseInt(month, 10).toString()] = (factor - 1) * 100;
+  }
+
+  return buildReturnsResult(factors, {
+    totalValueDates,
+    totalValueValues,
+    percentChanges,
+    firstDate,
+    firstValue,
+    lastValue,
+    now: effectiveNow,
+    monthlyReturns,
+    yearlyReturns: {},
+  });
+}
+
+// PERF-SNAP-030: Computar returns de portfolio desde daily docs (elimina dependencia V2)
+function computePortfolioReturnsFromDailyDocs(docs, currency, now) {
+  const effectiveNow = now || DateTime.now().setZone('America/New_York');
+  const boundaries = calculatePeriodBoundaries(effectiveNow);
+  const factors = initializePeriodFactors();
+
+  const totalValueDates = [];
+  const totalValueValues = [];
+  const percentChanges = [];
+  const monthlyFactors = {};
+  let firstDate = null;
+  let firstValue = 0;
+  let lastValue = 0;
+
+  for (const doc of docs) {
+    const data = doc.data ? doc.data() : doc;
+    const date = data.date;
+    const currencyData = data[currency];
+    if (!currencyData) continue;
+
+    processDailyDocument(factors, boundaries, currencyData, date);
+
+    const value = currencyData.totalValue ?? 0;
+    const change = currencyData.adjustedDailyChangePercentage
+      ?? currencyData.dailyChangePercentage ?? 0;
+
+    totalValueDates.push(date);
+    totalValueValues.push(value);
+    percentChanges.push(change);
+
+    if (!firstDate) { firstDate = date; firstValue = value; }
+    lastValue = value;
+
+    const monthKey = date.substring(0, 7);
+    if (!monthlyFactors[monthKey]) monthlyFactors[monthKey] = 1;
+    monthlyFactors[monthKey] *= (1 + change / 100);
+  }
+
+  if (totalValueDates.length === 0) {
+    return null;
+  }
+
+  const monthlyReturns = {};
   for (const [monthKey, factor] of Object.entries(monthlyFactors)) {
     const [year, month] = monthKey.split('-');
     if (!monthlyReturns[year]) monthlyReturns[year] = {};
@@ -519,6 +576,8 @@ module.exports = {
   filterDocsForAsset,
   buildAssetDailyTimeline,
   computeAssetReturnsFromDailyDocs,
+  // PERF-SNAP-030
+  computePortfolioReturnsFromDailyDocs,
   // P&L monthlyCompound fix
   buildMonthlyCompoundFromDailyDocs,
 };

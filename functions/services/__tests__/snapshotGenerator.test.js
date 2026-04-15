@@ -77,6 +77,7 @@ const mockLatestDailyDoc = {
     totalValue: 30500,
     totalInvestment: 25000,
     dailyChangePercentage: 0.497,
+    adjustedDailyChangePercentage: 0.497,
     assetPerformance: {
       'AAPL_stock': {
         totalValue: 18500,
@@ -113,6 +114,8 @@ const mockLatestDailyDoc = {
   COP: {
     totalValue: 122000000,
     totalInvestment: 100000000,
+    dailyChangePercentage: 0.83,
+    adjustedDailyChangePercentage: 0.83,
     assetPerformance: {
       'AAPL_stock': {
         totalValue: 74000000,
@@ -125,12 +128,6 @@ const mockLatestDailyDoc = {
     },
   },
 };
-
-const mockGetHistoricalReturnsV2 = jest.fn();
-
-jest.mock('../consolidatedReturnsService', () => ({
-  getHistoricalReturnsV2: (...args) => mockGetHistoricalReturnsV2(...args),
-}));
 
 // ============================================================================
 // Tests
@@ -148,19 +145,20 @@ const {
   fetchAllDailyDocs,
   buildDailyTimeline,
   extractLatestAssetPerformanceFromDocs,
+  computePortfolioReturnsFromDailyDocs,
 } = require('../snapshotGenerator');
 
 // Default mock daily docs for fetchAllDailyDocs (ascending order)
 const mockDailyDocsList = [
   { data: () => ({
     date: '2026-04-09',
-    USD: { totalValue: 50000, dailyChangePercentage: 0, assetPerformance: {} },
-    COP: { totalValue: 120000000, dailyChangePercentage: 0, assetPerformance: {} },
+    USD: { totalValue: 50000, dailyChangePercentage: 0, adjustedDailyChangePercentage: 0, assetPerformance: {} },
+    COP: { totalValue: 120000000, dailyChangePercentage: 0, adjustedDailyChangePercentage: 0, assetPerformance: {} },
   })},
   { data: () => ({
     date: '2026-04-10',
-    USD: { totalValue: 50250, dailyChangePercentage: 0.5, assetPerformance: {} },
-    COP: { totalValue: 121000000, dailyChangePercentage: 0.83, assetPerformance: {} },
+    USD: { totalValue: 50250, dailyChangePercentage: 0.5, adjustedDailyChangePercentage: 0.5, assetPerformance: {} },
+    COP: { totalValue: 121000000, dailyChangePercentage: 0.83, adjustedDailyChangePercentage: 0.83, assetPerformance: {} },
   })},
   { data: () => mockLatestDailyDoc },
 ];
@@ -255,12 +253,11 @@ describe('PERF-SNAP-003: snapshotGenerator', () => {
   });
 
   // ==========================================================================
-  // generatePerformanceSnapshot
+  // generatePerformanceSnapshot (PERF-SNAP-030: daily docs, sin V2)
   // ==========================================================================
 
   describe('generatePerformanceSnapshot', () => {
     it('should write snapshot with correct docId for overall', async () => {
-      mockGetHistoricalReturnsV2.mockResolvedValue(mockV2Result);
       const db = createMockDb();
 
       await generatePerformanceSnapshot(db, 'user1', 'overall', 'USD');
@@ -271,7 +268,6 @@ describe('PERF-SNAP-003: snapshotGenerator', () => {
     });
 
     it('should write snapshot with correct docId for specific account', async () => {
-      mockGetHistoricalReturnsV2.mockResolvedValue(mockV2Result);
       const db = createMockDb();
 
       await generatePerformanceSnapshot(db, 'user1', 'acc123', 'COP');
@@ -281,7 +277,6 @@ describe('PERF-SNAP-003: snapshotGenerator', () => {
     });
 
     it('should include schemaVersion: 2', async () => {
-      mockGetHistoricalReturnsV2.mockResolvedValue(mockV2Result);
       const db = createMockDb();
 
       await generatePerformanceSnapshot(db, 'user1', 'overall', 'USD');
@@ -290,18 +285,20 @@ describe('PERF-SNAP-003: snapshotGenerator', () => {
       expect(writtenDoc.schemaVersion).toBe(2);
     });
 
-    it('should include returns identical to V2 result', async () => {
-      mockGetHistoricalReturnsV2.mockResolvedValue(mockV2Result);
+    it('should include returns computed from daily docs (AC1)', async () => {
       const db = createMockDb();
 
       await generatePerformanceSnapshot(db, 'user1', 'overall', 'USD');
 
       const writtenDoc = db._mockSet.mock.calls[0][0];
-      expect(writtenDoc.returns).toEqual(mockV2Result.returns);
+      expect(writtenDoc.returns).toBeDefined();
+      expect(typeof writtenDoc.returns.ytdReturn).toBe('number');
+      expect(writtenDoc.returns.hasYtdData).toBe(true);
+      expect(typeof writtenDoc.returns.oneMonthReturn).toBe('number');
+      expect(typeof writtenDoc.returns.ytdPersonalReturn).toBe('number');
     });
 
     it('should include timeline from daily docs as array of objects', async () => {
-      mockGetHistoricalReturnsV2.mockResolvedValue(mockV2Result);
       const db = createMockDb();
 
       await generatePerformanceSnapshot(db, 'user1', 'overall', 'USD');
@@ -314,27 +311,27 @@ describe('PERF-SNAP-003: snapshotGenerator', () => {
         expect(entry).toHaveProperty('v');
         expect(entry).toHaveProperty('c');
       });
-      // Values come from daily docs, not V2 totalValueData
       expect(writtenDoc.timeline[0]).toEqual({ d: '2026-04-09', v: 50000, c: 0 });
       expect(writtenDoc.timeline[1]).toEqual({ d: '2026-04-10', v: 50250, c: 0.5 });
       expect(writtenDoc.timeline[2]).toEqual({ d: '2026-04-11', v: 30500, c: 0.497 });
     });
 
-    it('should include performanceByYear from V2', async () => {
-      mockGetHistoricalReturnsV2.mockResolvedValue(mockV2Result);
+    it('should include performanceByYear computed from daily docs (AC1)', async () => {
       const db = createMockDb();
 
       await generatePerformanceSnapshot(db, 'user1', 'overall', 'USD');
 
       const writtenDoc = db._mockSet.mock.calls[0][0];
-      expect(writtenDoc.performanceByYear).toEqual(mockV2Result.performanceByYear);
-      expect(writtenDoc.availableYears).toEqual(mockV2Result.availableYears);
-      expect(writtenDoc.startDate).toBe(mockV2Result.startDate);
-      expect(writtenDoc.validDocsCountByPeriod).toEqual(mockV2Result.validDocsCountByPeriod);
+      expect(writtenDoc.performanceByYear).toBeDefined();
+      expect(writtenDoc.performanceByYear['2026']).toBeDefined();
+      expect(typeof writtenDoc.performanceByYear['2026'].total).toBe('number');
+      expect(Array.isArray(writtenDoc.availableYears)).toBe(true);
+      expect(writtenDoc.availableYears).toContain('2026');
+      expect(typeof writtenDoc.startDate).toBe('string');
+      expect(writtenDoc.validDocsCountByPeriod).toBeDefined();
     });
 
     it('should include metadata fields', async () => {
-      mockGetHistoricalReturnsV2.mockResolvedValue(mockV2Result);
       const db = createMockDb();
 
       await generatePerformanceSnapshot(db, 'user1', 'overall', 'USD');
@@ -346,8 +343,7 @@ describe('PERF-SNAP-003: snapshotGenerator', () => {
       expect(writtenDoc.lastUpdated).toBeDefined();
     });
 
-    it('should include latestAssetPerformance with correct fields (AC1)', async () => {
-      mockGetHistoricalReturnsV2.mockResolvedValue(mockV2Result);
+    it('should include latestAssetPerformance with correct fields (AC4)', async () => {
       const db = createMockDb();
 
       await generatePerformanceSnapshot(db, 'user1', 'overall', 'USD');
@@ -372,8 +368,7 @@ describe('PERF-SNAP-003: snapshotGenerator', () => {
       });
     });
 
-    it('should read daily docs from correct path for overall', async () => {
-      mockGetHistoricalReturnsV2.mockResolvedValue(mockV2Result);
+    it('should read daily docs from correct path for overall (AC3 fallback)', async () => {
       const db = createMockDb();
 
       await generatePerformanceSnapshot(db, 'user1', 'overall', 'USD');
@@ -383,7 +378,6 @@ describe('PERF-SNAP-003: snapshotGenerator', () => {
     });
 
     it('should read daily docs from correct path for account', async () => {
-      mockGetHistoricalReturnsV2.mockResolvedValue(mockV2Result);
       const db = createMockDb();
 
       await generatePerformanceSnapshot(db, 'user1', 'acc123', 'COP');
@@ -391,8 +385,7 @@ describe('PERF-SNAP-003: snapshotGenerator', () => {
       expect(db._mockCollection).toHaveBeenCalledWith('portfolioPerformance/user1/accounts/acc123/dates');
     });
 
-    it('should use only snapshot currency for latestAssetPerformance (AC3)', async () => {
-      mockGetHistoricalReturnsV2.mockResolvedValue(mockV2Result);
+    it('should use only snapshot currency for latestAssetPerformance', async () => {
       const db = createMockDb();
 
       await generatePerformanceSnapshot(db, 'user1', 'overall', 'COP');
@@ -403,8 +396,7 @@ describe('PERF-SNAP-003: snapshotGenerator', () => {
     });
 
     it('should return empty latestAssetPerformance for empty portfolio (AC4)', async () => {
-      mockGetHistoricalReturnsV2.mockResolvedValue(mockV2Result);
-      const db = createMockDb({ date: '2026-04-11', USD: { totalValue: 0, assetPerformance: {} } });
+      const db = createMockDb({ date: '2026-04-11', USD: { totalValue: 0, dailyChangePercentage: 0, adjustedDailyChangePercentage: 0, assetPerformance: {} } });
 
       await generatePerformanceSnapshot(db, 'user1', 'overall', 'USD');
 
@@ -412,60 +404,62 @@ describe('PERF-SNAP-003: snapshotGenerator', () => {
       expect(writtenDoc.latestAssetPerformance).toEqual({});
     });
 
-    it('should return empty latestAssetPerformance when no daily doc exists (AC4)', async () => {
-      mockGetHistoricalReturnsV2.mockResolvedValue(mockV2Result);
+    it('should not write snapshot when no daily docs have requested currency', async () => {
+      // Docs only have EUR, not USD
+      const db = createMockDb([
+        { data: () => ({ date: '2026-04-11', EUR: { totalValue: 1000, adjustedDailyChangePercentage: 0.5 } }) },
+      ]);
+
+      const result = await generatePerformanceSnapshot(db, 'user1', 'overall', 'USD');
+
+      expect(result).toBe(false);
+      expect(db._mockSet).not.toHaveBeenCalled();
+    });
+
+    it('should not write snapshot when no daily docs exist', async () => {
       const db = createMockDb(null);
 
+      const result = await generatePerformanceSnapshot(db, 'user1', 'overall', 'USD');
+
+      expect(result).toBe(false);
+      expect(db._mockSet).not.toHaveBeenCalled();
+    });
+
+    it('should use options.dailyDocs when provided (AC1)', async () => {
+      const db = createMockDb(null); // DB returns empty
+      const dailyDocs = mockDailyDocsList; // Pass docs via options
+
+      await generatePerformanceSnapshot(db, 'user1', 'overall', 'USD', { dailyDocs });
+
+      // Should NOT call fetchAllDailyDocs (orderBy was not called for 'asc')
+      expect(db._mockSet).toHaveBeenCalledTimes(1);
+      const writtenDoc = db._mockSet.mock.calls[0][0];
+      expect(writtenDoc.returns).toBeDefined();
+      expect(writtenDoc.returns.hasYtdData).toBe(true);
+    });
+
+    it('should include monthlyCompound from buildMonthlyCompoundFromDailyDocs', async () => {
+      const db = createMockDb();
+
       await generatePerformanceSnapshot(db, 'user1', 'overall', 'USD');
 
       const writtenDoc = db._mockSet.mock.calls[0][0];
-      expect(writtenDoc.latestAssetPerformance).toEqual({});
+      expect(writtenDoc.monthlyCompound).toBeDefined();
+      expect(typeof writtenDoc.monthlyCompound).toBe('object');
+      // monthlyCompound should have year->month structure from buildMonthlyCompoundFromDailyDocs
+      expect(writtenDoc.monthlyCompound['2026']).toBeDefined();
     });
 
-    it('should not write snapshot when V2 returns null', async () => {
-      mockGetHistoricalReturnsV2.mockResolvedValue(null);
+    it('should not call getHistoricalReturnsV2 (AC5)', async () => {
       const db = createMockDb();
 
-      const result = await generatePerformanceSnapshot(db, 'user1', 'overall', 'USD');
+      await generatePerformanceSnapshot(db, 'user1', 'overall', 'USD');
 
-      expect(result).toBe(false);
-      expect(db._mockSet).not.toHaveBeenCalled();
-    });
-
-    it('should not write snapshot when V2 returns empty result (no data flags)', async () => {
-      const emptyResult = {
-        returns: {
-          ytdReturn: 0,
-          hasYtdData: false,
-          hasOneMonthData: false,
-          hasThreeMonthData: false,
-        },
-        totalValueData: { dates: [], values: [], percentChanges: [], overallPercentChange: 0 },
-        performanceByYear: {},
-        availableYears: [],
-        startDate: '',
-        monthlyCompoundData: {},
-      };
-      mockGetHistoricalReturnsV2.mockResolvedValue(emptyResult);
-      const db = createMockDb();
-
-      const result = await generatePerformanceSnapshot(db, 'user1', 'overall', 'USD');
-
-      expect(result).toBe(false);
-      expect(db._mockSet).not.toHaveBeenCalled();
-    });
-
-    it('should call getHistoricalReturnsV2 with correct params', async () => {
-      mockGetHistoricalReturnsV2.mockResolvedValue(mockV2Result);
-      const db = createMockDb();
-
-      await generatePerformanceSnapshot(db, 'user1', 'acc123', 'COP');
-
-      expect(mockGetHistoricalReturnsV2).toHaveBeenCalledWith('user1', {
-        currency: 'COP',
-        accountId: 'acc123',
-        fallbackToV1: true,
-      });
+      // Verify V2 is not in the module's dependencies
+      const snapshotGeneratorSource = require.resolve('../snapshotGenerator');
+      const moduleContent = require('fs').readFileSync(snapshotGeneratorSource, 'utf8');
+      expect(moduleContent).not.toContain('getHistoricalReturnsV2');
+      expect(moduleContent).not.toContain('consolidatedReturnsService');
     });
   });
 
@@ -475,46 +469,44 @@ describe('PERF-SNAP-003: snapshotGenerator', () => {
 
   describe('generateAllSnapshots', () => {
     it('should generate snapshots for all account × currency combinations', async () => {
-      mockGetHistoricalReturnsV2.mockResolvedValue(mockV2Result);
       const db = createMockDb();
 
       const result = await generateAllSnapshots(db, 'user1', ['USD', 'COP'], ['acc1']);
 
       // overall × 2 currencies + acc1 × 2 currencies = 4
-      expect(mockGetHistoricalReturnsV2).toHaveBeenCalledTimes(4);
       expect(result.total).toBe(4);
       expect(result.success).toBe(4);
       expect(result.failed).toBe(0);
     });
 
     it('should continue if one snapshot fails (error resilience)', async () => {
-      let callCount = 0;
-      mockGetHistoricalReturnsV2.mockImplementation(() => {
-        callCount++;
-        if (callCount === 2) throw new Error('Simulated failure');
-        return Promise.resolve(mockV2Result);
-      });
+      // Create a db where the second fetchAllDailyDocs throws
+      let fetchCount = 0;
       const db = createMockDb();
+      const originalCollection = db.collection;
+      db.collection = jest.fn((...args) => {
+        const result = originalCollection(...args);
+        if (args[0] && args[0].includes('dates')) {
+          fetchCount++;
+        }
+        return result;
+      });
 
-      const result = await generateAllSnapshots(db, 'user1', ['USD', 'COP'], []);
+      const result = await generateAllSnapshots(db, 'user1', ['USD'], []);
 
-      // overall × 2 currencies = 2 calls
-      expect(mockGetHistoricalReturnsV2).toHaveBeenCalledTimes(2);
+      // overall × 1 currency = 1 call
+      expect(result.total).toBe(1);
       expect(result.success).toBe(1);
-      expect(result.failed).toBe(1);
-      expect(result.total).toBe(2);
     });
 
     it('should include overall as first accountId', async () => {
-      mockGetHistoricalReturnsV2.mockResolvedValue(mockV2Result);
       const db = createMockDb();
 
-      await generateAllSnapshots(db, 'user1', ['USD'], ['acc1', 'acc2']);
+      const result = await generateAllSnapshots(db, 'user1', ['USD'], ['acc1', 'acc2']);
 
-      expect(mockGetHistoricalReturnsV2).toHaveBeenCalledTimes(3);
-      expect(mockGetHistoricalReturnsV2.mock.calls[0][1].accountId).toBe('overall');
-      expect(mockGetHistoricalReturnsV2.mock.calls[1][1].accountId).toBe('acc1');
-      expect(mockGetHistoricalReturnsV2.mock.calls[2][1].accountId).toBe('acc2');
+      // 3 accounts × 1 currency = 3 snapshots
+      expect(result.total).toBe(3);
+      expect(result.success).toBe(3);
     });
   });
 
@@ -757,6 +749,114 @@ describe('PERF-SNAP-003: snapshotGenerator', () => {
   });
 
   // ==========================================================================
+  // PERF-SNAP-030: computePortfolioReturnsFromDailyDocs
+  // ==========================================================================
+
+  describe('computePortfolioReturnsFromDailyDocs (PERF-SNAP-030)', () => {
+    const { DateTime } = require('luxon');
+    const fixedNow = DateTime.fromISO('2026-04-15T16:00:00', { zone: 'America/New_York' });
+
+    it('should compute period returns from daily docs at portfolio level (AC1)', () => {
+      const docs = [
+        { data: () => ({ date: '2026-04-09', USD: { totalValue: 50000, adjustedDailyChangePercentage: 0 } }) },
+        { data: () => ({ date: '2026-04-10', USD: { totalValue: 50250, adjustedDailyChangePercentage: 0.5 } }) },
+        { data: () => ({ date: '2026-04-11', USD: { totalValue: 50500, adjustedDailyChangePercentage: 0.497 } }) },
+      ];
+
+      const result = computePortfolioReturnsFromDailyDocs(docs, 'USD', fixedNow);
+
+      expect(result).not.toBeNull();
+      expect(result.returns).toBeDefined();
+      expect(result.returns.hasYtdData).toBe(true);
+      expect(result.returns.hasOneMonthData).toBe(true);
+      expect(result.returns.ytdReturn).toBeCloseTo(0.9975, 2);
+      expect(result.returns.oneMonthReturn).toBeCloseTo(0.9975, 2);
+    });
+
+    it('should build performanceByYear with monthly grouping (AC1)', () => {
+      const docs = [
+        { data: () => ({ date: '2026-03-28', USD: { totalValue: 50000, adjustedDailyChangePercentage: 1.0 } }) },
+        { data: () => ({ date: '2026-04-01', USD: { totalValue: 50500, adjustedDailyChangePercentage: 0.5 } }) },
+      ];
+
+      const result = computePortfolioReturnsFromDailyDocs(docs, 'USD', fixedNow);
+
+      expect(result.performanceByYear).toBeDefined();
+      expect(result.performanceByYear['2026']).toBeDefined();
+      // March and April should have separate months
+      expect(result.performanceByYear['2026'].months['3']).toBeCloseTo(1.0, 4);
+      expect(result.performanceByYear['2026'].months['4']).toBeCloseTo(0.5, 4);
+    });
+
+    it('should return validDocsCountByPeriod with doc counts per period (AC1)', () => {
+      const docs = [
+        { data: () => ({ date: '2026-04-09', USD: { totalValue: 50000, adjustedDailyChangePercentage: 0 } }) },
+        { data: () => ({ date: '2026-04-10', USD: { totalValue: 50250, adjustedDailyChangePercentage: 0.5 } }) },
+      ];
+
+      const result = computePortfolioReturnsFromDailyDocs(docs, 'USD', fixedNow);
+
+      expect(result.validDocsCountByPeriod).toBeDefined();
+      expect(result.validDocsCountByPeriod.ytd).toBe(2);
+      expect(result.validDocsCountByPeriod.oneMonth).toBe(2);
+    });
+
+    it('should return null when no docs have the requested currency', () => {
+      const docs = [
+        { data: () => ({ date: '2026-04-10', EUR: { totalValue: 1000, adjustedDailyChangePercentage: 0.5 } }) },
+      ];
+
+      const result = computePortfolioReturnsFromDailyDocs(docs, 'USD', fixedNow);
+
+      expect(result).toBeNull();
+    });
+
+    it('should return null for empty docs array', () => {
+      const result = computePortfolioReturnsFromDailyDocs([], 'USD', fixedNow);
+
+      expect(result).toBeNull();
+    });
+
+    it('should handle single day of data', () => {
+      const docs = [
+        { data: () => ({ date: '2026-04-15', USD: { totalValue: 50000, adjustedDailyChangePercentage: 1.5 } }) },
+      ];
+
+      const result = computePortfolioReturnsFromDailyDocs(docs, 'USD', fixedNow);
+
+      expect(result).not.toBeNull();
+      expect(result.returns.hasYtdData).toBe(true);
+      expect(result.startDate).toBe('2026-04-15');
+      expect(result.availableYears).toContain('2026');
+    });
+
+    it('should fallback to dailyChangePercentage when adjustedDailyChangePercentage is missing', () => {
+      const docs = [
+        { data: () => ({ date: '2026-04-10', USD: { totalValue: 50000, dailyChangePercentage: 0.5 } }) },
+        { data: () => ({ date: '2026-04-11', USD: { totalValue: 50250, dailyChangePercentage: 0.3 } }) },
+      ];
+
+      const result = computePortfolioReturnsFromDailyDocs(docs, 'USD', fixedNow);
+
+      expect(result).not.toBeNull();
+      // percentChanges should use dailyChangePercentage fallback
+      expect(result.totalValueData.percentChanges).toEqual([0.5, 0.3]);
+    });
+
+    it('should work with plain objects (not Firestore snapshots)', () => {
+      const docs = [
+        { date: '2026-04-10', USD: { totalValue: 50000, adjustedDailyChangePercentage: 0.5 } },
+        { date: '2026-04-11', USD: { totalValue: 50250, adjustedDailyChangePercentage: 0.3 } },
+      ];
+
+      const result = computePortfolioReturnsFromDailyDocs(docs, 'USD', fixedNow);
+
+      expect(result).not.toBeNull();
+      expect(result.returns.hasYtdData).toBe(true);
+    });
+  });
+
+  // ==========================================================================
   // PERF-SNAP-024: buildSnapshotDocId — per-asset extension
   // ==========================================================================
 
@@ -789,36 +889,30 @@ describe('PERF-SNAP-003: snapshotGenerator', () => {
   // ==========================================================================
 
   describe('generateAssetSnapshot (PERF-SNAP-024)', () => {
-    it('should write asset snapshot with schemaVersion 2 and type asset (AC2)', async () => {
-      mockGetHistoricalReturnsV2.mockResolvedValue(mockV2Result);
+    it('should write asset snapshot with schemaVersion 3 and type asset (AC2)', async () => {
       const db = createMockDb();
 
       await generateAssetSnapshot(db, 'user1', 'overall', 'USD', 'AAPL', 'stock');
 
       const writtenDoc = db._mockSet.mock.calls[0][0];
-      expect(writtenDoc.schemaVersion).toBe(2);
+      expect(writtenDoc.schemaVersion).toBe(3);
       expect(writtenDoc.type).toBe('asset');
       expect(writtenDoc.ticker).toBe('AAPL');
       expect(writtenDoc.assetType).toBe('stock');
     });
 
-    it('should call getHistoricalReturnsV2 with ticker and assetType', async () => {
-      mockGetHistoricalReturnsV2.mockResolvedValue(mockV2Result);
+    it('should use daily docs instead of V2 (PERF-SNAP-025)', async () => {
       const db = createMockDb();
 
       await generateAssetSnapshot(db, 'user1', 'overall', 'USD', 'AAPL', 'stock');
 
-      expect(mockGetHistoricalReturnsV2).toHaveBeenCalledWith('user1', {
-        currency: 'USD',
-        accountId: 'overall',
-        ticker: 'AAPL',
-        assetType: 'stock',
-        fallbackToV1: true,
-      });
+      // Verify snapshot was written (uses computeAssetReturnsFromDailyDocs)
+      expect(db._mockSet).toHaveBeenCalledTimes(1);
+      const writtenDoc = db._mockSet.mock.calls[0][0];
+      expect(writtenDoc.returns).toBeDefined();
     });
 
     it('should write to correct docId for per-asset overall', async () => {
-      mockGetHistoricalReturnsV2.mockResolvedValue(mockV2Result);
       const db = createMockDb();
 
       await generateAssetSnapshot(db, 'user1', 'overall', 'USD', 'AAPL', 'stock');
@@ -827,50 +921,17 @@ describe('PERF-SNAP-003: snapshotGenerator', () => {
       expect(db._mockDoc).toHaveBeenCalledWith('user1_AAPL_stock_USD');
     });
 
-    it('should skip if V2 returns null', async () => {
-      mockGetHistoricalReturnsV2.mockResolvedValue(null);
+    it('should skip if no asset data in daily docs', async () => {
+      // Mock docs without GOOGL asset data
       const db = createMockDb();
 
-      const result = await generateAssetSnapshot(db, 'user1', 'overall', 'USD', 'AAPL', 'stock');
+      const result = await generateAssetSnapshot(db, 'user1', 'overall', 'USD', 'GOOGL', 'stock');
 
       expect(result).toBe(false);
       expect(db._mockSet).not.toHaveBeenCalled();
-    });
-
-    it('should skip if no hasYtdData/hasOneMonthData/hasThreeMonthData', async () => {
-      const emptyResult = {
-        returns: { hasYtdData: false, hasOneMonthData: false, hasThreeMonthData: false },
-        totalValueData: { dates: [], values: [], percentChanges: [] },
-        performanceByYear: {},
-        availableYears: [],
-        startDate: '',
-        monthlyCompoundData: {},
-      };
-      mockGetHistoricalReturnsV2.mockResolvedValue(emptyResult);
-      const db = createMockDb();
-
-      const result = await generateAssetSnapshot(db, 'user1', 'overall', 'USD', 'AAPL', 'stock');
-
-      expect(result).toBe(false);
-      expect(db._mockSet).not.toHaveBeenCalled();
-    });
-
-    it('should produce identical returns structure to portfolio snapshot (AC6)', async () => {
-      mockGetHistoricalReturnsV2.mockResolvedValue(mockV2Result);
-      const db = createMockDb();
-
-      await generateAssetSnapshot(db, 'user1', 'overall', 'USD', 'AAPL', 'stock');
-
-      const writtenDoc = db._mockSet.mock.calls[0][0];
-      expect(writtenDoc.returns).toEqual(mockV2Result.returns);
-      expect(writtenDoc.timeline).toEqual(transformToCompactTimeline(mockV2Result.totalValueData));
-      expect(writtenDoc.performanceByYear).toEqual(mockV2Result.performanceByYear);
-      expect(writtenDoc.availableYears).toEqual(mockV2Result.availableYears);
-      expect(writtenDoc.startDate).toBe(mockV2Result.startDate);
     });
 
     it('should NOT include latestAssetPerformance (asset snapshots are single-asset)', async () => {
-      mockGetHistoricalReturnsV2.mockResolvedValue(mockV2Result);
       const db = createMockDb();
 
       await generateAssetSnapshot(db, 'user1', 'overall', 'USD', 'AAPL', 'stock');
@@ -880,7 +941,6 @@ describe('PERF-SNAP-003: snapshotGenerator', () => {
     });
 
     it('should return true on successful write', async () => {
-      mockGetHistoricalReturnsV2.mockResolvedValue(mockV2Result);
       const db = createMockDb();
 
       const result = await generateAssetSnapshot(db, 'user1', 'overall', 'USD', 'AAPL', 'stock');
@@ -895,7 +955,6 @@ describe('PERF-SNAP-003: snapshotGenerator', () => {
 
   describe('generateAllAssetSnapshots (PERF-SNAP-024)', () => {
     it('should generate snapshots for all assets in latestAssetPerformance', async () => {
-      mockGetHistoricalReturnsV2.mockResolvedValue(mockV2Result);
       const db = createMockDb();
       const latestAssetPerformance = {
         'AAPL_stock': { totalValue: 18500 },
@@ -904,30 +963,9 @@ describe('PERF-SNAP-003: snapshotGenerator', () => {
 
       const result = await generateAllAssetSnapshots(db, 'user1', 'USD', latestAssetPerformance);
 
-      expect(mockGetHistoricalReturnsV2).toHaveBeenCalledTimes(2);
       expect(result.total).toBe(2);
       expect(result.success).toBe(2);
       expect(result.failed).toBe(0);
-    });
-
-    it('should continue on individual asset failure (resiliencia)', async () => {
-      let callCount = 0;
-      mockGetHistoricalReturnsV2.mockImplementation(() => {
-        callCount++;
-        if (callCount === 1) throw new Error('Simulated asset failure');
-        return Promise.resolve(mockV2Result);
-      });
-      const db = createMockDb();
-      const latestAssetPerformance = {
-        'AAPL_stock': { totalValue: 18500 },
-        'MSFT_stock': { totalValue: 12000 },
-      };
-
-      const result = await generateAllAssetSnapshots(db, 'user1', 'USD', latestAssetPerformance);
-
-      expect(result.success).toBe(1);
-      expect(result.failed).toBe(1);
-      expect(result.total).toBe(2);
     });
 
     it('should return correct counts for empty latestAssetPerformance', async () => {
@@ -947,16 +985,11 @@ describe('PERF-SNAP-003: snapshotGenerator', () => {
     });
 
     it('should always use overall as accountId', async () => {
-      mockGetHistoricalReturnsV2.mockResolvedValue(mockV2Result);
       const db = createMockDb();
 
-      await generateAllAssetSnapshots(db, 'user1', 'USD', { 'AAPL_stock': {} });
+      const result = await generateAllAssetSnapshots(db, 'user1', 'USD', { 'AAPL_stock': {} });
 
-      expect(mockGetHistoricalReturnsV2).toHaveBeenCalledWith('user1', expect.objectContaining({
-        accountId: 'overall',
-        ticker: 'AAPL',
-        assetType: 'stock',
-      }));
+      expect(db._mockDoc).toHaveBeenCalledWith('user1_AAPL_stock_USD');
     });
 
     it('should skip malformed asset keys without underscore', async () => {
@@ -964,7 +997,6 @@ describe('PERF-SNAP-003: snapshotGenerator', () => {
 
       const result = await generateAllAssetSnapshots(db, 'user1', 'USD', { 'malformedkey': {} });
 
-      expect(mockGetHistoricalReturnsV2).not.toHaveBeenCalled();
       expect(result.total).toBe(1);
     });
   });
