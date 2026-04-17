@@ -15,6 +15,9 @@ const { generateLogoUrl } = require('../utils/logoGenerator');
 // PERF-SNAP-024: Importar generador de snapshots per-asset
 const { generateAllSnapshots, generateAllAssetSnapshots, fetchLatestAssetPerformance } = require('./snapshotGenerator');
 
+// VS-009: Importar servicio de benchmark snapshots
+const { updateBenchmarkSnapshots } = require('./benchmarkSnapshotService');
+
 /**
  * SCALE-001: Máximo de usuarios procesados en paralelo.
  * Calibrado para no exceder throughput de Firestore (~500 writes/sec).
@@ -1277,6 +1280,15 @@ exports.unifiedMarketDataUpdate = onSchedule({
       }
     }
     
+    // VS-009 Paso 5.5: Generar benchmarkSnapshots (best-effort)
+    try {
+      const benchmarkOp = logger.startOperation('generateBenchmarkSnapshots');
+      const benchmarkResult = await updateBenchmarkSnapshots(db, currentPrices, currencies, yesterday, logger);
+      benchmarkOp.success({ written: benchmarkResult.success, failed: benchmarkResult.failed, skipped: benchmarkResult.skipped });
+    } catch (benchmarkError) {
+      logger.warn('[VS-009] benchmarkSnapshots generation failed (non-critical)', { error: benchmarkError.message });
+    }
+
     const executionTime = (Date.now() - startTime) / 1000;
     
     // Paso 6: Actualizar systemStatus

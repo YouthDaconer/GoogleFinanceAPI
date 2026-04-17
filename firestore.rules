@@ -370,5 +370,18 @@ service cloud.firestore {
       allow read: if isAuthenticated();
       allow write: if false;
     }
+
+    // ============================================================
+    // VS-009: Benchmark Snapshots — Timelines de índices (SPY, QQQ)
+    // @see docs/stories/VS-009.story.md
+    // ============================================================
+
+    // ---- BENCHMARK SNAPSHOTS ----
+    // Timelines históricos de benchmarks — lectura para usuarios autenticados
+    // Escritura exclusiva del EOD pipeline (Admin SDK)
+    match /benchmarkSnapshots/{docId} {
+      allow read: if isAuthenticated();
+      allow write: if false;
+    }
   }
 }
