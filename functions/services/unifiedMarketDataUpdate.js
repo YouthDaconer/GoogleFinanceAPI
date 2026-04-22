@@ -841,7 +841,17 @@ async function processUserPerformance({
       const currencyCodes = snapshotCurrencies;
       const accountIds = accounts.map(a => a.id);
       const snapshotResult = await generateAllSnapshots(db, userId, currencyCodes, accountIds);
-      logInfo(`[EOD][Snapshot] Snapshots generados para ${userId}: ${snapshotResult.success} OK, ${snapshotResult.failed} fallidos`);
+      // R-02: Structured coverage log for auditing snapshot generation completeness.
+      // Frontend getMultiAccountHistoricalReturns requests per-account snapshots in the user's
+      // selected currency. If the selected currency differs from defaultCurrency, a miss occurs.
+      logInfo(`[SNAPSHOT-COVERAGE] ${JSON.stringify({
+        userId,
+        currencies: currencyCodes,
+        accounts: ['overall', ...accountIds],
+        success: snapshotResult.success,
+        failed: snapshotResult.failed,
+        total: snapshotResult.total,
+      })}`);
 
       // PERF-SNAP-025: Reutilizar dailyDocs ya leídos (0 re-fetch)
       const dailyDocsOverall = snapshotResult.dailyDocsByAccount?.get('overall');
@@ -871,6 +881,11 @@ async function processUserPerformance({
     try {
       const lastSnapshotTs = new Date().toISOString();
       await db.collection("portfolioPerformance").doc(userId).set({
+        lastSnapshotUpdate: lastSnapshotTs
+      }, { merge: true });
+      // R-08: Also write to userData so the frontend onSnapshot(userData) picks it up
+      // without a separate getDoc to portfolioPerformance. Saves 1 read + eliminates 30s poll.
+      await db.collection("userData").doc(userId).set({
         lastSnapshotUpdate: lastSnapshotTs
       }, { merge: true });
       logInfo(`[EOD][Snapshot] lastSnapshotUpdate written for ${userId}: ${lastSnapshotTs}`);

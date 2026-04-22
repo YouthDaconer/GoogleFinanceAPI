@@ -366,8 +366,14 @@ describe('PERF-SNAP-021: Snapshot in-memory cache', () => {
     });
 
     it('should include lastSnapshotUpdate in getHistoricalReturns response (AC3)', async () => {
-      const timestamp = '2026-04-13T00:10:00.000Z';
+      // R-03: readSnapshotSignal is called first (1 read), then getSnapshotWithCache
+      // receives the signal as a parameter (skips its own signal read).
+      // Use a timestamp OLDER than mockSnapshot.lastUpdated to avoid stale detection.
+      const timestamp = '2026-04-11T00:10:00.000Z';
+      mockBuildSnapshotDocId.mockReturnValue('user1_USD');
+      // 1st get(): readSnapshotSignal → portfolioPerformance/{userId}
       mockSnapshotGet.mockResolvedValueOnce({ exists: true, data: () => ({ lastSnapshotUpdate: timestamp }) });
+      // 2nd get(): getSnapshotWithCache → performanceSnapshots/{snapshotId}
       mockSnapshotGet.mockResolvedValueOnce({ exists: true, data: () => mockSnapshot });
 
       clearSnapshotMemCache();

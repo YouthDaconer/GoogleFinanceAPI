@@ -491,9 +491,11 @@ function _mergeIncrementalCache(existingCache, newPoints, range) {
  */
 const refreshIndexCache = onSchedule(
   {
-    // OPT-FIRESTORE-002: Solo trading days (martes-sábado UTC = lunes-viernes ET)
+    // OPT-FIRESTORE-002 W-01: Normalizado a America/New_York (era UTC).
+    // 00:30 ET Mar-Sáb = Lun-Vie post-market close.
+    // Antes: 00:30 UTC = 7:30 PM COT = horario activo del usuario → cascada de cache misses.
     schedule: "30 0 * * 2-6",
-    timeZone: "UTC",
+    timeZone: "America/New_York",
     region: "us-central1",
     memory: "512MiB",
     timeoutSeconds: 540,

@@ -74,10 +74,25 @@ function getSnapshotCacheTTL() {
   return isNYSEMarketOpen() ? MARKET_CACHE_TTL_MS : calculateTTLUntilNextEOD();
 }
 
-async function getSnapshotWithCache(snapshotId, userId) {
-  // PERF-SNAP-023: Read lastSnapshotUpdate for invalidation signal
+// R-03: Read the lastSnapshotUpdate signal once per CF invocation, reuse across N calls.
+async function readSnapshotSignal(userId) {
+  if (!userId) return null;
+  try {
+    const userPerfDoc = await db.doc(`portfolioPerformance/${userId}`).get();
+    return userPerfDoc.exists ? userPerfDoc.data()?.lastSnapshotUpdate || null : null;
+  } catch {
+    return null;
+  }
+}
+
+async function getSnapshotWithCache(snapshotId, userId, preloadedSignal) {
+  // R-03: Accept pre-loaded signal to avoid N reads of the same doc per CF invocation.
+  // If preloadedSignal is provided (string or null), skip Firestore read entirely.
+  // If preloadedSignal is undefined, read from Firestore (backwards-compatible).
   let lastSnapshotUpdate = null;
-  if (userId) {
+  if (preloadedSignal !== undefined) {
+    lastSnapshotUpdate = preloadedSignal;
+  } else if (userId) {
     try {
       const userPerfDoc = await db.doc(`portfolioPerformance/${userId}`).get();
       lastSnapshotUpdate = userPerfDoc.exists ? userPerfDoc.data()?.lastSnapshotUpdate || null : null;
@@ -99,9 +114,23 @@ async function getSnapshotWithCache(snapshotId, userId) {
   }
 
   const doc = await db.doc(`performanceSnapshots/${snapshotId}`).get();
-  if (!doc.exists) return { data: null, lastSnapshotUpdate };
+  if (!doc.exists) {
+    console.log(`[SNAPSHOT-MISS] ${JSON.stringify({ snapshotId, userId, reason: 'not-found' })}`);
+    return { data: null, lastSnapshotUpdate };
+  }
 
   const data = doc.data();
+
+  // OPT-FX-001: Detect stale Firestore snapshot (generated before last EOD run).
+  // Snapshots for non-default currencies (e.g. COP when defaultCurrency=USD) are
+  // only generated on-demand and never refreshed by the scheduled EOD pipeline.
+  // Without this check, the stale snapshot is served indefinitely.
+  if (lastSnapshotUpdate && data.lastUpdated &&
+      new Date(lastSnapshotUpdate).getTime() > new Date(data.lastUpdated).getTime()) {
+    console.log(`[SNAPSHOT-MISS] ${JSON.stringify({ snapshotId, userId, reason: 'stale', snapshotLastUpdated: data.lastUpdated, signalLastUpdate: lastSnapshotUpdate })}`);
+    return { data: null, lastSnapshotUpdate };
+  }
+
   snapshotMemCache.set(snapshotId, { data, cachedAt: Date.now() });
 
   if (snapshotMemCache.size > SNAPSHOT_MEM_CACHE_MAX_SIZE) {
@@ -385,10 +414,13 @@ async function getHistoricalReturns(context, payload) {
   console.log(`[queryHandlers][getHistoricalReturns] userId: ${userId}, currency: ${currency}, accountId: ${accountId}`);
 
   try {
+    // R-03: Read signal once, reuse across all snapshot lookups in this CF invocation.
+    const signal = await readSnapshotSignal(userId);
+
     // PERF-SNAP-024: Per-asset snapshot read path (antes del bypass legacy)
     if (ticker && assetType && !forceRefresh) {
       const assetSnapshotId = buildSnapshotDocId(userId, accountId, currency, ticker, assetType);
-      const assetSnapshotResult = await getSnapshotWithCache(assetSnapshotId, userId);
+      const assetSnapshotResult = await getSnapshotWithCache(assetSnapshotId, userId, signal);
       const assetSnapshot = assetSnapshotResult.data;
 
       if (assetSnapshot) {
@@ -436,7 +468,7 @@ async function getHistoricalReturns(context, payload) {
     // PERF-SNAP-007/021: Intentar leer snapshot (cache in-memory → Firestore)
     if (!forceRefresh) {
       const snapshotDocId = buildSnapshotDocId(userId, accountId, currency);
-      const snapshotResult = await getSnapshotWithCache(snapshotDocId, userId);
+      const snapshotResult = await getSnapshotWithCache(snapshotDocId, userId, signal);
       const snapshot = snapshotResult.data;
 
       if (snapshot) {
@@ -643,10 +675,12 @@ async function getMultiAccountHistoricalReturns(context, payload) {
     // ============================================================================
     // PERF-SNAP-008: Snapshot path — N reads en vez de N full collection scans
     // Uses getSnapshotWithCache for in-memory cache + lastSnapshotUpdate invalidation
+    // R-03: Read signal once, reuse across all N snapshot lookups.
     // ============================================================================
     if (!forceRefresh && !ticker && !assetType) {
+      const signal = await readSnapshotSignal(userId);
       const snapshotPromises = accountIds.map(accountId =>
-        getSnapshotWithCache(buildSnapshotDocId(userId, accountId, currency), userId)
+        getSnapshotWithCache(buildSnapshotDocId(userId, accountId, currency), userId, signal)
       );
       const snapshotResults = await Promise.all(snapshotPromises);
 
