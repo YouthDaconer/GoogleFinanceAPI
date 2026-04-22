@@ -63,7 +63,8 @@ const { isNYSEMarketOpen, calculateTTLUntilNextEOD, MARKET_CACHE_TTL_MS } = requ
 
 const VALID_INDEX_RANGES = ["1M", "3M", "6M", "YTD", "1Y", "5Y", "MAX"];
 const INDEX_CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 horas
-const INDEX_INTRADAY_CACHE_TTL_MS = 5 * 60 * 1000; // 5 min (cuando falta punto de hoy)
+// OPT-FIRESTORE-002: Aumentado de 5min a 1h (consistente con indexHistoryService)
+const INDEX_INTRADAY_CACHE_TTL_MS = 60 * 60 * 1000; // 1 hora (cuando falta punto de hoy)
 
 // PERF-SNAP-021: In-memory cache para snapshots a nivel de módulo (sobrevive warm starts)
 const SNAPSHOT_MEM_CACHE_MAX_SIZE = 100;
@@ -137,73 +138,19 @@ async function getCurrentPricesForUser(context, payload) {
   const { auth } = context;
   const userId = auth.uid;
 
-  console.log(`[queryHandlers][getCurrentPricesForUser] userId: ${userId}`);
-
-  try {
-    // 1. Obtener portfolioAccounts activas del usuario
-    const accountsSnapshot = await db.collection('portfolioAccounts')
-      .where('userId', '==', userId)
-      .where('isActive', '==', true)
-      .get();
-    
-    if (accountsSnapshot.empty) {
-      console.log(`[queryHandlers][getCurrentPricesForUser] Usuario sin cuentas activas`);
-      return { prices: [], symbols: [], timestamp: Date.now(), source: 'none' };
-    }
-    
-    const accountIds = accountsSnapshot.docs.map(doc => doc.id);
-    
-    // 2. Obtener símbolos únicos de assets activos
-    const symbolsSet = new Set();
-    
-    for (let i = 0; i < accountIds.length; i += 10) {
-      const batchAccountIds = accountIds.slice(i, i + 10);
-      
-      const assetsSnapshot = await db.collection('assets')
-        .where('portfolioAccount', 'in', batchAccountIds)
-        .where('isActive', '==', true)
-        .get();
-      
-      assetsSnapshot.docs.forEach(doc => {
-        const name = doc.data().name;
-        if (name) {
-          symbolsSet.add(name);
-        }
-      });
-    }
-    
-    const symbols = Array.from(symbolsSet);
-    
-    if (symbols.length === 0) {
-      console.log(`[queryHandlers][getCurrentPricesForUser] Usuario sin assets activos`);
-      return { prices: [], symbols: [], timestamp: Date.now(), source: 'none' };
-    }
-    
-    // OPT-DEMAND-CLEANUP: Obtener precios del API Lambda en lugar de Firestore
-    console.log(`[queryHandlers][getCurrentPricesForUser] Consultando API Lambda para ${symbols.length} símbolos`);
-    
-    const pricesFromApi = await getPricesFromApi(symbols);
-    
-    // Formatear respuesta para mantener compatibilidad con el frontend
-    const prices = pricesFromApi.map(price => ({
-      id: price.symbol,
-      symbol: price.symbol,
-      ...price
-    }));
-    
-    console.log(`[queryHandlers][getCurrentPricesForUser] Éxito - ${prices.length} precios desde API Lambda`);
-    
-    return {
-      prices,
-      symbols,
-      timestamp: Date.now(),
-      source: 'api-lambda'  // OPT-DEMAND-CLEANUP: Indicar fuente de datos
-    };
-
-  } catch (error) {
-    console.error(`[queryHandlers][getCurrentPricesForUser] Error:`, error);
-    throw new HttpsError('internal', 'Error al obtener precios del usuario');
-  }
+  // OPT-FIRESTORE-002 P0-B+: Frontend hook useUserCurrentPrices is dead code (0 imports).
+  // Remaining 396 calls/week come from stale browser bundles with polling.
+  // Short-circuit: return empty result without Firestore reads (-16K reads/mes).
+  // Main price path uses marketDataPollingManager → API Lambda directly.
+  console.log(`[queryHandlers][getCurrentPricesForUser] DEPRECATED — userId: ${userId} (stale client)`);
+  return {
+    prices: [],
+    symbols: [],
+    timestamp: Date.now(),
+    source: 'deprecated',
+    _deprecated: true,
+    _message: 'getCurrentPricesForUser is deprecated. Use marketDataPollingManager for current prices.',
+  };
 }
 
 // ============================================================================
@@ -458,10 +405,27 @@ async function getHistoricalReturns(context, payload) {
         };
       }
 
-      console.log(`[PERF] Asset snapshot miss - ${assetSnapshotId}, falling back to legacy`);
-      generateAssetSnapshot(db, userId, accountId, currency, ticker, assetType).catch(err =>
-        console.warn(`[PERF] On-demand asset snapshot failed for ${assetSnapshotId}: ${err.message}`)
-      );
+      // OPT-FIRESTORE-002 P2-A: Await snapshot generation to avoid double-read with legacy.
+      // Previously fire-and-forget + legacy read the same daily docs twice (~27K reads/mes).
+      console.log(`[PERF] Asset snapshot miss - ${assetSnapshotId}, generating on-demand`);
+      try {
+        const generatedSnapshot = await generateAssetSnapshot(db, userId, accountId, currency, ticker, assetType);
+        if (generatedSnapshot) {
+          snapshotMemCache.set(assetSnapshotId, { data: generatedSnapshot, cachedAt: Date.now() });
+          const result = transformSnapshotToResponse(generatedSnapshot);
+          const now = new Date();
+          console.log(`[PERF] Asset snapshot generated on-demand - ${assetSnapshotId}`);
+          return {
+            ...result,
+            cacheHit: false,
+            lastCalculated: now.toISOString(),
+            validUntil: calculateDynamicTTL().toISOString(),
+            lastSnapshotUpdate: assetSnapshotResult.lastSnapshotUpdate || null,
+          };
+        }
+      } catch (err) {
+        console.warn(`[PERF] On-demand asset snapshot generation failed for ${assetSnapshotId}: ${err.message}`);
+      }
     }
 
     // PERF-SNAP-007: Ticker/AssetType → ruta legacy
@@ -491,12 +455,29 @@ async function getHistoricalReturns(context, payload) {
       }
 
       // PERF-SNAP-009: Log estandarizado con snapshotId para monitoreo
-      console.log(`[PERF] Snapshot not found for ${snapshotDocId}, falling back to legacy`);
+      console.log(`[PERF] Snapshot not found for ${snapshotDocId}, generating on-demand`);
 
-      // PERF-SNAP-009: Generación on-demand fire-and-forget
-      generatePerformanceSnapshot(db, userId, accountId, currency).catch(err =>
-        console.warn(`[PERF] On-demand snapshot generation failed for ${snapshotDocId}: ${err.message}`)
-      );
+      // OPT-FIRESTORE-002 P2-A: Await snapshot generation to avoid double-read.
+      // Previously fire-and-forget + legacy both read all daily docs (~27K reads/mes).
+      // Now: generate snapshot → use directly. Legacy only on failure.
+      try {
+        const generatedSnapshot = await generatePerformanceSnapshot(db, userId, accountId, currency);
+        if (generatedSnapshot) {
+          snapshotMemCache.set(snapshotDocId, { data: generatedSnapshot, cachedAt: Date.now() });
+          const result = transformSnapshotToResponse(generatedSnapshot);
+          const now = new Date();
+          console.log(`[PERF] Snapshot generated on-demand - ${snapshotDocId}`);
+          return {
+            ...result,
+            cacheHit: false,
+            lastCalculated: now.toISOString(),
+            validUntil: calculateDynamicTTL().toISOString(),
+            lastSnapshotUpdate: snapshotResult.lastSnapshotUpdate || null,
+          };
+        }
+      } catch (err) {
+        console.warn(`[PERF] On-demand snapshot generation failed for ${snapshotDocId}: ${err.message}`);
+      }
     }
 
     // Fallback a ruta legacy (V2/V1 + cache)

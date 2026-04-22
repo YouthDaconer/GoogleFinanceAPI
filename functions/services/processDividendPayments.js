@@ -26,6 +26,15 @@ exports.processDividendPayments = onSchedule({
 
   console.log(`Verificando dividendos para la fecha ${formattedDate}`);
 
+  // OPT-FIRESTORE-002: Early exit en weekends y feriados.
+  // Los dividendos solo se pagan en trading days. Ejecutar en weekends
+  // lee ~1,800 assets × 2 veces/día sin resultado = ~25K lecturas/semana desperdiciadas.
+  const dayOfWeek = now.weekday; // 1=Monday ... 7=Sunday
+  if (dayOfWeek === 6 || dayOfWeek === 7) {
+    console.log(`[processDividendPayments] Skipping - weekend (day ${dayOfWeek})`);
+    return null;
+  }
+
   try {
     // Primero actualizar información de dividendos para ETFs y acciones sin datos
     console.log('Actualizando información de dividendos de activos...');

@@ -531,7 +531,9 @@ const { RATE_LIMITS_COLLECTION } = require('./utils/rateLimiter');
  */
 exports.cleanupRateLimits = onSchedule(
   {
-    schedule: '0 * * * *',
+    // OPT-FIRESTORE-002: Reducido de cada hora a cada 12h.
+    // Con pocos usuarios activos, los rate limits apenas se acumulan.
+    schedule: '0 */12 * * *',
     timeZone: 'America/New_York',
     retryCount: 1,
     memory: '256MiB',

@@ -261,7 +261,9 @@ async function generatePerformanceSnapshot(db, userId, accountId, currency, opti
   const docId = buildSnapshotDocId(userId, accountId, currency);
   console.log(`[snapshotGenerator] Writing snapshot ${docId} — timeline: ${timeline.length} points`);
   await db.collection('performanceSnapshots').doc(docId).set(snapshot);
-  return true;
+  // OPT-FIRESTORE-002 P2-A: Return snapshot object so callers can use it directly
+  // without an additional Firestore read. Truthy, so `if (wrote)` checks still work.
+  return snapshot;
 }
 
 // PERF-SNAP-025: Pre-filtrar docs que contienen data del activo específico
@@ -501,7 +503,8 @@ async function generateAssetSnapshot(db, userId, accountId, currency, ticker, as
   console.log(`[snapshotGenerator] Writing asset snapshot ${docId} — timeline: ${timeline.length} points (daily)`);
 
   await db.collection('performanceSnapshots').doc(docId).set(snapshot);
-  return true;
+  // OPT-FIRESTORE-002 P2-A: Return snapshot object (truthy, backward-compatible)
+  return snapshot;
 }
 
 async function generateAllAssetSnapshots(db, userId, currency, latestAssetPerformance, options = {}) {

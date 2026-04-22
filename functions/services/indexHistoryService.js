@@ -31,7 +31,9 @@ const callableConfig = {
 
 const VALID_RANGES = ["1M", "3M", "6M", "YTD", "1Y", "5Y", "MAX"];
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 horas (histórico)
-const INTRADAY_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutos (para punto intraday en memoria)
+// OPT-FIRESTORE-002: Aumentado de 5min a 1h para reducir cache misses on-demand.
+// Los datos de índice son para referencia visual en charts, no para trading en tiempo real.
+const INTRADAY_CACHE_TTL_MS = 60 * 60 * 1000; // 1 hora (cuando falta punto intraday de hoy)
 
 // In-memory cache for intraday quote (avoids hammering API on every CF call)
 let _intradayCache = { data: null, timestamp: 0 };
@@ -415,86 +417,235 @@ function calculateDateRange(range) {
 }
 
 // ============================================================================
+// FUNCIÓN AUXILIAR: _mergeIncrementalCache
+// ============================================================================
+
+/**
+ * OPT-FIRESTORE-002 P0-D+: Merge incremental — combina datos existentes del cache
+ * con nuevos puntos de Firestore sin re-leer toda la subcolección dates.
+ *
+ * @param {Object} existingCache - Datos actuales del cache doc
+ * @param {Array} newPoints - Nuevos puntos de datos [{date, value, percentChange}]
+ * @param {string} range - Rango de tiempo (para calcular ventana de trimming)
+ * @returns {Object} Datos actualizados listos para escribir en indexCache
+ */
+function _mergeIncrementalCache(existingCache, newPoints, range) {
+  const { startDate } = calculateDateRange(range);
+
+  // Merge: existing + new, dedup by date (prefer new → official close reemplaza intraday)
+  const dateMap = new Map();
+  for (const point of existingCache.chartData) {
+    dateMap.set(point.date, point);
+  }
+  for (const point of newPoints) {
+    dateMap.set(point.date, point); // overwrites intraday with official close
+  }
+
+  // Sort by date + trim before startDate (sliding window ranges)
+  let mergedData = Array.from(dateMap.values())
+    .filter(point => point.date >= startDate)
+    .sort((a, b) => a.date.localeCompare(b.date));
+
+  // Recalculate overallChange and latestValue
+  let overallChange = 0;
+  let latestValue = 0;
+
+  if (mergedData.length >= 2) {
+    const initialValue = mergedData[0].value;
+    latestValue = mergedData[mergedData.length - 1].value;
+    if (initialValue > 0 && isFinite(initialValue) && isFinite(latestValue)) {
+      overallChange = ((latestValue - initialValue) / initialValue) * 100;
+    }
+  } else if (mergedData.length === 1) {
+    latestValue = mergedData[0].value;
+  }
+
+  if (!isFinite(overallChange)) overallChange = 0;
+  if (!isFinite(latestValue)) latestValue = 0;
+
+  return {
+    chartData: mergedData,
+    overallChange: Math.round(overallChange * 100) / 100,
+    latestValue: Math.round(latestValue * 100) / 100,
+    indexInfo: existingCache.indexInfo,
+  };
+}
+
+// ============================================================================
 // CLOUD FUNCTION: refreshIndexCache (Scheduled)
 // ============================================================================
 
 /**
  * Función programada para refrescar todos los caches de índices.
  * Se ejecuta diariamente a las 00:30 UTC (después del cierre de mercados US).
+ *
+ * OPT-FIRESTORE-002 P0-D+: Refresh incremental — lee solo fechas nuevas de Firestore
+ * y las mergea con el cache existente en vez de recalcular los 7 rangos completos.
+ * Reduce lecturas de ~8,400/ejecución a ~108 (98.7% reducción).
+ *
+ * Patrón por índice:
+ *  1. Lee los 7 cache docs en paralelo (7 reads)
+ *  2. Query dates subcollection solo desde la última fecha cacheada (1 read, ~1-2 docs)
+ *  3. Merge incremental para cada rango (0 reads)
+ *  4. Cold start fallback a calculateIndexData si no hay cache previo
  */
 const refreshIndexCache = onSchedule(
   {
-    schedule: "30 0 * * *", // Diario a las 00:30 UTC
+    // OPT-FIRESTORE-002: Solo trading days (martes-sábado UTC = lunes-viernes ET)
+    schedule: "30 0 * * 2-6",
     timeZone: "UTC",
     region: "us-central1",
     memory: "512MiB",
-    timeoutSeconds: 540, // 9 minutos para procesar todos los índices
+    timeoutSeconds: 540,
   },
   async (event) => {
-    console.log("[refreshIndexCache] Iniciando refresh de caches de índices...");
+    console.log("[refreshIndexCache] Iniciando refresh incremental de caches de índices...");
 
     const startTime = Date.now();
     let refreshed = 0;
     let errors = 0;
+    let fullRecalcs = 0;
+    let incrementalMerges = 0;
     const errorDetails = [];
 
     try {
-      // Obtener lista de todos los índices
+      // 1. Obtener lista de todos los índices (también sirve como fallback de indexInfo)
       const indicesSnapshot = await db.collection("indexHistories").get();
-      const indices = indicesSnapshot.docs.map(doc => doc.id);
-      
-      console.log(`[refreshIndexCache] Procesando ${indices.length} índices x ${VALID_RANGES.length} rangos = ${indices.length * VALID_RANGES.length} caches`);
+      const indices = indicesSnapshot.docs.map(doc => ({ id: doc.id, data: doc.data() }));
 
-      // Procesar cada combinación índice + rango
-      for (const code of indices) {
-        for (const range of VALID_RANGES) {
-          try {
-            const result = await calculateIndexData(code, range);
-            const cacheKey = `${code}_${range}`;
-            
-            await db.collection("indexCache").doc(cacheKey).set({
-              ...result,
-              lastUpdated: Date.now(),
-            });
+      console.log(`[refreshIndexCache] Procesando ${indices.length} índices incrementalmente`);
 
-            refreshed++;
-            
-            // Log de progreso cada 20 caches
-            if (refreshed % 20 === 0) {
-              console.log(`[refreshIndexCache] Progreso: ${refreshed} caches actualizados`);
+      for (const index of indices) {
+        const code = index.id;
+
+        try {
+          // 2. Leer los 7 cache docs en paralelo
+          const cacheRefs = VALID_RANGES.map(range =>
+            db.collection("indexCache").doc(`${code}_${range}`).get()
+          );
+          const cacheDocs = await Promise.all(cacheRefs);
+
+          // 3. Determinar la última fecha cacheada (todas deberían coincidir)
+          let lastCachedDate = null;
+          for (const cacheDoc of cacheDocs) {
+            if (cacheDoc.exists) {
+              const data = cacheDoc.data();
+              const cd = data.chartData;
+              if (cd && cd.length > 0) {
+                const d = cd[cd.length - 1].date;
+                if (!lastCachedDate || d > lastCachedDate) lastCachedDate = d;
+              }
             }
-
-          } catch (error) {
-            errors++;
-            errorDetails.push(`${code}/${range}: ${error.message}`);
-            console.error(`[refreshIndexCache] Error procesando ${code}/${range}:`, error.message);
           }
+
+          // 4. Query nuevas fechas desde Firestore (solo dates >= lastCachedDate)
+          //    Usa >= para que el cierre oficial reemplace un posible punto intraday
+          const endDate = new Date().toISOString().split("T")[0];
+          let newPoints = [];
+
+          if (lastCachedDate) {
+            const newDatesSnapshot = await db
+              .collection("indexHistories").doc(code).collection("dates")
+              .where("date", ">=", lastCachedDate)
+              .where("date", "<=", endDate)
+              .orderBy("date", "asc")
+              .get();
+
+            newPoints = newDatesSnapshot.docs.map(doc => {
+              const d = doc.data();
+              const value = parseFloat(d.score) || 0;
+              let percentChange = parseFloat(d.percentChange) || 0;
+              if (!isFinite(percentChange)) percentChange = 0;
+              if (!isFinite(value)) return null;
+              return { date: d.date, value, percentChange };
+            }).filter(Boolean);
+
+            if (newPoints.length > 0) {
+              console.log(`[refreshIndexCache] ${code}: ${newPoints.length} punto(s) desde ${lastCachedDate}`);
+            }
+          }
+
+          // 5. Append intraday point so lastCachedDate === todayStr → 24h TTL
+          // OPT-FIRESTORE-002 R1: Without this, cache docs have yesterday's date,
+          // triggering 1h TTL → on-demand calculateIndexData on every CF call (~45K reads/day).
+          // With the intraday append, on-demand calls see today → 24h TTL → near-zero misses.
+          const todayStr = new Date().toISOString().split("T")[0];
+          const hasToday = newPoints.some(p => p.date === todayStr);
+          let intradayPoint = null;
+
+          if (!hasToday) {
+            // Only need to fetch once per index (same point for all 7 ranges)
+            // Uses the Yahoo Finance symbolMap inside _fetchIntradayPoint
+            intradayPoint = await _fetchIntradayPoint(code, todayStr);
+            if (intradayPoint) {
+              newPoints.push(intradayPoint);
+              console.log(`[refreshIndexCache] ${code}: appended intraday point ${intradayPoint.value} for ${todayStr}`);
+            }
+          }
+
+          // 6. Actualizar cada rango: incremental merge o full recalc
+          for (let i = 0; i < VALID_RANGES.length; i++) {
+            const range = VALID_RANGES[i];
+
+            try {
+              let result;
+              const cacheDoc = cacheDocs[i];
+              const hasValidCache = cacheDoc.exists
+                && cacheDoc.data().chartData?.length > 0
+                && cacheDoc.data().indexInfo;
+
+              if (hasValidCache && lastCachedDate) {
+                result = _mergeIncrementalCache(cacheDoc.data(), newPoints, range);
+                incrementalMerges++;
+              } else {
+                // Cold start: full recalculation
+                result = await calculateIndexData(code, range);
+                fullRecalcs++;
+              }
+
+              await db.collection("indexCache").doc(`${code}_${range}`).set({
+                ...result,
+                lastUpdated: Date.now(),
+              });
+
+              refreshed++;
+            } catch (error) {
+              errors++;
+              errorDetails.push(`${code}/${range}: ${error.message}`);
+              console.error(`[refreshIndexCache] Error ${code}/${range}:`, error.message);
+            }
+          }
+
+        } catch (error) {
+          errors += VALID_RANGES.length;
+          errorDetails.push(`${code}/*: ${error.message}`);
+          console.error(`[refreshIndexCache] Error procesando ${code}:`, error.message);
         }
       }
 
       const duration = Math.round((Date.now() - startTime) / 1000);
-      console.log(`[refreshIndexCache] Completado en ${duration}s: ${refreshed} caches actualizados, ${errors} errores`);
-      
+      console.log(
+        `[refreshIndexCache] Completado en ${duration}s: ${refreshed} caches ` +
+        `(${incrementalMerges} incremental, ${fullRecalcs} full), ${errors} errores`
+      );
+
       if (errorDetails.length > 0) {
-        console.log(`[refreshIndexCache] Errores detallados:`, errorDetails.slice(0, 10));
+        console.log(`[refreshIndexCache] Errores:`, errorDetails.slice(0, 10));
       }
 
-      return { 
-        success: true, 
-        refreshed, 
-        errors, 
+      return {
+        success: true,
+        refreshed,
+        incrementalMerges,
+        fullRecalcs,
+        errors,
         duration,
         totalIndices: indices.length,
       };
 
     } catch (error) {
       console.error("[refreshIndexCache] Error fatal:", error);
-      return { 
-        success: false, 
-        error: error.message,
-        refreshed,
-        errors,
-      };
+      return { success: false, error: error.message, refreshed, errors };
     }
   }
 );

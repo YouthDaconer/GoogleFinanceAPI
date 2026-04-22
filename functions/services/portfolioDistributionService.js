@@ -40,7 +40,9 @@ const SECTORS_CACHE_TTL = 60 * 60 * 1000; // 1 hora
 // Cache para países
 let countriesCache = null;
 let countriesCacheTimestamp = 0;
-const COUNTRIES_CACHE_TTL = 60 * 60 * 1000; // 1 hora
+// OPT-FIRESTORE-002: Aumentado de 1h a 24h. Los países son datos 100% estáticos.
+// Reduce de ~23 lecturas/día a ~1-2 (solo cold-starts).
+const COUNTRIES_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 horas
 
 // Cache para tasas de cambio de monedas
 let currencyRatesCache = null;
