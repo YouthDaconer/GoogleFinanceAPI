@@ -158,7 +158,7 @@ exports.updateRiskFreeRate = updateRiskFreeRate;
 
 exports.processDividendPaymentsV2 = processDividendPayments.processDividendPayments;
 exports.scheduledMarketStatusUpdateV2 = marketStatusService.scheduledMarketStatusUpdate;
-exports.scheduledMarketStatusUpdateAdditionalV2 = marketStatusService.scheduledMarketStatusUpdateAdditional;
+exports.scheduledMarketStatusUpdateTransitionsV2 = marketStatusService.scheduledMarketStatusUpdateTransitions;
 exports.updateMarketStatusHttpV2 = marketStatusService.updateMarketStatusHttp;
 
 // OPT-DEMAND-400-FIX: Sincronización de festivos de NYSE desde Finnhub

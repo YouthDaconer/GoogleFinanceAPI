@@ -155,12 +155,12 @@ exports.scheduledMarketStatusUpdate = onSchedule({
   return null;
 });
 
-// WS-OPT-009: Updates en minutos críticos de transición
-exports.scheduledMarketStatusUpdateAdditional = onSchedule({
-  // Minutos críticos:
-  // - 9:30 AM: Apertura exacta del mercado
-  // - 9:31 AM: Confirmación post-apertura (para clientes que cargaron justo antes)
-  schedule: '30,31 9 * * 1-5',
+// WS-OPT-009 + BUG-MARKET-001: Updates en minutos críticos de transición (apertura + cierre)
+// Cron combina ambas transiciones en una sola función (SRP: "transiciones de estado").
+// Minutos 1,2 cubren post-cierre (16:01, 16:02) y minutos 30,31 cubren post-apertura (9:30, 9:31).
+// Las ejecuciones extra (9:01, 9:02, 16:30, 16:31) son inofensivas — el estado ya es correcto.
+exports.scheduledMarketStatusUpdateTransitions = onSchedule({
+  schedule: '1,2,30,31 9,16 * * 1-5',
   timeZone: 'America/New_York',
   retryCount: 3,
   minBackoff: '1m',
@@ -286,7 +286,7 @@ module.exports = {
   getMarketStatus,
   syncMarketHolidays,
   scheduledMarketStatusUpdate: exports.scheduledMarketStatusUpdate,
-  scheduledMarketStatusUpdateAdditional: exports.scheduledMarketStatusUpdateAdditional,
+  scheduledMarketStatusUpdateTransitions: exports.scheduledMarketStatusUpdateTransitions,
   updateMarketStatusHttp: exports.updateMarketStatusHttp,
   scheduledHolidaySync: exports.scheduledHolidaySync,
   syncHolidaysHttp: exports.syncHolidaysHttp
