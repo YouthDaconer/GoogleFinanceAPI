@@ -656,7 +656,11 @@ async function sellAsset(context, payload) {
     const realizedPnL = cleanDecimal((sellPrice - buyPrice) * sellAmount);
 
     const remainingUnits = cleanDecimal(currentUnits - sellAmount);
-    const isFullSale = Math.abs(remainingUnits) < Number.EPSILON || remainingUnits <= 0;
+    // FIX-ROUNDING-001: Number.EPSILON (~2.2e-16) es demasiado estricto para redondeo financiero.
+    // cleanDecimal redondea a 8 decimales, así que residuos de ~1e-8 son posibles.
+    // Usar 0.0001 como threshold práctico: cualquier residuo menor a 0.01% de una unidad
+    // se considera venta total, evitando assets fantasma con units ~0.
+    const isFullSale = Math.abs(remainingUnits) < 0.0001 || remainingUnits <= 0;
 
     // 7. Ejecutar transacción atómica
     const batch = db.batch();
@@ -828,7 +832,8 @@ async function sellPartialAssetsFIFO(context, payload) {
 
       const assetRef = db.collection('assets').doc(asset.id);
       const remainingUnits = cleanDecimal(assetUnits - unitsToSellFromAsset);
-      const isFullSale = Math.abs(remainingUnits) < Number.EPSILON;
+      // FIX-ROUNDING-001: Usar threshold práctico en vez de Number.EPSILON
+      const isFullSale = Math.abs(remainingUnits) < 0.0001;
 
       if (isFullSale) {
         batch.update(assetRef, { units: 0, isActive: false });

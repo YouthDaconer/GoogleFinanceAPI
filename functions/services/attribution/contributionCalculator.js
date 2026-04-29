@@ -625,13 +625,34 @@ async function calculateContributions(userId, period, currency = 'USD', accountI
     if (isNewAsset) {
       // Activo nuevo: la contribución es el P&L desde la compra
       totalChange = unrealizedPnL + realizedPnLInPeriod;
-    } else if (priceStart > 0) {
-      // FIX-ATTRIBUTION-002: Para CUALQUIER activo existente (compras, ventas, o sin cambio)
-      // Usar la misma fórmula: efecto del cambio de precio sobre unidades iniciales
-      // Esto aísla correctamente el rendimiento y evita incluir cashflows como rendimiento
+    } else if (priceStart > 0 && (unitsEnd > 0 || !hasPartialSales)) {
+      // Activo existente con unidades restantes (o sin ventas):
+      // Aislar efecto del cambio de precio sobre unidades iniciales
       const priceChange = priceEnd - priceStart;
       const valueChangeFromPrice = priceChange * unitsStart;
       totalChange = valueChangeFromPrice + realizedPnLInPeriod;
+    } else if (hasPartialSales && unitsEnd === 0 && totalSoldAmount > 0) {
+      // =========================================================================
+      // FIX-ATTR-003: Venta TOTAL de un activo existente (unitsEnd = 0)
+      //
+      // Fórmula: realizedPnLInPeriod - unrealizedPnLAtStart
+      //
+      // Esto funciona porque:
+      // - realizedPnL captura la ganancia real de TODAS las ventas (vs precio de compra)
+      // - unrealizedPnLAtStart descuenta la ganancia que ya existía al inicio del período
+      //   (que no es ganancia del período, sino de períodos anteriores)
+      //
+      // Ejemplo META: vendió 0.6137 unidades (0.202 originales + 0.4117 compradas en YTD)
+      //   - totalSoldRevenue = $420 (INCORRECTO si se resta de valueStart: $420-$131=$289)
+      //   - realizedPnL = $55.85 (ganancia real de todas las ventas)
+      //   - unrealizedPnLAtStart = $3.41 (ganancia pre-existente de las 0.202 unidades)
+      //   - totalChange = $55.85 - $3.41 = $52.44 (ganancia real del período)
+      //
+      // La fórmula anterior (totalSoldRevenue - valueStart) era incorrecta cuando
+      // hubo compras intermedias, porque contaba el capital inyectado como ganancia.
+      // =========================================================================
+      const unrealizedPnLAtStart = startAssetData?.unrealizedProfitAndLoss || 0;
+      totalChange = realizedPnLInPeriod - unrealizedPnLAtStart;
     } else {
       // Fallback para casos edge (ej: precio inicial 0)
       const periodValueChange = assetValueEnd - assetValueStart;
@@ -645,12 +666,23 @@ async function calculateContributions(userId, period, currency = 'USD', accountI
     
     // Calcular peso actual (usando peso al final del período)
     const weight = totalPortfolioValue > 0 ? assetValueEnd / totalPortfolioValue : 0;
+    // FIX-ATTR-003: Para activos vendidos completamente, usar peso al inicio del período
+    const weightAtStart = startTotalValue > 0 ? assetValueStart / startTotalValue : 0;
+    const isSold = unitsEnd === 0 && hasPartialSales;
     
     console.log(`[Attribution] ${ticker}: startVal=$${assetValueStart.toFixed(2)}, endVal=$${assetValueEnd.toFixed(2)}, units=${unitsStart.toFixed(4)}->${unitsEnd.toFixed(4)}${hasUnitChange ? ' (cambio)' : ''}${isNewAsset ? ' (NUEVO)' : ''}, periodReturn=${periodReturn.toFixed(2)}%, weight=${(weight*100).toFixed(2)}%, contribution=${contribution.toFixed(4)}pp`);
     
     // ROI para mostrar: usar el retorno del período calculado
     let displayROI = periodReturn;
-    if (realizedPnLInPeriod !== 0 && totalSoldAmount > 0) {
+    if (isSold && priceStart > 0 && totalSoldAmount > 0) {
+      // FIX-ATTR-003: Para ventas totales, calcular ROI basado en el precio promedio
+      // de venta vs el precio al inicio del período
+      const totalUnitsSold = sellData?.transactions?.reduce((sum, t) => sum + (parseFloat(t.amount) || 0), 0) || 0;
+      if (totalUnitsSold > 0) {
+        const avgSellPrice = totalSoldAmount / totalUnitsSold;
+        displayROI = ((avgSellPrice - priceStart) / priceStart) * 100;
+      }
+    } else if (realizedPnLInPeriod !== 0 && totalSoldAmount > 0) {
       // Ajustar ROI si hubo ventas parciales para incluir P&L realizada
       const costOfSold = totalSoldAmount - realizedPnLInPeriod;
       const totalInvestmentIncludingSold = assetInvestment + costOfSold;
@@ -667,10 +699,11 @@ async function calculateContributions(userId, period, currency = 'USD', accountI
       sector: 'Unknown',
       logo: null,
       type: type.toLowerCase(),
-      status: 'active',
-      weightStart: weight,
+      // FIX-ATTR-003: Marcar como 'sold' si no quedan unidades al final del período
+      status: isSold ? 'sold' : 'active',
+      weightStart: isSold ? weightAtStart : weight,
       weightEnd: weight,
-      weightAverage: weight,
+      weightAverage: isSold ? weightAtStart : weight,
       returnPercent: displayROI, // Retorno del período (basado en precio si hubo cambio de unidades)
       contribution,
       contributionAbsolute: totalChange,
@@ -702,23 +735,45 @@ async function calculateContributions(userId, period, currency = 'USD', accountI
     if (processedAssetKeys.has(assetKey)) continue; // Ya procesado arriba
     
     const realizedPnL = sellData.totalRealizedPnL;
-    const costBasis = sellData.totalSold - realizedPnL; // Costo aproximado
+    const totalSoldRevenue = sellData.totalSold; // sellPrice × units (ingreso real)
+    const costBasis = totalSoldRevenue - realizedPnL; // Costo original
     
-    // Contribución = P&L realizada como % del valor inicial del portafolio
+    // =========================================================================
+    // FIX-ATTR-003: Contribución = realizedPnL - unrealizedPnLAtStart
+    //
+    // Misma fórmula que la sección 5 para ventas totales.
+    // Si el activo existía al inicio del período, descontamos la ganancia
+    // pre-existente (unrealizedPnL) para obtener solo la ganancia del período.
+    // Si no existía (comprado y vendido dentro del período), toda la
+    // realizedPnL es ganancia del período.
+    // =========================================================================
+    const startAssetData = startAssetPerformance[assetKey];
+    const assetValueAtStart = startAssetData?.totalValue || 0;
+    const unrealizedPnLAtStart = startAssetData?.unrealizedProfitAndLoss || 0;
+    const periodChange = realizedPnL - unrealizedPnLAtStart;
+    
     const contribution = startTotalValue > 0 
-      ? (realizedPnL / startTotalValue) * 100 
+      ? (periodChange / startTotalValue) * 100 
       : 0;
     
-    // ROI de la posición cerrada = P&L / Costo
-    const returnPercent = costBasis > 0 ? (realizedPnL / costBasis) * 100 : 0;
+    // ROI del período = precio promedio de venta vs precio al inicio del período
+    const startUnits = startAssetData?.units || 0;
+    const priceAtStart = startUnits > 0 ? assetValueAtStart / startUnits : 0;
+    const totalUnitsSold = sellData.transactions.reduce((sum, t) => sum + (parseFloat(t.amount) || 0), 0);
+    const avgSellPrice = totalUnitsSold > 0 ? totalSoldRevenue / totalUnitsSold : 0;
+    const returnPercent = (priceAtStart > 0 && avgSellPrice > 0)
+      ? ((avgSellPrice - priceAtStart) / priceAtStart) * 100
+      : (costBasis > 0 ? (realizedPnL / costBasis) * 100 : 0);
     
-    // Peso que tenía el activo al momento de venderlo (aproximado)
-    const weightAtSale = startTotalValue > 0 ? costBasis / startTotalValue : 0;
+    // Peso que tenía el activo al inicio del período
+    const weightAtStart = startTotalValue > 0 
+      ? (assetValueAtStart || costBasis) / startTotalValue 
+      : 0;
     
     // Solo agregar si la contribución es significativa
     if (Math.abs(contribution) < 0.01) continue;
     
-    console.log(`[Attribution] ${sellData.ticker}: Posición cerrada con contribución: ${contribution.toFixed(2)}pp ($${realizedPnL.toFixed(2)}) ROI: ${returnPercent.toFixed(1)}%`);
+    console.log(`[Attribution] ${sellData.ticker}: Posición cerrada - periodChange=$${periodChange.toFixed(2)}, contribution=${contribution.toFixed(2)}pp, realizedPnL=$${realizedPnL.toFixed(2)}, unrealizedPnLAtStart=$${unrealizedPnLAtStart.toFixed(2)}`);
     
     attributions.push({
       assetKey: `${assetKey}_sold`,
@@ -727,19 +782,22 @@ async function calculateContributions(userId, period, currency = 'USD', accountI
       sector: 'Unknown',
       type: sellData.assetType.toLowerCase(),
       status: 'sold',
-      weightStart: weightAtSale, // Peso aproximado al vender
+      weightStart: weightAtStart,
       weightEnd: 0,
-      weightAverage: weightAtSale / 2, // Aproximación
-      returnPercent, // ROI de la posición cerrada
+      weightAverage: weightAtStart / 2, // Aproximación
+      returnPercent,
       contribution,
-      contributionAbsolute: realizedPnL, // Valor absoluto de la ganancia/pérdida
-      valueStart: costBasis,
+      contributionAbsolute: periodChange,
+      valueStart: assetValueAtStart || costBasis,
       valueEnd: 0,
-      valueChange: realizedPnL,
+      valueChange: periodChange,
       hasPartialSales: false,
       _source: {
         realizedPnL,
         costBasis,
+        periodChange,
+        assetValueAtStart,
+        totalSoldRevenue,
         transactionCount: sellData.transactions.length
       }
     });
