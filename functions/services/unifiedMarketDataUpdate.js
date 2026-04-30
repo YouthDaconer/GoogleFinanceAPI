@@ -13,7 +13,10 @@ const { generateLogoUrl } = require('../utils/logoGenerator');
 
 // PERF-SNAP-004: Importar generador de snapshots pre-computados
 // PERF-SNAP-024: Importar generador de snapshots per-asset
-const { generateAllSnapshots, generateAllAssetSnapshots, fetchLatestAssetPerformance } = require('./snapshotGenerator');
+const { generateAllSnapshots, generateAllAssetSnapshots, fetchLatestAssetPerformance, fetchAllDailyDocs, generatePerformanceSnapshot, generateAssetSnapshot, buildSnapshotDocId } = require('./snapshotGenerator');
+
+// OPT-SNAP-INCR: Importar servicio de actualización incremental de snapshots
+const { updateSnapshotIncremental, updateAssetSnapshotIncremental } = require('./snapshotIncrementalService');
 
 // VS-009: Importar servicio de benchmark snapshots
 const { updateBenchmarkSnapshots } = require('./benchmarkSnapshotService');
@@ -71,6 +74,12 @@ const API_BASE_URL = FINANCE_QUERY_API_URL;
 
 // Flag para habilitar logs detallados (puede causar mucho ruido en producción)
 const ENABLE_DETAILED_LOGS = process.env.ENABLE_DETAILED_LOGS === 'true';
+
+// OPT-SNAP-INCR: Feature flag para rollback a regeneración completa de snapshots
+// Set SNAPSHOT_INCREMENTAL_ENABLED=false para revertir al comportamiento anterior
+function isSnapshotIncrementalEnabled() {
+  return process.env.SNAPSHOT_INCREMENTAL_ENABLED !== 'false';
+}
 
 // Horarios de NYSE en hora local de Nueva York (no UTC)
 // Esto maneja automáticamente EST/EDT gracias a Luxon
@@ -686,6 +695,9 @@ async function processUserPerformance({
       ...overallPerformance
     });
 
+    // OPT-SNAP-INCR: Collect account performances for incremental snapshot update
+    const accountPerformancesMap = new Map();
+
     // Procesar cada cuenta del usuario
     for (const account of accounts) {
       const accountSellTransactions = sellTransactionsByAccount[account.id] || [];
@@ -820,11 +832,15 @@ async function processUserPerformance({
         date: formattedDate,
         ...accountPerformance
       });
+
+      // OPT-SNAP-INCR: Store for incremental snapshot update
+      accountPerformancesMap.set(account.id, accountPerformance);
     }
 
     await batch.commit();
 
-    // PERF-SNAP-004: Generar snapshots pre-computados (best-effort, no bloquea pipeline)
+    // OPT-SNAP-INCR: Snapshot incremental append (1 read + 1 write per snapshot)
+    // Feature flag allows instant rollback to legacy full-rebuild path
     try {
       // PERF-SNAP-026: Smart Currency — solo USD + defaultCurrency del usuario
       let snapshotCurrencies = ['USD'];
@@ -834,46 +850,119 @@ async function processUserPerformance({
         if (defaultCurrency && defaultCurrency !== 'USD') {
           snapshotCurrencies.push(defaultCurrency);
         }
-        logInfo(`[EOD][Snapshot] Currencies for ${userId}: [${snapshotCurrencies.join(', ')}] (default: ${defaultCurrency || 'USD'})`);
       } catch (currencyReadError) {
         logWarn(`[EOD][Snapshot] Could not read defaultCurrency for ${userId}, using USD only: ${currencyReadError.message}`);
       }
-      const currencyCodes = snapshotCurrencies;
+
       const accountIds = accounts.map(a => a.id);
-      const snapshotResult = await generateAllSnapshots(db, userId, currencyCodes, accountIds);
-      // R-02: Structured coverage log for auditing snapshot generation completeness.
-      // Frontend getMultiAccountHistoricalReturns requests per-account snapshots in the user's
-      // selected currency. If the selected currency differs from defaultCurrency, a miss occurs.
-      logInfo(`[SNAPSHOT-COVERAGE] ${JSON.stringify({
-        userId,
-        currencies: currencyCodes,
-        accounts: ['overall', ...accountIds],
-        success: snapshotResult.success,
-        failed: snapshotResult.failed,
-        total: snapshotResult.total,
-      })}`);
 
-      // PERF-SNAP-025: Reutilizar dailyDocs ya leídos (0 re-fetch)
-      const dailyDocsOverall = snapshotResult.dailyDocsByAccount?.get('overall');
+      if (isSnapshotIncrementalEnabled()) {
+        // === INCREMENTAL PATH (OPT-SNAP-INCR) ===
+        const allAccountIds = ['overall', ...accountIds];
+        let snapshotSuccess = 0;
+        let snapshotFailed = 0;
+        const methods = { incremental: 0, 'full-rebuild': 0, skipped: 0 };
 
-      // PERF-SNAP-024+025: Generar snapshots per-asset (best-effort)
-      if (dailyDocsOverall) {
-        try {
-          for (const currencyCode of currencyCodes) {
-            const latestAssetPerf = await fetchLatestAssetPerformance(db, userId, 'overall', currencyCode);
-            if (Object.keys(latestAssetPerf).length > 0) {
-              const assetResult = await generateAllAssetSnapshots(db, userId, currencyCode, latestAssetPerf, {
-                dailyDocs: dailyDocsOverall,
-              });
-              logInfo(`[EOD][Snapshot] Asset snapshots para ${userId}/${currencyCode}: ${assetResult.success} OK, ${assetResult.failed} fallidos`);
+        // Portfolio snapshots (overall + per-account)
+        for (const accountId of allAccountIds) {
+          const perfData = accountId === 'overall'
+            ? overallPerformance
+            : accountPerformancesMap.get(accountId);
+
+          if (!perfData) continue;
+
+          for (const currency of snapshotCurrencies) {
+            try {
+              // M3-FIX: Guard against currency not existing in perfData
+              const currencyData = perfData[currency];
+              if (!currencyData || (currencyData.totalValue === undefined && currencyData.totalInvestment === undefined)) {
+                continue;
+              }
+
+              const dailyData = {
+                date: formattedDate,
+                totalValue: currencyData.totalValue ?? 0,
+                totalInvestment: currencyData.totalInvestment ?? 0,
+                adjustedDailyChangePercentage: currencyData.adjustedDailyChangePercentage ?? 0,
+                dailyChangePercentage: currencyData.dailyChangePercentage ?? 0,
+                totalCashFlow: currencyData.totalCashFlow ?? 0,
+                doneProfitAndLoss: currencyData.doneProfitAndLoss ?? 0,
+                unrealizedProfitAndLoss: currencyData.unrealizedProfitAndLoss ?? 0,
+                assetPerformance: currencyData.assetPerformance || {},
+              };
+
+              const docId = buildSnapshotDocId(userId, accountId, currency);
+              const result = await updateSnapshotIncremental(db, docId, dailyData);
+
+              if (result.method === 'full-rebuild') {
+                const dailyDocs = await fetchAllDailyDocs(db, userId, accountId);
+                await generatePerformanceSnapshot(db, userId, accountId, currency, { dailyDocs });
+                methods['full-rebuild']++;
+              } else {
+                methods[result.method]++;
+              }
+              snapshotSuccess++;
+            } catch (err) {
+              snapshotFailed++;
+              logWarn(`[OPT-SNAP-INCR] Portfolio snapshot failed ${userId}/${accountId}/${currency}: ${err.message}`);
             }
           }
-        } catch (assetSnapshotError) {
-          logWarn(`[EOD][Snapshot] Error generando asset snapshots para ${userId}: ${assetSnapshotError.message}`);
+        }
+
+        // Asset snapshots (overall only, incremental)
+        // H2-FIX: Cache dailyDocs to avoid re-fetching for each asset on first deploy
+        let cachedOverallDailyDocs = null;
+
+        for (const currency of snapshotCurrencies) {
+          const overallCurrencyData = overallPerformance[currency] || {};
+          const assetPerf = overallCurrencyData.assetPerformance || {};
+
+          for (const [assetKey, assetData] of Object.entries(assetPerf)) {
+            const parts = assetKey.split('_');
+            if (parts.length < 2) continue;
+            const assetType = parts.pop();
+            const ticker = parts.join('_');
+
+            try {
+              const docId = buildSnapshotDocId(userId, 'overall', currency, ticker, assetType);
+              const result = await updateAssetSnapshotIncremental(db, docId, assetData, formattedDate);
+
+              if (result.method === 'full-rebuild') {
+                // H2-FIX: Reuse cached dailyDocs across all assets needing full rebuild
+                if (!cachedOverallDailyDocs) {
+                  cachedOverallDailyDocs = await fetchAllDailyDocs(db, userId, 'overall');
+                }
+                await generateAssetSnapshot(db, userId, 'overall', currency, ticker, assetType, { dailyDocs: cachedOverallDailyDocs });
+                methods['full-rebuild']++;
+              } else {
+                methods[result.method]++;
+              }
+              snapshotSuccess++;
+            } catch (err) {
+              snapshotFailed++;
+            }
+          }
+        }
+
+        logInfo(`[OPT-SNAP-INCR] User ${userId}: success=${snapshotSuccess}, failed=${snapshotFailed}, methods=${JSON.stringify(methods)}`);
+
+      } else {
+        // === LEGACY PATH (rollback) ===
+        const snapshotResult = await generateAllSnapshots(db, userId, snapshotCurrencies, accountIds);
+        logInfo(`[EOD][Snapshot-LEGACY] User ${userId}: success=${snapshotResult.success}, failed=${snapshotResult.failed}`);
+
+        const dailyDocsOverall = snapshotResult.dailyDocsByAccount?.get('overall');
+        if (dailyDocsOverall) {
+          for (const currencyCode of snapshotCurrencies) {
+            const latestAssetPerf = await fetchLatestAssetPerformance(db, userId, 'overall', currencyCode);
+            if (Object.keys(latestAssetPerf).length > 0) {
+              await generateAllAssetSnapshots(db, userId, currencyCode, latestAssetPerf, { dailyDocs: dailyDocsOverall });
+            }
+          }
         }
       }
     } catch (snapshotError) {
-      logWarn(`[EOD][Snapshot] Error generando snapshots para ${userId}: ${snapshotError.message}`);
+      logWarn(`[EOD][Snapshot] Error en snapshot para ${userId}: ${snapshotError.message}`);
     }
 
     // IMPORTANTE: Fuera del try/catch de snapshots para que SIEMPRE se escriba,

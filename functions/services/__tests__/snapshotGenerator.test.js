@@ -282,7 +282,7 @@ describe('PERF-SNAP-003: snapshotGenerator', () => {
       await generatePerformanceSnapshot(db, 'user1', 'overall', 'USD');
 
       const writtenDoc = db._mockSet.mock.calls[0][0];
-      expect(writtenDoc.schemaVersion).toBe(2);
+      expect(writtenDoc.schemaVersion).toBe(3);
     });
 
     it('should include returns computed from daily docs (AC1)', async () => {
@@ -940,12 +940,12 @@ describe('PERF-SNAP-003: snapshotGenerator', () => {
       expect(writtenDoc.latestAssetPerformance).toBeUndefined();
     });
 
-    it('should return true on successful write', async () => {
+    it('should return truthy value on successful write', async () => {
       const db = createMockDb();
 
       const result = await generateAssetSnapshot(db, 'user1', 'overall', 'USD', 'AAPL', 'stock');
 
-      expect(result).toBe(true);
+      expect(result).toBeTruthy();
     });
   });
 

@@ -113,10 +113,30 @@ const mockGenerateAllSnapshots = jest.fn().mockResolvedValue({ success: 3, faile
 // PERF-SNAP-024: Mocks para per-asset snapshots
 const mockGenerateAllAssetSnapshots = jest.fn().mockResolvedValue({ success: 2, failed: 0, total: 2 });
 const mockFetchLatestAssetPerformance = jest.fn().mockResolvedValue({ 'AAPL_stock': { totalValue: 18500 }, 'MSFT_stock': { totalValue: 12000 } });
+const mockGeneratePerformanceSnapshot = jest.fn().mockResolvedValue({ timeline: [] });
+const mockGenerateAssetSnapshot = jest.fn().mockResolvedValue({ timeline: [] });
+const mockFetchAllDailyDocs = jest.fn().mockResolvedValue([]);
+const mockBuildSnapshotDocId = jest.fn((userId, accountId, currency, ticker, assetType) => {
+  if (ticker && assetType) return `${userId}_${ticker}_${assetType}_${currency}`;
+  if (accountId === 'overall') return `${userId}_${currency}`;
+  return `${userId}_${accountId}_${currency}`;
+});
 jest.mock("../snapshotGenerator", () => ({
   generateAllSnapshots: (...args) => mockGenerateAllSnapshots(...args),
   generateAllAssetSnapshots: (...args) => mockGenerateAllAssetSnapshots(...args),
   fetchLatestAssetPerformance: (...args) => mockFetchLatestAssetPerformance(...args),
+  generatePerformanceSnapshot: (...args) => mockGeneratePerformanceSnapshot(...args),
+  generateAssetSnapshot: (...args) => mockGenerateAssetSnapshot(...args),
+  fetchAllDailyDocs: (...args) => mockFetchAllDailyDocs(...args),
+  buildSnapshotDocId: (...args) => mockBuildSnapshotDocId(...args),
+}));
+
+// OPT-SNAP-INCR: Mock del servicio incremental
+const mockUpdateSnapshotIncremental = jest.fn().mockResolvedValue({ updated: true, method: 'incremental' });
+const mockUpdateAssetSnapshotIncremental = jest.fn().mockResolvedValue({ updated: true, method: 'incremental' });
+jest.mock("../snapshotIncrementalService", () => ({
+  updateSnapshotIncremental: (...args) => mockUpdateSnapshotIncremental(...args),
+  updateAssetSnapshotIncremental: (...args) => mockUpdateAssetSnapshotIncremental(...args),
 }));
 
 jest.mock("../../utils/logger", () => ({
@@ -613,8 +633,13 @@ describe("SCALE-004: markInconsistentUsersAsStale", () => {
 describe("PERF-SNAP-004: Snapshot generation in processUserPerformance", () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    process.env.SNAPSHOT_INCREMENTAL_ENABLED = 'false'; // Test legacy path
     mockBatchCommit.mockResolvedValue(undefined);
     mockGenerateAllSnapshots.mockResolvedValue({ success: 3, failed: 0, total: 3 });
+  });
+
+  afterEach(() => {
+    delete process.env.SNAPSHOT_INCREMENTAL_ENABLED;
   });
 
   it("should call generateAllSnapshots after successful batch.commit (AC1)", async () => {
@@ -701,9 +726,14 @@ describe("PERF-SNAP-004: Snapshot generation in processUserPerformance", () => {
 describe("PERF-SNAP-023: lastSnapshotUpdate signal in processUserPerformance", () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    process.env.SNAPSHOT_INCREMENTAL_ENABLED = 'false'; // Test legacy path
     mockBatchCommit.mockResolvedValue(undefined);
     mockGenerateAllSnapshots.mockResolvedValue({ success: 3, failed: 0, total: 3 });
     mockDocSet.mockResolvedValue(undefined);
+  });
+
+  afterEach(() => {
+    delete process.env.SNAPSHOT_INCREMENTAL_ENABLED;
   });
 
   it("should write lastSnapshotUpdate after successful generateAllSnapshots (AC1, AC4)", async () => {
@@ -728,19 +758,19 @@ describe("PERF-SNAP-023: lastSnapshotUpdate signal in processUserPerformance", (
     expect(result.userId).toBe("user-1");
   });
 
-  it("should NOT write lastSnapshotUpdate when generateAllSnapshots throws", async () => {
+  it("should STILL write lastSnapshotUpdate even when generateAllSnapshots throws (signal always written)", async () => {
     mockGenerateAllSnapshots.mockRejectedValueOnce(new Error("Snapshot fatal error"));
     mockDocSet.mockClear();
     const params = buildBaseParams();
 
     await processUserPerformance(params);
 
-    // mockDocSet is called for other things (batch.set delegates), so check specifically
-    // that no call included lastSnapshotUpdate
+    // lastSnapshotUpdate is intentionally outside the snapshot try/catch
+    // so frontend always gets notified (see code comment: "IMPORTANTE: SIEMPRE se escriba")
     const lastSnapshotCalls = mockDocSet.mock.calls.filter(
       call => call[0] && call[0].lastSnapshotUpdate
     );
-    expect(lastSnapshotCalls).toHaveLength(0);
+    expect(lastSnapshotCalls.length).toBeGreaterThan(0);
   });
 });
 
@@ -752,12 +782,17 @@ describe("PERF-SNAP-023: lastSnapshotUpdate signal in processUserPerformance", (
 describe("PERF-SNAP-024: Asset snapshot generation in processUserPerformance", () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    process.env.SNAPSHOT_INCREMENTAL_ENABLED = 'false'; // Test legacy path
     mockBatchCommit.mockResolvedValue(undefined);
     const mockDailyDocsByAccount = new Map([['overall', [{ id: 'doc1', data: () => ({}) }]]]);
     mockGenerateAllSnapshots.mockResolvedValue({ success: 3, failed: 0, total: 3, dailyDocsByAccount: mockDailyDocsByAccount });
     mockGenerateAllAssetSnapshots.mockResolvedValue({ success: 2, failed: 0, total: 2 });
     mockFetchLatestAssetPerformance.mockResolvedValue({ 'AAPL_stock': { totalValue: 18500 }, 'MSFT_stock': { totalValue: 12000 } });
     mockDocSet.mockResolvedValue(undefined);
+  });
+
+  afterEach(() => {
+    delete process.env.SNAPSHOT_INCREMENTAL_ENABLED;
   });
 
   it("should call generateAllAssetSnapshots after portfolio snapshots (AC3)", async () => {
@@ -812,12 +847,17 @@ describe("PERF-SNAP-024: Asset snapshot generation in processUserPerformance", (
 describe("PERF-SNAP-026: Smart Currency filtering in processUserPerformance", () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    process.env.SNAPSHOT_INCREMENTAL_ENABLED = 'false'; // Test legacy path
     mockBatchCommit.mockResolvedValue(undefined);
     const mockDailyDocsByAccount = new Map([['overall', [{ id: 'doc1', data: () => ({}) }]]]);
     mockGenerateAllSnapshots.mockResolvedValue({ success: 3, failed: 0, total: 3, dailyDocsByAccount: mockDailyDocsByAccount });
     mockGenerateAllAssetSnapshots.mockResolvedValue({ success: 2, failed: 0, total: 2 });
     mockFetchLatestAssetPerformance.mockResolvedValue({ 'AAPL_stock': { totalValue: 18500 } });
     mockDocSet.mockResolvedValue(undefined);
+  });
+
+  afterEach(() => {
+    delete process.env.SNAPSHOT_INCREMENTAL_ENABLED;
   });
 
   it("should generate snapshots for USD + defaultCurrency when defaultCurrency is COP (AC1)", async () => {

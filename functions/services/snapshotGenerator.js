@@ -18,7 +18,7 @@ const {
   buildReturnsResult,
 } = require('../utils/periodConsolidation');
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 const ASSET_SCHEMA_VERSION = 3;
 
 function buildSnapshotDocId(userId, accountId, currency, ticker, assetType) {
@@ -256,6 +256,9 @@ async function generatePerformanceSnapshot(db, userId, accountId, currency, opti
     startDate: computedResult.startDate || '',
 
     latestAssetPerformance,
+
+    // OPT-SNAP-INCR: Enable incremental path on next run
+    lastDateInTimeline: timeline.length > 0 ? timeline[timeline.length - 1].d : null,
   };
 
   const docId = buildSnapshotDocId(userId, accountId, currency);
@@ -497,6 +500,9 @@ async function generateAssetSnapshot(db, userId, accountId, currency, ticker, as
     validDocsCountByPeriod: computedResult.validDocsCountByPeriod || {},
     availableYears: computedResult.availableYears || [],
     startDate: computedResult.startDate || '',
+
+    // OPT-SNAP-INCR: Enable incremental path on next run
+    lastDateInTimeline: timeline.length > 0 ? timeline[timeline.length - 1].d : null,
   };
 
   const docId = buildSnapshotDocId(userId, accountId, currency, ticker, assetType);
