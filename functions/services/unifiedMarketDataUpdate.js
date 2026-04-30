@@ -1218,6 +1218,7 @@ async function calculateDailyPortfolioPerformance(db, currentPrices, currencies)
   return {
     count: successUserIds.length,
     userIds: successUserIds,
+    userPortfolios,  // OPT-SNAP-INCR Fase 2: Exponer para inyección a calculatePortfolioRisk
     failedCount: failedUserIds.length,
     failedUserIds,
     consistencyStaleMarked,
@@ -1366,8 +1367,27 @@ exports.unifiedMarketDataUpdate = onSchedule({
     });
     
     // Paso 4: Calcular riesgo del portafolio
+    // OPT-SNAP-INCR Fase 2: Inyectar datos ya en memoria para evitar re-reads
     const riskOp = logger.startOperation('calculatePortfolioRisk');
-    await calculatePortfolioRisk();
+    const currentPricesMap = {};
+    currentPrices.forEach(quote => {
+      currentPricesMap[quote.symbol] = { beta: quote.beta ?? 1.0, price: quote.price || 0 };
+    });
+    // OPT-SNAP-INCR Fase 2: Solo calculamos riesgo para usuarios exitosos.
+    // Usuarios fallidos están marcados _stale y serán reconciliados en el siguiente ciclo.
+    if (portfolioResult.failedCount > 0) {
+      logger.warn(`⚠️ Risk calculation excludes ${portfolioResult.failedCount} failed users`, {
+        failedUserIds: portfolioResult.failedUserIds
+      });
+    }
+    await calculatePortfolioRisk({
+      allAssets: assetsSnapshot.docs.map(d => ({ id: d.id, ...d.data() })),
+      userPortfolios: portfolioResult.userPortfolios,
+      userIds: portfolioResult.userIds,
+      currentPricesMap,
+      currencies,
+      calculationDate: yesterday.toISODate()
+    });
     riskOp.success();
     
     logger.info('⚠️ Portfolio risk calculated');

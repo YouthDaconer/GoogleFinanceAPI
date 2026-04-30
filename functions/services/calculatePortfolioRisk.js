@@ -24,66 +24,57 @@ function logError(...args) {
 }
 
 /**
- * Calcula el riesgo del portafolio basado en el beta de los activos
+ * Calcula el riesgo del portafolio basado en el beta de los activos.
  * 
- * OPT-DEMAND-CLEANUP: Migrado para usar API Lambda en lugar de Firestore
- * para obtener precios y tasas de cambio.
+ * OPT-SNAP-INCR Fase 2: Acepta datos inyectados desde el pipeline EOD para
+ * evitar re-leer Firestore y re-llamar al API Lambda.
+ * Si no recibe datos (ejecución standalone/debugging), hace self-fetch.
  * 
+ * @param {Object|null} injectedData - Datos pre-cargados del pipeline (null = self-fetch)
+ * @param {Array} injectedData.allAssets - Assets activos [{id, name, units, portfolioAccount, assetType, ...}]
+ * @param {Object} injectedData.userPortfolios - Mapa {userId: [{id, userId, isActive, ...}]}
+ * @param {string[]} injectedData.userIds - IDs de usuarios a procesar
+ * @param {Object} injectedData.currentPricesMap - Mapa {symbol: {beta, price}}
+ * @param {Array} injectedData.currencies - Array de currencies para conversión
+ * @param {string} injectedData.calculationDate - Fecha ISO del trading day (YYYY-MM-DD)
  * @returns {Promise<null>}
  */
-async function calculatePortfolioRisk() {
+async function calculatePortfolioRisk(injectedData = null) {
   const db = admin.firestore();
-  const calculationDate = DateTime.now().setZone('America/New_York').toISODate();
+  
+  let allAssets, userPortfolios, userIds, currentPricesMap, currencies, calculationDate;
+  
+  if (injectedData) {
+    // Path optimizado: datos inyectados desde EOD pipeline (0 reads, 0 HTTP)
+    // Guard: validar campos críticos para evitar silent failures (beta=1.0 para todos)
+    if (!injectedData.currentPricesMap || !injectedData.allAssets || !injectedData.userIds) {
+      logError('❌ [INJECTED] injectedData incompleto — fallback a standalone', {
+        hasCurrentPricesMap: !!injectedData.currentPricesMap,
+        hasAllAssets: !!injectedData.allAssets,
+        hasUserIds: !!injectedData.userIds
+      });
+      ({ allAssets, userPortfolios, userIds, currentPricesMap, currencies, calculationDate } = await fetchRiskDataFromSources(db));
+    } else {
+      ({ allAssets, userPortfolios, userIds, currentPricesMap, currencies, calculationDate } = injectedData);
+      logInfo(`📊 [INJECTED] Iniciando cálculo de riesgo - ${userIds.length} usuarios, datos pre-cargados`);
+    }
+  } else {
+    // Path standalone: self-fetch para debugging/ejecución manual
+    // NOTA: calculationDate será "hoy" (DateTime.now()), no "yesterday" como en el pipeline EOD.
+    // Esto es intencional — standalone se usa para debugging adhoc, no para el ciclo EOD.
+    ({ allAssets, userPortfolios, userIds, currentPricesMap, currencies, calculationDate } = await fetchRiskDataFromSources(db));
+  }
   
   try {
-    // Obtener todos los usuarios con portfolioPerformance
-    const portfolioPerformanceSnapshot = await db.collection('portfolioPerformance').get();
-    const userIds = portfolioPerformanceSnapshot.docs.map(doc => doc.id);
-    
-    // OPT-DEMAND-CLEANUP: Primero obtener todos los assets para saber qué símbolos necesitamos
-    const allAssetsSnapshot = await db.collection('assets').where('isActive', '==', true).get();
-    const allAssetsData = allAssetsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-    
-    // Extraer símbolos únicos
-    const symbols = [...new Set(allAssetsData.map(a => a.name).filter(Boolean))];
-    
-    // OPT-DEMAND-CLEANUP: Obtener precios (con betas) y currencies del API Lambda
-    const [pricesArray, currencies] = await Promise.all([
-      getPricesFromApi(symbols),
-      getCurrencyRatesFromApi()
-    ]);
-    
-    // Convertir array a mapa para acceso rápido
-    const currentPrices = {};
-    pricesArray.forEach(quote => {
-      currentPrices[quote.symbol] = {
-        beta: quote.beta !== undefined ? quote.beta : 1.0,
-        price: quote.price || 0
-      };
-    });
-    
-    logInfo(`📊 Iniciando cálculo de riesgo - ${userIds.length} usuarios, ${symbols.length} símbolos del API Lambda`);
-    
     let processedUsers = 0;
     let usersWithData = 0;
     let totalAccounts = 0;
-    let totalAssets = 0;
+    let totalAssetsProcessed = 0;
     
-    // Para cada usuario
     for (const userId of userIds) {
-      // 🚀 OPTIMIZACIÓN: Solo log detallado si está habilitado
       logDebug(`Calculando riesgo para usuario: ${userId}`);
       
-      // Obtener cuentas del usuario
-      const accountsSnapshot = await db.collection('portfolioAccounts')
-        .where('userId', '==', userId)
-        .where('isActive', '==', true)
-        .get();
-      
-      const accounts = accountsSnapshot.docs.map(doc => ({
-        id: doc.id,
-        ...doc.data()
-      }));
+      const accounts = (userPortfolios[userId] || []).filter(a => a.isActive !== false);
       
       if (accounts.length === 0) {
         logDebug(`No hay cuentas activas para el usuario ${userId}`);
@@ -91,76 +82,49 @@ async function calculatePortfolioRisk() {
         continue;
       }
       
-      // Obtener los IDs de las cuentas del usuario
-      const accountIds = accounts.map(account => account.id);
+      const accountIds = accounts.map(a => a.id);
+      const userAssets = allAssets.filter(a => accountIds.includes(a.portfolioAccount));
       
-      // Obtener activos activos relacionados con las cuentas del usuario
-      const assetsSnapshot = await db.collection('assets')
-        .where('portfolioAccount', 'in', accountIds)
-        .where('isActive', '==', true)
-        .get();
-      
-      const assets = assetsSnapshot.docs.map(doc => ({
-        id: doc.id,
-        ...doc.data()
-      }));
-      
-      if (assets.length === 0) {
+      if (userAssets.length === 0) {
         logDebug(`No hay activos activos para el usuario ${userId}`);
         processedUsers++;
         continue;
       }
       
-      // Agrupar activos por cuenta
       const assetsByAccount = {};
       accounts.forEach(account => {
-        assetsByAccount[account.id] = assets.filter(asset => asset.portfolioAccount === account.id);
+        assetsByAccount[account.id] = userAssets.filter(asset => asset.portfolioAccount === account.id);
       });
       
-      // Crear batch para guardar resultados
       const batch = db.batch();
-      
-      // Crear/actualizar documento de métricas generales
       const userMetricsRef = db.collection('portfolioMetrics').doc(userId);
       const riskMetricsRef = userMetricsRef.collection('riskMetrics').doc('latest');
       
-      // Calcular riesgo general (todas las cuentas)
-      const overallRisk = calculateBetaForAssets(assets, currentPrices, currencies);
+      const overallRisk = calculateBetaForAssets(userAssets, currentPricesMap, currencies);
       
-      // Preparar datos para escritura general
-      const riskData = {
+      batch.set(riskMetricsRef, {
         calculationDate,
         metrics: {
           portfolioBeta: overallRisk.portfolioBeta,
           riskCategory: getRiskCategory(overallRisk.portfolioBeta),
-          assetCount: assets.length,
+          assetCount: userAssets.length,
           weightedBetas: overallRisk.weightedBetas,
           totalValue: overallRisk.totalValue,
           includedValue: overallRisk.includedValue,
           portfolioCoverage: overallRisk.portfolioCoverage,
           excludedAssetCount: overallRisk.excludedAssets?.length || 0
         }
-      };
+      });
       
-      // Agregar a batch
-      batch.set(riskMetricsRef, riskData);
-      
-      // Calcular y guardar riesgo por cuenta
       for (const [accountId, accountAssets] of Object.entries(assetsByAccount)) {
         if (accountAssets.length === 0) continue;
         
-        // Calcular beta para esta cuenta
-        const accountRisk = calculateBetaForAssets(accountAssets, currentPrices, currencies);
-        
-        // Crear referencia para la cuenta
+        const accountRisk = calculateBetaForAssets(accountAssets, currentPricesMap, currencies);
         const accountRiskMetricsRef = userMetricsRef
-          .collection('accounts')
-          .doc(accountId)
-          .collection('riskMetrics')
-          .doc('latest');
+          .collection('accounts').doc(accountId)
+          .collection('riskMetrics').doc('latest');
         
-        // Preparar datos para escritura de la cuenta
-        const accountRiskData = {
+        batch.set(accountRiskMetricsRef, {
           calculationDate,
           metrics: {
             portfolioBeta: accountRisk.portfolioBeta,
@@ -172,34 +136,69 @@ async function calculatePortfolioRisk() {
             portfolioCoverage: accountRisk.portfolioCoverage,
             excludedAssetCount: accountRisk.excludedAssets?.length || 0
           }
-        };
-        
-        // Agregar a batch
-        batch.set(accountRiskMetricsRef, accountRiskData);
+        });
       }
       
-      // Guardar todos los cambios
       await batch.commit();
       
-      // 🚀 OPTIMIZACIÓN: Contadores para log consolidado
       processedUsers++;
       usersWithData++;
       totalAccounts += accounts.length;
-      totalAssets += assets.length;
+      totalAssetsProcessed += userAssets.length;
       
-      // 🚀 OPTIMIZACIÓN: Solo log detallado si está habilitado
       if (ENABLE_DETAILED_LOGS) {
-        logDebug(`Datos de riesgo calculados para usuario ${userId} (${accounts.length} cuentas, ${assets.length} activos)`);
+        logDebug(`Datos de riesgo calculados para usuario ${userId} (${accounts.length} cuentas, ${userAssets.length} activos)`);
       }
     }
     
-    // 🚀 OPTIMIZACIÓN: Log consolidado final
-    logInfo(`✅ Cálculo de riesgo completado: ${usersWithData}/${processedUsers} usuarios procesados, ${totalAccounts} cuentas, ${totalAssets} activos`);
+    logInfo(`✅ Cálculo de riesgo completado: ${usersWithData}/${processedUsers} usuarios procesados, ${totalAccounts} cuentas, ${totalAssetsProcessed} activos`);
     return null;
   } catch (error) {
     logError('❌ Error al calcular riesgo del portafolio:', error);
     return null;
   }
+}
+
+/**
+ * Self-fetch de datos para ejecución standalone (debugging/manual).
+ * Aísla la adquisición de datos del core logic.
+ * 
+ * @param {FirebaseFirestore.Firestore} db
+ * @returns {Promise<Object>} Datos en el mismo formato que injectedData
+ */
+async function fetchRiskDataFromSources(db) {
+  const calculationDate = DateTime.now().setZone('America/New_York').toISODate();
+  
+  const [perfSnap, assetsSnap, accountsSnap] = await Promise.all([
+    db.collection('portfolioPerformance').get(),
+    db.collection('assets').where('isActive', '==', true).get(),
+    db.collection('portfolioAccounts').where('isActive', '==', true).get()
+  ]);
+  
+  const userIds = perfSnap.docs.map(doc => doc.id);
+  const allAssets = assetsSnap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+  
+  const accounts = accountsSnap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+  const userPortfolios = accounts.reduce((acc, a) => {
+    if (!acc[a.userId]) acc[a.userId] = [];
+    acc[a.userId].push(a);
+    return acc;
+  }, {});
+  
+  const symbols = [...new Set(allAssets.map(a => a.name).filter(Boolean))];
+  const [pricesArray, currenciesArr] = await Promise.all([
+    getPricesFromApi(symbols),
+    getCurrencyRatesFromApi()
+  ]);
+  
+  const currentPricesMap = {};
+  pricesArray.forEach(q => {
+    currentPricesMap[q.symbol] = { beta: q.beta ?? 1.0, price: q.price || 0 };
+  });
+  
+  logInfo(`📊 [STANDALONE] Iniciando cálculo de riesgo - ${userIds.length} usuarios, ${symbols.length} símbolos del API Lambda`);
+  
+  return { allAssets, userPortfolios, userIds, currentPricesMap, currencies: currenciesArr, calculationDate };
 }
 
 /**
