@@ -328,28 +328,26 @@ async function isValidTradingDayForIndices(dateStr) {
  * @see unifiedMarketDataUpdate.js (función de referencia para temporalidad)
  */
 const saveIndicesHistoryData = onSchedule({
-  // FIX-INDEX-001: 00:10 ET Martes-Sábado = datos de cierre definitivos del día anterior
-  // OPT-SNAP-INCR Fase 3: Kept as standalone fallback. Primary execution now via unifiedMarketDataUpdate.
-  schedule: '10 0 * * 2-6',
+  // OPT-SNAP-INCR Fase 3: Disabled daily cron — primary execution is via unifiedMarketDataUpdate.
+  // Weekly Sunday backup: catches any data missed if the pipeline failed all week.
+  schedule: '10 0 * * 0',
   timeZone: 'America/New_York',
   retryCount: 2,
   memory: '256MiB',
-  secrets: [cfServiceToken],  // SEC-TOKEN-001: Binding del secret para API auth
+  secrets: [cfServiceToken],
   labels: {
-    status: 'active',
-    purpose: 'index-history-eod-fallback',
-    updated: '2026-04-30'
+    status: 'backup',
+    purpose: 'index-history-eod-backup-weekly',
+    updated: '2026-05-01'
   }
 }, async (event) => {
-  // FIX-INDEX-001: Calcular la fecha del DÍA ANTERIOR (el trading day que cerró)
   const now = new Date();
   const yesterday = new Date(now);
   yesterday.setDate(yesterday.getDate() - 1);
   const formattedDate = yesterday.toISOString().split('T')[0];
 
-  console.log(`[saveIndicesHistoryData] Standalone execution - target: ${formattedDate}`);
+  console.log(`[saveIndicesHistoryData] Weekly backup execution - target: ${formattedDate}`);
 
-  // Validar trading day
   const tradingDayCheck = await isValidTradingDayForIndices(formattedDate);
   if (!tradingDayCheck.isValid) {
     console.log(`[saveIndicesHistoryData] ⏭️ Saltando: ${formattedDate} no es día de trading (${tradingDayCheck.reason})`);
@@ -357,7 +355,8 @@ const saveIndicesHistoryData = onSchedule({
   }
 
   try {
-    await saveIndicesHistoryDataInternal({ formattedDate });
+    // skipCacheInvalidation: refreshIndexCache runs right after and handles freshness
+    await saveIndicesHistoryDataInternal({ formattedDate, skipCacheInvalidation: true });
   } catch (error) {
     console.error('[saveIndicesHistoryData] Error:', error.message);
     throw error;

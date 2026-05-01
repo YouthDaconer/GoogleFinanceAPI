@@ -630,15 +630,16 @@ async function refreshIndexCacheInternal() {
  */
 const refreshIndexCache = onSchedule(
   {
-    // OPT-FIRESTORE-002 W-01: Normalizado a America/New_York (era UTC).
-    schedule: "30 0 * * 2-6",
+    // OPT-SNAP-INCR Fase 3: Disabled daily cron — primary execution is via unifiedMarketDataUpdate.
+    // Weekly Sunday backup: rebuilds cache if pipeline failed all week.
+    schedule: "30 0 * * 0",
     timeZone: "America/New_York",
     region: "us-central1",
     memory: "512MiB",
     timeoutSeconds: 540,
   },
   async (event) => {
-    console.log("[refreshIndexCache] Standalone execution — delegating to internal");
+    console.log("[refreshIndexCache] Weekly backup execution — delegating to internal");
     try {
       return await refreshIndexCacheInternal();
     } catch (error) {
