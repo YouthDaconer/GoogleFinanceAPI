@@ -13,13 +13,17 @@ const { generateLogoUrl } = require('../utils/logoGenerator');
 
 // PERF-SNAP-004: Importar generador de snapshots pre-computados
 // PERF-SNAP-024: Importar generador de snapshots per-asset
-const { generateAllSnapshots, generateAllAssetSnapshots, fetchLatestAssetPerformance, fetchAllDailyDocs, generatePerformanceSnapshot, generateAssetSnapshot, buildSnapshotDocId } = require('./snapshotGenerator');
+const { fetchAllDailyDocs, generatePerformanceSnapshot, generateAssetSnapshot, buildSnapshotDocId } = require('./snapshotGenerator');
 
 // OPT-SNAP-INCR: Importar servicio de actualización incremental de snapshots
 const { updateSnapshotIncremental, updateAssetSnapshotIncremental } = require('./snapshotIncrementalService');
 
 // VS-009: Importar servicio de benchmark snapshots
 const { updateBenchmarkSnapshots } = require('./benchmarkSnapshotService');
+
+// OPT-SNAP-INCR Fase 3: Funciones internas para consolidación del pipeline nocturno
+const { saveIndicesHistoryDataInternal } = require('./marketDataScheduled');
+const { refreshIndexCacheInternal } = require('./indexHistoryService');
 
 /**
  * SCALE-001: Máximo de usuarios procesados en paralelo.
@@ -74,12 +78,6 @@ const API_BASE_URL = FINANCE_QUERY_API_URL;
 
 // Flag para habilitar logs detallados (puede causar mucho ruido en producción)
 const ENABLE_DETAILED_LOGS = process.env.ENABLE_DETAILED_LOGS === 'true';
-
-// OPT-SNAP-INCR: Feature flag para rollback a regeneración completa de snapshots
-// Set SNAPSHOT_INCREMENTAL_ENABLED=false para revertir al comportamiento anterior
-function isSnapshotIncrementalEnabled() {
-  return process.env.SNAPSHOT_INCREMENTAL_ENABLED !== 'false';
-}
 
 // Horarios de NYSE en hora local de Nueva York (no UTC)
 // Esto maneja automáticamente EST/EDT gracias a Luxon
@@ -856,111 +854,94 @@ async function processUserPerformance({
 
       const accountIds = accounts.map(a => a.id);
 
-      if (isSnapshotIncrementalEnabled()) {
-        // === INCREMENTAL PATH (OPT-SNAP-INCR) ===
-        const allAccountIds = ['overall', ...accountIds];
-        let snapshotSuccess = 0;
-        let snapshotFailed = 0;
-        const methods = { incremental: 0, 'full-rebuild': 0, skipped: 0 };
+      // OPT-SNAP-INCR: Incremental snapshot append (1 read + 1 write per snapshot)
+      const allAccountIds = ['overall', ...accountIds];
+      let snapshotSuccess = 0;
+      let snapshotFailed = 0;
+      const methods = { incremental: 0, 'full-rebuild': 0, skipped: 0 };
 
-        // Portfolio snapshots (overall + per-account)
-        for (const accountId of allAccountIds) {
-          const perfData = accountId === 'overall'
-            ? overallPerformance
-            : accountPerformancesMap.get(accountId);
+      // Portfolio snapshots (overall + per-account)
+      for (const accountId of allAccountIds) {
+        const perfData = accountId === 'overall'
+          ? overallPerformance
+          : accountPerformancesMap.get(accountId);
 
-          if (!perfData) continue;
-
-          for (const currency of snapshotCurrencies) {
-            try {
-              // M3-FIX: Guard against currency not existing in perfData
-              const currencyData = perfData[currency];
-              if (!currencyData || (currencyData.totalValue === undefined && currencyData.totalInvestment === undefined)) {
-                continue;
-              }
-
-              const dailyData = {
-                date: formattedDate,
-                totalValue: currencyData.totalValue ?? 0,
-                totalInvestment: currencyData.totalInvestment ?? 0,
-                adjustedDailyChangePercentage: currencyData.adjustedDailyChangePercentage ?? 0,
-                dailyChangePercentage: currencyData.dailyChangePercentage ?? 0,
-                totalCashFlow: currencyData.totalCashFlow ?? 0,
-                doneProfitAndLoss: currencyData.doneProfitAndLoss ?? 0,
-                unrealizedProfitAndLoss: currencyData.unrealizedProfitAndLoss ?? 0,
-                assetPerformance: currencyData.assetPerformance || {},
-              };
-
-              const docId = buildSnapshotDocId(userId, accountId, currency);
-              const result = await updateSnapshotIncremental(db, docId, dailyData);
-
-              if (result.method === 'full-rebuild') {
-                const dailyDocs = await fetchAllDailyDocs(db, userId, accountId);
-                await generatePerformanceSnapshot(db, userId, accountId, currency, { dailyDocs });
-                methods['full-rebuild']++;
-              } else {
-                methods[result.method]++;
-              }
-              snapshotSuccess++;
-            } catch (err) {
-              snapshotFailed++;
-              logWarn(`[OPT-SNAP-INCR] Portfolio snapshot failed ${userId}/${accountId}/${currency}: ${err.message}`);
-            }
-          }
-        }
-
-        // Asset snapshots (overall only, incremental)
-        // H2-FIX: Cache dailyDocs to avoid re-fetching for each asset on first deploy
-        let cachedOverallDailyDocs = null;
+        if (!perfData) continue;
 
         for (const currency of snapshotCurrencies) {
-          const overallCurrencyData = overallPerformance[currency] || {};
-          const assetPerf = overallCurrencyData.assetPerformance || {};
-
-          for (const [assetKey, assetData] of Object.entries(assetPerf)) {
-            const parts = assetKey.split('_');
-            if (parts.length < 2) continue;
-            const assetType = parts.pop();
-            const ticker = parts.join('_');
-
-            try {
-              const docId = buildSnapshotDocId(userId, 'overall', currency, ticker, assetType);
-              const result = await updateAssetSnapshotIncremental(db, docId, assetData, formattedDate);
-
-              if (result.method === 'full-rebuild') {
-                // H2-FIX: Reuse cached dailyDocs across all assets needing full rebuild
-                if (!cachedOverallDailyDocs) {
-                  cachedOverallDailyDocs = await fetchAllDailyDocs(db, userId, 'overall');
-                }
-                await generateAssetSnapshot(db, userId, 'overall', currency, ticker, assetType, { dailyDocs: cachedOverallDailyDocs });
-                methods['full-rebuild']++;
-              } else {
-                methods[result.method]++;
-              }
-              snapshotSuccess++;
-            } catch (err) {
-              snapshotFailed++;
+          try {
+            // M3-FIX: Guard against currency not existing in perfData
+            const currencyData = perfData[currency];
+            if (!currencyData || (currencyData.totalValue === undefined && currencyData.totalInvestment === undefined)) {
+              continue;
             }
-          }
-        }
 
-        logInfo(`[OPT-SNAP-INCR] User ${userId}: success=${snapshotSuccess}, failed=${snapshotFailed}, methods=${JSON.stringify(methods)}`);
+            const dailyData = {
+              date: formattedDate,
+              totalValue: currencyData.totalValue ?? 0,
+              totalInvestment: currencyData.totalInvestment ?? 0,
+              adjustedDailyChangePercentage: currencyData.adjustedDailyChangePercentage ?? 0,
+              dailyChangePercentage: currencyData.dailyChangePercentage ?? 0,
+              totalCashFlow: currencyData.totalCashFlow ?? 0,
+              doneProfitAndLoss: currencyData.doneProfitAndLoss ?? 0,
+              unrealizedProfitAndLoss: currencyData.unrealizedProfitAndLoss ?? 0,
+              assetPerformance: currencyData.assetPerformance || {},
+            };
 
-      } else {
-        // === LEGACY PATH (rollback) ===
-        const snapshotResult = await generateAllSnapshots(db, userId, snapshotCurrencies, accountIds);
-        logInfo(`[EOD][Snapshot-LEGACY] User ${userId}: success=${snapshotResult.success}, failed=${snapshotResult.failed}`);
+            const docId = buildSnapshotDocId(userId, accountId, currency);
+            const result = await updateSnapshotIncremental(db, docId, dailyData);
 
-        const dailyDocsOverall = snapshotResult.dailyDocsByAccount?.get('overall');
-        if (dailyDocsOverall) {
-          for (const currencyCode of snapshotCurrencies) {
-            const latestAssetPerf = await fetchLatestAssetPerformance(db, userId, 'overall', currencyCode);
-            if (Object.keys(latestAssetPerf).length > 0) {
-              await generateAllAssetSnapshots(db, userId, currencyCode, latestAssetPerf, { dailyDocs: dailyDocsOverall });
+            if (result.method === 'full-rebuild') {
+              const dailyDocs = await fetchAllDailyDocs(db, userId, accountId);
+              await generatePerformanceSnapshot(db, userId, accountId, currency, { dailyDocs });
+              methods['full-rebuild']++;
+            } else {
+              methods[result.method]++;
             }
+            snapshotSuccess++;
+          } catch (err) {
+            snapshotFailed++;
+            logWarn(`[OPT-SNAP-INCR] Portfolio snapshot failed ${userId}/${accountId}/${currency}: ${err.message}`);
           }
         }
       }
+
+      // Asset snapshots (overall only, incremental)
+      // H2-FIX: Cache dailyDocs to avoid re-fetching for each asset on first deploy
+      let cachedOverallDailyDocs = null;
+
+      for (const currency of snapshotCurrencies) {
+        const overallCurrencyData = overallPerformance[currency] || {};
+        const assetPerf = overallCurrencyData.assetPerformance || {};
+
+        for (const [assetKey, assetData] of Object.entries(assetPerf)) {
+          const parts = assetKey.split('_');
+          if (parts.length < 2) continue;
+          const assetType = parts.pop();
+          const ticker = parts.join('_');
+
+          try {
+            const docId = buildSnapshotDocId(userId, 'overall', currency, ticker, assetType);
+            const result = await updateAssetSnapshotIncremental(db, docId, assetData, formattedDate);
+
+            if (result.method === 'full-rebuild') {
+              // H2-FIX: Reuse cached dailyDocs across all assets needing full rebuild
+              if (!cachedOverallDailyDocs) {
+                cachedOverallDailyDocs = await fetchAllDailyDocs(db, userId, 'overall');
+              }
+              await generateAssetSnapshot(db, userId, 'overall', currency, ticker, assetType, { dailyDocs: cachedOverallDailyDocs });
+              methods['full-rebuild']++;
+            } else {
+              methods[result.method]++;
+            }
+            snapshotSuccess++;
+          } catch (err) {
+            snapshotFailed++;
+          }
+        }
+      }
+
+      logInfo(`[OPT-SNAP-INCR] User ${userId}: success=${snapshotSuccess}, failed=${snapshotFailed}, methods=${JSON.stringify(methods)}`);
     } catch (snapshotError) {
       logWarn(`[EOD][Snapshot] Error en snapshot para ${userId}: ${snapshotError.message}`);
     }
@@ -1391,6 +1372,33 @@ exports.unifiedMarketDataUpdate = onSchedule({
     riskOp.success();
     
     logger.info('⚠️ Portfolio risk calculated');
+
+    // =========================================================================
+    // OPT-SNAP-INCR Fase 3: Consolidated Index Pipeline
+    // Previously 2 separate scheduled functions with independent cold-starts.
+    // Now runs in-process, inheriting the trading-day guard above.
+    // =========================================================================
+
+    // Paso 4.1: Save indices history data (EOD close prices)
+    try {
+      const indicesOp = logger.startOperation('saveIndicesHistoryData');
+      // skipCacheInvalidation: refreshIndexCacheInternal runs immediately after and handles freshness
+      const indicesResult = await saveIndicesHistoryDataInternal({ formattedDate: yesterday.toISODate(), skipCacheInvalidation: true });
+      indicesOp.success({ count: indicesResult.count, durationMs: indicesResult.durationMs });
+    } catch (indicesError) {
+      // Non-critical: index history is independent of portfolio calculations
+      logger.warn('[OPT-SNAP-INCR Fase 3] saveIndicesHistoryData failed (non-critical)', { error: indicesError.message });
+    }
+
+    // Paso 4.2: Refresh index cache (incremental merge)
+    try {
+      const indexCacheOp = logger.startOperation('refreshIndexCache');
+      const cacheResult = await refreshIndexCacheInternal();
+      indexCacheOp.success({ refreshed: cacheResult.refreshed, errors: cacheResult.errors, duration: cacheResult.duration });
+    } catch (indexCacheError) {
+      // Non-critical: cache will rebuild on next on-demand request
+      logger.warn('[OPT-SNAP-INCR Fase 3] refreshIndexCache failed (non-critical)', { error: indexCacheError.message });
+    }
     
     // Paso 5: Invalidar cache de performance
     let cacheInvalidationResult = { usersProcessed: 0, cachesDeleted: 0 };
@@ -1460,8 +1468,5 @@ if (process.env.NODE_ENV === "test" || process.env.FUNCTIONS_EMULATOR) {
     PerformanceDataCache,
     MAX_PARALLEL_USERS,
     markInconsistentUsersAsStale,
-    generateAllSnapshots,
-    generateAllAssetSnapshots,
-    fetchLatestAssetPerformance,
   };
 }

@@ -154,6 +154,15 @@ jest.mock("../../utils/logger", () => ({
   }
 }));
 
+// OPT-SNAP-INCR Fase 3: Mock de funciones consolidadas del pipeline nocturno
+jest.mock("../marketDataScheduled", () => ({
+  saveIndicesHistoryDataInternal: jest.fn().mockResolvedValue({ success: true, count: 10, durationMs: 200 }),
+}));
+
+jest.mock("../indexHistoryService", () => ({
+  refreshIndexCacheInternal: jest.fn().mockResolvedValue({ success: true, refreshed: 70, errors: 0, duration: 3 }),
+}));
+
 // === Imports ===
 
 process.env.NODE_ENV = "test";

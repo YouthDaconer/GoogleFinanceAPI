@@ -31,6 +31,80 @@ const SCHEMA_VERSION_INCREMENTAL = 3;
 /** Max calendar days gap before triggering full rebuild */
 const MAX_GAP_CALENDAR_DAYS = 7;
 
+/**
+ * OPT-SNAP-INCR Fase 3: Timeline Windowing
+ * Maximum daily points to keep in timeline before compaction.
+ * ~5 years of trading days (252/year × 5 = 1,260).
+ */
+const MAX_DAILY_POINTS = 1260;
+
+// ============================================================================
+// TIMELINE WINDOWING: compressToMonthly
+// ============================================================================
+
+/**
+ * Compresses daily timeline points into monthly summaries.
+ * Each monthly point contains:
+ * - d: last date of the month in the group
+ * - v: last value of the month (end-of-month portfolio value)
+ * - c: compounded daily change for the entire month (TWR)
+ *
+ * @param {Array<{d: string, v: number, c: number}>} points - Daily points to compress
+ * @returns {Array<{d: string, v: number, c: number}>} Monthly compressed points
+ */
+function compressToMonthly(points) {
+  if (points.length === 0) return [];
+
+  const monthGroups = new Map();
+
+  for (const point of points) {
+    const monthKey = point.d.substring(0, 7); // "YYYY-MM"
+    if (!monthGroups.has(monthKey)) {
+      monthGroups.set(monthKey, []);
+    }
+    monthGroups.get(monthKey).push(point);
+  }
+
+  const compressed = [];
+  for (const [, monthPoints] of monthGroups) {
+    // Compound all daily changes for TWR
+    let factor = 1;
+    for (const p of monthPoints) {
+      factor *= (1 + (p.c || 0) / 100);
+    }
+
+    const lastPoint = monthPoints[monthPoints.length - 1];
+    compressed.push({
+      d: lastPoint.d,
+      v: lastPoint.v,
+      c: (factor - 1) * 100,
+    });
+  }
+
+  return compressed;
+}
+
+/**
+ * Applies timeline windowing: if the timeline exceeds MAX_DAILY_POINTS,
+ * compresses the oldest points to monthly granularity.
+ *
+ * @param {Array<{d: string, v: number, c: number}>} timeline - Full timeline after append
+ * @returns {Array<{d: string, v: number, c: number}>} Windowed timeline
+ */
+function applyTimelineWindowing(timeline) {
+  if (timeline.length <= MAX_DAILY_POINTS) {
+    return timeline;
+  }
+
+  const excessCount = timeline.length - MAX_DAILY_POINTS;
+  const oldPoints = timeline.slice(0, excessCount);
+  const recentPoints = timeline.slice(excessCount);
+
+  const monthlyCompressed = compressToMonthly(oldPoints);
+
+  return [...monthlyCompressed, ...recentPoints];
+}
+
 // ============================================================================
 // CORE: computeReturnsFromTimeline
 // ============================================================================
@@ -151,9 +225,12 @@ async function updateSnapshotIncremental(db, snapshotDocId, newDailyData, option
   const updatedTimeline = snapshot.timeline ? snapshot.timeline.slice() : [];
   updatedTimeline.push(newPoint);
 
+  // OPT-SNAP-INCR Fase 3: Apply timeline windowing to prevent unbounded growth
+  const windowedTimeline = applyTimelineWindowing(updatedTimeline);
+
   // Recompute returns from in-memory timeline (M2-FIX: accept injected now)
   const now = options.now || DateTime.now().setZone('America/New_York');
-  const computed = computeReturnsFromTimeline(updatedTimeline, now);
+  const computed = computeReturnsFromTimeline(windowedTimeline, now);
 
   if (!computed) {
     return { updated: false, method: 'full-rebuild', reason: 'compute-failed' };
@@ -180,7 +257,7 @@ async function updateSnapshotIncremental(db, snapshotDocId, newDailyData, option
     userId: snapshot.userId,
     currency: snapshot.currency,
     accountId: snapshot.accountId,
-    timeline: updatedTimeline,
+    timeline: windowedTimeline,
     returns: computed.returns,
     performanceByYear: updatedPerformanceByYear,
     monthlyCompound: updatedMonthlyCompound,
@@ -240,8 +317,11 @@ async function updateAssetSnapshotIncremental(db, snapshotDocId, newAssetData, d
   const updatedTimeline = snapshot.timeline ? snapshot.timeline.slice() : [];
   updatedTimeline.push(newPoint);
 
+  // OPT-SNAP-INCR Fase 3: Apply timeline windowing
+  const windowedAssetTimeline = applyTimelineWindowing(updatedTimeline);
+
   // Compute returns only from points with active position
-  const activePoints = updatedTimeline.filter(p => p.u > 0);
+  const activePoints = windowedAssetTimeline.filter(p => p.u > 0);
   const now = options.now || DateTime.now().setZone('America/New_York');
   const computed = activePoints.length > 0 ? computeReturnsFromTimeline(activePoints, now) : null;
 
@@ -253,7 +333,7 @@ async function updateAssetSnapshotIncremental(db, snapshotDocId, newAssetData, d
     assetType: snapshot.assetType,
     type: 'asset',
     timelineGranularity: 'daily',
-    timeline: updatedTimeline,
+    timeline: windowedAssetTimeline,
     returns: computed?.returns || snapshot.returns,
     performanceByYear: computed?.performanceByYear || snapshot.performanceByYear,
     monthlyCompound: snapshot.monthlyCompound || {},
@@ -426,8 +506,11 @@ module.exports = {
   appendToMonthlyCompound,
   appendToPerformanceByYear,
   buildLatestAssetPerformance,
+  compressToMonthly,
+  applyTimelineWindowing,
 
   // Constants
   SCHEMA_VERSION_INCREMENTAL,
   MAX_GAP_CALENDAR_DAYS,
+  MAX_DAILY_POINTS,
 };

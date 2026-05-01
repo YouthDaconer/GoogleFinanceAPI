@@ -162,6 +162,91 @@ const SECTOR_MAPPING = {
 };
 
 // ============================================================================
+// INTERNAL: saveIndicesHistoryDataInternal
+// OPT-SNAP-INCR Fase 3: Core logic extracted for pipeline consolidation.
+// Can be called standalone (scheduled) or as a step within unifiedMarketDataUpdate.
+// ============================================================================
+
+/**
+ * Persiste los datos de cierre de índices bursátiles para una fecha dada.
+ *
+ * @param {Object} params
+ * @param {string} params.formattedDate - Fecha del trading day (YYYY-MM-DD)
+ * @param {boolean} [params.skipCacheInvalidation=false] - Skip invalidation when refreshIndexCache runs after
+ * @returns {Promise<{success: boolean, count: number, durationMs: number}>}
+ */
+async function saveIndicesHistoryDataInternal({ formattedDate, skipCacheInvalidation = false }) {
+  const startTime = Date.now();
+  const db = admin.firestore();
+
+  const indices = await requestIndicesFromFinance();
+
+  if (!indices || indices.length === 0) {
+    console.warn('[saveIndicesHistoryDataInternal] No se encontraron índices');
+    return { success: false, count: 0, durationMs: Date.now() - startTime };
+  }
+
+  const batch = db.batch();
+  let count = 0;
+
+  indices.forEach(index => {
+    const generalDocRef = db.collection('indexHistories').doc(index.code);
+
+    batch.set(generalDocRef, {
+      name: index.name,
+      code: index.code,
+      region: index.region,
+      lastUpdated: Date.now()
+    }, { merge: true });
+
+    const dateDocRef = generalDocRef.collection('dates').doc(formattedDate);
+
+    batch.set(dateDocRef, {
+      score: index.value,
+      change: index.change,
+      percentChange: normalizeNumber(index.percentChange),
+      date: formattedDate,
+      timestamp: Date.now(),
+      captureType: 'close'
+    }, { merge: true });
+
+    count++;
+  });
+
+  // OPT-FS-202: Documento resumen consolidado
+  const summaryDocRef = db.collection('indexHistories').doc('_summary');
+  batch.set(summaryDocRef, {
+    indices: indices.map(index => ({
+      code: index.code,
+      name: index.name,
+      region: index.region,
+      score: index.value,
+      change: index.change,
+      percentChange: normalizeNumber(index.percentChange),
+    })),
+    date: formattedDate,
+    lastUpdated: Date.now(),
+  });
+
+  await batch.commit();
+
+  // OPT-CACHE-001: Invalidar cache de índices (skip when refreshIndexCache runs immediately after)
+  if (!skipCacheInvalidation) {
+    try {
+      const invalidatedCount = await invalidateAllIndexCaches();
+      console.log(`[saveIndicesHistoryDataInternal] Cache invalidado: ${invalidatedCount} documentos`);
+    } catch (cacheError) {
+      console.warn(`[saveIndicesHistoryDataInternal] Error invalidando cache: ${cacheError.message}`);
+    }
+  }
+
+  const durationMs = Date.now() - startTime;
+  console.log(`[saveIndicesHistoryDataInternal] ✅ Guardados ${count} índices + summary para ${formattedDate} en ${durationMs}ms`);
+
+  return { success: true, count, durationMs };
+}
+
+// ============================================================================
 // SCHEDULED FUNCTION: saveIndicesHistoryData
 // ============================================================================
 
@@ -244,6 +329,7 @@ async function isValidTradingDayForIndices(dateStr) {
  */
 const saveIndicesHistoryData = onSchedule({
   // FIX-INDEX-001: 00:10 ET Martes-Sábado = datos de cierre definitivos del día anterior
+  // OPT-SNAP-INCR Fase 3: Kept as standalone fallback. Primary execution now via unifiedMarketDataUpdate.
   schedule: '10 0 * * 2-6',
   timeZone: 'America/New_York',
   retryCount: 2,
@@ -251,103 +337,30 @@ const saveIndicesHistoryData = onSchedule({
   secrets: [cfServiceToken],  // SEC-TOKEN-001: Binding del secret para API auth
   labels: {
     status: 'active',
-    purpose: 'index-history-eod',
-    updated: '2026-03-04'
+    purpose: 'index-history-eod-fallback',
+    updated: '2026-04-30'
   }
 }, async (event) => {
-  const startTime = Date.now();
-  
   // FIX-INDEX-001: Calcular la fecha del DÍA ANTERIOR (el trading day que cerró)
   const now = new Date();
   const yesterday = new Date(now);
   yesterday.setDate(yesterday.getDate() - 1);
   const formattedDate = yesterday.toISOString().split('T')[0];
-  
-  console.log(`[saveIndicesHistoryData] Iniciando captura EOD de índices - target: ${formattedDate}`);
 
-  // FIX-INDEX-001: Validar que el día anterior fue un día de trading válido
+  console.log(`[saveIndicesHistoryData] Standalone execution - target: ${formattedDate}`);
+
+  // Validar trading day
   const tradingDayCheck = await isValidTradingDayForIndices(formattedDate);
   if (!tradingDayCheck.isValid) {
     console.log(`[saveIndicesHistoryData] ⏭️ Saltando: ${formattedDate} no es día de trading (${tradingDayCheck.reason})`);
     return null;
   }
-  
-  console.log(`[saveIndicesHistoryData] ✅ ${formattedDate} es un día de trading válido`);
 
   try {
-    const indices = await requestIndicesFromFinance();
-    
-    if (!indices || indices.length === 0) {
-      console.warn('[saveIndicesHistoryData] No se encontraron índices');
-      return null;
-    }
-
-    const batch = admin.firestore().batch();
-    let count = 0;
-
-    indices.forEach(index => {
-      // Documento principal con info general
-      const generalDocRef = admin.firestore()
-        .collection('indexHistories')
-        .doc(index.code);
-
-      batch.set(generalDocRef, {
-        name: index.name,
-        code: index.code,
-        region: index.region,
-        lastUpdated: Date.now()
-      }, { merge: true });
-
-      // FIX-INDEX-001: Documento de fecha del DÍA ANTERIOR con datos de cierre
-      const dateDocRef = generalDocRef.collection('dates').doc(formattedDate);
-      
-      batch.set(dateDocRef, {
-        score: index.value,
-        change: index.change,
-        percentChange: normalizeNumber(index.percentChange),
-        date: formattedDate,
-        timestamp: Date.now(),
-        captureType: 'close'  // FIX-INDEX-001: Siempre es cierre (después de medianoche)
-      }, { merge: true });
-
-      count++;
-    });
-
-    // OPT-FS-202: Escribir documento resumen consolidado con todos los índices
-    // El frontend lee 1 doc en vez de N+1 queries (1 parent collection + N subcollection)
-    const summaryDocRef = admin.firestore()
-      .collection('indexHistories')
-      .doc('_summary');
-
-    batch.set(summaryDocRef, {
-      indices: indices.map(index => ({
-        code: index.code,
-        name: index.name,
-        region: index.region,
-        score: index.value,
-        change: index.change,
-        percentChange: normalizeNumber(index.percentChange),
-      })),
-      date: formattedDate,
-      lastUpdated: Date.now(),
-    });
-
-    await batch.commit();
-    
-    // OPT-CACHE-001: Invalidar cache de índices para que el frontend reciba datos frescos
-    try {
-      const invalidatedCount = await invalidateAllIndexCaches();
-      console.log(`[saveIndicesHistoryData] Cache invalidado: ${invalidatedCount} documentos`);
-    } catch (cacheError) {
-      console.warn(`[saveIndicesHistoryData] Error invalidando cache: ${cacheError.message}`);
-    }
-    
-    const duration = Date.now() - startTime;
-    console.log(`[saveIndicesHistoryData] ✅ Guardados ${count} índices + summary para ${formattedDate} en ${duration}ms`);
-
+    await saveIndicesHistoryDataInternal({ formattedDate });
   } catch (error) {
     console.error('[saveIndicesHistoryData] Error:', error.message);
-    throw error; // Re-throw para activar retry
+    throw error;
   }
 
   return null;
@@ -539,6 +552,7 @@ const updateRiskFreeRate = onSchedule({
 
 module.exports = {
   saveIndicesHistoryData,
+  saveIndicesHistoryDataInternal,
   saveSectorsSnapshot,
   updateRiskFreeRate
 };

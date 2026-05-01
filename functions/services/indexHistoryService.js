@@ -472,7 +472,146 @@ function _mergeIncrementalCache(existingCache, newPoints, range) {
 }
 
 // ============================================================================
+// INTERNAL: refreshIndexCacheInternal
+// OPT-SNAP-INCR Fase 3: Core logic extracted for pipeline consolidation.
+// Can be called standalone (scheduled) or as a step within unifiedMarketDataUpdate.
+// ============================================================================
+
+/**
+ * Refresh incremental de todos los caches de índices.
+ * Lee solo fechas nuevas de Firestore y las mergea con el cache existente.
+ *
+ * @returns {Promise<{success: boolean, refreshed: number, incrementalMerges: number, fullRecalcs: number, errors: number, duration: number}>}
+ */
+async function refreshIndexCacheInternal() {
+  const startTime = Date.now();
+  let refreshed = 0;
+  let errors = 0;
+  let fullRecalcs = 0;
+  let incrementalMerges = 0;
+  const errorDetails = [];
+
+  const indicesSnapshot = await db.collection("indexHistories").get();
+  const indices = indicesSnapshot.docs.map(doc => ({ id: doc.id, data: doc.data() }));
+
+  console.log(`[refreshIndexCacheInternal] Procesando ${indices.length} índices incrementalmente`);
+
+  for (const index of indices) {
+    const code = index.id;
+
+    try {
+      // Leer los 7 cache docs en paralelo
+      const cacheRefs = VALID_RANGES.map(range =>
+        db.collection("indexCache").doc(`${code}_${range}`).get()
+      );
+      const cacheDocs = await Promise.all(cacheRefs);
+
+      // Determinar la última fecha cacheada
+      let lastCachedDate = null;
+      for (const cacheDoc of cacheDocs) {
+        if (cacheDoc.exists) {
+          const data = cacheDoc.data();
+          const cd = data.chartData;
+          if (cd && cd.length > 0) {
+            const d = cd[cd.length - 1].date;
+            if (!lastCachedDate || d > lastCachedDate) lastCachedDate = d;
+          }
+        }
+      }
+
+      // Query nuevas fechas desde Firestore (solo dates >= lastCachedDate)
+      const endDate = new Date().toISOString().split("T")[0];
+      let newPoints = [];
+
+      if (lastCachedDate) {
+        const newDatesSnapshot = await db
+          .collection("indexHistories").doc(code).collection("dates")
+          .where("date", ">=", lastCachedDate)
+          .where("date", "<=", endDate)
+          .orderBy("date", "asc")
+          .get();
+
+        newPoints = newDatesSnapshot.docs.map(doc => {
+          const d = doc.data();
+          const value = parseFloat(d.score) || 0;
+          let percentChange = parseFloat(d.percentChange) || 0;
+          if (!isFinite(percentChange)) percentChange = 0;
+          if (!isFinite(value)) return null;
+          return { date: d.date, value, percentChange };
+        }).filter(Boolean);
+
+        if (newPoints.length > 0) {
+          console.log(`[refreshIndexCacheInternal] ${code}: ${newPoints.length} punto(s) desde ${lastCachedDate}`);
+        }
+      }
+
+      // Append intraday point (ensures 24h TTL instead of 1h)
+      const todayStr = new Date().toISOString().split("T")[0];
+      const hasToday = newPoints.some(p => p.date === todayStr);
+
+      if (!hasToday) {
+        const intradayPoint = await _fetchIntradayPoint(code, todayStr);
+        if (intradayPoint) {
+          newPoints.push(intradayPoint);
+          console.log(`[refreshIndexCacheInternal] ${code}: appended intraday point ${intradayPoint.value} for ${todayStr}`);
+        }
+      }
+
+      // Actualizar cada rango: incremental merge o full recalc
+      for (let i = 0; i < VALID_RANGES.length; i++) {
+        const range = VALID_RANGES[i];
+
+        try {
+          let result;
+          const cacheDoc = cacheDocs[i];
+          const hasValidCache = cacheDoc.exists
+            && cacheDoc.data().chartData?.length > 0
+            && cacheDoc.data().indexInfo;
+
+          if (hasValidCache && lastCachedDate) {
+            result = _mergeIncrementalCache(cacheDoc.data(), newPoints, range);
+            incrementalMerges++;
+          } else {
+            result = await calculateIndexData(code, range);
+            fullRecalcs++;
+          }
+
+          await db.collection("indexCache").doc(`${code}_${range}`).set({
+            ...result,
+            lastUpdated: Date.now(),
+          });
+
+          refreshed++;
+        } catch (error) {
+          errors++;
+          errorDetails.push(`${code}/${range}: ${error.message}`);
+          console.error(`[refreshIndexCacheInternal] Error ${code}/${range}:`, error.message);
+        }
+      }
+
+    } catch (error) {
+      errors += VALID_RANGES.length;
+      errorDetails.push(`${code}/*: ${error.message}`);
+      console.error(`[refreshIndexCacheInternal] Error procesando ${code}:`, error.message);
+    }
+  }
+
+  const duration = Math.round((Date.now() - startTime) / 1000);
+  console.log(
+    `[refreshIndexCacheInternal] Completado en ${duration}s: ${refreshed} caches ` +
+    `(${incrementalMerges} incremental, ${fullRecalcs} full), ${errors} errores`
+  );
+
+  if (errorDetails.length > 0) {
+    console.log(`[refreshIndexCacheInternal] Errores:`, errorDetails.slice(0, 10));
+  }
+
+  return { success: true, refreshed, incrementalMerges, fullRecalcs, errors, duration, totalIndices: indices.length };
+}
+
+// ============================================================================
 // CLOUD FUNCTION: refreshIndexCache (Scheduled)
+// OPT-SNAP-INCR Fase 3: Kept as standalone fallback. Primary execution now via unifiedMarketDataUpdate.
 // ============================================================================
 
 /**
@@ -492,8 +631,6 @@ function _mergeIncrementalCache(existingCache, newPoints, range) {
 const refreshIndexCache = onSchedule(
   {
     // OPT-FIRESTORE-002 W-01: Normalizado a America/New_York (era UTC).
-    // 00:30 ET Mar-Sáb = Lun-Vie post-market close.
-    // Antes: 00:30 UTC = 7:30 PM COT = horario activo del usuario → cascada de cache misses.
     schedule: "30 0 * * 2-6",
     timeZone: "America/New_York",
     region: "us-central1",
@@ -501,153 +638,12 @@ const refreshIndexCache = onSchedule(
     timeoutSeconds: 540,
   },
   async (event) => {
-    console.log("[refreshIndexCache] Iniciando refresh incremental de caches de índices...");
-
-    const startTime = Date.now();
-    let refreshed = 0;
-    let errors = 0;
-    let fullRecalcs = 0;
-    let incrementalMerges = 0;
-    const errorDetails = [];
-
+    console.log("[refreshIndexCache] Standalone execution — delegating to internal");
     try {
-      // 1. Obtener lista de todos los índices (también sirve como fallback de indexInfo)
-      const indicesSnapshot = await db.collection("indexHistories").get();
-      const indices = indicesSnapshot.docs.map(doc => ({ id: doc.id, data: doc.data() }));
-
-      console.log(`[refreshIndexCache] Procesando ${indices.length} índices incrementalmente`);
-
-      for (const index of indices) {
-        const code = index.id;
-
-        try {
-          // 2. Leer los 7 cache docs en paralelo
-          const cacheRefs = VALID_RANGES.map(range =>
-            db.collection("indexCache").doc(`${code}_${range}`).get()
-          );
-          const cacheDocs = await Promise.all(cacheRefs);
-
-          // 3. Determinar la última fecha cacheada (todas deberían coincidir)
-          let lastCachedDate = null;
-          for (const cacheDoc of cacheDocs) {
-            if (cacheDoc.exists) {
-              const data = cacheDoc.data();
-              const cd = data.chartData;
-              if (cd && cd.length > 0) {
-                const d = cd[cd.length - 1].date;
-                if (!lastCachedDate || d > lastCachedDate) lastCachedDate = d;
-              }
-            }
-          }
-
-          // 4. Query nuevas fechas desde Firestore (solo dates >= lastCachedDate)
-          //    Usa >= para que el cierre oficial reemplace un posible punto intraday
-          const endDate = new Date().toISOString().split("T")[0];
-          let newPoints = [];
-
-          if (lastCachedDate) {
-            const newDatesSnapshot = await db
-              .collection("indexHistories").doc(code).collection("dates")
-              .where("date", ">=", lastCachedDate)
-              .where("date", "<=", endDate)
-              .orderBy("date", "asc")
-              .get();
-
-            newPoints = newDatesSnapshot.docs.map(doc => {
-              const d = doc.data();
-              const value = parseFloat(d.score) || 0;
-              let percentChange = parseFloat(d.percentChange) || 0;
-              if (!isFinite(percentChange)) percentChange = 0;
-              if (!isFinite(value)) return null;
-              return { date: d.date, value, percentChange };
-            }).filter(Boolean);
-
-            if (newPoints.length > 0) {
-              console.log(`[refreshIndexCache] ${code}: ${newPoints.length} punto(s) desde ${lastCachedDate}`);
-            }
-          }
-
-          // 5. Append intraday point so lastCachedDate === todayStr → 24h TTL
-          // OPT-FIRESTORE-002 R1: Without this, cache docs have yesterday's date,
-          // triggering 1h TTL → on-demand calculateIndexData on every CF call (~45K reads/day).
-          // With the intraday append, on-demand calls see today → 24h TTL → near-zero misses.
-          const todayStr = new Date().toISOString().split("T")[0];
-          const hasToday = newPoints.some(p => p.date === todayStr);
-          let intradayPoint = null;
-
-          if (!hasToday) {
-            // Only need to fetch once per index (same point for all 7 ranges)
-            // Uses the Yahoo Finance symbolMap inside _fetchIntradayPoint
-            intradayPoint = await _fetchIntradayPoint(code, todayStr);
-            if (intradayPoint) {
-              newPoints.push(intradayPoint);
-              console.log(`[refreshIndexCache] ${code}: appended intraday point ${intradayPoint.value} for ${todayStr}`);
-            }
-          }
-
-          // 6. Actualizar cada rango: incremental merge o full recalc
-          for (let i = 0; i < VALID_RANGES.length; i++) {
-            const range = VALID_RANGES[i];
-
-            try {
-              let result;
-              const cacheDoc = cacheDocs[i];
-              const hasValidCache = cacheDoc.exists
-                && cacheDoc.data().chartData?.length > 0
-                && cacheDoc.data().indexInfo;
-
-              if (hasValidCache && lastCachedDate) {
-                result = _mergeIncrementalCache(cacheDoc.data(), newPoints, range);
-                incrementalMerges++;
-              } else {
-                // Cold start: full recalculation
-                result = await calculateIndexData(code, range);
-                fullRecalcs++;
-              }
-
-              await db.collection("indexCache").doc(`${code}_${range}`).set({
-                ...result,
-                lastUpdated: Date.now(),
-              });
-
-              refreshed++;
-            } catch (error) {
-              errors++;
-              errorDetails.push(`${code}/${range}: ${error.message}`);
-              console.error(`[refreshIndexCache] Error ${code}/${range}:`, error.message);
-            }
-          }
-
-        } catch (error) {
-          errors += VALID_RANGES.length;
-          errorDetails.push(`${code}/*: ${error.message}`);
-          console.error(`[refreshIndexCache] Error procesando ${code}:`, error.message);
-        }
-      }
-
-      const duration = Math.round((Date.now() - startTime) / 1000);
-      console.log(
-        `[refreshIndexCache] Completado en ${duration}s: ${refreshed} caches ` +
-        `(${incrementalMerges} incremental, ${fullRecalcs} full), ${errors} errores`
-      );
-
-      if (errorDetails.length > 0) {
-        console.log(`[refreshIndexCache] Errores:`, errorDetails.slice(0, 10));
-      }
-
-      return {
-        success: true,
-        refreshed,
-        incrementalMerges,
-        fullRecalcs,
-        errors,
-        duration,
-        totalIndices: indices.length,
-      };
-
+      return await refreshIndexCacheInternal();
     } catch (error) {
       console.error("[refreshIndexCache] Error fatal:", error);
-      return { success: false, error: error.message, refreshed, errors };
+      return { success: false, error: error.message };
     }
   }
 );
@@ -705,6 +701,7 @@ async function invalidateAllIndexCaches() {
 module.exports = { 
   getIndexHistory,
   refreshIndexCache,
+  refreshIndexCacheInternal,
   invalidateIndexCache,
   invalidateAllIndexCaches,
   calculateIndexData, // Exportado para tests
