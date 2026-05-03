@@ -837,6 +837,11 @@ async function processUserPerformance({
 
     await batch.commit();
 
+    // FIX-READS-001: Capture timestamp BEFORE snapshot loop starts.
+    // Snapshots write lastUpdated: new Date() DURING the loop, so pipelineTs <= snapshot.lastUpdated always.
+    // This prevents the staleness check (signal > snapshot.lastUpdated) from false-positive marking fresh snapshots as stale.
+    const pipelineTs = new Date().toISOString();
+
     // OPT-SNAP-INCR: Snapshot incremental append (1 read + 1 write per snapshot)
     // Feature flag allows instant rollback to legacy full-rebuild path
     try {
@@ -948,17 +953,17 @@ async function processUserPerformance({
 
     // IMPORTANTE: Fuera del try/catch de snapshots para que SIEMPRE se escriba,
     // IndexedDB cache aunque los snapshots no se hayan regenerado.
+    // FIX-READS-001: Use pipelineTs (captured pre-loop) to guarantee signal <= snapshot.lastUpdated.
     try {
-      const lastSnapshotTs = new Date().toISOString();
       await db.collection("portfolioPerformance").doc(userId).set({
-        lastSnapshotUpdate: lastSnapshotTs
+        lastSnapshotUpdate: pipelineTs
       }, { merge: true });
       // R-08: Also write to userData so the frontend onSnapshot(userData) picks it up
       // without a separate getDoc to portfolioPerformance. Saves 1 read + eliminates 30s poll.
       await db.collection("userData").doc(userId).set({
-        lastSnapshotUpdate: lastSnapshotTs
+        lastSnapshotUpdate: pipelineTs
       }, { merge: true });
-      logInfo(`[EOD][Snapshot] lastSnapshotUpdate written for ${userId}: ${lastSnapshotTs}`);
+      logInfo(`[EOD][Snapshot] lastSnapshotUpdate written for ${userId}: ${pipelineTs}`);
     } catch (signalError) {
       logWarn(`[EOD][Snapshot] Error writing lastSnapshotUpdate for ${userId}: ${signalError.message}`);
     }
@@ -1031,8 +1036,10 @@ async function markInconsistentUsersAsStale(db, inconsistentUsers) {
  * @param {FirebaseFirestore.Firestore} db - Instancia de Firestore
  * @param {Array} currentPrices - Precios actuales del API Lambda
  * @param {Array} currencies - Tasas de cambio del API Lambda
+ * @param {Object} [options] - Opciones adicionales
+ * @param {FirebaseFirestore.QuerySnapshot} [options.activeAssetsSnapshot] - FIX-READS-002: Pre-fetched active assets to avoid redundant global scan
  */
-async function calculateDailyPortfolioPerformance(db, currentPrices, currencies) {
+async function calculateDailyPortfolioPerformance(db, currentPrices, currencies, options = {}) {
   logInfo('🔄 Calculando rendimiento diario del portafolio (API Lambda)...');
   
   // OPT-DEMAND-400-FIX: Usar fecha del DÍA ANTERIOR para el cálculo
@@ -1051,6 +1058,7 @@ async function calculateDailyPortfolioPerformance(db, currentPrices, currencies)
   
   // OPT-DEMAND-CLEANUP: Solo consultar datos que NO vienen del API
   // FIX-TIMESTAMP-002: Usar rango de fechas para soportar timestamps completos
+  // FIX-READS-002: Use injected assets if available to avoid redundant global scan
   const [
     transactionsSnapshot,
     activeAssetsSnapshot,
@@ -1060,7 +1068,9 @@ async function calculateDailyPortfolioPerformance(db, currentPrices, currencies)
       .where('date', '>=', dateRangeStart)
       .where('date', '<=', dateRangeEnd)
       .get(),
-    db.collection('assets').where('isActive', '==', true).get(),
+    options.activeAssetsSnapshot
+      ? Promise.resolve(options.activeAssetsSnapshot)
+      : db.collection('assets').where('isActive', '==', true).get(),
     db.collection('portfolioAccounts').where('isActive', '==', true).get()
   ]);
   
@@ -1337,8 +1347,9 @@ exports.unifiedMarketDataUpdate = onSchedule({
     }
     
     // Paso 3: Calcular performance del portafolio
+    // FIX-READS-002: Pass pre-fetched assetsSnapshot to avoid redundant global scan inside
     const perfOp = logger.startOperation('calculateDailyPortfolioPerformance');
-    const portfolioResult = await calculateDailyPortfolioPerformance(db, currentPrices, currencies);
+    const portfolioResult = await calculateDailyPortfolioPerformance(db, currentPrices, currencies, { activeAssetsSnapshot: assetsSnapshot });
     perfOp.success({ portfoliosCalculated: portfolioResult.count, failed: portfolioResult.failedCount || 0 });
     
     logger.info('📈 Portfolio performance calculated', {

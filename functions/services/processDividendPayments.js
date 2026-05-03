@@ -36,14 +36,15 @@ exports.processDividendPayments = onSchedule({
   }
 
   try {
-    // Primero actualizar información de dividendos para ETFs y acciones sin datos
-    console.log('Actualizando información de dividendos de activos...');
-    await scrapeDividendsInfoFromStockEvents();
-    console.log('Actualización de información de dividendos completada');
-
-    // Obtener todos los activos activos primero para saber qué símbolos consultar
+    // FIX-READS-004: Read assets ONCE and inject into scrapeDividendsInfoFromStockEvents
+    // to avoid redundant global scan inside that function
     const assetsSnapshot = await db.collection('assets').where('isActive', '==', true).get();
     const assets = assetsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+
+    // Primero actualizar información de dividendos para ETFs y acciones sin datos
+    console.log('Actualizando información de dividendos de activos...');
+    await scrapeDividendsInfoFromStockEvents({ injectedAssetsSnapshot: assetsSnapshot });
+    console.log('Actualización de información de dividendos completada');
     
     // Extraer símbolos únicos
     const symbols = [...new Set(assets.map(a => a.name).filter(Boolean))];

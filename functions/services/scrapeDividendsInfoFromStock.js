@@ -145,15 +145,15 @@ async function scrapeDividendInfo(symbol) {
  * 
  * @returns {Promise<Map<string, object>>} Mapa de símbolo a datos de dividendos
  */
-async function scrapeDividendsInfoFromStockEvents() {
+async function scrapeDividendsInfoFromStockEvents(options = {}) {
   const db = admin.firestore();
   const dividendDataMap = new Map();
   
   try {
-    // OPT-DEMAND-CLEANUP: Leer símbolos de assets activos (no de currentPrices)
-    const assetsSnapshot = await db.collection('assets')
-      .where('isActive', '==', true)
-      .get();
+    // FIX-READS-004: Use injected assets if provided to avoid redundant global scan
+    const assetsSnapshot = options.injectedAssetsSnapshot
+      ? options.injectedAssetsSnapshot
+      : await db.collection('assets').where('isActive', '==', true).get();
     
     if (assetsSnapshot.empty) {
       console.log('[scrapeDividendsInfoFromStockEvents] No se encontraron assets activos');
