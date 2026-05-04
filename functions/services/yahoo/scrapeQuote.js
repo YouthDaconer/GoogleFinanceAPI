@@ -1,6 +1,5 @@
 /* eslint-disable require-jsdoc */
 const axios = require("axios");
-const puppeteer = require("puppeteer");
 const NodeCache = require("node-cache");
 const cheerio = require("cheerio");
 const { createSimpleQuoteForYahoo } = require("../../models/quoteModel");
@@ -69,6 +68,12 @@ async function scrapeSimpleYahooQuote(symbol) {
 }
 
 async function getCookiesWithPuppeteer(url) {
+  let puppeteer;
+  try {
+    puppeteer = require("puppeteer");
+  } catch (e) {
+    throw new Error("puppeteer no está disponible en este entorno. Usa un entorno con soporte para headless browser.");
+  }
   console.log("Iniciando Puppeteer para obtener cookies...");
   const browser = await puppeteer.launch({
     args: ['--no-sandbox', '--disable-setuid-sandbox'],
