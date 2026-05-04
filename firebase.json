@@ -13,7 +13,16 @@
         "firebase-debug.log",
         "firebase-debug.*.log",
         "*.local",
-        "key.json"
+        "key.json",
+        ".cache",
+        "coverage",
+        "tests",
+        "__tests__",
+        "scripts",
+        "*.test.js",
+        "*.spec.js",
+        "testScrapeQuote.js",
+        "testProcessDividendPayments.js"
       ],
       "predeploy": [
         "npm --prefix \"$RESOURCE_DIR\" run lint"
