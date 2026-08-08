@@ -681,6 +681,10 @@ async function sellAsset(context, payload) {
       assetId: data.assetId,
       assetName: asset.name,
       type: 'sell',
+      // TXG-001.1: Identificador de operación + índice de lote. Aquí la venta es de un
+      // único lote, así que la operación se identifica con el id del propio documento.
+      operationId: transactionRef.id,
+      lotIndex: 0,
       amount: sellAmount,
       price: sellPrice,
       currency: asset.currency,
@@ -810,10 +814,19 @@ async function sellPartialAssetsFIFO(context, payload) {
     const pricePerUnit = cleanDecimal(Number(data.pricePerUnit) || 0);
     const totalCommission = cleanDecimal(Number(data.totalCommission) || 0);
     // FIX-TIMESTAMP-001: Usar fecha proporcionada o generar timestamp con hora actual
-    const sellDate = data.sellDate 
+    const sellDate = data.sellDate
       ? combineDateWithCurrentTime(data.sellDate)
       : new Date().toISOString();
     const currency = assetsList[0]?.currency || 'USD';
+    // TXG-001.1: Identificador único de la operación de venta, generado UNA sola vez
+    // antes del bucle FIFO. Los N documentos de lote lo comparten, lo que permite al
+    // visor consolidarlos en una sola fila sin heurísticas de inferencia.
+    // Autoid de Firestore: único sin round-trip ni dependencias nuevas.
+    const operationId = db.collection('transactions').doc().id;
+    // TXG-001.1: Posición del lote en el consumo FIFO (0-based). El orden FIFO no es
+    // recuperable desde el cliente (todos los lotes comparten `date` y `createdAt`, y
+    // los doc-id son aleatorios), así que se persiste explícitamente.
+    let lotIndex = 0;
 
     for (const asset of assetsList) {
       if (remainingUnitsToSell <= 0) break;
@@ -848,6 +861,9 @@ async function sellPartialAssetsFIFO(context, payload) {
         assetId: asset.id,
         assetName: asset.name,
         type: 'sell',
+        // TXG-001.1: agrupación exacta por construcción en el visor de transacciones
+        operationId: operationId,
+        lotIndex: lotIndex,
         amount: unitsToSellFromAsset,
         price: pricePerUnit,
         currency: asset.currency,
@@ -884,6 +900,9 @@ async function sellPartialAssetsFIFO(context, payload) {
         pnl: lotPnL,
         isFullSale: isFullSale,
       });
+
+      // TXG-001.1: avanzar la posición FIFO sólo cuando el lote produjo documento
+      lotIndex += 1;
     }
 
     // 6. Actualizar balance de la cuenta
