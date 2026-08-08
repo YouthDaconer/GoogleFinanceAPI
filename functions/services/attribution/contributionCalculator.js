@@ -80,13 +80,18 @@ async function getLatestPerformanceData(userId, accountId = 'overall') {
 
 /**
  * Obtiene las transacciones de venta realizadas en un período
+ * 
+ * FIX-ATTR-CURRENCY-001: Ahora convierte valuePnL y totalSold a la moneda
+ * de solicitud usando dollarPriceToDate de la transacción.
+ * 
  * @param {string} userId - ID del usuario
  * @param {Date} startDate - Fecha de inicio del período
  * @param {Date} endDate - Fecha de fin del período
  * @param {string[]} accountIds - IDs de cuentas a filtrar
+ * @param {string} [currency='USD'] - Moneda de salida para los cálculos
  * @returns {Promise<Object>} Ventas agrupadas por activo con P&L
  */
-async function getSellTransactionsInPeriod(userId, startDate, endDate, accountIds = []) {
+async function getSellTransactionsInPeriod(userId, startDate, endDate, accountIds = [], currency = 'USD') {
   const startDateStr = startDate.toISOString().split('T')[0];
   const endDateStr = endDate.toISOString().split('T')[0];
   
@@ -141,15 +146,47 @@ async function getSellTransactionsInPeriod(userId, startDate, endDate, accountId
       };
     }
     
-    // Usar valuePnL si está disponible, sino es 0
-    const pnl = tx.valuePnL || 0;
+    // FIX-ATTR-CURRENCY-001: Convertir valuePnL y totalSold a la moneda de solicitud
+    // Las transacciones pueden estar en COP, MXN, BRL, etc. pero el cálculo de
+    // atribución se hace en currency (default USD). Hay que convertir usando
+    // dollarPriceToDate de la transacción.
+    let pnl = tx.valuePnL || 0;
+    let txTotalValue = (parseFloat(tx.amount) || 0) * (parseFloat(tx.price) || 0);
+    const txCurrency = tx.currency || 'USD';
+    const dollarPrice = tx.dollarPriceToDate ? parseFloat(tx.dollarPriceToDate) : null;
+    
+    if (dollarPrice && dollarPrice > 0 && txCurrency !== currency) {
+      // Convertir de moneda local a USD (o a otra moneda objetivo)
+      // Ejemplo: COP → USD: dividir entre tipo de cambio
+      if (txCurrency === 'USD') {
+        // Ya está en USD, pero si currency es otra cosa, convertir
+        if (currency === 'COP') {
+          pnl = pnl * dollarPrice;
+          txTotalValue = txTotalValue * dollarPrice;
+        }
+        // Si currency es USD, no hacer nada
+      } else {
+        // Transacción en moneda local (COP, MXN, etc.) → convertir a currency
+        // dollarPriceToDate es precio del USD en moneda local
+        // Ejemplo: dollarPriceToDate=3575 significa 1 USD = 3575 COP
+        pnl = pnl / dollarPrice;
+        txTotalValue = txTotalValue / dollarPrice;
+      }
+      
+      console.log(`[Attribution] Conversión transacción ${tx.assetName}: ${txCurrency}→${currency}, valuePnL: ${tx.valuePnL} → ${pnl.toFixed(2)}, totalSold: ${txTotalValue.toFixed(2)}`);
+    } else if (txCurrency !== currency && !dollarPrice) {
+      // Advertir si no hay dollarPriceToDate para conversión
+      console.warn(`[Attribution] ⚠️ Sin dollarPriceToDate para convertir ${txCurrency}→${currency} para ${tx.assetName}. Usando valor original.`);
+    }
+    
     sellsByAsset[assetKey].totalRealizedPnL += pnl;
-    sellsByAsset[assetKey].totalSold += (parseFloat(tx.amount) || 0) * (parseFloat(tx.price) || 0);
+    sellsByAsset[assetKey].totalSold += txTotalValue;
     sellsByAsset[assetKey].transactions.push({
       date: tx.date,
       amount: tx.amount,
       price: tx.price,
-      pnl
+      pnl,
+      originalCurrency: txCurrency
     });
   }
   
@@ -432,11 +469,13 @@ async function calculateContributions(userId, period, currency = 'USD', accountI
     : 0;
   
   // 4. NUEVO: Obtener ventas realizadas en el período
+  // FIX-ATTR-CURRENCY-001: Pasar currency para conversión de valuePnL
   const sellsByAsset = await getSellTransactionsInPeriod(
     userId, 
     periodStartDate, 
     periodEndDate, 
-    accountIds
+    accountIds,
+    currency
   );
   
   // Calcular P&L realizada total

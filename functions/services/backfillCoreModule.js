@@ -627,14 +627,20 @@ function calculateAccountDayPerformance(transactions, date, exchangeRates, price
   let totalValueUSD = 0;
   let totalInvestmentUSD = 0;
   let skippedAssets = 0;
-  
+  let valuedAssets = 0;
+  // FIX-ATTR-BACKFILL: Construir assetPerformance por activo para que los docs de
+  // backfill tengan la MISMA estructura que unifiedMarketDataUpdate. Sin esto, el
+  // .set({merge:true}) escribía un doc USD sin assetPerformance y la atribución
+  // no encontraba activos activos (treemap vacío).
+  const assetPerformance = {};
+
   for (const asset of assets) {
     const symbolPrices = pricesBySymbol[asset.name];
     const price = getPriceForDate(symbolPrices, date);
-    
+
     if (price > 0) {
       const valueInLocalCurrency = asset.units * price;
-      
+
       let valueInUSD = valueInLocalCurrency;
       if (asset.currency && asset.currency !== 'USD') {
         if (exchangeRates[asset.currency]) {
@@ -647,12 +653,34 @@ function calculateAccountDayPerformance(transactions, date, exchangeRates, price
           continue;
         }
       }
-      
+
       totalValueUSD += valueInUSD;
       totalInvestmentUSD += asset.totalCostUSD;
+      valuedAssets++;
+
+      const assetUnrealizedPnL = valueInUSD - asset.totalCostUSD;
+      assetPerformance[`${asset.name}_${asset.assetType}`] = {
+        units: asset.units,
+        totalValue: valueInUSD,
+        totalInvestment: asset.totalCostUSD,
+        totalROI: asset.totalCostUSD > 0
+          ? ((valueInUSD - asset.totalCostUSD) / asset.totalCostUSD) * 100
+          : 0,
+        unrealizedProfitAndLoss: assetUnrealizedPnL,
+      };
     }
   }
-  
+
+  // FIX-ATTR-BACKFILL: Si HAY tenencias pero NINGUNA se pudo valorar (precios
+  // históricos faltantes, ej: el día en curso antes del EOD), NO escribir un doc
+  // en ceros. Escribirlo con {merge:true} corrompería el doc EOD (buenos datos)
+  // poniendo USD.totalValue=0, o crearía un stub sin assetPerformance. Mejor
+  // saltar el día y conservar el último doc EOD válido.
+  if (valuedAssets === 0) {
+    console.warn(`[backfillCore] ${date}: ${assets.length} tenencias pero 0 valorables (sin precios). Se omite escritura para no sobrescribir datos EOD.`);
+    return null;
+  }
+
   const previousTotalValue = previousDayData?.totalValue || 0;
   const isNewInvestment = previousTotalValue === 0 && totalValueUSD > 0;
   
@@ -694,6 +722,9 @@ function calculateAccountDayPerformance(transactions, date, exchangeRates, price
       dailyReturn: adjustedDailyChangePercentage / 100,
       monthlyReturn: 0,
       annualReturn: 0,
+      // FIX-ATTR-BACKFILL: incluir assetPerformance para que la atribución
+      // encuentre las tenencias activas (paridad con unifiedMarketDataUpdate).
+      assetPerformance,
     },
     lastUpdated: new Date().toISOString(),
   };
@@ -717,20 +748,38 @@ function aggregateOverallPerformance(accountsPerformance, date) {
   let totalPreChangeValue = 0;
   let weightedAdjustedChange = 0;
   let weightedRawChange = 0;
-  
+
+  // FIX-ATTR-BACKFILL: agregar assetPerformance sumando por assetKey entre cuentas
+  // (mismo criterio que el flujo overall de unifiedMarketDataUpdate).
+  const assetPerformance = {};
+
   for (const [accountId, perfData] of accountsPerformance.entries()) {
     const usdData = perfData.USD;
     if (!usdData) continue;
-    
+
     const accountValue = usdData.totalValue || 0;
     const accountAdjChange = usdData.adjustedDailyChangePercentage || 0;
     const accountRawChange = usdData.rawDailyChangePercentage || 0;
-    
+
     totalValue += accountValue;
     totalInvestment += usdData.totalInvestment || 0;
     totalCashFlow += usdData.totalCashFlow || 0;
     totalDonePnL += usdData.doneProfitAndLoss || 0;
-    
+
+    // Sumar assetPerformance por assetKey
+    for (const [assetKey, ap] of Object.entries(usdData.assetPerformance || {})) {
+      if (!assetPerformance[assetKey]) {
+        assetPerformance[assetKey] = {
+          units: 0, totalValue: 0, totalInvestment: 0, unrealizedProfitAndLoss: 0, totalROI: 0,
+        };
+      }
+      const agg = assetPerformance[assetKey];
+      agg.units += ap.units || 0;
+      agg.totalValue += ap.totalValue || 0;
+      agg.totalInvestment += ap.totalInvestment || 0;
+      agg.unrealizedProfitAndLoss += ap.unrealizedProfitAndLoss || 0;
+    }
+
     // Pre-change value method for weighted average
     if (accountValue > 0) {
       const preChangeValue = accountAdjChange !== 0 
@@ -753,10 +802,17 @@ function aggregateOverallPerformance(accountsPerformance, date) {
   }
   
   const unrealizedProfitAndLoss = totalValue - totalInvestment;
-  const totalROI = totalInvestment > 0 
-    ? ((totalValue - totalInvestment) / totalInvestment) * 100 
+  const totalROI = totalInvestment > 0
+    ? ((totalValue - totalInvestment) / totalInvestment) * 100
     : 0;
-  
+
+  // FIX-ATTR-BACKFILL: recomputar totalROI por activo tras la suma entre cuentas
+  for (const ap of Object.values(assetPerformance)) {
+    ap.totalROI = ap.totalInvestment > 0
+      ? ((ap.totalValue - ap.totalInvestment) / ap.totalInvestment) * 100
+      : 0;
+  }
+
   return {
     date,
     USD: {
@@ -772,6 +828,7 @@ function aggregateOverallPerformance(accountsPerformance, date) {
       dailyReturn: adjustedDailyChangePercentage / 100,
       monthlyReturn: 0,
       annualReturn: 0,
+      assetPerformance,
     },
     overall: {
       totalValue,

@@ -199,6 +199,7 @@ exports.weeklyProfitableWeeksCalculation = onSchedule({
   schedule: "every sunday 23:00",
   timeZone: "America/New_York",
   retryCount: 3,
+  memory: "512MiB",  // OOM fix: default 256MiB se excedía (275 MiB usados)
 }, async (event) => {
   try {
     console.log('Iniciando cálculo semanal de semanas rentables');

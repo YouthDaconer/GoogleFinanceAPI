@@ -226,6 +226,46 @@
         { "fieldPath": "userId", "order": "ASCENDING" },
         { "fieldPath": "processedAt", "order": "DESCENDING" }
       ]
+    },
+    {
+      "collectionGroup": "userData",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "subscription.status", "order": "ASCENDING" },
+        { "fieldPath": "subscription.currentPeriodEnd", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "userData",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "subscription.cancelAtPeriodEnd", "order": "ASCENDING" },
+        { "fieldPath": "subscription.currentPeriodEnd", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "userData",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "subscription.status", "order": "ASCENDING" },
+        { "fieldPath": "subscription.subscriptionId", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "portfolioPerformance",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "_stale.since", "order": "DESCENDING" },
+        { "fieldPath": "_stale", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "performanceSnapshots",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "type", "order": "ASCENDING" },
+        { "fieldPath": "lastUpdated", "order": "ASCENDING" }
+      ]
     }
   ],
   "fieldOverrides": [
