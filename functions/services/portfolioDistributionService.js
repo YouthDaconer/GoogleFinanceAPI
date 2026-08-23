@@ -32,6 +32,22 @@ const CACHE_TTL = 5 * 60 * 1000;
 const etfDataCache = new Map();
 const ETF_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 horas
 
+// FIX-ETF-EU-001: Cobertura mínima de holdings para considerar un ETF
+// completamente desagregado.
+// Fuentes como etf.com publican la cartera completa (~99.9%), pero Yahoo y
+// justETF solo publican el top-10 (VUAA.L ≈ 36%, VWCE.DE ≈ 23%). Si se
+// desagregara ese top-10 y se descartara el ETF, el resto del fondo
+// desaparecería del treemap y los pesos dejarían de sumar 100%.
+// Por debajo del umbral se conserva el remanente como posición del propio ETF.
+const ETF_HOLDINGS_COVERAGE_THRESHOLD = 0.97;
+
+// FIX-ETF-EU-001: Timeout de cada llamada a /v1/etf/{symbol}/unified.
+// La cadena de fuentes del API tarda ~18s en frío para un UCITS europeo.
+// Cota superior: los símbolos se piden en lotes de CONCURRENT_LIMIT en paralelo,
+// así que el coste es (nº de lotes × el símbolo más lento del lote), no la suma.
+// Con 2 lotes son 50s como máximo, dentro de los 60s de timeout de queryOperations.
+const ETF_API_TIMEOUT_MS = 25000;
+
 // Cache para sectores (raramente cambian)
 let sectorsCache = null;
 let sectorsCacheTimestamp = 0;
@@ -83,6 +99,7 @@ const EXTERNAL_SECTOR_MAPPINGS = {
   
   // === Consumer Cyclical ===
   'Consumer Durables': 'Consumer Cyclical',
+  'Consumer Cyclicals': 'Consumer Cyclical', // justETF
   'Consumer Services': 'Consumer Cyclical',
   'Retail Trade': 'Consumer Cyclical',
   'CONSUMER DISCRETIONARY': 'Consumer Cyclical',
@@ -95,6 +112,8 @@ const EXTERNAL_SECTOR_MAPPINGS = {
   
   // === Consumer Defensive ===
   'Consumer Non-Durables': 'Consumer Defensive',
+  'Consumer Non-Cyclicals': 'Consumer Defensive', // justETF
+  'Consumer Non-Cyclical': 'Consumer Defensive',
   'CONSUMER STAPLES': 'Consumer Defensive',
   'Consumer Staples': 'Consumer Defensive',
   'Food': 'Consumer Defensive',
@@ -408,7 +427,11 @@ async function getPortfolioDistribution(userId, options = {}) {
         etfCount: etfSymbols.length,
         etfDataLoaded: etfData.size,
         etfDecomposed: etfStats.decomposed,
-        etfNotDecomposed: etfStats.notDecomposed
+        etfNotDecomposed: etfStats.notDecomposed,
+        // FIX-ETF-EU-001: ETFs cuya fuente sólo publica el top-10 de la cartera.
+        // El resto se conserva como posición del propio ETF en `holdings`.
+        etfPartiallyDecomposed: Array.from(etfStats.partiallyDecomposed),
+        etfHoldingsCoverage: etfStats.coverage
       }
     };
 
@@ -693,6 +716,25 @@ async function getPortfolioAccounts(userId) {
 }
 
 /**
+ * FIX-ETF-EU-001: Determina si la respuesta del API de ETFs es aprovechable.
+ *
+ * Antes se exigían holdings; eso descartaba respuestas que sí traen sectores
+ * y/o países (p.ej. justETF sin top-10), perdiendo la geografía del ETF y
+ * dejándolo en `nonGeographicData`.
+ *
+ * @param {Object|null} data - Respuesta de /v1/etf/{symbol}/unified
+ * @returns {boolean} true si aporta holdings, sectores o países
+ */
+function hasUsableETFData(data) {
+  if (!data) return false;
+  return Boolean(
+    (data.holdings && data.holdings.length > 0) ||
+    (data.sectors && data.sectors.length > 0) ||
+    (data.countries && data.countries.length > 0)
+  );
+}
+
+/**
  * Obtiene datos de ETFs en batch (con cache)
  * Optimizado para evitar rate limiting (429) y llamadas duplicadas
  */
@@ -707,8 +749,8 @@ async function batchGetETFData(symbols) {
     const cached = etfDataCache.get(normalized);
     
     if (cached && Date.now() - cached.timestamp < ETF_CACHE_TTL) {
-      // Solo usar cache si tiene datos válidos (holdings)
-      if (cached.data && cached.data.holdings && cached.data.holdings.length > 0) {
+      // Solo usar cache si tiene datos válidos
+      if (hasUsableETFData(cached.data)) {
         etfData.set(normalized, cached.data);
         cacheHits.push(normalized);
       } else {
@@ -739,7 +781,7 @@ async function batchGetETFData(symbols) {
 
   // Procesar resultados
   for (const { symbol, data } of results) {
-    if (data && data.holdings && data.holdings.length > 0) {
+    if (hasUsableETFData(data)) {
       etfDataCache.set(symbol, { data, timestamp: Date.now() });
       etfData.set(symbol, data);
     }
@@ -814,8 +856,12 @@ async function fetchETFDataFromAPI(symbol) {
   logger.debug('ETF API request', { symbol, url, hasToken });
   
   // FIX-FETCH-001: Usar AbortController para timeout (fetch nativo no soporta timeout param)
+  // FIX-ETF-EU-001: Subido de 15s a 25s. Medido en producción, la cadena del API
+  // para un UCITS europeo tarda ~18s en frío (etf.com 0.3s + TrackInsight
+  // rate-limited 4.4s + justETF/Yahoo 13s) y ~7s en caliente. Con 15s se abortaba
+  // justo el primer fetch, el que puebla la caché, y el ETF quedaba sin desagregar.
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 15000);
+  const timeoutId = setTimeout(() => controller.abort(), ETF_API_TIMEOUT_MS);
   
   try {
     const response = await fetch(url, { 
@@ -1029,7 +1075,9 @@ function calculateTotalValue(assets, prices, currencyRates) {
 function calculateSectorDistribution(assets, prices, etfData, sectorMappings, portfolioAccounts, userId, totalValue, currencyRates) {
   const holdingsMap = {};
   const sectorsMap = {};
-  const etfStats = { decomposed: 0, notDecomposed: [] };
+  // FIX-ETF-EU-001: `coverage` y `partiallyDecomposed` permiten diagnosticar
+  // desde los logs qué ETFs sólo traen el top-10 de su cartera.
+  const etfStats = { decomposed: 0, notDecomposed: [], partiallyDecomposed: new Set(), coverage: {} };
 
   // Filtrar assets relevantes
   const relevantAssets = assets.filter(asset => {
@@ -1081,9 +1129,22 @@ function calculateSectorDistribution(assets, prices, etfData, sectorMappings, po
   });
 
   // Procesar ETFs
-  const etfAssets = relevantAssets.filter(asset => 
+  const etfAssets = relevantAssets.filter(asset =>
     asset.assetType === 'etf' || prices[asset.name]?.type === 'etf'
   );
+
+  // FIX-ETF-EU-001: Eliminar del mapa los ETFs que se van a desglosar ANTES de
+  // recorrer las posiciones. Si el `delete` se hiciera dentro del bucle (como
+  // antes), con un mismo ETF en varias cuentas la segunda iteración borraría el
+  // remanente acumulado en la primera.
+  const decomposableEtfSymbols = new Set();
+  for (const etf of etfAssets) {
+    const info = etfData.get(etf.name.trim().toUpperCase());
+    if (info && info.holdings && info.holdings.length > 0) {
+      decomposableEtfSymbols.add(etf.name);
+    }
+  }
+  decomposableEtfSymbols.forEach(symbol => { delete holdingsMap[symbol]; });
 
   for (const etf of etfAssets) {
     const price = prices[etf.name];
@@ -1098,11 +1159,20 @@ function calculateSectorDistribution(assets, prices, etfData, sectorMappings, po
     const etfInfo = etfData.get(normalized);
 
     if (etfInfo && etfInfo.holdings && etfInfo.holdings.length > 0) {
-      // BUGFIX: Eliminar el ETF del mapa de holdings ya que lo vamos a desglosar
-      // Solo mostramos los holdings subyacentes, no el ETF en sí
-      delete holdingsMap[etf.name];
       etfStats.decomposed++;
-      
+
+      // FIX-ETF-EU-001: Fracción del fondo efectivamente desagregable.
+      // etf.com devuelve la cartera completa (~1.0); Yahoo/justETF solo el top-10.
+      // Sólo cuentan las posiciones con identificador: las que no lo tienen se
+      // descartan más abajo, así que incluirlas aquí inflaría la cobertura y su
+      // peso se perdería del treemap. Es el caso de TLT, cuyos 42 bonos del
+      // Tesoro llegan sin symbol ni isin: cobertura real 0 → se conserva entero.
+      const rawCoverage = etfInfo.holdings
+        .filter(h => h.symbol || h.isin)
+        .reduce((sum, h) => sum + (h.weight || 0), 0);
+      const coverage = Math.min(Math.max(rawCoverage, 0), 1);
+      etfStats.coverage[etf.name] = coverage;
+
       // Procesar holdings del ETF
       for (const holding of etfInfo.holdings) {
         if (!holding.symbol && !holding.isin) continue;
@@ -1130,22 +1200,67 @@ function calculateSectorDistribution(assets, prices, etfData, sectorMappings, po
         });
       }
 
-      // Procesar sectores del ETF
-      // SECTOR-HOMOLOGATION: Usar normalizeSectorName para mapear a sectores estándar
-      for (const sector of (etfInfo.sectors || [])) {
-        const standardSector = normalizeSectorName(sector.name, sectorMappings);
-        if (!standardSector) continue;
-
-        const contribution = (sector.weight || 0) * etfWeight;
-
-        if (!sectorsMap[standardSector]) {
-          sectorsMap[standardSector] = { sector: standardSector, weight: 0 };
+      // FIX-ETF-EU-001: Con desglose parcial, el resto del fondo se mantiene
+      // como posición del propio ETF para que los pesos sigan sumando 100%.
+      if (coverage < ETF_HOLDINGS_COVERAGE_THRESHOLD) {
+        const remainderWeight = etfWeight * (1 - coverage);
+        if (remainderWeight > 0) {
+          if (!holdingsMap[etf.name]) {
+            holdingsMap[etf.name] = {
+              symbol: etf.name,
+              description: `${price.name || etf.name} (resto no desagregado)`,
+              weight: 0,
+              asset_type: 'etf',
+              sector: price.sector || null,
+              assetClass: price.sector || null,
+              isPartialRemainder: true,
+              holdingsCoverage: coverage,
+              sources: []
+            };
+          }
+          holdingsMap[etf.name].weight += remainderWeight;
+          holdingsMap[etf.name].sources.push({ symbol: etf.name, contribution: remainderWeight });
+          etfStats.partiallyDecomposed.add(etf.name);
         }
-        sectorsMap[standardSector].weight += contribution;
       }
+
     } else {
-      // Si no hay datos de ETF, el ETF permanece como holding directo
+      // Si no hay holdings del ETF, el ETF permanece como holding directo
       etfStats.notDecomposed.push(etf.name);
+    }
+
+    // Procesar sectores del ETF
+    // SECTOR-HOMOLOGATION: Usar normalizeSectorName para mapear a sectores estándar
+    // FIX-ETF-EU-001: Fuera del bloque de holdings. Una fuente puede publicar el
+    // desglose sectorial sin publicar la cartera (p.ej. justETF sin top-10); esa
+    // exposición debe reflejarse en el gráfico de sectores igualmente.
+    let sectorCoverage = 0;
+    for (const sector of ((etfInfo && etfInfo.sectors) || [])) {
+      const standardSector = normalizeSectorName(sector.name, sectorMappings);
+      if (!standardSector) continue;
+
+      const sectorWeight = sector.weight || 0;
+      const contribution = sectorWeight * etfWeight;
+      sectorCoverage += sectorWeight;
+
+      if (!sectorsMap[standardSector]) {
+        sectorsMap[standardSector] = { sector: standardSector, weight: 0 };
+      }
+      sectorsMap[standardSector].weight += contribution;
+    }
+
+    // FIX-ETF-EU-001: Si la fuente clasificó sólo una parte del fondo, el resto
+    // se imputa a 'Other' para que la distribución sectorial siga sumando el
+    // total del portafolio. Si no clasificó nada (sectorCoverage === 0) se
+    // mantiene el comportamiento previo: el ETF no aporta sectores.
+    const sectorRemainder = sectorCoverage > 0
+      ? Math.max(0, 1 - Math.min(sectorCoverage, 1))
+      : 0;
+    if (sectorRemainder > 0.001) {
+      if (!sectorsMap['Other']) {
+        sectorsMap['Other'] = { sector: 'Other', weight: 0 };
+      }
+      sectorsMap['Other'].weight += sectorRemainder * etfWeight;
     }
   }
 
@@ -1296,6 +1411,12 @@ function calculateCountryDistribution(assets, prices, etfData, countryMappings, 
         if (!countryName) continue;
 
         const country = countryMappings.get(countryName.toLowerCase());
+        // FIX-ETF-EU-001: justETF agrupa la cola de la cartera en "Other" y usa
+        // nombres propios de país. Sin este log, cualquier nombre que no exista
+        // en la colección `countries` se descartaba de forma silenciosa.
+        if (!country && !/^others?$/i.test(countryName)) {
+          logger.warn('Unmapped ETF country found', { etf: etf.name, country: countryName });
+        }
         if (country) {
           // SCALE-OPT-001: Usar codeNo para compatibilidad con TopoJSON del mapa mundial
           const countryId = country.codeNo || country.id;
@@ -1507,5 +1628,14 @@ async function getAvailableSectors() {
 module.exports = {
   getPortfolioDistribution,
   invalidateDistributionCache,
-  getAvailableSectors
+  getAvailableSectors,
+  // FIX-ETF-EU-001: expuestos para pruebas unitarias del desglose de ETFs
+  // (no forman parte del contrato público del servicio).
+  __testing: {
+    calculateSectorDistribution,
+    calculateCountryDistribution,
+    hasUsableETFData,
+    normalizeSectorName,
+    ETF_HOLDINGS_COVERAGE_THRESHOLD
+  }
 };
