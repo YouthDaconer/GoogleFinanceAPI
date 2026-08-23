@@ -191,13 +191,79 @@ const CONTENT_PATTERNS = {
  * @type {string[]}
  */
 const KNOWN_BROKERS = [
+  // Anglosajones (catálogo original)
   'interactive_brokers',
   'td_ameritrade',
   'fidelity',
   'etoro',
   'charles_schwab',
   'robinhood',
+
+  // HU 1.5 — Colombia
+  'trii',
+  'tyba',
+  'valores_bancolombia',
+
+  // HU 1.5 — Europa
+  'degiro',
+  'trade_republic',
+  'xtb',
+  'renta4',
+
+  // HU 1.5 — Criptomonedas
+  'binance',
+  'coinbase',
+  'bitso',
 ];
+
+/**
+ * HU 1.5: formatos numéricos que un broker puede declarar.
+ *
+ * - `us`: 1,234.56 (coma para miles, punto decimal)
+ * - `eu`: 1.234,56 (punto para miles, coma decimal) — Europa y Colombia
+ *
+ * @typedef {'us'|'eu'} NumberFormat
+ */
+const NUMBER_FORMATS = ['us', 'eu'];
+
+// ============================================================================
+// GLOBAL EQUIVALENCE CATALOG (HU 1.6)
+// ============================================================================
+
+/**
+ * Umbrales del catálogo global de equivalencias.
+ *
+ * El umbral de RETIRO es deliberadamente MENOR que el de promoción: el daño de
+ * propagar una equivalencia errónea a toda la base de usuarios supera el costo de
+ * dejar de proponer una válida (RN-31).
+ */
+const GLOBAL_EQUIVALENCE_THRESHOLDS = {
+  /** RN-07: usuarios distintos que deben coincidir para promover una equivalencia */
+  promoteDistinctUsers: 5,
+
+  /** RN-31: usuarios distintos que deben contradecirla para retirarla */
+  retireDistinctUsers: 3,
+
+  /** RN-31: ventana de la contradicción sostenida, en días */
+  retireWindowDays: 90,
+};
+
+/**
+ * Estados de una entrada del catálogo global.
+ * Una entrada retirada deja de proponerse, pero NO se borra: su historial de
+ * evidencia sigue siendo relevante y el retiro no reescribe transacciones (RN-32).
+ */
+const GLOBAL_EQUIVALENCE_STATUS = {
+  ACTIVE: 'active',
+  RETIRED: 'retired',
+};
+
+/** Acciones que se registran en la auditoría del catálogo global */
+const GLOBAL_EQUIVALENCE_AUDIT_ACTIONS = {
+  PROMOTED: 'promoted',
+  RETIRED_BY_EVIDENCE: 'retired_by_evidence',
+  RETIRED_BY_OPERATOR: 'retired_by_operator',
+};
 
 // ============================================================================
 // VALIDATION LIMITS (AC-003, AC-004, AC-022)
@@ -293,7 +359,14 @@ module.exports = {
   
   // Brokers
   KNOWN_BROKERS,
-  
+  NUMBER_FORMATS,
+
+  // HU 1.6: catálogo global de equivalencias
+  GLOBAL_EQUIVALENCE_THRESHOLDS,
+  GLOBAL_EQUIVALENCE_STATUS,
+  GLOBAL_EQUIVALENCE_AUDIT_ACTIONS,
+
+
   // Limits
   LIMITS,
   

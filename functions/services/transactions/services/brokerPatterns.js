@@ -17,6 +17,43 @@
 const { DETECTION_CONFIDENCE } = require('../types');
 
 // ============================================================================
+// BROKER DISPLAY NAMES
+// ============================================================================
+
+/**
+ * Nombre visible de cada broker.
+ *
+ * Fuente única: el frontend lo consume vía `lib/transactionImport/brokerNames.ts`,
+ * que se mantiene sincronizado con esta lista. Antes existían dos mapas duplicados
+ * y ya habían divergido.
+ */
+const BROKER_DISPLAY_NAMES = {
+  // Anglosajones (catálogo original)
+  interactive_brokers: 'Interactive Brokers',
+  td_ameritrade: 'TD Ameritrade',
+  fidelity: 'Fidelity',
+  etoro: 'eToro',
+  charles_schwab: 'Charles Schwab',
+  robinhood: 'Robinhood',
+
+  // HU 1.5 — Colombia
+  trii: 'Trii',
+  tyba: 'Tyba',
+  valores_bancolombia: 'Valores Bancolombia',
+
+  // HU 1.5 — Europa
+  degiro: 'DEGIRO',
+  trade_republic: 'Trade Republic',
+  xtb: 'XTB',
+  renta4: 'Renta 4',
+
+  // HU 1.5 — Criptomonedas
+  binance: 'Binance',
+  coinbase: 'Coinbase',
+  bitso: 'Bitso',
+};
+
+// ============================================================================
 // BROKER DETECTION PATTERNS
 // ============================================================================
 
@@ -27,10 +64,21 @@ const { DETECTION_CONFIDENCE } = require('../types');
 const BROKER_SIGNATURES = {
   interactive_brokers: {
     // IBKR Flex Query exports have these distinctive headers
+    // HU 1.5: se amplían las variantes de formato e idioma reconocidas
     headers: [
       ['Symbol', 'Date/Time', 'Quantity', 'T. Price', 'Comm/Fee'],
       ['Symbol', 'TradeDate', 'Quantity', 'TradePrice', 'Commission'],
       ['Símbolo', 'Fecha/Hora', 'Cantidad', 'Precio T.', 'Comisión'],
+      // Activity Statement (sección Trades)
+      ['Symbol', 'Date/Time', 'Quantity', 'T. Price', 'C. Price', 'Proceeds', 'Comm/Fee'],
+      // Trade Confirmation Flex Query
+      ['Symbol', 'TradeDate', 'TradeTime', 'Quantity', 'Price', 'IBCommission'],
+      // Alemán
+      ['Symbol', 'Datum/Zeit', 'Menge', 'T. Kurs', 'Prov./Gebühr'],
+      // Francés
+      ['Symbole', 'Date/Heure', 'Quantité', 'Prix T.', 'Comm/Frais'],
+      // Portugués
+      ['Símbolo', 'Data/Hora', 'Quantidade', 'Preço T.', 'Comissão'],
     ],
     // Filename patterns
     filePatterns: [
@@ -38,9 +86,15 @@ const BROKER_SIGNATURES = {
       /interactive.?brokers/i,
       /flex.?query/i,
       /statement_/i,
+      /activity.?statement/i,
+      /trade.?confirmation/i,
     ],
     // Unique headers that only IBKR uses
-    uniqueHeaders: ['T. Price', 'Comm/Fee', 'Realized P/L', 'MTM P/L'],
+    uniqueHeaders: [
+      'T. Price', 'Comm/Fee', 'Realized P/L', 'MTM P/L',
+      'IBCommission', 'C. Price',
+      'Precio T.', 'T. Kurs', 'Prov./Gebühr', 'Prix T.', 'Comm/Frais', 'Preço T.',
+    ],
   },
   
   td_ameritrade: {
@@ -80,14 +134,22 @@ const BROKER_SIGNATURES = {
   },
   
   charles_schwab: {
+    // HU 1.5: se amplían las variantes de formato reconocidas
     headers: [
       ['Symbol', 'Action', 'Quantity', 'Price', 'Date'],
       ['Symbol', 'Description', 'Action', 'Qty', 'Price', 'Fees & Comm'],
+      // Transactions export (History)
+      ['Date', 'Action', 'Symbol', 'Description', 'Quantity', 'Price', 'Fees & Comm', 'Amount'],
+      // Realized gain/loss export
+      ['Symbol', 'Name', 'Closed Date', 'Opened Date', 'Quantity', 'Proceeds', 'Cost Basis'],
+      // Layout heredado de TD Ameritrade tras la fusión
+      ['Symbol', 'Trade Date', 'Settlement Date', 'Action', 'Quantity', 'Price', 'Commission'],
     ],
     filePatterns: [
       /schwab/i,
+      /charles.?schwab/i,
     ],
-    uniqueHeaders: ['Fees & Comm', 'Account Number'],
+    uniqueHeaders: ['Fees & Comm', 'Account Number', 'Cost Basis', 'Closed Date'],
   },
   
   robinhood: {
@@ -98,6 +160,152 @@ const BROKER_SIGNATURES = {
       /robinhood/i,
     ],
     uniqueHeaders: ['Instrument', 'Activity Date', 'Average Price'],
+  },
+
+  // ==========================================================================
+  // HU 1.5: CATÁLOGO AMPLIADO — COLOMBIA, EUROPA, CRIPTO
+  //
+  // Los `uniqueHeaders` se eligen para ser DISCRIMINANTES: se evalúan antes que
+  // los patrones de cabecera y devuelven en el primer acierto, así que una cabecera
+  // genérica ('Symbol', 'Fecha', 'Cantidad') aquí provocaría falsos positivos.
+  // ==========================================================================
+
+  // ── Colombia ─────────────────────────────────────────────────────────────
+  trii: {
+    headers: [
+      ['Fecha', 'Tipo', 'Simbolo', 'Cantidad', 'Precio'],
+      ['Fecha', 'Tipo de operación', 'Símbolo', 'Cantidad', 'Precio', 'Comisión'],
+    ],
+    filePatterns: [
+      /trii/i,
+    ],
+    // 'Tipo de operación' + 'Símbolo' juntos son propios de Trii; ninguno de los
+    // brokers anglosajones del catálogo usa esa combinación acentuada.
+    uniqueHeaders: ['Tipo de operación', 'Valor total operación'],
+  },
+
+  tyba: {
+    headers: [
+      ['Fecha', 'Fondo', 'Tipo', 'Unidades', 'Valor unidad'],
+      ['Fecha', 'Portafolio', 'Movimiento', 'Unidades', 'Valor de la unidad'],
+    ],
+    filePatterns: [
+      /tyba/i,
+    ],
+    uniqueHeaders: ['Valor unidad', 'Valor de la unidad', 'Portafolio'],
+  },
+
+  valores_bancolombia: {
+    headers: [
+      ['Fecha', 'Especie', 'Operacion', 'Cantidad', 'Precio'],
+      ['Fecha', 'Especie', 'Operación', 'Cantidad', 'Precio', 'Comisión'],
+    ],
+    filePatterns: [
+      /bancolombia/i,
+      /valores.?bancolombia/i,
+    ],
+    // 'Especie' es el término de la BVC para el instrumento: muy discriminante.
+    uniqueHeaders: ['Especie'],
+  },
+
+  // ── Europa ───────────────────────────────────────────────────────────────
+  degiro: {
+    headers: [
+      // Español
+      ['Fecha', 'Hora', 'Producto', 'ISIN', 'Bolsa de', 'Número', 'Precio'],
+      // Inglés
+      ['Date', 'Time', 'Product', 'ISIN', 'Reference exchange', 'Quantity', 'Price'],
+      // Neerlandés
+      ['Datum', 'Tijd', 'Product', 'ISIN', 'Beurs', 'Aantal', 'Koers'],
+    ],
+    filePatterns: [
+      /degiro/i,
+      // NO se añaden /transactions/ ni /transacciones/: son nombres de archivo
+      // genéricos que usan muchos brokers, y `detectByFilename` devuelve en el
+      // primer acierto. Un "coinbase_transactions.csv" se atribuiría a DEGIRO.
+    ],
+    // 'ID Orden'/'Order ID' junto a 'Centro de ejecución'/'Venue' identifica
+    // inequívocamente el export de transacciones de DEGIRO.
+    uniqueHeaders: [
+      'Centro de ejecución', 'ID Orden',
+      'Reference exchange', 'Order ID',
+      'Beurs', 'Uitvoeringsplaats',
+    ],
+  },
+
+  trade_republic: {
+    headers: [
+      ['Date', 'Type', 'Value', 'Note', 'ISIN', 'Shares'],
+      ['Fecha', 'Tipo', 'Valor', 'Nota', 'ISIN', 'Acciones'],
+      ['Datum', 'Typ', 'Wert', 'Notiz', 'ISIN', 'Anteile'],
+    ],
+    filePatterns: [
+      /trade.?republic/i,
+      /traderepublic/i,
+    ],
+    uniqueHeaders: ['Notiz', 'Anteile'],
+  },
+
+  xtb: {
+    headers: [
+      ['ID', 'Type', 'Time', 'Symbol', 'Comment', 'Amount'],
+      ['Position', 'Symbol', 'Type', 'Volume', 'Open time', 'Open price'],
+      ['ID', 'Tipo', 'Hora', 'Símbolo', 'Comentario', 'Importe'],
+    ],
+    filePatterns: [
+      /xtb/i,
+      /xstation/i,
+    ],
+    uniqueHeaders: ['Open time', 'Close time', 'Gross P/L'],
+  },
+
+  renta4: {
+    headers: [
+      ['Fecha', 'Valor', 'Operacion', 'Titulos', 'Precio', 'Efectivo'],
+      ['Fecha', 'Valor', 'Operación', 'Títulos', 'Precio', 'Efectivo', 'Comisión'],
+    ],
+    filePatterns: [
+      /renta4/i,
+      /renta.?4/i,
+    ],
+    // 'Títulos' + 'Efectivo' es la terminología de Renta4 para unidades e importe.
+    uniqueHeaders: ['Titulos', 'Títulos', 'Efectivo'],
+  },
+
+  // ── Criptomonedas ────────────────────────────────────────────────────────
+  binance: {
+    headers: [
+      ['Date(UTC)', 'Pair', 'Side', 'Price', 'Executed', 'Amount'],
+      ['Date(UTC)', 'Market', 'Type', 'Price', 'Amount', 'Total'],
+      ['UTC_Time', 'Account', 'Operation', 'Coin', 'Change'],
+    ],
+    filePatterns: [
+      /binance/i,
+    ],
+    uniqueHeaders: ['Date(UTC)', 'Executed', 'UTC_Time'],
+  },
+
+  coinbase: {
+    headers: [
+      ['Timestamp', 'Transaction Type', 'Asset', 'Quantity Transacted', 'Spot Price at Transaction'],
+      ['Timestamp', 'Transaction Type', 'Asset', 'Quantity Transacted', 'Subtotal', 'Total'],
+    ],
+    filePatterns: [
+      /coinbase/i,
+    ],
+    uniqueHeaders: ['Quantity Transacted', 'Spot Price at Transaction', 'Spot Price Currency'],
+  },
+
+  bitso: {
+    headers: [
+      ['oid', 'side', 'major', 'minor', 'price', 'book'],
+      ['Fecha', 'Tipo', 'Moneda', 'Cantidad', 'Precio', 'Comisión'],
+    ],
+    filePatterns: [
+      /bitso/i,
+    ],
+    // 'book', 'major' y 'minor' son la nomenclatura de la API de Bitso.
+    uniqueHeaders: ['book', 'major', 'minor', 'oid'],
   },
 };
 
@@ -124,12 +332,29 @@ const BROKER_MAPPINGS = {
       'Commission': 'commission',
       'Currency': 'currency',
       'Exchange': 'market',
+      'IBCommission': 'commission',
       // Spanish
       'Símbolo': 'ticker',
       'Fecha/Hora': 'date',
       'Cantidad': 'amount',
       'Precio T.': 'price',
       'Comisión': 'commission',
+      // German
+      'Datum/Zeit': 'date',
+      'Menge': 'amount',
+      'T. Kurs': 'price',
+      'Prov./Gebühr': 'commission',
+      // French
+      'Symbole': 'ticker',
+      'Date/Heure': 'date',
+      'Quantité': 'amount',
+      'Prix T.': 'price',
+      'Comm/Frais': 'commission',
+      // Portuguese
+      'Data/Hora': 'date',
+      'Quantidade': 'amount',
+      'Preço T.': 'price',
+      'Comissão': 'commission',
     },
     // How to derive type from IBKR data
     // IBKR uses positive/negative quantity: + = buy, - = sell
@@ -138,6 +363,7 @@ const BROKER_MAPPINGS = {
     defaultCurrency: 'USD',
     // Date format used
     dateFormat: 'YYYY-MM-DD, HH:mm:ss',
+    numberFormat: 'us',
   },
   
   td_ameritrade: {
@@ -208,15 +434,20 @@ const BROKER_MAPPINGS = {
       'Qty': 'amount',
       'Price': 'price',
       'Date': 'date',
+      'Trade Date': 'date',
       'Fees & Comm': 'commission',
+      'Commission': 'commission',
+      'Description': 'description',
+      'Amount': 'total',
     },
     typeDerivation: 'action_column',
     typePatterns: {
-      buy: ['Buy', 'Bought'],
-      sell: ['Sell', 'Sold'],
+      buy: ['Buy', 'Bought', 'Buy to Open', 'Reinvest Shares'],
+      sell: ['Sell', 'Sold', 'Sell to Close'],
     },
     defaultCurrency: 'USD',
     dateFormat: 'MM/DD/YYYY',
+    numberFormat: 'us',
   },
   
   robinhood: {
@@ -234,6 +465,268 @@ const BROKER_MAPPINGS = {
     },
     defaultCurrency: 'USD',
     dateFormat: 'YYYY-MM-DD',
+  },
+
+  // ==========================================================================
+  // HU 1.5: MAPEOS DEL CATÁLOGO AMPLIADO
+  //
+  // `numberFormat` es un dato DECLARADO, no lógica por broker: dice si el archivo
+  // usa coma o punto como separador decimal. Sin él, un importe europeo como
+  // "1.234,56" se interpretaría como 1.23456 sin lanzar ningún error.
+  // ==========================================================================
+
+  // ── Colombia ─────────────────────────────────────────────────────────────
+  trii: {
+    columnMappings: {
+      'Fecha': 'date',
+      'Tipo': 'type',
+      'Tipo de operación': 'type',
+      'Simbolo': 'ticker',
+      'Símbolo': 'ticker',
+      'Cantidad': 'amount',
+      'Precio': 'price',
+      'Comision': 'commission',
+      'Comisión': 'commission',
+      'Moneda': 'currency',
+    },
+    typeDerivation: 'action_column',
+    typePatterns: {
+      buy: ['Compra', 'COMPRA', 'Buy'],
+      sell: ['Venta', 'VENTA', 'Sell'],
+    },
+    defaultCurrency: 'COP',
+    dateFormat: 'DD/MM/YYYY',
+    numberFormat: 'eu',
+  },
+
+  tyba: {
+    columnMappings: {
+      'Fecha': 'date',
+      'Fondo': 'ticker',
+      'Portafolio': 'ticker',
+      'Tipo': 'type',
+      'Movimiento': 'type',
+      'Unidades': 'amount',
+      'Valor unidad': 'price',
+      'Valor de la unidad': 'price',
+      'Comisión': 'commission',
+    },
+    typeDerivation: 'action_column',
+    typePatterns: {
+      buy: ['Aporte', 'APORTE', 'Compra'],
+      sell: ['Retiro', 'RETIRO', 'Venta'],
+    },
+    defaultCurrency: 'COP',
+    dateFormat: 'DD/MM/YYYY',
+    numberFormat: 'eu',
+  },
+
+  valores_bancolombia: {
+    columnMappings: {
+      'Fecha': 'date',
+      'Especie': 'ticker',
+      'Operacion': 'type',
+      'Operación': 'type',
+      'Cantidad': 'amount',
+      'Precio': 'price',
+      'Comision': 'commission',
+      'Comisión': 'commission',
+      'Mercado': 'market',
+    },
+    typeDerivation: 'action_column',
+    typePatterns: {
+      buy: ['Compra', 'COMPRA', 'C'],
+      sell: ['Venta', 'VENTA', 'V'],
+    },
+    defaultCurrency: 'COP',
+    dateFormat: 'DD/MM/YYYY',
+    numberFormat: 'eu',
+  },
+
+  // ── Europa ───────────────────────────────────────────────────────────────
+  degiro: {
+    columnMappings: {
+      // Español
+      'Fecha': 'date',
+      'Producto': 'ticker',
+      'Número': 'amount',
+      'Numero': 'amount',
+      'Precio': 'price',
+      'Bolsa de': 'market',
+      'Costes de transacción': 'commission',
+      // Inglés
+      'Date': 'date',
+      'Product': 'ticker',
+      'Quantity': 'amount',
+      'Price': 'price',
+      'Reference exchange': 'market',
+      'Transaction and/or third': 'commission',
+      // Neerlandés
+      'Datum': 'date',
+      'Aantal': 'amount',
+      'Koers': 'price',
+      'Beurs': 'market',
+      'Transactiekosten': 'commission',
+    },
+    // DEGIRO usa el signo de la cantidad: + = compra, - = venta
+    typeDerivation: 'quantity_sign',
+    defaultCurrency: 'EUR',
+    dateFormat: 'DD-MM-YYYY',
+    numberFormat: 'eu',
+  },
+
+  trade_republic: {
+    columnMappings: {
+      'Date': 'date',
+      'Fecha': 'date',
+      'Datum': 'date',
+      'Type': 'type',
+      'Tipo': 'type',
+      'Typ': 'type',
+      'ISIN': 'ticker',
+      'Shares': 'amount',
+      'Acciones': 'amount',
+      'Anteile': 'amount',
+      'Value': 'total',
+      'Valor': 'total',
+      'Wert': 'total',
+    },
+    typeDerivation: 'action_column',
+    typePatterns: {
+      buy: ['Buy', 'Compra', 'Kauf', 'Kaufen'],
+      sell: ['Sell', 'Venta', 'Verkauf', 'Verkaufen'],
+    },
+    defaultCurrency: 'EUR',
+    dateFormat: 'DD.MM.YYYY',
+    numberFormat: 'eu',
+  },
+
+  xtb: {
+    columnMappings: {
+      'Symbol': 'ticker',
+      'Símbolo': 'ticker',
+      'Type': 'type',
+      'Tipo': 'type',
+      'Time': 'date',
+      'Hora': 'date',
+      'Open time': 'date',
+      'Volume': 'amount',
+      'Open price': 'price',
+      'Amount': 'total',
+      'Importe': 'total',
+      'Commission': 'commission',
+      'Comisión': 'commission',
+    },
+    typeDerivation: 'action_column',
+    typePatterns: {
+      buy: ['Buy', 'BUY', 'Compra', 'Stocks purchase'],
+      sell: ['Sell', 'SELL', 'Venta', 'Stocks sale'],
+    },
+    defaultCurrency: 'EUR',
+    dateFormat: 'DD.MM.YYYY',
+    numberFormat: 'eu',
+  },
+
+  renta4: {
+    columnMappings: {
+      'Fecha': 'date',
+      'Valor': 'ticker',
+      'Operacion': 'type',
+      'Operación': 'type',
+      'Titulos': 'amount',
+      'Títulos': 'amount',
+      'Precio': 'price',
+      'Comision': 'commission',
+      'Comisión': 'commission',
+      'Efectivo': 'total',
+      'Divisa': 'currency',
+    },
+    typeDerivation: 'action_column',
+    typePatterns: {
+      buy: ['Compra', 'COMPRA', 'Suscripción'],
+      sell: ['Venta', 'VENTA', 'Reembolso'],
+    },
+    defaultCurrency: 'EUR',
+    dateFormat: 'DD/MM/YYYY',
+    numberFormat: 'eu',
+  },
+
+  // ── Criptomonedas ────────────────────────────────────────────────────────
+  binance: {
+    columnMappings: {
+      'Date(UTC)': 'date',
+      'UTC_Time': 'date',
+      'Pair': 'ticker',
+      'Market': 'ticker',
+      'Coin': 'ticker',
+      'Side': 'type',
+      'Type': 'type',
+      'Operation': 'type',
+      'Price': 'price',
+      'Executed': 'amount',
+      'Change': 'amount',
+      'Amount': 'total',
+      'Total': 'total',
+      'Fee': 'commission',
+    },
+    typeDerivation: 'action_column',
+    typePatterns: {
+      buy: ['BUY', 'Buy', 'Deposit'],
+      sell: ['SELL', 'Sell', 'Withdraw'],
+    },
+    defaultCurrency: 'USD',
+    dateFormat: 'YYYY-MM-DD',
+    numberFormat: 'us',
+  },
+
+  coinbase: {
+    columnMappings: {
+      'Timestamp': 'date',
+      'Transaction Type': 'type',
+      'Asset': 'ticker',
+      'Quantity Transacted': 'amount',
+      'Spot Price at Transaction': 'price',
+      'Spot Price Currency': 'currency',
+      'Subtotal': 'total',
+      'Fees': 'commission',
+      'Notes': 'description',
+    },
+    typeDerivation: 'action_column',
+    typePatterns: {
+      buy: ['Buy', 'Receive', 'Advanced Trade Buy'],
+      sell: ['Sell', 'Send', 'Advanced Trade Sell'],
+    },
+    defaultCurrency: 'USD',
+    dateFormat: 'ISO',
+    numberFormat: 'us',
+  },
+
+  bitso: {
+    columnMappings: {
+      // Nomenclatura de la API
+      'created_at': 'date',
+      'side': 'type',
+      'book': 'ticker',
+      'major': 'amount',
+      'price': 'price',
+      'fees_amount': 'commission',
+      'minor': 'total',
+      // Export en español
+      'Fecha': 'date',
+      'Tipo': 'type',
+      'Moneda': 'ticker',
+      'Cantidad': 'amount',
+      'Precio': 'price',
+      'Comisión': 'commission',
+    },
+    typeDerivation: 'action_column',
+    typePatterns: {
+      buy: ['buy', 'Buy', 'Compra'],
+      sell: ['sell', 'Sell', 'Venta'],
+    },
+    defaultCurrency: 'MXN',
+    dateFormat: 'ISO',
+    numberFormat: 'us',
   },
 };
 
@@ -446,16 +939,25 @@ function deriveTypeMapping(brokerId, config, headers, mappings) {
  * @returns {string} Human-readable broker name
  */
 function getBrokerDisplayName(brokerId) {
-  const names = {
-    interactive_brokers: 'Interactive Brokers',
-    td_ameritrade: 'TD Ameritrade',
-    fidelity: 'Fidelity',
-    etoro: 'eToro',
-    charles_schwab: 'Charles Schwab',
-    robinhood: 'Robinhood',
-  };
-  
-  return names[brokerId] || brokerId;
+  return BROKER_DISPLAY_NAMES[brokerId] || brokerId;
+}
+
+/**
+ * Formato numérico declarado de un broker (HU 1.5).
+ *
+ * Determina si el archivo usa coma o punto como separador decimal. Es un dato del
+ * formato, no lógica: los brokers europeos y colombianos exportan "1.234,56" y sin
+ * esta declaración ese importe se leería como 1.23456 sin lanzar ningún error.
+ *
+ * @param {string|null} brokerId
+ * @returns {'us'|'eu'} Formato numérico; 'us' por defecto (comportamiento actual)
+ */
+function getBrokerNumberFormat(brokerId) {
+  if (!brokerId) {
+    return 'us';
+  }
+
+  return BROKER_MAPPINGS[brokerId]?.numberFormat || 'us';
 }
 
 // ============================================================================
@@ -466,12 +968,15 @@ module.exports = {
   // Detection
   detectBrokerFormat,
   detectByFilename,
-  
+
   // Mappings
   getBrokerMappings,
   getBrokerDisplayName,
-  
+  // HU 1.5: formato numérico declarado del broker
+  getBrokerNumberFormat,
+
   // For testing
   BROKER_SIGNATURES,
   BROKER_MAPPINGS,
+  BROKER_DISPLAY_NAMES,
 };

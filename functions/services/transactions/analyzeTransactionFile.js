@@ -21,10 +21,20 @@ const { defineSecret } = require("firebase-functions/params");
 const { validateFeatureAccess } = require('../helpers/subscriptionValidator');
 
 // Import services
-const { detectBrokerFormat, getBrokerMappings } = require('./services/brokerPatterns');
+const {
+  detectBrokerFormat,
+  getBrokerMappings,
+  // HU 1.5: formato numérico declarado del broker
+  getBrokerNumberFormat,
+} = require('./services/brokerPatterns');
 const { detectColumnsGeneric, detectHasHeader } = require('./services/columnDetector');
 const { validateTickerSample } = require('./services/tickerValidator');
 const { calculateOverallConfidence, generateFeedback, evaluateReadiness } = require('./services/confidenceCalculator');
+// HU 1.1: memoria del mapeo confirmado (perfil de importación recordado)
+const { buildSourceFormatId } = require('./services/formatFingerprint');
+const { getProfile, isProfileStillValid } = require('./services/importMemoryRepository');
+// HU 1.2: memoria de equivalencias de símbolo
+const { resolveSymbols } = require('./services/symbolEquivalenceResolver');
 const { REQUIRED_FIELDS, LIMITS } = require('./types');
 
 // ============================================================================
@@ -151,25 +161,63 @@ const analyzeTransactionFile = onCall(
     // ─────────────────────────────────────────────────────────────────────
     const headers = hasHeader ? truncatedData[0] : null;
     const detectedBroker = detectBrokerFormat(headers, fileName);
-    
+
     console.log(`[analyzeTransactionFile] Detected broker: ${detectedBroker || 'generic'}`);
-    
+
+    // ─────────────────────────────────────────────────────────────────────
+    // 3b. FORMAT IDENTITY + REMEMBERED MAPPING (HU 1.1)
+    // ─────────────────────────────────────────────────────────────────────
+    const columnCount = truncatedData[0]?.length || 0;
+    const sourceFormatId = buildSourceFormatId({ detectedBroker, headers, columnCount });
+
+    console.log(`[analyzeTransactionFile] Source format: ${sourceFormatId}`);
+
+    // RN-04: un perfil que dejó de coincidir se descarta EN SILENCIO. No se añade
+    // warning ni suggestion a la respuesta, para no exponer terminología interna.
+    const storedProfile = await getProfile(userId, sourceFormatId);
+    const profileIsUsable = isProfileStillValid(storedProfile, headers, columnCount);
+
+    if (storedProfile && !profileIsUsable) {
+      console.log('[analyzeTransactionFile] Stored profile no longer matches - falling back to detection');
+    }
+
+    let rememberedMapping = null;
+
     // ─────────────────────────────────────────────────────────────────────
     // 4. COLUMN DETECTION (AC-010 to AC-021)
     // ─────────────────────────────────────────────────────────────────────
     let mappings = [];
-    
-    if (detectedBroker) {
+
+    if (profileIsUsable) {
+      // El mapeo confirmado por el usuario reemplaza a la detección automática.
+      // Sigue siendo editable en el wizard y no se importa nada sin confirmación (RN-01).
+      mappings = hydrateRememberedMappings(storedProfile, truncatedData, hasHeader);
+
+      rememberedMapping = {
+        matched: true,
+        defaultValues: storedProfile.defaultValues || null,
+        confirmedImportCount: storedProfile.confirmedImportCount || 1,
+      };
+
+      console.log(`[analyzeTransactionFile] Applied remembered mapping: ${mappings.length} columns`);
+    } else if (detectedBroker) {
       // Use pre-defined broker mappings
       mappings = getBrokerMappings(detectedBroker, truncatedData, hasHeader);
       console.log(`[analyzeTransactionFile] Broker mappings: ${mappings.length} columns`);
     }
     
-    // If broker detection didn't map all required fields, fall back to generic
+    // If detection didn't map all required fields, fall back to generic
     const mappedFields = new Set(mappings.map(m => m.targetField));
-    const missingFromBroker = REQUIRED_FIELDS.filter(f => !mappedFields.has(f));
-    
-    if (!detectedBroker || missingFromBroker.length > 0) {
+    const missingFromDetection = REQUIRED_FIELDS.filter(f => !mappedFields.has(f));
+
+    // HU 1.1: con un mapeo recordado completo NO se ejecuta la detección genérica.
+    // Añadir campos que el usuario había dejado sin asignar contradiría "el asistente
+    // presenta el mapeo ya resuelto" y reintroduciría decisiones que él ya tomó.
+    const needsGenericFallback = profileIsUsable
+      ? missingFromDetection.length > 0
+      : (!detectedBroker || missingFromDetection.length > 0);
+
+    if (needsGenericFallback) {
       const genericMappings = detectColumnsGeneric(truncatedData, hasHeader);
       
       // Merge: prefer broker mappings, add generic for unmapped columns
@@ -190,7 +238,7 @@ const analyzeTransactionFile = onCall(
     // ─────────────────────────────────────────────────────────────────────
     // 5. IDENTIFY UNMAPPED COLUMNS AND MISSING FIELDS
     // ─────────────────────────────────────────────────────────────────────
-    const totalColumns = truncatedData[0]?.length || 0;
+    const totalColumns = columnCount;
     const mappedColumnIndices = new Set(mappings.map(m => m.sourceColumn));
     const unmappedColumns = Array.from(
       { length: totalColumns }, 
@@ -218,7 +266,10 @@ const analyzeTransactionFile = onCall(
       details: {},
       validDetails: {},
     };
-    
+
+    // HU 1.2: símbolos que llegaron resueltos desde la memoria del usuario
+    let equivalences = {};
+
     if (tickerMapping) {
       // Determine which tickers to validate:
       // 1. If frontend provided uniqueTickers (all from full file), use those
@@ -243,12 +294,27 @@ const analyzeTransactionFile = onCall(
       
       if (tickersToValidate.length > 0) {
         console.log(`[analyzeTransactionFile] Validating tickers using /quotes...`);
-        tickerValidation = await validateTickerSample(tickersToValidate);
+
+        // HU 1.2: los símbolos con equivalencia recordada se validan por su ticker
+        // canónico, no por el texto del archivo. Así el escenario 7 (activo que
+        // dejó de existir) se detecta sin lógica adicional.
+        const resolution = await resolveSymbols({
+          userId,
+          sourceFormatId,
+          symbols: tickersToValidate,
+          validate: validateTickerSample,
+        });
+
+        tickerValidation = resolution.tickerValidation;
+        equivalences = resolution.equivalences;
+
+        console.log(`[analyzeTransactionFile] Equivalences applied: ${Object.keys(equivalences).length}`);
       }
     } else {
       console.log(`[analyzeTransactionFile] No ticker column mapped - skipping validation`);
     }
-    
+
+
     // ─────────────────────────────────────────────────────────────────────
     // 7. CALCULATE CONFIDENCE (AC-027 to AC-030)
     // ─────────────────────────────────────────────────────────────────────
@@ -296,7 +362,23 @@ const analyzeTransactionFile = onCall(
       
       // AC-032: Detected broker
       detectedBroker,
-      
+
+      // HU 1.1: identidad del formato y mapeo recordado.
+      // rememberedMapping = null cubre tanto "sin memoria previa" (RN-11) como
+      // "el perfil dejó de coincidir" (RN-04), sin distinguirlos para el usuario.
+      sourceFormatId,
+      rememberedMapping,
+
+      // HU 1.2: símbolos que llegaron ya resueltos desde la memoria del usuario.
+      // Mapa símbolo del archivo → activo al que quedó vinculado, con su origen.
+      equivalences,
+
+      // HU 1.5: separador decimal del archivo, declarado por el broker detectado.
+      // El frontend lo usa al parsear cantidades y precios: sin esto, un importe
+      // europeo como "1.234,56" se leería como 1.23456 sin lanzar ningún error.
+      detectedNumberFormat: getBrokerNumberFormat(detectedBroker),
+
+
       // AC-033: Column mappings
       mappings: mappings.map(m => ({
         sourceColumn: m.sourceColumn,
@@ -354,8 +436,44 @@ const analyzeTransactionFile = onCall(
 // ============================================================================
 
 /**
+ * Reconstruye los ColumnMapping completos a partir de un perfil recordado (HU 1.1).
+ *
+ * El perfil solo persiste columna → campo. Los valores de muestra son de la sesión
+ * actual, así que se extraen del archivo que el usuario acaba de cargar para que el
+ * paso de mapeo muestre datos reales y verificables.
+ *
+ * detectionMethod 'remembered' con confianza 1.0: el usuario ya confirmó este mapeo,
+ * así que no hay incertidumbre que comunicar.
+ *
+ * @param {Object} profile - Perfil almacenado
+ * @param {string[][]} sampleData - Muestra del archivo actual
+ * @param {boolean} hasHeader - Si la primera fila es cabecera
+ * @returns {Object[]} Mappings listos para el wizard
+ */
+function hydrateRememberedMappings(profile, sampleData, hasHeader) {
+  const dataRows = hasHeader ? sampleData.slice(1) : sampleData;
+
+  return profile.mappings.map((mapping) => {
+    const sampleValues = dataRows
+      .slice(0, 5)
+      .map(row => String(row[mapping.sourceColumn] ?? ''))
+      .filter(v => v.length > 0);
+
+    return {
+      sourceColumn: mapping.sourceColumn,
+      sourceHeader: mapping.sourceHeader,
+      targetField: mapping.targetField,
+      confidence: 1.0,
+      detectionMethod: 'remembered',
+      sampleValues,
+      transformation: undefined,
+    };
+  });
+}
+
+/**
  * Extracts date format from sample values
- * 
+ *
  * @param {string[]} sampleValues - Sample date values
  * @returns {string|null} Detected date format
  */
@@ -406,4 +524,7 @@ function extractDateFormat(sampleValues) {
 
 module.exports = {
   analyzeTransactionFile,
+
+  // For testing
+  hydrateRememberedMappings,
 };

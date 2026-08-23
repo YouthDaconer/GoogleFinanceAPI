@@ -729,7 +729,12 @@ exports.getMarketDataToken = getMarketDataToken;
  * @see docs/stories/89.story.md (IMPORT-001)
  * @see docs/architecture/FEAT-IMPORT-001-smart-transaction-import-design.md
  */
-const { analyzeTransactionFile, importTransactionBatch } = require('./services/transactions');
+const {
+  analyzeTransactionFile,
+  importTransactionBatch,
+  saveImportMemory,
+  classifyTransactionRows,
+} = require('./services/transactions');
 exports.analyzeTransactionFile = analyzeTransactionFile;
 
 /**
@@ -743,6 +748,27 @@ exports.analyzeTransactionFile = analyzeTransactionFile;
  * @see docs/architecture/FEAT-IMPORT-001-smart-transaction-import-design.md
  */
 exports.importTransactionBatch = importTransactionBatch;
+
+/**
+ * Cloud Function: saveImportMemory
+ *
+ * HU 1.1: Persiste la memoria interna del canal de importación (mapeo de columnas
+ * confirmado por formato de origen) después de una importación confirmada.
+ * Único punto de escritura de esa memoria.
+ *
+ * @see platform-docs/stories/1.1-perfil-importacion-recordado/
+ */
+exports.saveImportMemory = saveImportMemory;
+
+/**
+ * Cloud Function: classifyTransactionRows
+ *
+ * HU 1.3: clasifica las filas de una reimportacion en nuevas / ya registradas
+ * ANTES de confirmar, para que el usuario decida que se importa. Solo lectura.
+ *
+ * @see platform-docs/stories/1.3-reimportacion-clasificada/
+ */
+exports.classifyTransactionRows = classifyTransactionRows;
 
 // ============================================================================
 // GATE-001: Mock Subscription Provider (Feature Gating)

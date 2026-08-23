@@ -497,3 +497,199 @@ describe('GATE-006: Import Feature Gate', () => {
     expect(result.success).toBe(true);
   });
 });
+
+// ============================================================================
+// HU 1.1: PERFIL DE IMPORTACIÓN RECORDADO
+// ============================================================================
+
+const { hydrateRememberedMappings } = require('../../transactions/analyzeTransactionFile');
+
+describe('HU 1.1: identidad de formato en la respuesta', () => {
+  test('la respuesta incluye sourceFormatId', async () => {
+    const result = await callFunction({
+      sampleData: GENERIC_SAMPLE,
+      fileName: 'test.xlsx',
+      hasHeader: true,
+    });
+
+    expect(result.sourceFormatId).toBeDefined();
+    expect(typeof result.sourceFormatId).toBe('string');
+  });
+
+  test('un broker detectado produce un sourceFormatId de broker', async () => {
+    const result = await callFunction({
+      sampleData: IBKR_SAMPLE,
+      fileName: 'ibkr_trades.xlsx',
+      hasHeader: true,
+    });
+
+    expect(result.sourceFormatId).toBe('broker:interactive_brokers');
+  });
+
+  test('sin broker detectado el sourceFormatId es una huella de cabeceras', async () => {
+    const result = await callFunction({
+      sampleData: GENERIC_SAMPLE,
+      fileName: 'export.csv',
+      hasHeader: true,
+    });
+
+    expect(result.sourceFormatId).toMatch(/^fmt:[0-9a-f]{16}$/);
+  });
+
+  test('RN-11: sin memoria previa, rememberedMapping es null y no hay regresión', async () => {
+    const result = await callFunction({
+      sampleData: GENERIC_SAMPLE,
+      fileName: 'test.xlsx',
+      hasHeader: true,
+    });
+
+    expect(result.rememberedMapping).toBeNull();
+    expect(result.success).toBe(true);
+    expect(result.mappings.length).toBeGreaterThan(0);
+  });
+
+  test('RN-04: no se emite warning ni suggestion sobre la memoria', async () => {
+    const result = await callFunction({
+      sampleData: GENERIC_SAMPLE,
+      fileName: 'test.xlsx',
+      hasHeader: true,
+    });
+
+    const allFeedback = [...result.warnings, ...result.suggestions].join(' ').toLowerCase();
+
+    expect(allFeedback).not.toContain('perfil');
+    expect(allFeedback).not.toContain('huella');
+    expect(allFeedback).not.toContain('plantilla');
+    expect(allFeedback).not.toContain('memoria');
+  });
+});
+
+describe('HU 1.1: hydrateRememberedMappings', () => {
+  const PROFILE = {
+    mappings: [
+      { sourceColumn: 0, sourceHeader: 'Ticker', targetField: 'ticker' },
+      { sourceColumn: 3, sourceHeader: 'Price', targetField: 'price' },
+    ],
+  };
+
+  test('reconstruye los mappings con confianza total y método remembered', () => {
+    const result = hydrateRememberedMappings(PROFILE, GENERIC_SAMPLE, true);
+
+    expect(result).toHaveLength(2);
+    result.forEach((mapping) => {
+      expect(mapping.detectionMethod).toBe('remembered');
+      expect(mapping.confidence).toBe(1.0);
+    });
+  });
+
+  test('preserva columna, cabecera y campo destino del perfil', () => {
+    const result = hydrateRememberedMappings(PROFILE, GENERIC_SAMPLE, true);
+
+    expect(result[0]).toMatchObject({
+      sourceColumn: 0,
+      sourceHeader: 'Ticker',
+      targetField: 'ticker',
+    });
+  });
+
+  test('toma los valores de muestra del archivo actual, no del perfil', () => {
+    const result = hydrateRememberedMappings(PROFILE, GENERIC_SAMPLE, true);
+
+    // GENERIC_SAMPLE fila 1 = ['AAPL', 'Buy', '10', '150.50', '2024-01-15']
+    expect(result[0].sampleValues).toContain('AAPL');
+    expect(result[1].sampleValues).toContain('150.50');
+  });
+
+  test('limita las muestras a 5 valores', () => {
+    const wideSample = [
+      ['Ticker', 'Type', 'Shares', 'Price', 'Date'],
+      ...Array.from({ length: 20 }, (_, i) => [`T${i}`, 'Buy', '1', '10', '2024-01-01']),
+    ];
+
+    const result = hydrateRememberedMappings(PROFILE, wideSample, true);
+
+    expect(result[0].sampleValues.length).toBeLessThanOrEqual(5);
+  });
+
+  test('respeta hasHeader=false: la primera fila también es dato', () => {
+    const noHeader = [
+      ['AAPL', 'Buy', '10', '150.50', '2024-01-15'],
+      ['NVDA', 'Sell', '5', '500.00', '2024-01-16'],
+    ];
+
+    const result = hydrateRememberedMappings(PROFILE, noHeader, false);
+
+    expect(result[0].sampleValues).toContain('AAPL');
+  });
+
+  test('descarta celdas vacías de las muestras', () => {
+    const sparse = [
+      ['Ticker', 'Type', 'Shares', 'Price', 'Date'],
+      ['AAPL', 'Buy', '10', '', '2024-01-15'],
+      ['NVDA', 'Buy', '5', '500.00', '2024-01-16'],
+    ];
+
+    const result = hydrateRememberedMappings(PROFILE, sparse, true);
+
+    expect(result[1].sampleValues).not.toContain('');
+    expect(result[1].sampleValues).toContain('500.00');
+  });
+});
+
+// ============================================================================
+// HU 1.2: MEMORIA DE EQUIVALENCIAS DE SÍMBOLO
+// ============================================================================
+
+describe('HU 1.2: equivalencias en la respuesta', () => {
+  test('la respuesta incluye el mapa de equivalencias', async () => {
+    const result = await callFunction({
+      sampleData: GENERIC_SAMPLE,
+      fileName: 'test.xlsx',
+      hasHeader: true,
+    });
+
+    expect(result.equivalences).toBeDefined();
+    expect(typeof result.equivalences).toBe('object');
+  });
+
+  test('Escenario 8: sin memoria previa el mapa llega vacío y no hay regresión', async () => {
+    const result = await callFunction({
+      sampleData: GENERIC_SAMPLE,
+      fileName: 'test.xlsx',
+      hasHeader: true,
+    });
+
+    expect(result.equivalences).toEqual({});
+    expect(result.success).toBe(true);
+    expect(result.tickerValidation.total).toBeGreaterThan(0);
+  });
+
+  test('sin columna de ticker mapeada no se consulta memoria de equivalencias', async () => {
+    const noTicker = [
+      ['Fecha', 'Cantidad', 'Precio'],
+      ['2024-01-15', '10', '150.50'],
+    ];
+
+    const result = await callFunction({
+      sampleData: noTicker,
+      fileName: 'test.xlsx',
+      hasHeader: true,
+    });
+
+    expect(result.equivalences).toEqual({});
+  });
+
+  test('los conteos de validación siguen expresándose en símbolos del archivo', async () => {
+    const result = await callFunction({
+      sampleData: GENERIC_SAMPLE,
+      fileName: 'test.xlsx',
+      hasHeader: true,
+    });
+
+    // GENERIC_SAMPLE trae 3 tickers distintos
+    expect(result.tickerValidation.total).toBe(3);
+    expect(
+      result.tickerValidation.valid + result.tickerValidation.invalid
+    ).toBeLessThanOrEqual(3);
+  });
+});
