@@ -1,16 +1,29 @@
 /**
  * FIX-DELETE-002: Tests del borrado en cascada de deletePortfolioAccount
  *
- * Dos defectos que dejaban assets huerfanos al eliminar una cuenta:
+ * CAUSA DE LOS 1817 ASSETS HUERFANOS ENCONTRADOS EN PRODUCCION: la consulta de
+ * assets y el escritor usaban nombres de campo distintos, y el desajuste se dio
+ * en las DOS direcciones a ambos lados de FIX-DELETE-001:
  *
- *   1. Los assets se borraban en UN SOLO batch. Firestore admite 500
- *      operaciones por batch, asi que una cuenta con mas de 500 assets hacia
- *      fallar el commit. Como los assets son el paso 1 de la cascada, al lanzar
- *      abortaba todo: no se borraban ni transacciones ni la cuenta.
+ *   - 456c3b5 (25-ene) creo la cascada consultando `portfolioAccountId`.
+ *   - 278c9cd (27-ene, FIX-DELETE-001) la cambio a `portfolioAccount`.
  *
- *   2. La consulta solo miraba el campo `portfolioAccount`. Los assets escritos
- *      antes de FIX-DELETE-001 usan `portfolioAccountId`, asi que quedaban
- *      invisibles al borrado y huerfanos para siempre.
+ * Los 1367 assets de la cuenta ob191eDnwf5ArlBkGX7R tienen `portfolioAccount`:
+ * sobrevivieron a un borrado hecho dentro de esa ventana de dos dias, cuando la
+ * consulta miraba el campo contrario. Los otros 450, escritos solo con
+ * `portfolioAccountId`, sobrevivieron a borrados posteriores al 27-ene por el
+ * desajuste inverso. En ambos casos la consulta devolvia vacio, no se borraba
+ * ningun asset, y la cuenta desaparecia sin error aparente.
+ *
+ * Por eso findAccountAssets() consulta los dos campos y deduplica: cualquiera de
+ * las dos generaciones de datos tiene que quedar alcanzable.
+ *
+ * DEFECTO LATENTE: los assets se borraban en UN SOLO batch, y Firestore admite
+ * 500 operaciones por batch. Nunca llego a dispararse en produccion — sin
+ * try/catch, el commit fallido habria lanzado y la cuenta NO se habria borrado,
+ * y no hay ninguna cuenta en ese estado. Pero al arreglar la consulta empieza a
+ * encontrar los 1367 assets de una sola cuenta, asi que trocear es requisito
+ * del arreglo principal, no un extra.
  */
 
 const { HttpsError } = require("firebase-functions/v2/https");
