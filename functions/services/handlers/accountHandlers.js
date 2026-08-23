@@ -59,17 +59,23 @@ async function deleteDocsInBatches(docs) {
  * Se consultan los dos campos y se deduplica por id de documento. No se usa un
  * filtro OR porque abarca campos distintos y exigiria un indice compuesto.
  *
- * @param {string} accountId
- * @param {string} userId
+ * NO se filtra por userId a proposito. Hay assets escritos sin ese campo, y en
+ * Firestore una igualdad sobre un campo ausente no coincide con nada, asi que el
+ * filtro los volvia invisibles al borrado igual que el desajuste de nombre de
+ * campo. La propiedad ya quedo probada antes de llegar aqui: la cuenta existe y
+ * su userId es el de quien llama. La cuenta es la unica autoridad sobre sus
+ * assets, que es el mismo criterio de las reglas de Firestore
+ * (`belongsToUser(resource.data.portfolioAccount)`).
+ *
+ * @param {string} accountId - Cuenta ya verificada como propiedad de quien llama
  * @returns {Promise<Array>} Documentos de asset, sin duplicados
  */
-async function findAccountAssets(accountId, userId) {
+async function findAccountAssets(accountId) {
   const byId = new Map();
 
   for (const field of ['portfolioAccount', 'portfolioAccountId']) {
     const snapshot = await db.collection('assets')
       .where(field, '==', accountId)
-      .where('userId', '==', userId)
       .get();
 
     snapshot.docs.forEach(doc => byId.set(doc.id, doc));
@@ -248,11 +254,12 @@ async function deletePortfolioAccount(context, payload) {
     let deletedTransactionsCount = 0;
 
     // 1. Eliminar todos los assets asociados a esta cuenta
-    // FIX-DELETE-002: se cubren los dos nombres de campo historicos y se trocea
-    // en batches de 500. Antes se usaba un unico batch, asi que una cuenta con
-    // mas de 500 assets hacia fallar el commit y abortaba el borrado completo.
+    // FIX-DELETE-002: se cubren los dos nombres de campo historicos y no se
+    // filtra por userId, porque ambas cosas dejaban assets fuera de la consulta
+    // y por tanto huerfanos. Se trocea en batches de 500: antes se usaba un
+    // unico batch, que con mas de 500 assets habria hecho fallar el commit.
     console.log(`[accountHandlers][deletePortfolioAccount] Eliminando assets de la cuenta ${accountId}`);
-    const assetDocs = await findAccountAssets(accountId, userId);
+    const assetDocs = await findAccountAssets(accountId);
 
     if (assetDocs.length > 0) {
       deletedAssetsCount = await deleteDocsInBatches(assetDocs);

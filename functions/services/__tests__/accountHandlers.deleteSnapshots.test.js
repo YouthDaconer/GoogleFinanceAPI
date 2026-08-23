@@ -52,8 +52,12 @@ jest.mock("firebase-admin/firestore", () => {
         };
       }
       if (name === 'assets') {
+        // FIX-DELETE-002: la consulta de assets ya no encadena un filtro por
+        // userId, asi que `get` cuelga del primer where. Se deja tambien tras un
+        // segundo where para no acoplar este test a la forma de la consulta.
         return {
           where: jest.fn(() => ({
+            get: mockAssetsGet,
             where: jest.fn(() => ({
               get: mockAssetsGet,
             })),

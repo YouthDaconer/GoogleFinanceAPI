@@ -56,6 +56,8 @@ const mockDocUpdate = jest.fn().mockResolvedValue();
 const assetsByField = {};
 /** Campos por los que se consulto la coleccion assets */
 const assetFieldsQueried = [];
+/** Filtros adicionales encadenados sobre la consulta de assets */
+const assetExtraFilters = [];
 
 jest.mock("firebase-admin/firestore", () => {
   const FieldValue = {
@@ -70,16 +72,20 @@ jest.mock("firebase-admin/firestore", () => {
       }
       if (name === 'assets') {
         // Captura el nombre del campo del primer where para devolver el
-        // resultado correspondiente
+        // resultado correspondiente. `get` se expone directamente y tambien
+        // detras de un segundo `where`, para que si alguien reintroduce un
+        // filtro extra el test falle por la asercion y no por la forma del mock.
         return {
           where: jest.fn((field) => {
             assetFieldsQueried.push(field);
+            const resultado = assetsByField[field] || { empty: true, docs: [] };
+            const get = jest.fn().mockResolvedValue(resultado);
             return {
-              where: jest.fn(() => ({
-                get: jest.fn().mockResolvedValue(
-                  assetsByField[field] || { empty: true, docs: [] }
-                ),
-              })),
+              get,
+              where: jest.fn((extra) => {
+                assetExtraFilters.push(extra);
+                return { get };
+              }),
             };
           }),
         };
@@ -137,6 +143,7 @@ describe('FIX-DELETE-002: borrado en cascada de la cuenta', () => {
     jest.clearAllMocks();
     batchSizes.length = 0;
     assetFieldsQueried.length = 0;
+    assetExtraFilters.length = 0;
     Object.keys(assetsByField).forEach(k => delete assetsByField[k]);
 
     mockAccountGet.mockResolvedValue({
@@ -246,6 +253,31 @@ describe('FIX-DELETE-002: borrado en cascada de la cuenta', () => {
       const result = await deletePortfolioAccount(CONTEXT, PAYLOAD);
 
       expect(result.deletedAssets).toBe(15);
+    });
+
+    test('la consulta de assets NO filtra por userId', async () => {
+      // Hay 331 assets en produccion sin el campo `userId`. En Firestore una
+      // igualdad sobre un campo ausente no coincide con nada, asi que ese filtro
+      // los volvia invisibles al borrado exactamente igual que el desajuste de
+      // nombre de campo. La propiedad ya la garantiza la verificacion de la
+      // cuenta, no hace falta repetirla aqui.
+      setAssets({ portfolioAccount: makeDocs(5) });
+
+      await deletePortfolioAccount(CONTEXT, PAYLOAD);
+
+      expect(assetExtraFilters).not.toContain('userId');
+      expect(assetExtraFilters).toHaveLength(0);
+    });
+
+    test('borra los assets a los que les falta el campo userId', async () => {
+      // Caso real: la cuenta "XTB" tiene 174 assets sin userId. Con el filtro
+      // puesto, borrarla habria dejado esos 174 huerfanos.
+      setAssets({ portfolioAccount: makeDocs(174, 'sin-userid') });
+
+      const result = await deletePortfolioAccount(CONTEXT, PAYLOAD);
+
+      expect(result.deletedAssets).toBe(174);
+      expect(batchSizes).toEqual([174]);
     });
 
     test('un asset que aparece en las DOS consultas se borra una sola vez', async () => {
