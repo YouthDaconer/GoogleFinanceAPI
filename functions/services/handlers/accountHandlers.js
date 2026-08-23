@@ -19,6 +19,66 @@ const { validateQuantityLimit } = require('../helpers/subscriptionValidator');
 const db = getFirestore();
 
 // ============================================================================
+// HELPERS
+// ============================================================================
+
+/** Límite duro de operaciones por batch en Firestore */
+const FIRESTORE_BATCH_LIMIT = 500;
+
+/**
+ * Borra una lista de documentos troceando en batches de 500.
+ *
+ * FIX-DELETE-002: un `db.batch()` admite como máximo 500 operaciones. Superarlo
+ * hace que `commit()` lance, y en un borrado en cascada eso deja los datos a
+ * medio eliminar: los pasos siguientes no se ejecutan y quedan huérfanos que ya
+ * no se pueden alcanzar, porque la cuenta que los referenciaba desaparecio.
+ *
+ * @param {Array} docs - Documentos a borrar (snapshot.docs)
+ * @returns {Promise<number>} Cuántos se borraron
+ */
+async function deleteDocsInBatches(docs) {
+  for (let i = 0; i < docs.length; i += FIRESTORE_BATCH_LIMIT) {
+    const batch = db.batch();
+    docs.slice(i, i + FIRESTORE_BATCH_LIMIT).forEach(doc => batch.delete(doc.ref));
+    await batch.commit();
+  }
+
+  return docs.length;
+}
+
+/**
+ * Busca los assets de una cuenta cubriendo AMBOS nombres de campo.
+ *
+ * FIX-DELETE-002: los assets se han escrito historicamente con dos nombres para
+ * la referencia a la cuenta. FIX-DELETE-001 cambio la consulta de
+ * `portfolioAccountId` a `portfolioAccount`, que es el que usan los escritores
+ * actuales (assetResolver.js y asset_repository.py), pero con eso dejo
+ * inalcanzables los assets antiguos escritos con el nombre viejo: al borrar su
+ * cuenta ya no aparecian en la consulta y quedaban huérfanos para siempre.
+ *
+ * Se consultan los dos campos y se deduplica por id de documento. No se usa un
+ * filtro OR porque abarca campos distintos y exigiria un indice compuesto.
+ *
+ * @param {string} accountId
+ * @param {string} userId
+ * @returns {Promise<Array>} Documentos de asset, sin duplicados
+ */
+async function findAccountAssets(accountId, userId) {
+  const byId = new Map();
+
+  for (const field of ['portfolioAccount', 'portfolioAccountId']) {
+    const snapshot = await db.collection('assets')
+      .where(field, '==', accountId)
+      .where('userId', '==', userId)
+      .get();
+
+    snapshot.docs.forEach(doc => byId.set(doc.id, doc));
+  }
+
+  return [...byId.values()];
+}
+
+// ============================================================================
 // HANDLERS
 // ============================================================================
 
@@ -188,45 +248,25 @@ async function deletePortfolioAccount(context, payload) {
     let deletedTransactionsCount = 0;
 
     // 1. Eliminar todos los assets asociados a esta cuenta
+    // FIX-DELETE-002: se cubren los dos nombres de campo historicos y se trocea
+    // en batches de 500. Antes se usaba un unico batch, asi que una cuenta con
+    // mas de 500 assets hacia fallar el commit y abortaba el borrado completo.
     console.log(`[accountHandlers][deletePortfolioAccount] Eliminando assets de la cuenta ${accountId}`);
-    // FIX-DELETE-001: Campo correcto es "portfolioAccount" no "portfolioAccountId"
-    const assetsQuery = db.collection("assets")
-      .where("portfolioAccount", "==", accountId)
-      .where("userId", "==", userId);
-    
-    const assetsSnapshot = await assetsQuery.get();
-    
-    if (!assetsSnapshot.empty) {
-      const batch = db.batch();
-      assetsSnapshot.docs.forEach(doc => {
-        batch.delete(doc.ref);
-      });
-      await batch.commit();
-      deletedAssetsCount = assetsSnapshot.size;
+    const assetDocs = await findAccountAssets(accountId, userId);
+
+    if (assetDocs.length > 0) {
+      deletedAssetsCount = await deleteDocsInBatches(assetDocs);
       console.log(`[accountHandlers][deletePortfolioAccount] Eliminados ${deletedAssetsCount} assets`);
     }
 
     // 2. Eliminar todas las transacciones asociadas a esta cuenta
     console.log(`[accountHandlers][deletePortfolioAccount] Eliminando transacciones de la cuenta ${accountId}`);
-    const transactionsQuery = db.collection("transactions")
-      .where("portfolioAccountId", "==", accountId);
-    
-    const transactionsSnapshot = await transactionsQuery.get();
-    
+    const transactionsSnapshot = await db.collection("transactions")
+      .where("portfolioAccountId", "==", accountId)
+      .get();
+
     if (!transactionsSnapshot.empty) {
-      // Eliminar en batches de 500 (límite de Firestore)
-      const BATCH_SIZE = 500;
-      const docs = transactionsSnapshot.docs;
-      
-      for (let i = 0; i < docs.length; i += BATCH_SIZE) {
-        const batch = db.batch();
-        const batchDocs = docs.slice(i, i + BATCH_SIZE);
-        batchDocs.forEach(doc => {
-          batch.delete(doc.ref);
-        });
-        await batch.commit();
-      }
-      deletedTransactionsCount = transactionsSnapshot.size;
+      deletedTransactionsCount = await deleteDocsInBatches(transactionsSnapshot.docs);
       console.log(`[accountHandlers][deletePortfolioAccount] Eliminadas ${deletedTransactionsCount} transacciones`);
     }
 
@@ -256,10 +296,10 @@ async function deletePortfolioAccount(context, payload) {
         .get();
 
       if (!accountSnapshots.empty) {
-        const snapshotBatch = db.batch();
-        accountSnapshots.docs.forEach(doc => snapshotBatch.delete(doc.ref));
-        await snapshotBatch.commit();
-        console.log(`[accountHandlers][deletePortfolioAccount] Deleted ${accountSnapshots.size} snapshots for account ${accountId}`);
+        // FIX-DELETE-002: tambien troceado. Los snapshots son diarios, asi que
+        // una cuenta con mas de año y medio de historia pasa de 500 documentos.
+        const deleted = await deleteDocsInBatches(accountSnapshots.docs);
+        console.log(`[accountHandlers][deletePortfolioAccount] Deleted ${deleted} snapshots for account ${accountId}`);
       }
     } catch (cleanupError) {
       console.warn(`[accountHandlers][deletePortfolioAccount] Snapshot cleanup failed for account ${accountId}: ${cleanupError.message}`);
