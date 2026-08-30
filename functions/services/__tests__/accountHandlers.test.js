@@ -6,16 +6,40 @@
 const { HttpsError } = require("firebase-functions/v2/https");
 
 // Mock firebase-admin/firestore
-const mockAdd = jest.fn(() => Promise.resolve({ id: "new-account-id" }));
-const mockCollection = jest.fn(() => ({ add: mockAdd }));
+//
+// HU 2.6: `addPortfolioAccount` escribe en batch y genera el id de la cuenta con
+// `.doc()` en vez de `.add()`, porque cada saldo inicial nace con su asiento de
+// apertura y las dos escrituras tienen que ir juntas (RN-2.6-C).
+const mockBatch = {
+  set: jest.fn(),
+  update: jest.fn(),
+  commit: jest.fn(() => Promise.resolve()),
+};
+const mockDoc = jest.fn(() => ({
+  id: "new-account-id",
+  get: jest.fn(() => Promise.resolve({ exists: false, data: () => undefined })),
+}));
+const mockCollection = jest.fn(() => ({ doc: mockDoc }));
 
 jest.mock("firebase-admin/firestore", () => ({
   getFirestore: () => ({
     collection: mockCollection,
+    batch: () => mockBatch,
   }),
   FieldValue: {
     serverTimestamp: () => "SERVER_TIMESTAMP",
   },
+}));
+
+jest.mock("../firebaseAdmin", () => {
+  const mockAdmin = { firestore: jest.fn(() => ({ collection: mockCollection })) };
+  mockAdmin.firestore.FieldValue = { serverTimestamp: () => "SERVER_TIMESTAMP" };
+  return mockAdmin;
+});
+
+jest.mock("../historicalRateService", () => ({
+  getCrossRate: jest.fn(() => Promise.resolve(null)),
+  getRateForDate: jest.fn(() => Promise.resolve(null)),
 }));
 
 jest.mock("../portfolioDistributionService", () => ({

@@ -26,7 +26,6 @@ const { scrapeSimpleCurrencie } = require("./services/scrapeCurrencies");
 const { scrapeGainers } = require("./services/scrapeGainers");
 const { scrapeLosers } = require("./services/scrapeLosers");
 const { scrapeNews } = require("./services/scrapeNews");
-const fetchHistoricalExchangeRate = require('./services/fetchHistoricalExchangeRate');
 const { getQuotes, getSimpleQuotes, getNewsFromSymbol, search } = require('./services/financeQuery');
 
 // Crear la app Express
@@ -287,34 +286,10 @@ app.get("/news", async (req, res) => {
   }
 });
 
-app.get("/api/historicalExchangeRate", async (req, res) => {
-  const { currency, date } = req.query;
-
-  if (!currency || !date) {
-    res.status(400).json({
-      error: 'Faltan parámetros requeridos: currency y date',
-    });
-    return;
-  }
-
-  try {
-    const dateObj = new Date(date);
-    const exchangeRate = await fetchHistoricalExchangeRate(currency, dateObj);
-
-    if (exchangeRate !== null) {
-      res.status(200).json({ exchangeRate });
-    } else {
-      res.status(404).json({
-        error: `No se pudo obtener el tipo de cambio para ${currency} en la fecha especificada`,
-      });
-    }
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({
-      error: 'Error al obtener el tipo de cambio histórico desde la API',
-    });
-  }
-});
+// HU #3: el endpoint `/api/historicalExchangeRate` se retiró junto con el camino
+// directo a Yahoo. Las tasas de cualquier fecha se piden por rango al canal de
+// datos de mercado: `GET /v1/exchange-rates?currencies=…&start=…&end=…`.
+// @see platform-docs/stories/3-tasa-vigente-canal-mercado/refinamiento.md (T10)
 
 app.get('/quotes', async (req, res) => {
   const { symbols } = req.query;

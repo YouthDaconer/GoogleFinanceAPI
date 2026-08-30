@@ -26,6 +26,8 @@ const {
   getBrokerMappings,
   // HU 1.5: formato numérico declarado del broker
   getBrokerNumberFormat,
+  // IMPORT-004: formato numérico inferido del contenido (verifica la declaración)
+  inferNumberFormatFromValues,
 } = require('./services/brokerPatterns');
 const { detectColumnsGeneric, detectHasHeader } = require('./services/columnDetector');
 const { validateTickerSample } = require('./services/tickerValidator');
@@ -349,6 +351,49 @@ const analyzeTransactionFile = onCall(
     // ─────────────────────────────────────────────────────────────────────
     // 10. BUILD RESPONSE (AC-031 to AC-039)
     // ─────────────────────────────────────────────────────────────────────
+    // IMPORT-004: verificar la declaración del broker contra el contenido real.
+    // Un reporte genérico en español puede coincidir al 80% con la firma de
+    // Trii y heredar su formato 'eu'; si el contenido usa puntos decimales,
+    // esa declaración corrompe cada cantidad ("101.70" → 10170).
+    const declaredNumberFormat = getBrokerNumberFormat(detectedBroker);
+    let detectedNumberFormat = declaredNumberFormat;
+    try {
+      const numericMappings = mappings.filter(m =>
+        m.targetField === 'amount' || m.targetField === 'price' || m.targetField === 'total'
+      );
+      if (numericMappings.length > 0) {
+        const numericColumns = numericMappings.map(m => m.sourceColumn);
+        const dataStartRow = hasHeader ? 1 : 0;
+        const sampleValues = [];
+
+        for (const row of truncatedData.slice(dataStartRow)) {
+          for (const col of numericColumns) {
+            const value = row?.[col];
+            if (value) {
+              sampleValues.push(String(value));
+            }
+          }
+          if (sampleValues.length >= 400) break;
+        }
+
+        const inferredFormat = inferNumberFormatFromValues(sampleValues);
+
+        if (inferredFormat && inferredFormat !== declaredNumberFormat) {
+          detectedNumberFormat = inferredFormat;
+          console.warn(
+            `[analyzeTransactionFile] declared number format "${declaredNumberFormat}" ` +
+            `(broker ${detectedBroker || 'generic'}) contradicted by content evidence "${inferredFormat}" — using content`
+          );
+          warnings.push(
+            'El formato numérico del archivo difiere del esperado para este formato; se usó el formato detectado en los datos.'
+          );
+        }
+      }
+    } catch (e) {
+      // La verificación es defensiva: cualquier fallo conserva la declaración
+      console.warn(`[analyzeTransactionFile] Number format verification failed: ${e.message}`);
+    }
+
     const duration = Date.now() - startTime;
     console.log(`[analyzeTransactionFile] Complete - duration: ${duration}ms`);
     
@@ -373,10 +418,11 @@ const analyzeTransactionFile = onCall(
       // Mapa símbolo del archivo → activo al que quedó vinculado, con su origen.
       equivalences,
 
-      // HU 1.5: separador decimal del archivo, declarado por el broker detectado.
-      // El frontend lo usa al parsear cantidades y precios: sin esto, un importe
-      // europeo como "1.234,56" se leería como 1.23456 sin lanzar ningún error.
-      detectedNumberFormat: getBrokerNumberFormat(detectedBroker),
+      // HU 1.5: separador decimal del archivo, declarado por el broker detectado
+      // y verificado contra el contenido real (IMPORT-004). El frontend lo usa
+      // al parsear cantidades y precios: sin esto, un importe europeo como
+      // "1.234,56" se leería como 1.23456 sin lanzar ningún error.
+      detectedNumberFormat,
 
 
       // AC-033: Column mappings

@@ -1,11 +1,19 @@
 /**
- * Tests for getExchangeRatesForDates, getRateWithFallback, chunkArray (SCALE-005)
- * 
+ * HU #3 — Tests de las tasas del backfill: por rango, sin archivo, sin fallback.
+ *
+ * Lo que estos tests defienden es el cambio que hace innecesaria la caché: el
+ * coste de resolver un período crece con el **número de divisas**, nunca con el
+ * de días. Antes era una llamada por día y divisa, con una pausa deliberada
+ * entre cada una; un año con tres divisas eran más de mil llamadas encadenadas.
+ *
+ * Y defienden lo segundo, que es lo que produjo el efecto divisa falso: cuando
+ * no hay tasa, el día se queda sin calcular. Nunca se rescata con la tasa
+ * vigente de `currencies/{code}`, que nadie refresca.
+ *
  * @module __tests__/services/backfillCoreModule.exchangeRates.test
- * @see docs/stories/SCALE-005.story.md
+ * @see platform-docs/stories/3-tasa-vigente-canal-mercado/refinamiento.md (T22)
  */
 
-// Mock firebaseAdmin before importing
 const mockGet = jest.fn();
 const mockSet = jest.fn().mockResolvedValue();
 const mockUpdate = jest.fn().mockResolvedValue();
@@ -39,7 +47,6 @@ jest.mock('../firebaseAdmin', () => {
     __esModule: false,
   };
 
-  // Provide admin.firestore.FieldValue for SCALE-005 code
   mockAdmin.firestore.FieldValue = {
     serverTimestamp: () => 'SERVER_TIMESTAMP',
     increment: (n) => `INCREMENT_${n}`,
@@ -48,7 +55,6 @@ jest.mock('../firebaseAdmin', () => {
   return mockAdmin;
 });
 
-// Mock node-fetch
 jest.mock('node-fetch', () => {
   const fn = jest.fn().mockResolvedValue({
     json: () => Promise.resolve({ chart: { result: null } }),
@@ -58,14 +64,16 @@ jest.mock('node-fetch', () => {
   return fn;
 });
 
-const {
-  getExchangeRatesForDates,
-  getRateWithFallback,
-  chunkArray,
-  getActiveCurrencies,
-} = require('../backfillCoreModule');
+// El canal de mercado, mockeado en su frontera real: el cliente HTTP.
+const mockGetExchangeRates = jest.fn();
+jest.mock('../financeQuery', () => ({
+  getExchangeRates: (...args) => mockGetExchangeRates(...args),
+}));
 
-// Helper to create Firestore query snapshot with forEach (matching real API)
+const { getExchangeRatesForDates, chunkArray } = require('../backfillCoreModule');
+const { _resetMemory } = require('../historicalRateService');
+
+/** Snapshot de query de Firestore con `forEach`, como el API real */
 function mockQuerySnapshot(docs) {
   return {
     forEach: (fn) => docs.forEach(fn),
@@ -75,272 +83,156 @@ function mockQuerySnapshot(docs) {
   };
 }
 
-// Helper to create individual doc in a query snapshot
-function mockQueryDoc(id, data) {
-  return {
-    id,
-    data: () => data,
-    ref: { path: `currencies/${id}` },
-  };
+/** Documento de divisa activa del catálogo (sin `exchangeRate`, HU #3) */
+const currencyDoc = (code) => ({ id: code, data: () => ({ code, isActive: true }) });
+
+/** Genera N días consecutivos desde una fecha */
+function daysFrom(start, count) {
+  const days = [];
+  const base = new Date(`${start}T12:00:00Z`);
+  for (let i = 0; i < count; i++) {
+    const d = new Date(base);
+    d.setUTCDate(d.getUTCDate() + i);
+    days.push(d.toISOString().substring(0, 10));
+  }
+  return days;
 }
 
-// Helper to create a mock Firestore document snapshot (for doc().get())
-function mockSnapshot(id, data, exists = true) {
-  return {
-    id,
-    exists,
-    data: () => data,
-    ref: { update: mockUpdate, id },
-  };
+/** Serie completa de una divisa para los días indicados */
+function seriesFor(days, rate) {
+  return days.reduce((acc, day, index) => ({ ...acc, [day]: rate + index }), {});
 }
+
+describe('getExchangeRatesForDates (HU #3)', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    _resetMemory();
+    mockCollection.mockReturnValue({ where: mockWhere, get: mockGet, doc: mockDoc });
+    mockWhere.mockReturnThis();
+    // El catálogo sigue diciendo qué divisas están activas: eso sí es suyo
+    mockGet.mockResolvedValue(mockQuerySnapshot([currencyDoc('COP'), currencyDoc('EUR')]));
+  });
+
+  it('resuelve un año con tres divisas con UNA consulta por divisa (RN-3-C)', async () => {
+    const days = daysFrom('2026-01-05', 250);
+
+    mockGet.mockResolvedValue(mockQuerySnapshot([
+      currencyDoc('COP'), currencyDoc('EUR'), currencyDoc('MXN'),
+    ]));
+    mockGetExchangeRates.mockResolvedValue({
+      base: 'USD',
+      rates: {
+        COP: seriesFor(days, 3900),
+        EUR: seriesFor(days, 0.85),
+        MXN: seriesFor(days, 17),
+      },
+      unavailable: [],
+    });
+
+    const result = await getExchangeRatesForDates(days);
+
+    // Una sola consulta al canal, con las tres divisas dentro
+    expect(mockGetExchangeRates).toHaveBeenCalledTimes(1);
+    const [currencies, start, end] = mockGetExchangeRates.mock.calls[0];
+    expect(currencies).toEqual(expect.arrayContaining(['COP', 'EUR', 'MXN']));
+    expect(start <= days[0]).toBe(true);
+    expect(end).toBe(days[days.length - 1]);
+
+    expect(Object.keys(result)).toHaveLength(250);
+    expect(result[days[0]].COP).toBe(3900);
+  });
+
+  it('no lee ni escribe la colección de tasas archivadas (RN-3-A)', async () => {
+    const days = ['2026-03-10', '2026-03-11'];
+    mockGetExchangeRates.mockResolvedValue({
+      base: 'USD',
+      rates: { COP: { '2026-03-10': 3880, '2026-03-11': 3890 }, EUR: {} },
+      unavailable: ['EUR'],
+    });
+
+    await getExchangeRatesForDates(days);
+
+    expect(mockGetAll).not.toHaveBeenCalled();
+    const touchedPaths = mockDoc.mock.calls.map((call) => call[0]);
+    expect(touchedPaths.some((path) => String(path).includes('historicalExchangeRates'))).toBe(false);
+    expect(mockSet).not.toHaveBeenCalled();
+  });
+
+  it('arrastra el cierre anterior a los días sin cotización, dentro del mismo rango', async () => {
+    // 2026-03-14 y 15 son fin de semana
+    const days = ['2026-03-13', '2026-03-14', '2026-03-15', '2026-03-16'];
+
+    mockGetExchangeRates.mockResolvedValue({
+      base: 'USD',
+      rates: { COP: { '2026-03-13': 3900, '2026-03-16': 3910 }, EUR: { '2026-03-13': 0.85, '2026-03-16': 0.86 } },
+      unavailable: [],
+    });
+
+    const result = await getExchangeRatesForDates(days);
+
+    expect(mockGetExchangeRates).toHaveBeenCalledTimes(1);
+    expect(result['2026-03-14'].COP).toBe(3900);
+    expect(result['2026-03-15'].COP).toBe(3900);
+    expect(result['2026-03-16'].COP).toBe(3910);
+  });
+
+  it('deja el día sin la divisa cuando no hay tasa, en vez de rescatarla con la vigente (RN-3-D)', async () => {
+    const days = ['2026-03-10', '2026-03-11'];
+
+    mockGetExchangeRates.mockResolvedValue({
+      base: 'USD',
+      rates: { COP: { '2026-03-10': 3880, '2026-03-11': 3890 } },
+      unavailable: ['EUR'],
+    });
+
+    const result = await getExchangeRatesForDates(days);
+
+    expect(result['2026-03-10']).toEqual({ USD: 1, COP: 3880 });
+    expect(result['2026-03-10'].EUR).toBeUndefined();
+    // Nadie fue a buscar `currencies/{code}.exchangeRate`
+    const touchedPaths = mockDoc.mock.calls.map((call) => String(call[0]));
+    expect(touchedPaths.some((path) => path.startsWith('currencies/'))).toBe(false);
+  });
+
+  it('deja el día solo con USD cuando el canal no responde', async () => {
+    mockGetExchangeRates.mockResolvedValue(null);
+
+    const result = await getExchangeRatesForDates(['2026-03-10']);
+
+    expect(result['2026-03-10']).toEqual({ USD: 1 });
+  });
+
+  it('devuelve vacío sin días que resolver', async () => {
+    expect(await getExchangeRatesForDates([])).toEqual({});
+    expect(mockGetExchangeRates).not.toHaveBeenCalled();
+  });
+
+  it('USD siempre vale 1 y no se le pregunta al mercado', async () => {
+    mockGet.mockResolvedValue(mockQuerySnapshot([currencyDoc('COP')]));
+    mockGetExchangeRates.mockResolvedValue({
+      base: 'USD',
+      rates: { COP: { '2026-03-10': 3880 } },
+      unavailable: [],
+    });
+
+    const result = await getExchangeRatesForDates(['2026-03-10']);
+
+    expect(result['2026-03-10'].USD).toBe(1);
+    const [currencies] = mockGetExchangeRates.mock.calls[0];
+    expect(currencies).not.toContain('USD');
+  });
+});
 
 describe('chunkArray', () => {
-  test('splits array into chunks of given size', () => {
+  it('parte el array en trozos del tamaño pedido', () => {
     expect(chunkArray([1, 2, 3, 4, 5], 2)).toEqual([[1, 2], [3, 4], [5]]);
   });
 
-  test('returns single chunk when array is smaller than size', () => {
-    expect(chunkArray([1, 2], 5)).toEqual([[1, 2]]);
+  it('devuelve un solo trozo cuando cabe entero', () => {
+    expect(chunkArray([1, 2], 10)).toEqual([[1, 2]]);
   });
 
-  test('returns empty array for empty input', () => {
-    expect(chunkArray([], 3)).toEqual([]);
-  });
-
-  test('handles chunk size of 1', () => {
-    expect(chunkArray([1, 2, 3], 1)).toEqual([[1], [2], [3]]);
-  });
-});
-
-describe('getExchangeRatesForDates', () => {
-
-  let testTimeOffset = 0;
-
-  beforeEach(() => {
-    jest.clearAllMocks();
-    mockCollection.mockReturnValue({
-      where: mockWhere,
-      get: mockGet,
-      doc: mockDoc,
-    });
-    mockWhere.mockReturnThis();
-    // Each test advances the clock by an additional 10min to ensure currency cache is expired
-    testTimeOffset += 10 * 60 * 1000;
-    jest.spyOn(Date, 'now').mockReturnValue(Date.now() + testTimeOffset);
-  });
-
-  afterEach(() => {
-    jest.restoreAllMocks();
-  });
-
-  test('returns cached rates for full cache hits without calling Yahoo Finance', async () => {
-    // Setup: getActiveCurrencies → forEach-based snapshot
-    mockGet.mockResolvedValueOnce(
-      mockQuerySnapshot([
-        mockQueryDoc('USD', { code: 'USD', isActive: true }),
-        mockQueryDoc('COP', { code: 'COP', isActive: true }),
-        mockQueryDoc('EUR', { code: 'EUR', isActive: true }),
-      ])
-    );
-
-    // Mock db.getAll returns full cache hits
-    mockGetAll.mockResolvedValueOnce([
-      mockSnapshot('2026-03-27', {
-        date: '2026-03-27',
-        rates: { USD: 1, COP: 4285, EUR: 0.917 },
-        _meta: { source: 'eod-pipeline', version: 1 },
-      }),
-      mockSnapshot('2026-03-28', {
-        date: '2026-03-28',
-        rates: { USD: 1, COP: 4290, EUR: 0.918 },
-        _meta: { source: 'eod-pipeline', version: 1 },
-      }),
-    ]);
-
-    const result = await getExchangeRatesForDates(['2026-03-27', '2026-03-28']);
-
-    expect(result['2026-03-27']).toEqual({ USD: 1, COP: 4285, EUR: 0.917 });
-    expect(result['2026-03-28']).toEqual({ USD: 1, COP: 4290, EUR: 0.918 });
-
-    // Yahoo Finance (node-fetch) should NOT have been called
-    const nodeFetch = require('node-fetch');
-    expect(nodeFetch).not.toHaveBeenCalled();
-  });
-
-  test('fetches from Yahoo Finance for cache misses and writes through', async () => {
-    // getActiveCurrencies
-    mockGet.mockResolvedValueOnce(
-      mockQuerySnapshot([
-        mockQueryDoc('USD', { code: 'USD', isActive: true }),
-        mockQueryDoc('COP', { code: 'COP', isActive: true }),
-      ])
-    );
-
-    // db.getAll: cache miss
-    mockGetAll.mockResolvedValueOnce([
-      mockSnapshot('2026-03-27', null, false),
-    ]);
-
-    // fetchHistoricalExchangeRate calls node-fetch for COP (USDCOP=X)
-    const nodeFetch = require('node-fetch');
-    nodeFetch.mockResolvedValueOnce({
-      json: () => Promise.resolve({
-        chart: {
-          result: [{
-            indicators: { quote: [{ close: [4285] }] },
-          }],
-        },
-      }),
-      ok: true,
-    });
-
-    // Mock for write-through: doc.get returns non-existing
-    mockGet.mockResolvedValueOnce({ exists: false });
-
-    const result = await getExchangeRatesForDates(['2026-03-27']);
-
-    expect(result['2026-03-27']).toBeDefined();
-    expect(result['2026-03-27'].USD).toBe(1);
-    expect(result['2026-03-27'].COP).toBe(4285);
-
-    // Should have called set for write-through
-    expect(mockSet).toHaveBeenCalled();
-  });
-
-  test('patches document when cache hit is partial (missing currency)', async () => {
-    // getActiveCurrencies: USD, COP, EUR
-    mockGet.mockResolvedValueOnce(
-      mockQuerySnapshot([
-        mockQueryDoc('USD', { code: 'USD', isActive: true }),
-        mockQueryDoc('COP', { code: 'COP', isActive: true }),
-        mockQueryDoc('EUR', { code: 'EUR', isActive: true }),
-      ])
-    );
-
-    // db.getAll: cache has COP but NOT EUR
-    mockGetAll.mockResolvedValueOnce([
-      mockSnapshot('2026-03-27', {
-        date: '2026-03-27',
-        rates: { USD: 1, COP: 4285 },
-        _meta: { source: 'eod-pipeline', version: 1 },
-      }),
-    ]);
-
-    // fetchHistoricalExchangeRate for EUR (EURUSD=X)
-    const nodeFetch = require('node-fetch');
-    nodeFetch.mockResolvedValueOnce({
-      json: () => Promise.resolve({
-        chart: {
-          result: [{
-            indicators: { quote: [{ close: [1.09] }] },
-          }],
-        },
-      }),
-      ok: true,
-    });
-
-    const result = await getExchangeRatesForDates(['2026-03-27']);
-
-    expect(result['2026-03-27'].COP).toBe(4285);
-    // EUR was fetched and inverted (EURUSD=1.09 → 1/1.09)
-    expect(result['2026-03-27'].EUR).toBeCloseTo(0.9174, 3);
-
-    // Should have patched the document
-    expect(mockUpdate).toHaveBeenCalled();
-    const patchArg = mockUpdate.mock.calls[0][0];
-    expect(patchArg['rates.EUR']).toBeCloseTo(0.9174, 3);
-  });
-
-  test('returns correct structure matching original ratesByDate format', async () => {
-    // getActiveCurrencies
-    mockGet.mockResolvedValueOnce(
-      mockQuerySnapshot([
-        mockQueryDoc('USD', { code: 'USD', isActive: true }),
-      ])
-    );
-
-    // All cache hits (only USD)
-    mockGetAll.mockResolvedValueOnce([
-      mockSnapshot('2026-03-27', {
-        date: '2026-03-27',
-        rates: { USD: 1 },
-        _meta: { source: 'eod-pipeline', version: 1 },
-      }),
-    ]);
-
-    const result = await getExchangeRatesForDates(['2026-03-27']);
-
-    // Structure: { "YYYY-MM-DD": { USD: 1, ... } }
-    expect(result).toHaveProperty('2026-03-27');
-    expect(typeof result['2026-03-27']).toBe('object');
-    expect(result['2026-03-27'].USD).toBe(1);
-  });
-});
-
-describe('getRateWithFallback', () => {
-
-  beforeEach(() => {
-    jest.clearAllMocks();
-  });
-
-  test('USD always returns 1', async () => {
-    const result = await getRateWithFallback('2026-03-27', 'USD');
-    expect(result).toBe(1);
-    expect(mockDoc).not.toHaveBeenCalled();
-  });
-
-  test('returns exact date rate from cache', async () => {
-    mockGet.mockResolvedValueOnce({
-      exists: true,
-      data: () => ({ rates: { COP: 4285 } }),
-    });
-
-    const result = await getRateWithFallback('2026-03-27', 'COP');
-    expect(result).toBe(4285);
-  });
-
-  test('falls back to previous day when exact date missing', async () => {
-    // Exact date: no rate for COP
-    mockGet.mockResolvedValueOnce({
-      exists: true,
-      data: () => ({ rates: { EUR: 0.917 } }),
-    });
-
-    // Day -1: has COP
-    mockGet.mockResolvedValueOnce({
-      exists: true,
-      data: () => ({ rates: { COP: 4280 } }),
-    });
-
-    const result = await getRateWithFallback('2026-03-27', 'COP');
-    expect(result).toBe(4280);
-  });
-
-  test('falls back to Firestore currencies collection when proximity fails', async () => {
-    // Exact date: miss
-    mockGet.mockResolvedValueOnce({ exists: false });
-    // Days -1 to -5: all miss
-    for (let i = 0; i < 5; i++) {
-      mockGet.mockResolvedValueOnce({ exists: false });
-    }
-    // currencies/{code} fallback
-    mockGet.mockResolvedValueOnce({
-      exists: true,
-      data: () => ({ exchangeRate: 4250 }),
-    });
-
-    const result = await getRateWithFallback('2026-03-27', 'COP');
-    expect(result).toBe(4250);
-  });
-
-  test('returns null when no rate available anywhere', async () => {
-    mockGet.mockResolvedValueOnce({ exists: false });
-    for (let i = 0; i < 5; i++) {
-      mockGet.mockResolvedValueOnce({ exists: false });
-    }
-    mockGet.mockResolvedValueOnce({ exists: false });
-
-    const result = await getRateWithFallback('2026-03-27', 'COP');
-    expect(result).toBeNull();
+  it('devuelve vacío para un array vacío', () => {
+    expect(chunkArray([], 10)).toEqual([]);
   });
 });

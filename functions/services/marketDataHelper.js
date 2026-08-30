@@ -246,18 +246,16 @@ async function getCurrencyRatesFromApi() {
       currencies: currencyCodes
     });
     
-    // Construir símbolos de currency para el API (formato: COP=X, EUR=X, etc.)
-    // Excluir USD ya que siempre es 1
-    const currencySymbols = currencyCodes
-      .filter(code => code !== 'USD')
-      .map(code => `${code}=X`);
+    // HU #3: la divisa se pide por el endpoint de tasas del canal de mercado, que
+    // ya devuelve todo en base USD. Así la convención se fija en un solo sitio
+    // (RN-3-E, D3).
+    const foreignCodes = currencyCodes.filter(code => code !== 'USD');
     
     let apiRates = {};
     
-    if (currencySymbols.length > 0) {
+    if (foreignCodes.length > 0) {
       try {
-        const symbolsParam = currencySymbols.join(',');
-        const url = `${API_BASE_URL}/market-quotes?symbols=${symbolsParam}`;
+        const url = `${API_BASE_URL}/exchange-rates?currencies=${encodeURIComponent(foreignCodes.join(','))}`;
         
         // SEC-TOKEN-004: Incluir headers de autenticación de servicio
         const { data } = await axios.get(url, { 
@@ -265,28 +263,29 @@ async function getCurrencyRatesFromApi() {
           headers: getServiceHeaders(),
         });
         
-        // Extraer tasas de la respuesta
-        if (Array.isArray(data)) {
-          data.forEach(item => {
-            if (item.symbol && item.regularMarketPrice) {
-              // Convertir COP=X a COP
-              const currencyCode = item.symbol.replace('=X', '');
-              apiRates[currencyCode] = parseFloat(item.regularMarketPrice) || 1;
+        if (data && data.rates) {
+          for (const [code, rate] of Object.entries(data.rates)) {
+            const parsed = parseFloat(rate);
+            if (Number.isFinite(parsed) && parsed > 0) {
+              apiRates[code] = parsed;
             }
-          });
+          }
         }
         
         logger.info('Exchange rates received from API', {
-          requested: currencySymbols.length,
+          requested: foreignCodes.length,
           received: Object.keys(apiRates).length,
+          unavailable: (data && data.unavailable) || [],
           rates: apiRates
         });
         
       } catch (apiError) {
-        logger.warn('Failed to fetch rates from API Lambda, using Firestore rates as fallback', {
+        // HU #3: no hay tasa de reserva. Una tasa ausente se declara ausente
+        // (RN-3-D); valorarla con la última conocida es el error que esta
+        // historia viene a cerrar.
+        logger.warn('El canal de mercado no devolvió tasas de cambio; se declararán no disponibles', {
           error: apiError.message
         });
-        // Continuar con las tasas de Firestore
       }
     }
     
@@ -307,10 +306,11 @@ async function getCurrencyRatesFromApi() {
         symbol: currency.symbol,
         flagCurrency: currency.flagCurrency,
         isActive: true,
-        // Usar tasa del API si está disponible, sino usar la de Firestore
-        exchangeRate: hasApiRate ? freshRate : (currency.exchangeRate || 1),
+        // HU #3: sin tasa del canal, la divisa queda sin valorar. Nunca se
+        // sustituye por la última conocida (RN-3-D)
+        exchangeRate: hasApiRate ? freshRate : null,
         // Metadata adicional para debugging
-        rateSource: hasApiRate ? 'api-lambda' : 'firestore-fallback',
+        rateSource: hasApiRate ? 'api-lambda' : 'unavailable',
         lastUpdated: new Date().toISOString(),
       };
     });
@@ -336,7 +336,9 @@ async function getCurrencyRatesFromApi() {
       stack: error.stack
     });
     
-    // Retornar default mínimo para no bloquear cálculos
+    // HU #3: sólo el USD, cuya tasa es 1 por definición. Ninguna otra divisa se
+    // devuelve con un valor inventado: lo que no se pudo consultar se declara
+    // ausente y quien lo lea mostrará "no disponible" (RN-3-D).
     return [{
       id: 'USD',
       code: 'USD',
@@ -345,7 +347,7 @@ async function getCurrencyRatesFromApi() {
       name: 'US Dollar',
       symbol: '$',
       flagCurrency: 'https://flagcdn.com/us.svg',
-      rateSource: 'default-fallback',
+      rateSource: 'base-currency',
     }];
   }
 }
@@ -364,30 +366,9 @@ function invalidateCurrencyRatesCache() {
   logger.info('Currency rates cache invalidated');
 }
 
-/**
- * SCALE-005: Normaliza una tasa de cambio a la convención "1 USD = X unidades".
- * 
- * EUR/GBP/AUD/NZD se cotizan inversamente en Yahoo Finance:
- *   EUR=X → ~1.09 significa "1 EUR = 1.09 USD" → invertir a 0.917 = "1 USD = 0.917 EUR"
- * COP/MXN/BRL/CAD se cotizan directamente:
- *   COP=X → ~4285 ya es "1 USD = 4285 COP"
- */
-function normalizeToUsdBase(currencyCode, rawRate) {
-  if (currencyCode === 'USD') return 1;
-  if (!rawRate || rawRate <= 0) return rawRate;
-
-  const invertCurrencies = ['EUR', 'GBP', 'AUD', 'NZD'];
-  if (invertCurrencies.includes(currencyCode) && rawRate > 1) {
-    return 1 / rawRate;
-  }
-
-  return rawRate;
-}
-
 module.exports = {
   getPricesFromApi,
   getCurrencyRatesFromApi,
   normalizeQuote,
   invalidateCurrencyRatesCache,
-  normalizeToUsdBase,
 };

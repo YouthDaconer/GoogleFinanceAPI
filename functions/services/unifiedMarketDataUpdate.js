@@ -46,7 +46,7 @@ const cfServiceToken = defineSecret('CF_SERVICE_TOKEN');
 const { StructuredLogger } = require('../utils/logger');
 
 // OPT-DEMAND-CLEANUP: Importar helper para obtener precios y currencies del API Lambda
-const { getPricesFromApi, getCurrencyRatesFromApi, normalizeToUsdBase } = require('./marketDataHelper');
+const { getPricesFromApi, getCurrencyRatesFromApi } = require('./marketDataHelper');
 
 /**
  * End-of-Day Portfolio Update
@@ -1318,34 +1318,12 @@ exports.unifiedMarketDataUpdate = onSchedule({
       source: 'api-lambda'
     });
     
-    // SCALE-005: Persist historical exchange rates for cache
-    try {
-      const rateDate = yesterday.toISODate();
-      const ratesMap = { USD: 1 };
-      currencies.forEach(c => {
-        if (c.code && c.code !== 'USD' && c.exchangeRate) {
-          ratesMap[c.code] = normalizeToUsdBase(c.code, c.exchangeRate);
-        }
-      });
-      const rateDocRef = db.doc(`historicalExchangeRates/${rateDate}`);
-      const existingRateDoc = await rateDocRef.get();
-      if (!existingRateDoc.exists) {
-        await rateDocRef.set({
-          date: rateDate,
-          rates: ratesMap,
-          _meta: {
-            source: 'eod-pipeline',
-            fetchedAt: admin.firestore.FieldValue.serverTimestamp(),
-            currencyCount: Object.keys(ratesMap).length,
-            version: 1
-          }
-        });
-        logger.info('SCALE-005: Historical rates persisted', { date: rateDate, currencies: Object.keys(ratesMap).length });
-      }
-    } catch (ratesCacheError) {
-      logger.warn('SCALE-005: Could not persist historical rates', { error: ratesCacheError.message });
-    }
-    
+    // HU #3: el cierre diario ya NO archiva las tasas del día.
+    // Ninguna tasa se guarda (RN-3-A): las de cualquier fecha se piden por rango
+    // al canal de datos de mercado cuando hacen falta, y la que un movimiento ya
+    // aplicó vive en el propio movimiento desde la épica #2 (RN-3-B).
+    // @see platform-docs/stories/3-tasa-vigente-canal-mercado/refinamiento.md (T6)
+
     // Paso 3: Calcular performance del portafolio
     // FIX-READS-002: Pass pre-fetched assetsSnapshot to avoid redundant global scan inside
     const perfOp = logger.startOperation('calculateDailyPortfolioPerformance');

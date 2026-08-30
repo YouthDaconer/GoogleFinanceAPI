@@ -226,12 +226,17 @@ describe('getRateLimitConfig', () => {
     const expectedFunctions = [
       'getHistoricalReturns', 'getMultiAccountHistoricalReturns',
       'createAsset', 'sellAsset', 'sellPartialAssetsFIFO', 'addCashTransaction',
+      'convertAccountCurrency',
       'updateAsset', 'deleteAsset', 'deleteAssets', 'updateStockSector',
-      'getCurrentPricesForUser', 'getIndexHistory',
+      'getCurrentPricesForUser', 'getIndexHistory', 'getHistoricalExchangeRate',
       'addCurrency', 'updateCurrency', 'deleteCurrency', 
       'updateDefaultCurrency', 'updateUserCountry', 'updateUserDisplayName',
       'addPortfolioAccount', 'updatePortfolioAccount', 
       'deletePortfolioAccount', 'updatePortfolioAccountBalance',
+      'confirmBalanceCostBasis', 'getBalanceCostBasisEstimate',
+      'backfillRealizedFxDecomposition',
+      // HU 2.6: libro mayor del saldo, ajuste manual y migracion
+      'getBalanceLedger', 'registerBalanceAdjustment', 'migrateBalanceLedger',
       'createCheckoutSession', 'createPortalSession',
     ];
     
@@ -241,6 +246,6 @@ describe('getRateLimitConfig', () => {
       expect(RATE_LIMITS[fn].windowMs).toBe(60000);
     });
     
-    expect(Object.keys(RATE_LIMITS).length).toBe(25);
+    expect(Object.keys(RATE_LIMITS).length).toBe(33);
   });
 });

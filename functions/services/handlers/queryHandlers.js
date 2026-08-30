@@ -49,6 +49,12 @@ const {
 // OPT-DEMAND-CLEANUP: Importar helper para obtener precios del API Lambda
 const { getPricesFromApi } = require('../marketDataHelper');
 
+// HU 2.1: Tasa de cambio de una fecha concreta para el diálogo de efectivo
+const historicalRateService = require('../historicalRateService');
+const { getUserReferenceCurrency } = require('../helpers/balanceCostBasis');
+// HU 2.6: proyeccion del saldo a partir de sus movimientos
+const { projectBalanceLedger } = require('../helpers/balanceLedger');
+
 // PERF-SNAP-007: Importar helper para construir ID de snapshot
 // PERF-SNAP-009: Importar generatePerformanceSnapshot para on-demand generation
 // PERF-SNAP-024: Importar generateAssetSnapshot para on-demand per-asset
@@ -1161,7 +1167,7 @@ async function getAvailableSectors(context, payload) {
     const sectors = await portfolioDistributionService.getAvailableSectors();
     
     console.log(`[queryHandlers][getAvailableSectors] Éxito - ${sectors.length} sectores`);
-    
+
     return { sectors };
   } catch (error) {
     console.error(`[queryHandlers][getAvailableSectors] Error:`, error);
@@ -1170,8 +1176,282 @@ async function getAvailableSectors(context, payload) {
 }
 
 /**
+ * HU 2.1 — Tipo de cambio de una fecha concreta entre dos divisas.
+ *
+ * Lo consume el diálogo de movimiento de efectivo para proponer la tasa de la
+ * fecha del ingreso, no la de hoy. La tasa se expresa como el usuario la
+ * entiende: cuántas unidades de `toCurrency` cuesta 1 unidad de `fromCurrency`.
+ *
+ * Cuando no hay tasa, devuelve `rate: null` en lugar de lanzar: la ausencia es
+ * una respuesta legítima que la interfaz traduce en "escríbela tú" (RN-05).
+ *
+ * @param {Object} context - Contexto de ejecución
+ * @param {Object} payload - { date, fromCurrency, toCurrency? }
+ * @returns {Promise<{rate: number|null, rateDate: string|null, isExactDate: boolean, source: string|null, fromCurrency: string, toCurrency: string}>}
+ */
+async function getHistoricalExchangeRate(context, payload) {
+  const { auth } = context;
+  const { date, fromCurrency } = payload || {};
+
+  console.log(`[queryHandlers][getHistoricalExchangeRate] userId: ${auth.uid}, date: ${date}, from: ${fromCurrency}`);
+
+  if (!date || !fromCurrency) {
+    throw new HttpsError('invalid-argument', 'date y fromCurrency son requeridos');
+  }
+
+  try {
+    // La moneda de referencia se resuelve en servidor: es una preferencia del
+    // usuario, no un dato que el cliente deba poder suplantar.
+    const toCurrency = payload.toCurrency || await getUserReferenceCurrency(auth.uid);
+
+    const result = await historicalRateService.getCrossRate(fromCurrency, toCurrency, date);
+
+    if (result === null) {
+      console.warn(`[queryHandlers][getHistoricalExchangeRate] Sin tasa - ${fromCurrency}/${toCurrency} en ${date}`);
+      return {
+        rate: null,
+        rateDate: null,
+        isExactDate: false,
+        source: null,
+        fromCurrency,
+        toCurrency,
+      };
+    }
+
+    console.log(`[queryHandlers][getHistoricalExchangeRate] Éxito - ${result.rate} (${result.source})`);
+
+    return {
+      rate: result.rate,
+      rateDate: result.rateDate,
+      isExactDate: result.rateDate === date,
+      source: result.source,
+      fromCurrency,
+      toCurrency,
+    };
+  } catch (error) {
+    if (error instanceof HttpsError) throw error;
+    console.error(`[queryHandlers][getHistoricalExchangeRate] Error:`, error);
+    throw new HttpsError('internal', 'Error obteniendo el tipo de cambio de la fecha');
+  }
+}
+
+/**
+ * HU 2.3 — Estimación de la base de costo de un saldo sin historia conocida.
+ *
+ * Cuando el usuario va a comprar pagando con un saldo cuyo tipo de cambio de
+ * adquisición el sistema no pudo determinar, se le pide **una sola vez** que lo
+ * confirme (RN-12). Para no obligarle a inventar nada, se le propone una
+ * estimación: la tasa de mercado de la fecha de su **primer movimiento** en esa
+ * cuenta y esa divisa, que es lo más cercano a "cuándo llegó ese dinero" que el
+ * sistema puede saber sin el libro mayor de 2.6.
+ *
+ * Si no hay ningún movimiento registrado, se cae a la fecha que indique el
+ * cliente (la de la compra que se está registrando).
+ *
+ * Devuelve `estimatedRate: null` en lugar de lanzar cuando no hay tasa: la
+ * ausencia es una respuesta legítima que la interfaz convierte en "escríbela
+ * tú" (RN-13).
+ *
+ * @param {Object} context - Contexto de ejecución
+ * @param {Object} payload - { portfolioAccountId, currency, fallbackDate? }
+ * @returns {Promise<{estimatedRate: number|null, rateDate: string|null, firstMovementDate: string|null, currency: string, referenceCurrency: string}>}
+ */
+async function getBalanceCostBasisEstimate(context, payload) {
+  const { auth } = context;
+  const { portfolioAccountId, currency, fallbackDate } = payload || {};
+
+  console.log(`[queryHandlers][getBalanceCostBasisEstimate] userId: ${auth.uid}, account: ${portfolioAccountId}, currency: ${currency}`);
+
+  if (!portfolioAccountId || !currency) {
+    throw new HttpsError('invalid-argument', 'portfolioAccountId y currency son requeridos');
+  }
+
+  try {
+    // Ownership: la cuenta tiene que ser del usuario que pregunta.
+    const accountDoc = await db.collection('portfolioAccounts').doc(portfolioAccountId).get();
+
+    if (!accountDoc.exists || accountDoc.data()?.userId !== auth.uid) {
+      throw new HttpsError('permission-denied', 'No tienes acceso a esta cuenta');
+    }
+
+    const referenceCurrency = await getUserReferenceCurrency(auth.uid);
+
+    // Sin exposición cambiaria no hay nada que estimar (RN-14).
+    if (currency === referenceCurrency) {
+      return {
+        estimatedRate: 1,
+        rateDate: null,
+        firstMovementDate: null,
+        currency,
+        referenceCurrency,
+      };
+    }
+
+    // Primer movimiento de efectivo de esa cuenta que tocó esa divisa. Se
+    // reutiliza EXACTAMENTE la query que ya usa el historial de saldo —
+    // `portfolioAccountId` + `assetType == 'cash'`— y la divisa se filtra en
+    // memoria, para no exigir un índice compuesto nuevo. El conjunto es el
+    // efectivo de una sola cuenta: cabe de sobra.
+    //
+    // HU 2.2: una conversión entró a esta divisa aunque su campo `currency` sea
+    // la de origen, así que cuenta como movimiento de las dos puntas.
+    let firstMovementDate = null;
+
+    const snapshot = await db.collection('transactions')
+      .where('portfolioAccountId', '==', portfolioAccountId)
+      .where('assetType', '==', 'cash')
+      .get();
+
+    snapshot.docs.forEach((doc) => {
+      const tx = doc.data() || {};
+
+      if (tx.currency !== currency && tx.toCurrency !== currency) return;
+      if (!tx.date) return;
+
+      const txDate = String(tx.date).substring(0, 10);
+
+      if (firstMovementDate === null || txDate < firstMovementDate) {
+        firstMovementDate = txDate;
+      }
+    });
+
+    const rateDateRequested = firstMovementDate
+      || (fallbackDate ? String(fallbackDate).substring(0, 10) : null);
+
+    if (!rateDateRequested) {
+      return {
+        estimatedRate: null,
+        rateDate: null,
+        firstMovementDate,
+        currency,
+        referenceCurrency,
+      };
+    }
+
+    const result = await historicalRateService.getCrossRate(currency, referenceCurrency, rateDateRequested);
+
+    if (result === null) {
+      console.warn(`[queryHandlers][getBalanceCostBasisEstimate] Sin tasa - ${currency}/${referenceCurrency} en ${rateDateRequested}`);
+      return {
+        estimatedRate: null,
+        rateDate: null,
+        firstMovementDate,
+        currency,
+        referenceCurrency,
+      };
+    }
+
+    console.log(`[queryHandlers][getBalanceCostBasisEstimate] Éxito - ${result.rate} (${result.source})`);
+
+    return {
+      estimatedRate: result.rate,
+      rateDate: result.rateDate,
+      firstMovementDate,
+      currency,
+      referenceCurrency,
+    };
+  } catch (error) {
+    if (error instanceof HttpsError) throw error;
+    console.error(`[queryHandlers][getBalanceCostBasisEstimate] Error:`, error);
+    throw new HttpsError('internal', 'Error estimando la base de costo del saldo');
+  }
+}
+
+/**
+ * HU 2.6 — El libro mayor de un saldo (AC-1) y su reconciliación (AC-3).
+ *
+ * Devuelve los movimientos que llevaron a ese saldo hasta donde está, de más
+ * reciente a más antiguo, con la tasa de cada uno y el saldo y la tasa promedio
+ * acumulados después de él. La aritmética vive en `balanceLedger`, que es el
+ * mismo módulo con el que la migración replaya el histórico (D1).
+ *
+ * **Persiste el veredicto de conciliación** en la propia cuenta (D4). AC-3 pide
+ * la marca de "no conciliado" al entrar a la gestión de cuentas, y recalcularla
+ * en cada visita obligaría a leer todas las transacciones de todas las cuentas.
+ * Como esta historia cierra los caminos que movían el saldo sin asiento, la
+ * deriva sólo puede venir de datos anteriores: basta con anotar el veredicto
+ * cada vez que el libro mayor se replaya de todas formas.
+ *
+ * La lectura reutiliza el índice `portfolioAccountId ASC + date DESC` que ya
+ * existe y filtra la divisa en memoria — la misma decisión que tomaron 2.3 y
+ * 2.4 para no exigir un índice compuesto nuevo. El conjunto es el de una sola
+ * cuenta.
+ *
+ * @param {Object} context - Contexto de ejecución
+ * @param {Object} payload - { portfolioAccountId, currency }
+ * @returns {Promise<{rows: Array<Object>, reconciliation: Object,
+ *   hasFxExposure: boolean, currency: string, referenceCurrency: string}>}
+ */
+async function getBalanceLedger(context, payload) {
+  const { auth } = context;
+  const { portfolioAccountId, currency } = payload || {};
+
+  console.log(`[queryHandlers][getBalanceLedger] userId: ${auth.uid}, account: ${portfolioAccountId}, currency: ${currency}`);
+
+  if (!portfolioAccountId || !currency) {
+    throw new HttpsError('invalid-argument', 'portfolioAccountId y currency son requeridos');
+  }
+
+  try {
+    const accountRef = db.collection('portfolioAccounts').doc(portfolioAccountId);
+    const accountDoc = await accountRef.get();
+
+    if (!accountDoc.exists || accountDoc.data()?.userId !== auth.uid) {
+      throw new HttpsError('permission-denied', 'No tienes acceso a esta cuenta');
+    }
+
+    const accountData = accountDoc.data();
+    const referenceCurrency = await getUserReferenceCurrency(auth.uid);
+
+    const snapshot = await db.collection('transactions')
+      .where('portfolioAccountId', '==', portfolioAccountId)
+      .get();
+
+    const transactions = snapshot.docs.map((doc) => ({ id: doc.id, ...doc.data() }));
+
+    const projection = projectBalanceLedger({
+      transactions,
+      currency,
+      referenceCurrency,
+      balance: accountData.balances?.[currency] || 0,
+    });
+
+    // El veredicto se guarda para que la página lo lea del documento de cuenta
+    // que ya tiene en memoria, sin una sola lectura nueva por visita (D4).
+    await accountRef.update({
+      [`balanceReconciliation.${currency}`]: {
+        ledgerBalance: projection.reconciliation.ledgerBalance,
+        difference: projection.reconciliation.difference,
+        status: projection.reconciliation.status,
+        checkedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+    });
+
+    console.log(`[queryHandlers][getBalanceLedger] Éxito - ${projection.rows.length} movimientos, ${projection.reconciliation.status}`);
+
+    return {
+      rows: projection.rows,
+      reconciliation: {
+        ledgerBalance: projection.reconciliation.ledgerBalance,
+        storedBalance: projection.reconciliation.storedBalance,
+        difference: projection.reconciliation.difference,
+        status: projection.reconciliation.status,
+        movementCount: projection.reconciliation.movementCount,
+      },
+      hasFxExposure: projection.hasFxExposure,
+      currency,
+      referenceCurrency,
+    };
+  } catch (error) {
+    if (error instanceof HttpsError) throw error;
+    console.error('[queryHandlers][getBalanceLedger] Error:', error);
+    throw new HttpsError('internal', 'Error obteniendo el historial del saldo');
+  }
+}
+
+/**
  * Obtiene rendimientos históricos usando períodos consolidados (V2)
- * 
+ *
  * COST-OPT-001: Versión optimizada que reduce lecturas de Firestore
  * de ~1,825 a ~40 documentos para consultas de 5 años.
  * 
@@ -1300,6 +1580,11 @@ module.exports = {
   getIndexHistory,
   getPortfolioDistribution,
   getAvailableSectors,
+  // HU 2.1: Tipo de cambio de una fecha concreta
+  getHistoricalExchangeRate,
+  getBalanceCostBasisEstimate,
+  // HU 2.6: libro mayor de un saldo
+  getBalanceLedger,
   // COST-OPT-001: Nuevos handlers para rendimientos optimizados
   getHistoricalReturnsOptimized,
   getConsolidatedDataStatus,

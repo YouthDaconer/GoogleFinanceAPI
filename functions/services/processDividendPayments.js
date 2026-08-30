@@ -6,6 +6,14 @@ const { scrapeDividendsInfoFromStockEvents } = require('./scrapeDividendsInfoFro
 // OPT-DEMAND-CLEANUP: Importar helper para obtener precios y currencies del API Lambda
 const { getPricesFromApi, getCurrencyRatesFromApi } = require('./marketDataHelper');
 
+// HU 2.4: un dividendo es dinero que nace dentro de la cuenta, así que entra al
+// saldo con el tipo de cambio del día del pago (RN-03). Hasta ahora este job era
+// el único punto de escritura de saldo que NO pasaba por el helper de 2.1: subía
+// `balances` sin tocar `balanceCostBasis`, de modo que la tasa promedio derivada
+// (`cost / balance`) quedaba mintiendo a la baja con cada dividendo cobrado.
+const { buildBalanceUpdate, getUserReferenceCurrency } = require('./helpers/balanceCostBasis');
+const { resolveRealizationRate } = require('./helpers/realizedFxDecomposition');
+
 /**
  * SEC-TOKEN-001: Secret para autenticación server-to-server con API finance-query
  * Usado por getPricesFromApi/getCurrencyRatesFromApi para obtener datos de dividendos.
@@ -153,9 +161,34 @@ exports.processDividendPayments = onSchedule({
 
     const batch = db.batch();
     let transactionsCreated = 0;
-    
+
     // Mapa para acumular los dividendos por cuenta y moneda
     const portfolioAccountUpdates = {};
+
+    // HU 2.4: la moneda de referencia y la tasa del día se resuelven una sola vez
+    // por usuario y por divisa. Todos los dividendos de una corrida comparten la
+    // misma fecha, así que la caché `historicalExchangeRates/{fecha}` resuelve la
+    // primera consulta y sirve el resto sin salir a Yahoo.
+    const referenceCurrencyByUser = new Map();
+    const realizationRateByPair = new Map();
+
+    const resolveReferenceCurrency = async (userId) => {
+      if (!referenceCurrencyByUser.has(userId)) {
+        referenceCurrencyByUser.set(userId, await getUserReferenceCurrency(userId));
+      }
+      return referenceCurrencyByUser.get(userId);
+    };
+
+    const resolveDayRate = async (currency, referenceCurrency) => {
+      const key = `${currency}_${referenceCurrency}`;
+      if (!realizationRateByPair.has(key)) {
+        realizationRateByPair.set(
+          key,
+          await resolveRealizationRate(currency, referenceCurrency, formattedDate)
+        );
+      }
+      return realizationRateByPair.get(key);
+    };
 
     // Crear transacciones por cuenta y símbolo
     for (const key of Object.keys(portfolioSymbolAssets)) {
@@ -194,6 +227,17 @@ exports.processDividendPayments = onSchedule({
       const taxDeductionAmount = grossAmount * (taxDeductionPercentage / 100);
       const netAmount = grossAmount - taxDeductionAmount;
 
+      // HU 2.4: a qué tipo de cambio entra este dividendo al saldo (RN-03)
+      const dividendCurrency = portfolioSymbolData.currency || 'USD';
+      const referenceCurrency = await resolveReferenceCurrency(portfolioSymbolData.userId);
+      const { realizationRate, realizationRateSource } =
+        await resolveDayRate(dividendCurrency, referenceCurrency);
+      // Sin tasa del día no se inventa un costo: el saldo queda indeterminado y
+      // el dividendo se registra igual — el usuario lo cobró (RN-13, D5).
+      const dividendCost = realizationRate === null
+        ? null
+        : Number((netAmount * realizationRate).toFixed(2));
+
       // Crear una única transacción de dividendo para esta cuenta y símbolo
       const transactionRef = db.collection('transactions').doc();
       const transaction = {
@@ -215,7 +259,13 @@ exports.processDividendPayments = onSchedule({
         relatedAssets: portfolioSymbolData.relatedAssets,
         taxDeductionPercentage: taxDeductionPercentage,
         taxDeductionAmount: taxDeductionAmount,
-        grossAmount: grossAmount
+        grossAmount: grossAmount,
+        // HU 2.4: trazabilidad cambiaria del dividendo. `dollarPriceToDate`
+        // conserva su semántica intacta para sus lectores actuales (D3).
+        referenceCurrency: referenceCurrency,
+        realizationRate: realizationRate,
+        realizationRateSource: realizationRateSource,
+        acquisitionCost: dividendCost
       };
 
       batch.set(transactionRef, transaction);
@@ -232,34 +282,46 @@ exports.processDividendPayments = onSchedule({
       }
       
       if (!portfolioAccountUpdates[accountKey][currency]) {
-        portfolioAccountUpdates[accountKey][currency] = 0;
+        // HU 2.4: el costo se acumula en paralelo al monto. Basta que UN dividendo
+        // de la misma cuenta y divisa no tenga tasa para que el costo del conjunto
+        // deje de ser determinable: se marca y el saldo pasa a indeterminado.
+        portfolioAccountUpdates[accountKey][currency] = { amount: 0, cost: 0, costKnown: true };
       }
-      
-      portfolioAccountUpdates[accountKey][currency] += netAmount;
+
+      portfolioAccountUpdates[accountKey][currency].amount += netAmount;
+      if (dividendCost === null) {
+        portfolioAccountUpdates[accountKey][currency].costKnown = false;
+      } else {
+        portfolioAccountUpdates[accountKey][currency].cost += dividendCost;
+      }
     }
-    
+
     // Actualizar los balances de las cuentas después de acumular todos los dividendos
     for (const [accountId, currencyAmounts] of Object.entries(portfolioAccountUpdates)) {
       const portfolioAccountRef = db.collection('portfolioAccounts').doc(accountId);
       const portfolioAccountDoc = await portfolioAccountRef.get();
-      const portfolioAccountData = portfolioAccountDoc.data();
-      
-      // Inicializar balances si no existe
-      if (!portfolioAccountData.balances) {
-        portfolioAccountData.balances = {};
+      const portfolioAccountData = { id: accountId, ...portfolioAccountDoc.data() };
+      const referenceCurrency = await resolveReferenceCurrency(portfolioAccountData.userId);
+
+      // HU 2.4: los fragmentos de cada divisa se fusionan en un solo `update`.
+      // Son rutas con punto (`balances.USD`), no el objeto `balances` completo, así
+      // que una divisa no puede pisar a otra ni perder una escritura concurrente.
+      const accountUpdate = {};
+
+      for (const [currency, accumulated] of Object.entries(currencyAmounts)) {
+        Object.assign(accountUpdate, buildBalanceUpdate({
+          account: portfolioAccountData,
+          currency,
+          amountDelta: accumulated.amount,
+          costDelta: accumulated.costKnown ? Number(accumulated.cost.toFixed(2)) : null,
+          referenceCurrency,
+        }));
+
+        console.log(`Acumulado dividendo neto de ${accumulated.amount.toFixed(4)} ${currency} para la cuenta ${accountId}. Nuevo balance: ${accountUpdate[`balances.${currency}`]}`);
       }
-      
-      // Actualizar el balance para cada moneda
-      for (const [currency, amount] of Object.entries(currencyAmounts)) {
-        const currentCurrencyBalance = portfolioAccountData.balances[currency] || 0;
-        portfolioAccountData.balances[currency] = currentCurrencyBalance + amount;
-        console.log(`Acumulado dividendo neto de ${amount.toFixed(4)} ${currency} para la cuenta ${accountId}. Nuevo balance: ${portfolioAccountData.balances[currency].toFixed(4)}`);
-      }
-      
+
       // Actualizar la cuenta del portafolio en el batch
-      batch.update(portfolioAccountRef, {
-        balances: portfolioAccountData.balances
-      });
+      batch.update(portfolioAccountRef, accountUpdate);
       console.log(`Preparada actualización de balances para la cuenta ${accountId}`);
     }
 

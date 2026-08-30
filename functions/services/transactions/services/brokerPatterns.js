@@ -960,6 +960,63 @@ function getBrokerNumberFormat(brokerId) {
   return BROKER_MAPPINGS[brokerId]?.numberFormat || 'us';
 }
 
+/**
+ * Formato numérico inferido del CONTENIDO de un conjunto de valores (IMPORT-004).
+ *
+ * `getBrokerNumberFormat` declara el formato por el broker detectado, pero la
+ * detección de broker puede dar falsos positivos (un reporte genérico en
+ * español que coincide con la firma de Trii). Esta función aplica la MISMA
+ * heurística de evidencia que el frontend (`detectNumberFormat` de
+ * numberParser.ts) para verificar la declaración contra los valores reales:
+ *
+ * - Dos separadores: el que aparece más a la derecha es el decimal (+2 evidencia)
+ * - Un separador con 1-2 dígitos al final: candidato a decimal (+1 evidencia)
+ *
+ * @param {string[]} values - Valores crudos de las columnas numéricas
+ * @returns {'us'|'eu'|null} El formato con más evidencia; null si no hay
+ *   evidencia (o empate), en cuyo caso se debe respetar la declaración.
+ */
+function inferNumberFormatFromValues(values) {
+  const NOISE = /[$€£¥₡₱₩¤\s '"]/g;
+  const CURRENCY_CODE = /\b[A-Z]{3}\b/g;
+
+  let euEvidence = 0;
+  let usEvidence = 0;
+
+  for (const raw of values) {
+    if (!raw) continue;
+
+    const cleaned = String(raw)
+      .replace(CURRENCY_CODE, '')
+      .replace(NOISE, '')
+      .replace(/^\((.*)\)$/, '-$1')
+      .trim();
+
+    // Dos separadores distintos: el último es el decimal, sin ambigüedad
+    if (cleaned.includes(',') && cleaned.includes('.')) {
+      if (cleaned.lastIndexOf(',') > cleaned.lastIndexOf('.')) {
+        euEvidence += 2;
+      } else {
+        usEvidence += 2;
+      }
+      continue;
+    }
+
+    // Un solo tipo de separador: solo cuenta si tiene forma decimal (1 o 2 dígitos)
+    if (/,\d{1,2}$/.test(cleaned)) {
+      euEvidence += 1;
+    } else if (/\.\d{1,2}$/.test(cleaned)) {
+      usEvidence += 1;
+    }
+  }
+
+  if (euEvidence === usEvidence) {
+    return null;
+  }
+
+  return euEvidence > usEvidence ? 'eu' : 'us';
+}
+
 // ============================================================================
 // EXPORTS
 // ============================================================================
@@ -974,6 +1031,8 @@ module.exports = {
   getBrokerDisplayName,
   // HU 1.5: formato numérico declarado del broker
   getBrokerNumberFormat,
+  // IMPORT-004: formato numérico inferido del contenido (verifica la declaración)
+  inferNumberFormatFromValues,
 
   // For testing
   BROKER_SIGNATURES,

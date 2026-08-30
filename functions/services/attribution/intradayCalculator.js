@@ -15,7 +15,7 @@
 
 const admin = require('../firebaseAdmin');
 const db = admin.firestore();
-const { getQuotes, getMarketQuotes } = require('../financeQuery');
+const { getQuotes, getExchangeRates } = require('../financeQuery');
 
 // ============================================================================
 // FUNCIONES DE DATOS
@@ -98,122 +98,63 @@ async function getActiveCurrencyCodes() {
 }
 
 /**
- * Obtiene las tasas de cambio en tiempo real desde el endpoint market-quotes
- * 
- * INTRADAY-001-FIX: Las tasas se obtienen del API protegido por Cloudflare
- * en lugar de la colección currencies de Firestore para mayor precisión.
- * 
- * @returns {Promise<Object>} Mapa de código de moneda -> { exchangeRate, code }
+ * Obtiene las tasas de cambio vigentes desde el canal de datos de mercado.
+ *
+ * HU #3: las tasas llegan por el mismo canal que los precios de los activos
+ * (RN-3-E) y **no hay caída a `currencies` de Firestore**. Ese campo se mantiene
+ * a mano y nadie lo refresca: usarlo como reserva convertía una ausencia en una
+ * cifra creíble, que es exactamente lo que producía un efecto divisa falso.
+ *
+ * Una divisa sin tasa queda **fuera del mapa**. Quien la necesite verá que falta
+ * en lugar de recibir un número inventado (RN-3-D).
+ *
+ * @returns {Promise<Object>} Mapa de código de moneda -> { code, exchangeRate }
+ * @see platform-docs/stories/3-tasa-vigente-canal-mercado/refinamiento.md (T8, D7)
  */
 async function getCurrencyRates() {
-  // 1. Obtener monedas activas desde Firestore
+  // 1. Obtener monedas activas desde Firestore (metadata del catálogo, no tasas)
   const currencyCodes = await getActiveCurrencyCodes();
-  
+
   const currencies = {};
-  
-  // USD siempre tiene tasa 1
+
+  // USD siempre tiene tasa 1: es la base, no un dato consultado
   currencies['USD'] = { code: 'USD', exchangeRate: 1 };
-  
+
   if (currencyCodes.length === 0) {
     console.log(`[IntradayCalc] No active currencies found, using only USD`);
     return currencies;
   }
-  
+
   try {
-    // 2. Construir símbolos de moneda para Yahoo Finance (ej: COP=X, EUR=X)
-    // INTRADAY-FIX: Codificar = como %3D para que el API lo reciba correctamente
-    const currencySymbols = currencyCodes.map(code => `${code}%3DX`);
-    const symbolsString = currencySymbols.join(',');
-    
-    console.log(`[IntradayCalc] Fetching currency rates for: ${symbolsString}`);
-    
-    // 3. Obtener rates desde el API usando getMarketQuotes (endpoint específico para currencies)
-    const quotesResponse = await getMarketQuotes(symbolsString);
-    
-    // INTRADAY-DEBUG: Diagnosticar respuesta del API de currencies
-    console.log(`[IntradayCalc] MarketQuotes response type: ${typeof quotesResponse}, isArray: ${Array.isArray(quotesResponse)}`);
-    
-    // 4. Procesar respuesta - puede ser array o objeto
-    // Primero, crear un mapa symbol -> data desde la respuesta
-    const quotesMap = {};
-    
-    if (Array.isArray(quotesResponse)) {
-      // Formato array: [{symbol: "COP=X", regularMarketPrice: 4150.25}, ...]
-      console.log(`[IntradayCalc] Processing MarketQuotes array with ${quotesResponse.length} items`);
-      for (const quote of quotesResponse) {
-        if (quote && quote.symbol) {
-          quotesMap[quote.symbol] = quote;
-        }
-      }
-    } else if (quotesResponse && typeof quotesResponse === 'object') {
-      // Formato objeto: {"COP=X": {regularMarketPrice: 4150.25}, ...}
-      Object.assign(quotesMap, quotesResponse);
-    }
-    
-    // Ahora procesar el mapa
+    console.log(`[IntradayCalc] Fetching currency rates for: ${currencyCodes.join(',')}`);
+
+    const response = await getExchangeRates(currencyCodes);
+
+    const rates = (response && response.rates) || {};
+
     for (const code of currencyCodes) {
-      const symbol = `${code}=X`;
-      const quoteData = quotesMap[symbol];
-      
-      if (quoteData) {
-        // INTRADAY-FIX: El API devuelve regularMarketPrice, no price
-        const price = quoteData.regularMarketPrice || quoteData.price;
-        const parsedPrice = typeof price === 'string' ? parseFloat(price) : price;
-        if (typeof parsedPrice === 'number' && !isNaN(parsedPrice) && parsedPrice > 0) {
-          // El precio de COP=X es cuántos COP por 1 USD
-          currencies[code] = {
-            code: code,
-            exchangeRate: parsedPrice
-          };
-          console.log(`[IntradayCalc] ${code}: ${parsedPrice}`);
-        } else {
-          console.warn(`[IntradayCalc] Invalid price for ${symbol}: ${price}`);
-        }
+      const raw = rates[code];
+      const parsed = typeof raw === 'string' ? parseFloat(raw) : raw;
+
+      if (typeof parsed === 'number' && Number.isFinite(parsed) && parsed > 0) {
+        currencies[code] = { code, exchangeRate: parsed };
+        console.log(`[IntradayCalc] ${code}: ${parsed}`);
       } else {
-        console.warn(`[IntradayCalc] No rate found for ${symbol}, will use Firestore fallback`);
+        console.warn(`[IntradayCalc] RATE-MISS: sin tasa vigente para ${code}; queda sin valorar`);
       }
     }
-    
-    // 5. Fallback a Firestore para monedas sin rate del API
-    const missingCurrencies = currencyCodes.filter(code => !currencies[code]);
-    if (missingCurrencies.length > 0) {
-      console.log(`[IntradayCalc] Falling back to Firestore for: ${missingCurrencies.join(', ')}`);
-      
-      const snapshot = await db.collection('currencies')
-        .where('isActive', '==', true)
-        .get();
-      
-      snapshot.docs.forEach(doc => {
-        const data = doc.data();
-        if (data.code && missingCurrencies.includes(data.code) && data.exchangeRate) {
-          currencies[data.code] = {
-            code: data.code,
-            exchangeRate: data.exchangeRate
-          };
-        }
-      });
+
+    const unavailable = (response && response.unavailable) || [];
+    if (unavailable.length > 0) {
+      console.warn(`[IntradayCalc] El canal declaró no disponibles: ${unavailable.join(', ')}`);
     }
-    
+
   } catch (error) {
-    console.error(`[IntradayCalc] Error fetching currency rates from API:`, error);
-    
-    // Fallback completo a Firestore si el API falla
-    console.log(`[IntradayCalc] Falling back to Firestore for all currencies`);
-    const snapshot = await db.collection('currencies')
-      .where('isActive', '==', true)
-      .get();
-    
-    snapshot.docs.forEach(doc => {
-      const data = doc.data();
-      if (data.code && data.exchangeRate) {
-        currencies[data.code] = {
-          code: data.code,
-          exchangeRate: data.exchangeRate
-        };
-      }
-    });
+    // Sin tasas del canal no se sustituye por las persistidas: el cálculo del día
+    // se queda con las divisas que sí llegaron (RN-3-D)
+    console.error(`[IntradayCalc] El canal de mercado no devolvió tasas de cambio:`, error.message);
   }
-  
+
   console.log(`[IntradayCalc] Loaded ${Object.keys(currencies).length} currencies with rates`);
   return currencies;
 }
@@ -353,7 +294,7 @@ function getTodayDate() {
  * @param {Object} currencies - Mapa de monedas con tasas de cambio
  * @param {number} acquisitionDollarValue - Valor de adquisición en USD (opcional)
  * @param {string} defaultCurrency - Moneda por defecto (opcional)
- * @returns {number} Cantidad convertida
+ * @returns {number|null} Cantidad convertida, o `null` si falta alguna tasa (RN-3-D)
  */
 function convertCurrency(amount, fromCurrency, toCurrency, currencies, acquisitionDollarValue, defaultCurrency) {
   // Validar que amount sea un número válido
@@ -366,9 +307,15 @@ function convertCurrency(amount, fromCurrency, toCurrency, currencies, acquisiti
     return amount;
   }
   
-  // Obtener las tasas de cambio
-  const fromRate = currencies[fromCurrency]?.exchangeRate || 1;
-  const toRate = currencies[toCurrency]?.exchangeRate || 1;
+  // HU #3: sin tasa no hay conversión. `|| 1` trataba 4.000 COP como 4.000 USD
+  // y presentaba el resultado como una cifra buena (RN-3-D)
+  const fromRate = currencies[fromCurrency]?.exchangeRate;
+  const toRate = currencies[toCurrency]?.exchangeRate;
+
+  if (!fromRate || !toRate) {
+    console.warn(`[IntradayCalc] RATE-MISS: sin tasa para convertir ${fromCurrency} → ${toCurrency}`);
+    return null;
+  }
   
   // Caso especial para valores de adquisición en USD
   if (fromCurrency === 'USD' && toCurrency === defaultCurrency && acquisitionDollarValue) {
@@ -503,6 +450,7 @@ async function calculateIntradayPerformance(params) {
     let totalValue = 0;
     let totalInvestment = 0;
     let assetsWithPrice = 0;
+    let assetsWithoutRate = 0;
     
     for (const asset of assets) {
       if (!asset.isActive || !asset.name) continue;
@@ -534,9 +482,21 @@ async function calculateIntradayPerformance(params) {
         asset.defaultCurrencyForAdquisitionDollar
       );
       
+      // HU #3: un activo cuya divisa no tiene tasa queda fuera del agregado en
+      // lugar de entrar con una cifra sin convertir (RN-3-D)
+      if (assetValue === null || assetInvestment === null) {
+        assetsWithoutRate++;
+        console.warn(`[IntradayCalc] RATE-MISS: ${asset.name} queda fuera del cálculo por falta de tasa`);
+        continue;
+      }
+
       totalValue += assetValue;
       totalInvestment += assetInvestment;
       assetsWithPrice++;
+    }
+
+    if (assetsWithoutRate > 0) {
+      console.warn(`[IntradayCalc] ${assetsWithoutRate} activo(s) excluidos del intradía por falta de tasa de cambio`);
     }
     
     console.log(`[IntradayCalc] Portfolio value: ${totalValue.toFixed(2)} ${currency} (${assetsWithPrice} assets with prices)`);

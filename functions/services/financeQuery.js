@@ -163,6 +163,29 @@ const getSimpleQuotes = (symbols) => getSimpleQuotesWithFallback(symbols);
 // Note: Returns [] on error so invalid tickers are properly detected
 const getMarketQuotes = (symbols) => getWithGracefulDegradation(`/market-quotes?symbols=${symbols}`, []);
 
+/**
+ * HU #3: tasas de cambio por el canal de datos de mercado, vigentes o por rango.
+ *
+ * Devuelve `null` —no un objeto vacío— cuando el canal no responde, para que
+ * quien pregunta pueda declarar la ausencia en lugar de confundirla con "no hay
+ * divisas" (RN-3-D).
+ *
+ * @param {string[]} currencies - Códigos de divisa (USD se ignora en el API)
+ * @param {string} [start] - Primer día del período (YYYY-MM-DD)
+ * @param {string} [end] - Último día del período (YYYY-MM-DD)
+ * @returns {Promise<Object|null>}
+ */
+const getExchangeRates = (currencies, start, end) => {
+  const codes = (Array.isArray(currencies) ? currencies : [currencies])
+    .filter(Boolean)
+    .join(',');
+  const range = start && end ? `&start=${start}&end=${end}` : '';
+  return getWithGracefulDegradation(
+    `/exchange-rates?currencies=${encodeURIComponent(codes)}${range}`,
+    null
+  );
+};
+
 // These don't have fallback - they throw on circuit open
 const getSimilarStocks = (symbol) => fetchData(`/similar-stocks/?symbol=${symbol}`);
 const getHistorical = (symbol, time, interval) => fetchData(`/historical/?symbol=${symbol}&time=${time}&interval=${interval}`);
@@ -178,6 +201,7 @@ module.exports = {
   getQuotes,
   getSimpleQuotes,
   getMarketQuotes,
+  getExchangeRates,
   getSimilarStocks,
   getSectors,
   search,

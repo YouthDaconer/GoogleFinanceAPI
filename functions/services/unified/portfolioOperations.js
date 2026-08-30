@@ -61,6 +61,14 @@ const ACTION_HANDLERS = {
   deleteAssets: assetHandlers.deleteAssets,
   sellPartialAssetsFIFO: assetHandlers.sellPartialAssetsFIFO,
   addCashTransaction: assetHandlers.addCashTransaction,
+  // HU 2.2: conversión de divisa dentro de una misma cuenta
+  convertAccountCurrency: assetHandlers.convertAccountCurrency,
+  // HU 2.4: recálculo del histórico de posiciones cerradas con la tasa del día de su venta
+  backfillRealizedFxDecomposition: assetHandlers.backfillRealizedFxDecomposition,
+  // HU 2.6: el ajuste manual del saldo deja su asiento (RN-06)
+  registerBalanceAdjustment: assetHandlers.registerBalanceAdjustment,
+  // HU 2.6: migracion de los saldos preexistentes al libro mayor (RN-12)
+  migrateBalanceLedger: assetHandlers.migrateBalanceLedger,
   updateStockSector: assetHandlers.updateStockSector,
 };
 

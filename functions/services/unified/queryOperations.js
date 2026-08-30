@@ -77,6 +77,11 @@ const ACTION_HANDLERS = {
   getIndexHistory: queryHandlers.getIndexHistory,
   getPortfolioDistribution: queryHandlers.getPortfolioDistribution,
   getAvailableSectors: queryHandlers.getAvailableSectors,
+  // HU 2.1: Tipo de cambio de una fecha concreta para el diálogo de efectivo
+  getHistoricalExchangeRate: queryHandlers.getHistoricalExchangeRate,
+  getBalanceCostBasisEstimate: queryHandlers.getBalanceCostBasisEstimate,
+  // HU 2.6: libro mayor de un saldo y su reconciliacion
+  getBalanceLedger: queryHandlers.getBalanceLedger,
   // COST-OPT-001: Nuevas acciones para rendimientos optimizados (V2)
   getHistoricalReturnsOptimized: queryHandlers.getHistoricalReturnsOptimized,
   getConsolidatedDataStatus: queryHandlers.getConsolidatedDataStatus,

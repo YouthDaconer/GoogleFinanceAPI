@@ -34,7 +34,7 @@ async function addCurrency(context, payload) {
   requireAdmin(context);
   
   const { auth } = context;
-  const { code, name, symbol, exchangeRate, isActive, flagCurrency } = payload;
+  const { code, name, symbol, isActive, flagCurrency } = payload;
 
   console.log(`[settingsHandlers][addCurrency] Admin userId: ${auth.uid}, code: ${code}`);
 
@@ -48,9 +48,6 @@ async function addCurrency(context, payload) {
   if (!symbol || typeof symbol !== 'string') {
     throw new HttpsError('invalid-argument', 'El símbolo de la moneda es requerido');
   }
-  if (typeof exchangeRate !== 'number' || exchangeRate <= 0) {
-    throw new HttpsError('invalid-argument', 'La tasa de cambio debe ser un número positivo');
-  }
 
   try {
     // Verificar si ya existe una moneda con ese código
@@ -62,11 +59,14 @@ async function addCurrency(context, payload) {
       throw new HttpsError('already-exists', `Ya existe una moneda con el código ${code}`);
     }
 
+    // HU #3: el catálogo guarda lo que es suyo —nombre, símbolo, bandera,
+    // si está activa—. La tasa de cambio no: se consulta al canal de datos de
+    // mercado cuando se necesita y no se persiste (RN-3-A).
+    // @see platform-docs/stories/3-tasa-vigente-canal-mercado/refinamiento.md (T9, D9)
     const currencyData = {
       code: code.toUpperCase(),
       name,
       symbol,
-      exchangeRate,
       isActive: isActive !== false,
       ...(flagCurrency && { flagCurrency }),
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -131,14 +131,11 @@ async function updateCurrency(context, payload) {
       );
     }
 
-    // Validar exchangeRate si se proporciona
-    if (updates.exchangeRate !== undefined && 
-        (typeof updates.exchangeRate !== 'number' || updates.exchangeRate <= 0)) {
-      throw new HttpsError('invalid-argument', 'La tasa de cambio debe ser un número positivo');
-    }
-
-    // Filtrar campos permitidos
-    const allowedFields = ['name', 'symbol', 'exchangeRate', 'isActive', 'flagCurrency'];
+    // HU #3: `exchangeRate` queda fuera de los campos permitidos. Está aquí y no
+    // en el formulario porque es el único sitio por el que pasan todos los
+    // llamadores: así un cliente antiguo tampoco puede reintroducir una tasa
+    // escrita a mano (RN-3-A, D9).
+    const allowedFields = ['name', 'symbol', 'isActive', 'flagCurrency'];
     const sanitizedUpdates = {};
     for (const field of allowedFields) {
       if (updates[field] !== undefined) {

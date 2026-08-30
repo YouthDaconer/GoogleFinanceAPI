@@ -9,6 +9,7 @@
  * - updatePortfolioAccount
  * - deletePortfolioAccount
  * - updatePortfolioAccountBalance
+ * - confirmBalanceCostBasis
  * 
  * @module unified/accountOperations
  * @see docs/stories/56.story.md
@@ -44,6 +45,8 @@ const ACTION_HANDLERS = {
   updatePortfolioAccount: accountHandlers.updatePortfolioAccount,
   deletePortfolioAccount: accountHandlers.deletePortfolioAccount,
   updatePortfolioAccountBalance: accountHandlers.updatePortfolioAccountBalance,
+  // HU 2.3: confirmacion unica de la base de costo de un saldo
+  confirmBalanceCostBasis: accountHandlers.confirmBalanceCostBasis,
 };
 
 /**
