@@ -118,7 +118,17 @@ const seedAccount = (cost = 4000000, extra = {}) => {
       userId: 'user-123',
       balances: { USD: 1000, COP: 5000000 },
       balanceCostBasis: {
-        USD: { cost, referenceCurrency: 'COP', status: 'known', ...extra },
+        USD: {
+          cost,
+          referenceCurrency: 'COP',
+          status: 'known',
+          // Estos escenarios describen dólares **comprados** con pesos, que es
+          // lo único que realiza diferencia en cambio al salir. Un saldo que
+          // hubiera llegado por un ingreso o un dividendo realizaría cero.
+          convertedAmount: 1000,
+          convertedCost: cost,
+          ...extra,
+        },
       },
     },
   };

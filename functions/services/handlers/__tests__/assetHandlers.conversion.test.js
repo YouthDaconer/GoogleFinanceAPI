@@ -220,12 +220,20 @@ describe('convertAccountCurrency — conversión de divisa en cuenta (HU 2.2)', 
     };
 
     beforeEach(() => {
-      // 2.000 USD que costaron 8.000.000 COP: tasa promedio 4.000
+      // 2.000 USD que costaron 8.000.000 COP: tasa promedio 4.000.
+      // "Costaron" es literal: se compraron entregando pesos, así que realizan
+      // diferencia en cambio al salir. El origen forma parte del dato.
       store.portfolioAccounts['account-123'] = {
         userId: 'user-123',
         balances: { USD: 2000 },
         balanceCostBasis: {
-          USD: { cost: 8000000, referenceCurrency: 'COP', status: 'known' },
+          USD: {
+            cost: 8000000,
+            referenceCurrency: 'COP',
+            status: 'known',
+            convertedAmount: 2000,
+            convertedCost: 8000000,
+          },
         },
       };
       historicalRateService.getCrossRate.mockResolvedValue({

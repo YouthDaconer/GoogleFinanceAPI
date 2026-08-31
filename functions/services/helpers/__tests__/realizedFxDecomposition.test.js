@@ -357,6 +357,10 @@ describe('buildRealizedFxFields', () => {
       realizedTotalAmount: 1160000,
       realizedFxAvailability: 'available',
       realizedFxUnavailableReason: null,
+      // Origen del dinero que pagó la posición: decide si el componente
+      // cambiario puede llamarse ganancia. Sin constancia de compra, no.
+      fxIsRealGainLoss: false,
+      fundedConvertedFraction: 0,
       acquisitionCost: 5160000,
     });
   });
@@ -382,3 +386,71 @@ describe('buildRealizedFxFields', () => {
     expect(fields.realizedFxAvailability).toBe('unavailable');
   });
 });
+
+// ============================================================================
+// El origen del dinero decide si la divisa fue una ganancia
+// ============================================================================
+//
+// Un colombiano que compra acciones colombianas con los pesos que ya tenía no
+// hizo ninguna apuesta cambiaria. Su resultado en pesos es el que es; medirlo
+// en dólares le añade un componente que no decidió y que no ganó. La
+// aritmética no cambia —mérito + divisa sigue sumando el total— pero ese
+// componente deja de poder presentarse como ganancia realizada.
+
+describe('decomposeRealizedResult — origen del dinero que pagó la posición', () => {
+  const venta = (fundedConvertedFraction) => decomposeRealizedResult({
+    grossProceeds: 1200,
+    invested: 1000,
+    acquisitionRate: 4000,
+    realizationRate: 4300,
+    fundedConvertedFraction,
+  });
+
+  it('divisa comprada por entero: el componente cambiario SÍ es ganancia', () => {
+    expect(venta(1).fxIsRealGainLoss).toBe(true);
+  });
+
+  it('divisa que el usuario ya tenía: NO lo es', () => {
+    expect(venta(0).fxIsRealGainLoss).toBe(false);
+  });
+
+  it('pagada a medias: tampoco, nos quedamos cortos antes que inventar', () => {
+    expect(venta(0.5).fxIsRealGainLoss).toBe(false);
+  });
+
+  it('sin constancia del origen se asume que no se compró', () => {
+    const sinDato = decomposeRealizedResult({
+      grossProceeds: 1200, invested: 1000, acquisitionRate: 4000, realizationRate: 4300,
+    });
+
+    expect(sinDato.fxIsRealGainLoss).toBe(false);
+  });
+
+  it('la clasificación NO altera ninguna cifra: sólo cómo se nombran', () => {
+    const comprada = venta(1);
+    const recibida = venta(0);
+
+    expect(comprada.assetMeritAmount).toBe(recibida.assetMeritAmount);
+    expect(comprada.realizedFxAmount).toBe(recibida.realizedFxAmount);
+    expect(comprada.realizedTotalAmount).toBe(recibida.realizedTotalAmount);
+  });
+
+  it('el invariante de la épica se mantiene: mérito + divisa = total (AC-2)', () => {
+    for (const fraccion of [0, 0.3, 1]) {
+      const d = venta(fraccion);
+      expect(d.assetMeritAmount + d.realizedFxAmount).toBeCloseTo(d.realizedTotalAmount, 2);
+    }
+  });
+
+  it('una descomposición no disponible no afirma nada sobre el origen', () => {
+    const sinTasa = decomposeRealizedResult({
+      grossProceeds: 1200, invested: 1000, acquisitionRate: null, realizationRate: 4300,
+      fundedConvertedFraction: 1,
+    });
+
+    expect(sinTasa.availability).toBe('unavailable');
+    expect(sinTasa.fxIsRealGainLoss).toBe(false);
+    expect(sinTasa.fundedConvertedFraction).toBeNull();
+  });
+});
+

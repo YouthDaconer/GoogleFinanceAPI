@@ -244,13 +244,57 @@ async function migrateBalanceLedgerForUser(userId, options = {}) {
         driftCount += 1;
       }
 
-      // Sin exposición cambiaria no hay base que reconstruir ni aviso que dar
-      // (RN-14, AC-9), pero el veredicto de arriba sí se guarda.
-      if (currency === referenceCurrency) continue;
+      const difference = projection.reconciliation.difference;
+
+      // Sin exposición cambiaria no hay **base de costo** que reconstruir ni
+      // aviso de tasa que dar (RN-14, AC-9). Pero la **apertura** sí hace
+      // falta: no es un asunto de divisa, es que el historial no llega a
+      // explicar el saldo. Un saldo en la moneda de referencia cuyo primer
+      // depósito nunca se registró replaya en negativo desde el primer día, y
+      // sin este asiento se queda "No conciliado" para siempre, pidiendo un
+      // ajuste que el usuario no tiene forma de cuadrar (D5).
+      if (currency === referenceCurrency) {
+        if (Math.abs(difference) < MIN_ADJUSTMENT_DELTA) continue;
+
+        const openingDate = resolveOpeningDate(projection.rows, accountData);
+
+        const { transactionData } = buildAdjustment({
+          account: {
+            balances: { [currency]: projection.reconciliation.ledgerBalance },
+            balanceCostBasis: { [currency]: projection.replayedCostBasis },
+          },
+          accountId: accountDoc.id,
+          userId,
+          currency,
+          delta: cleanDecimal(difference),
+          date: `${openingDate}T${new Date().toISOString().substring(11)}`,
+          referenceCurrency,
+          adjustmentReason: ADJUSTMENT_REASONS.OPENING,
+          // En la moneda de referencia no hay tasa que resolver: es la misma
+          // convención que usa `resolveAdjustmentRate` para un ajuste manual.
+          acquisitionRate: null,
+          acquisitionRateSource: ADJUSTMENT_RATE_SOURCES.IDENTITY,
+          estimated: true,
+        });
+
+        openingTransactions.push(transactionData);
+
+        // Con la apertura escrita el saldo cuadra con su historial. Es lo que
+        // hace idempotente esta rama: en la siguiente pasada el replay ya
+        // incluye el asiento, la diferencia es cero y no se escribe nada.
+        accountUpdate[`balanceReconciliation.${currency}`] = {
+          ledgerBalance: cleanDecimal(balance),
+          difference: 0,
+          status: RECONCILIATION_STATUS.RECONCILED,
+          checkedAt: admin.firestore.FieldValue.serverTimestamp(),
+        };
+
+        migratedCount += 1;
+        // Sin aviso: no hay tasa que confirmar (AC-9).
+        continue;
+      }
 
       if (alreadySettled(currentBasis, referenceCurrency)) continue;
-
-      const difference = projection.reconciliation.difference;
 
       // Caso 1: el historial explica el saldo entero. La base sale del replay.
       if (Math.abs(difference) < EMPTY_BALANCE_EPSILON) {

@@ -398,6 +398,14 @@ function projectBalanceLedger({ transactions, currency, referenceCurrency, balan
       amountDelta: impact.amount,
       costDelta: impact.amount > 0 ? impact.costDelta : null,
       referenceCurrency,
+      // El replay tiene que reconstruir también qué parte del saldo se compró
+      // de verdad, o la migración devolvería una base sin esa distinción y el
+      // primer retiro volvería a realizar lo que no debe. Sólo la entrada de
+      // una conversión cuenta como compra.
+      convertedDelta: impact.kind === MOVEMENT_KINDS.CONVERSION_IN
+        && Number.isFinite(impact.costDelta)
+        ? { amount: impact.amount, cost: impact.costDelta }
+        : null,
     });
 
     state = applyUpdate(state, update, currency);

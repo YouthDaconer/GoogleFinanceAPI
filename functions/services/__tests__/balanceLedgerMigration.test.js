@@ -371,24 +371,93 @@ describe('migrateBalanceLedgerForUser — acotación', () => {
 });
 
 describe('migrateBalanceLedgerForUser — sin exposición cambiaria, sin ruido (AC-9, RN-14)', () => {
-  it('un saldo en la moneda de referencia no estima nada ni deja aviso', async () => {
+  it('un saldo en la moneda de referencia no estima tasa ni deja aviso', async () => {
     seedAccount({ balances: { COP: 5000000 } });
 
     const result = await migrateBalanceLedgerForUser('user-123');
 
     expect(result.notices).toHaveLength(0);
-    expect(openings()).toHaveLength(0);
     expect(historicalRateService.getCrossRate).not.toHaveBeenCalled();
   });
 
-  it('pero su veredicto de conciliación sí se anota', async () => {
+  // La apertura NO es un asunto de divisa: es que el historial no llega a
+  // explicar el saldo. Saltársela en la moneda de referencia dejaba a las
+  // cuentas preexistentes en "No conciliado" para siempre, pidiendo un ajuste
+  // que el usuario no tenía forma de cuadrar.
+  it('pero su apertura sí se escribe: la deriva no depende de la divisa (D5)', async () => {
+    seedAccount({ balances: { COP: 5000000 } });
+
+    await migrateBalanceLedgerForUser('user-123');
+
+    expect(openings()).toHaveLength(1);
+    expect(openings()[0]).toMatchObject({
+      currency: 'COP',
+      adjustmentReason: 'opening',
+      adjustmentDelta: 5000000,
+      // Sin exposición cambiaria no hay tasa que resolver (RN-14).
+      acquisitionRate: null,
+      acquisitionRateSource: 'identity',
+    });
+  });
+
+  it('y con la apertura escrita el saldo pasa a cuadrar', async () => {
     seedAccount({ balances: { COP: 5000000 } });
 
     await migrateBalanceLedgerForUser('user-123');
 
     expect(accountUpdate()['balanceReconciliation.COP']).toMatchObject({
-      difference: 5000000,
-      status: 'drift',
+      difference: 0,
+      status: 'reconciled',
+    });
+  });
+
+  it('un historial que ya explica el saldo no recibe apertura', async () => {
+    seedAccount({ balances: { COP: 1000 } });
+    store.transactions = {
+      'tx-1': {
+        portfolioAccountId: 'account-123',
+        type: 'cash_income',
+        amount: 1000,
+        price: 1,
+        currency: 'COP',
+        date: '2026-02-01T10:00:00.000Z',
+      },
+    };
+
+    await migrateBalanceLedgerForUser('user-123');
+
+    // Es lo que hace idempotente la rama: en la segunda pasada el replay ya
+    // incluye el asiento de la primera y no hay diferencia que cerrar.
+    expect(openings()).toHaveLength(0);
+    expect(accountUpdate()['balanceReconciliation.COP']).toMatchObject({
+      status: 'reconciled',
+    });
+  });
+
+  it('el caso real: transacciones sin depósito inicial replayan en negativo', async () => {
+    // IBKR del hallazgo: el saldo guardado es 0,12 pero el historial importado
+    // sólo tiene compras, ventas y dividendos —nunca el depósito inicial—, así
+    // que el replay corre en negativo desde el primer día.
+    seedAccount({ balances: { COP: 0.12 } });
+    store.transactions = {
+      'tx-buy': {
+        portfolioAccountId: 'account-123',
+        type: 'buy',
+        assetName: 'NVDA',
+        amount: 1,
+        price: 2192.75,
+        currency: 'COP',
+        date: '2026-06-26T10:00:00.000Z',
+      },
+    };
+
+    await migrateBalanceLedgerForUser('user-123');
+
+    expect(openings()).toHaveLength(1);
+    // La apertura es exactamente lo que faltaba por explicar.
+    expect(openings()[0].adjustmentDelta).toBeCloseTo(2192.87, 2);
+    expect(accountUpdate()['balanceReconciliation.COP']).toMatchObject({
+      status: 'reconciled',
     });
   });
 });

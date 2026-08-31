@@ -264,11 +264,19 @@ async function resolveRealizationRate(currency, referenceCurrency, date) {
  * @returns {{assetMeritAmount: number|null, realizedFxAmount: number|null,
  *   realizedTotalAmount: number|null, availability: string, unavailableReason: string|null}}
  */
-function decomposeRealizedResult({ grossProceeds, invested, acquisitionRate, realizationRate }) {
+function decomposeRealizedResult({
+  grossProceeds,
+  invested,
+  acquisitionRate,
+  realizationRate,
+  fundedConvertedFraction = 0,
+}) {
   const unavailable = (reason) => ({
     assetMeritAmount: null,
     realizedFxAmount: null,
     realizedTotalAmount: null,
+    fxIsRealGainLoss: false,
+    fundedConvertedFraction: null,
     availability: DECOMPOSITION_AVAILABILITY.UNAVAILABLE,
     unavailableReason: reason,
   });
@@ -287,6 +295,24 @@ function decomposeRealizedResult({ grossProceeds, invested, acquisitionRate, rea
   const assetMeritAmount = round2((proceeds - cost) * acquisitionRate);
   const realizedFxAmount = round2(proceeds * (realizationRate - acquisitionRate));
 
+  // ¿Es el componente cambiario una ganancia de verdad?
+  //
+  // La aritmética NO cambia: `mérito + divisa = total` sigue cuadrando al
+  // céntimo (AC-2), y las cifras ya escritas no se mueven. Lo que se añade es
+  // **cómo se puede nombrar** el componente cambiario.
+  //
+  // Sólo lo es si la divisa con la que se pagó la posición se había comprado
+  // entregando moneda de referencia. Cuando el activo se compró con divisa que
+  // el usuario ya tenía —un colombiano comprando acciones colombianas con sus
+  // pesos—, el movimiento del cambio no es dinero que ganara: es el mismo
+  // resultado medido con otra regla. Llamarlo ganancia realizada lo mete en su
+  // rendimiento y le atribuye un acierto que nadie tuvo.
+  //
+  // Se exige la fracción **entera**: un lote pagado a medias con divisa
+  // comprada no se presenta como ganancia. Quedarse corto es el error seguro.
+  const fraction = Number(fundedConvertedFraction);
+  const fxIsRealGainLoss = Number.isFinite(fraction) && fraction >= 1;
+
   return {
     assetMeritAmount,
     realizedFxAmount,
@@ -294,6 +320,10 @@ function decomposeRealizedResult({ grossProceeds, invested, acquisitionRate, rea
     // directo: así la suma que el usuario ve cuadra al céntimo, sin residuos
     // que tendría que creerse (AC-2).
     realizedTotalAmount: round2(assetMeritAmount + realizedFxAmount),
+    /** true si el componente cambiario puede presentarse como ganancia/pérdida */
+    fxIsRealGainLoss,
+    /** Fracción de la posición pagada con divisa comprada (0..1) */
+    fundedConvertedFraction: Number.isFinite(fraction) ? fraction : 0,
     availability: DECOMPOSITION_AVAILABILITY.AVAILABLE,
     unavailableReason: null,
   };
@@ -336,6 +366,11 @@ function buildRealizedFxFields({
     realizedTotalAmount: decomposition.realizedTotalAmount,
     realizedFxAvailability: decomposition.availability,
     realizedFxUnavailableReason: decomposition.unavailableReason,
+    // Origen del dinero que pagó la posición. Se persiste con la operación
+    // porque describe un hecho del pasado: cambiar de moneda de referencia o
+    // mover el saldo después no debe reescribir si aquello fue una ganancia.
+    fxIsRealGainLoss: decomposition.fxIsRealGainLoss === true,
+    fundedConvertedFraction: decomposition.fundedConvertedFraction ?? null,
     acquisitionCost: acquisitionCost === null || acquisitionCost === undefined
       ? null
       : round2(acquisitionCost),

@@ -101,6 +101,48 @@ function deriveAverageRate(costBasis, balance, referenceCurrency) {
   return costBasis.cost / balance;
 }
 
+/**
+ * Tasa media de la porción **comprada** de un saldo.
+ *
+ * HU 2.5 / origen del efectivo: sólo la divisa que se adquirió entregando
+ * moneda de referencia —una conversión— tiene un precio de compra. La que
+ * llegó por un ingreso, una venta en su propia divisa o un dividendo no costó
+ * nada en moneda de referencia: su "costo" es una **traducción** al cambio del
+ * día, no un desembolso. Distinguirlas es lo que impide que sacar pesos a tu
+ * propio banco te fabrique un resultado cambiario realizado.
+ *
+ * @param {Object|undefined} costBasis - Entrada de `balanceCostBasis[divisa]`
+ * @param {string} referenceCurrency - Moneda de referencia vigente
+ * @returns {number|null} Tasa media de lo convertido, o `null` si no hay nada convertido
+ */
+function deriveConvertedAverageRate(costBasis, referenceCurrency) {
+  if (!costBasis) return null;
+  if (costBasis.referenceCurrency !== referenceCurrency) return null;
+
+  const amount = toFiniteNumber(costBasis.convertedAmount);
+  const cost = toFiniteNumber(costBasis.convertedCost);
+
+  if (amount === null || cost === null) return null;
+  if (Math.abs(amount) < EMPTY_BALANCE_EPSILON) return null;
+
+  return cost / amount;
+}
+
+/**
+ * Unidades del saldo que proceden de una conversión real.
+ *
+ * @param {Object|undefined} costBasis - Entrada de `balanceCostBasis[divisa]`
+ * @returns {number} Cero cuando no consta ninguna (lo normal en datos previos)
+ */
+function convertedAmountOf(costBasis) {
+  return toFiniteNumber(costBasis?.convertedAmount) || 0;
+}
+
+/** @param {*} value @returns {number|null} */
+function toFiniteNumber(value) {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
 // ============================================================================
 // API PÚBLICA
 // ============================================================================
@@ -131,7 +173,14 @@ function deriveAverageRate(costBasis, balance, referenceCurrency) {
  * @param {string} params.referenceCurrency - Moneda de referencia del usuario
  * @returns {Object} Fragmento para `update()` / `batch.update()`
  */
-function buildBalanceUpdate({ account, currency, amountDelta, costDelta = null, referenceCurrency }) {
+function buildBalanceUpdate({
+  account,
+  currency,
+  amountDelta,
+  costDelta = null,
+  referenceCurrency,
+  convertedDelta = null,
+}) {
   const currentBalance = account?.balances?.[currency] || 0;
   const newBalance = cleanDecimal(currentBalance + amountDelta);
 
@@ -151,6 +200,9 @@ function buildBalanceUpdate({ account, currency, amountDelta, costDelta = null, 
       cost: 0,
       referenceCurrency,
       status: COST_BASIS_STATUS.KNOWN,
+      // Sin saldo no queda nada comprado que pueda realizar diferencia.
+      convertedAmount: 0,
+      convertedCost: 0,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     };
     return update;
@@ -162,12 +214,28 @@ function buildBalanceUpdate({ account, currency, amountDelta, costDelta = null, 
     && currentBasis.status === COST_BASIS_STATUS.KNOWN
     && currentBasis.referenceCurrency === referenceCurrency;
 
+  // Lo comprado sobrevive aunque el costo traducido se vuelva indeterminado:
+  // son dos preguntas distintas, y saber que 500 COP se compraron a 4.000 no
+  // deja de ser cierto porque otro ingreso llegara sin tasa.
+  const previousConvertedAmount = convertedAmountOf(currentBasis);
+  const previousConvertedCost = toFiniteNumber(currentBasis?.convertedCost) || 0;
+  const convertedIn = convertedDelta && Number.isFinite(convertedDelta.amount)
+    && Number.isFinite(convertedDelta.cost)
+    ? convertedDelta
+    : null;
+
   if (amountDelta > 0) {
+    const nextConverted = {
+      convertedAmount: round2(previousConvertedAmount + (convertedIn ? convertedIn.amount : 0)),
+      convertedCost: round2(previousConvertedCost + (convertedIn ? convertedIn.cost : 0)),
+    };
+
     if (costDelta === null || costDelta === undefined || !Number.isFinite(costDelta)) {
       update[basisPath] = {
         cost: null,
         referenceCurrency,
         status: COST_BASIS_STATUS.UNKNOWN,
+        ...nextConverted,
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       };
       return update;
@@ -180,6 +248,7 @@ function buildBalanceUpdate({ account, currency, amountDelta, costDelta = null, 
         cost: null,
         referenceCurrency,
         status: COST_BASIS_STATUS.UNKNOWN,
+        ...nextConverted,
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       };
       return update;
@@ -191,10 +260,24 @@ function buildBalanceUpdate({ account, currency, amountDelta, costDelta = null, 
       cost: round2(previousCost + costDelta),
       referenceCurrency,
       status: COST_BASIS_STATUS.KNOWN,
+      ...nextConverted,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     };
     return update;
   }
+
+  // Salida: el dinero sale sin distinguir de dónde vino, así que **las dos
+  // porciones bajan en la misma proporción**. Retirar la mitad del saldo retira
+  // la mitad de lo comprado y la mitad de lo traducido; el reparto no depende
+  // del orden en que se registraron las entradas, igual que el promedio
+  // ponderado (RN-02).
+  const outflowFraction = Math.abs(currentBalance) > EMPTY_BALANCE_EPSILON
+    ? Math.min(Math.abs(amountDelta) / Math.abs(currentBalance), 1)
+    : 1;
+  const remainingConverted = {
+    convertedAmount: round2(previousConvertedAmount * (1 - outflowFraction)),
+    convertedCost: round2(previousConvertedCost * (1 - outflowFraction)),
+  };
 
   // Salida: se retira costo a la tasa promedio vigente. Si el costo no era
   // determinable, sigue sin serlo.
@@ -206,6 +289,7 @@ function buildBalanceUpdate({ account, currency, amountDelta, costDelta = null, 
         cost: null,
         referenceCurrency,
         status: COST_BASIS_STATUS.UNKNOWN,
+        ...remainingConverted,
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       };
     }
@@ -216,6 +300,7 @@ function buildBalanceUpdate({ account, currency, amountDelta, costDelta = null, 
     cost: round2(currentBasis.cost + amountDelta * averageRate),
     referenceCurrency,
     status: COST_BASIS_STATUS.KNOWN,
+    ...remainingConverted,
     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
   };
 
@@ -225,6 +310,8 @@ function buildBalanceUpdate({ account, currency, amountDelta, costDelta = null, 
 module.exports = {
   buildBalanceUpdate,
   deriveAverageRate,
+  deriveConvertedAverageRate,
+  convertedAmountOf,
   getUserReferenceCurrency,
   COST_BASIS_STATUS,
   EMPTY_BALANCE_EPSILON,

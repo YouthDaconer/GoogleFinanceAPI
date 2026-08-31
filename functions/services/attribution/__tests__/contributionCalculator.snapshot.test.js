@@ -80,10 +80,11 @@ function buildFirestoreSnapshot(docs) {
 // ============================================================================
 
 const SNAPSHOT_WITH_ASSETS = {
+  // Los snapshots persisten puntos {d, v, c} (ver services/snapshotGenerator.js)
   timeline: [
-    ['2026-04-01', 10000],
-    ['2026-04-10', 11000],
-    ['2026-04-11', 11500],
+    { d: '2026-04-01', v: 10000, c: 0 },
+    { d: '2026-04-10', v: 11000, c: 1.2 },
+    { d: '2026-04-11', v: 11500, c: 4.5 },
   ],
   latestAssetPerformance: {
     'AAPL_stock': {
@@ -192,8 +193,8 @@ describe('PERF-SNAP-012: calculateContributions with snapshot', () => {
       );
 
       expect(result.attributions).toBeDefined();
-      expect(result.totalPortfolioValue).toBe(11500); // timeline[last][1]
-      expect(result.latestDate).toBe('2026-04-11'); // timeline[last][0]
+      expect(result.totalPortfolioValue).toBe(11500); // timeline[last].v
+      expect(result.latestDate).toBe('2026-04-11'); // timeline[last].d
 
       // getLatestPerformanceData should NOT have been called for latest data
       // (only findNearestPerformanceData for start data is expected)
@@ -202,7 +203,7 @@ describe('PERF-SNAP-012: calculateContributions with snapshot', () => {
       expect(tickers).toEqual(['AAPL', 'AMZN', 'MSFT']);
     });
 
-    it('derives totalPortfolioValue from snapshot.timeline[last][1]', async () => {
+    it('derives totalPortfolioValue from snapshot.timeline[last].v', async () => {
       const result = await calculateContributions(
         'user123', 'YTD', 'USD', ['overall'], undefined,
         { snapshot: SNAPSHOT_WITH_ASSETS }
@@ -221,7 +222,7 @@ describe('PERF-SNAP-012: calculateContributions with snapshot', () => {
       expect(result.totalPortfolioInvestment).toBe(9500);
     });
 
-    it('derives latestDate from snapshot.timeline[last][0]', async () => {
+    it('derives latestDate from snapshot.timeline[last].d', async () => {
       const result = await calculateContributions(
         'user123', 'YTD', 'USD', ['overall'], undefined,
         { snapshot: SNAPSHOT_WITH_ASSETS }
@@ -248,7 +249,7 @@ describe('PERF-SNAP-012: calculateContributions with snapshot', () => {
   describe('fallback sin snapshot (AC3)', () => {
     it('falls back to getLatestPerformanceData when snapshot has no latestAssetPerformance', async () => {
       const snapshotWithoutAssets = {
-        timeline: [['2026-04-11', 11500]],
+        timeline: [{ d: '2026-04-11', v: 11500, c: 0 }],
         returns: { ytdReturn: 15 },
       };
 
@@ -303,7 +304,7 @@ describe('PERF-SNAP-012: calculateContributions with snapshot', () => {
 
     it('falls back when latestAssetPerformance is empty object', async () => {
       const snapshotWithEmpty = {
-        timeline: [['2026-04-11', 11500]],
+        timeline: [{ d: '2026-04-11', v: 11500, c: 0 }],
         latestAssetPerformance: {},
       };
 

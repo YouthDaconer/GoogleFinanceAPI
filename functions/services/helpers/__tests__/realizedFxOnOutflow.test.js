@@ -43,7 +43,33 @@ const accountWith = (balance, cost, overrides = {}) => ({
       cost,
       referenceCurrency: 'COP',
       status: cost === null ? 'unknown' : 'known',
+      // Origen del efectivo: estos escenarios describen divisa **comprada**
+      // ("1.000 USD adquiridos a 4.000"), es decir, obtenida entregando moneda
+      // de referencia en una conversión. Es lo único que puede realizar
+      // diferencia en cambio al salir, y por eso el fixture lo declara.
+      // Los saldos que llegaron sin comprarse tienen su propio bloque más
+      // abajo, y realizan cero.
+      convertedAmount: balance,
+      convertedCost: cost,
       ...overrides,
+    },
+  },
+});
+
+/**
+ * Saldo **traducido**: llegó por un ingreso, una venta en su propia divisa o un
+ * dividendo. Tiene costo —lo que valía el día que entró— pero nadie entregó
+ * moneda de referencia para conseguirlo.
+ */
+const translatedAccountWith = (balance, cost) => ({
+  balances: { USD: balance },
+  balanceCostBasis: {
+    USD: {
+      cost,
+      referenceCurrency: 'COP',
+      status: cost === null ? 'unknown' : 'known',
+      convertedAmount: 0,
+      convertedCost: 0,
     },
   },
 });
@@ -395,6 +421,107 @@ describe('computeOutflowRealizedFx — la salida realiza la diferencia en cambio
       });
 
       expect(fields.realizationRate).toBe(4300.123457);
+    });
+  });
+
+  // ==========================================================================
+  // Origen del efectivo: sólo se realiza lo que se compró
+  // ==========================================================================
+  //
+  // Un inversor colombiano con el dólar como moneda de referencia mete pesos a
+  // su cuenta directamente: nunca entrega dólares para conseguirlos. Cuando
+  // saca esos pesos a su banco no ha ganado ni perdido nada — sigue teniendo
+  // los mismos pesos, sólo que fuera del producto. Contarlo como diferencia en
+  // cambio realizada le fabricaba un resultado que nadie tuvo, y lo metía en
+  // sus posiciones cerradas.
+
+  describe('divisa que llegó sin comprarse', () => {
+    it('no realiza nada al salir, aunque la tasa se haya movido', () => {
+      const account = translatedAccountWith(1000, 4000000);
+
+      const result = computeOutflowRealizedFx({
+        account, currency: 'USD', amount: 500, outflowRate: 4300, referenceCurrency: 'COP',
+      });
+
+      expect(result.availability).toBe('available');
+      expect(result.realizedFxAmount).toBe(0);
+    });
+
+    it('pero su costo liberado sí se informa: es un dato que sí se conoce', () => {
+      const account = translatedAccountWith(1000, 4000000);
+
+      const result = computeOutflowRealizedFx({
+        account, currency: 'USD', amount: 500, outflowRate: 4300, referenceCurrency: 'COP',
+      });
+
+      expect(result.releasedCost).toBe(2000000);
+      expect(result.averageRate).toBe(4000);
+    });
+
+    it('cero no es lo mismo que "no se sabe": la disponibilidad lo distingue', () => {
+      const conocido = computeOutflowRealizedFx({
+        account: translatedAccountWith(1000, 4000000),
+        currency: 'USD', amount: 500, outflowRate: 4300, referenceCurrency: 'COP',
+      });
+      const desconocido = computeOutflowRealizedFx({
+        account: translatedAccountWith(1000, null),
+        currency: 'USD', amount: 500, outflowRate: 4300, referenceCurrency: 'COP',
+      });
+
+      expect(conocido.realizedFxAmount).toBe(0);
+      expect(desconocido.realizedFxAmount).toBeNull();
+      expect(desconocido.availability).toBe('unavailable');
+    });
+  });
+
+  describe('saldo mixto: parte comprada y parte recibida', () => {
+    // 1.000 USD en total: 400 se compraron a 4.000 (1.600.000 COP) y 600
+    // llegaron por un dividendo. Al sacar la mitad sale la mitad de cada parte.
+    const mixto = () => ({
+      balances: { USD: 1000 },
+      balanceCostBasis: {
+        USD: {
+          cost: 4000000,
+          referenceCurrency: 'COP',
+          status: 'known',
+          convertedAmount: 400,
+          convertedCost: 1600000,
+        },
+      },
+    });
+
+    it('realiza sólo sobre la porción comprada que sale', () => {
+      const result = computeOutflowRealizedFx({
+        account: mixto(), currency: 'USD', amount: 500, outflowRate: 4300, referenceCurrency: 'COP',
+      });
+
+      // Salen 500 de 1.000 → sale la mitad de lo comprado: 200 USD.
+      // 200 × (4.300 − 4.000) = 60.000 COP
+      expect(result.convertedAmountOut).toBe(200);
+      expect(result.convertedAverageRate).toBe(4000);
+      expect(result.realizedFxAmount).toBe(60000);
+    });
+
+    it('el reparto no depende de en qué orden entró cada parte', () => {
+      const mitad = computeOutflowRealizedFx({
+        account: mixto(), currency: 'USD', amount: 500, outflowRate: 4300, referenceCurrency: 'COP',
+      });
+      const total = computeOutflowRealizedFx({
+        account: mixto(), currency: 'USD', amount: 1000, outflowRate: 4300, referenceCurrency: 'COP',
+      });
+
+      // Sacar todo realiza exactamente el doble que sacar la mitad.
+      expect(total.realizedFxAmount).toBeCloseTo(mitad.realizedFxAmount * 2, 6);
+      expect(total.convertedAmountOut).toBe(400);
+    });
+
+    it('nunca realiza más de lo comprado, aunque se vacíe el saldo', () => {
+      const result = computeOutflowRealizedFx({
+        account: mixto(), currency: 'USD', amount: 1000, outflowRate: 4300, referenceCurrency: 'COP',
+      });
+
+      // 400 × (4.300 − 4.000) = 120.000, no 1.000 × 300 = 300.000
+      expect(result.realizedFxAmount).toBe(120000);
     });
   });
 });

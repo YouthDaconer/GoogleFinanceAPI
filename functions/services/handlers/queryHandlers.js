@@ -67,6 +67,17 @@ const { isNYSEMarketOpen, calculateTTLUntilNextEOD, MARKET_CACHE_TTL_MS } = requ
 // CONSTANTES
 // ============================================================================
 
+/**
+ * Movimientos que devuelve `getBalanceLedger` si el cliente no pide otra cosa.
+ *
+ * Cubre de sobra lo que la tarjeta muestra al desplegarse; el resto se pide
+ * cuando el usuario decide mirar más atrás.
+ */
+const LEDGER_DEFAULT_ROWS = 50;
+
+/** Tope duro por petición: nadie lee mil filas de una tabla plegable. */
+const LEDGER_MAX_ROWS = 500;
+
 const VALID_INDEX_RANGES = ["1M", "3M", "6M", "YTD", "1Y", "5Y", "MAX"];
 const INDEX_CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 horas
 // OPT-FIRESTORE-002: Aumentado de 5min a 1h (consistente con indexHistoryService)
@@ -1384,13 +1395,24 @@ async function getBalanceCostBasisEstimate(context, payload) {
  */
 async function getBalanceLedger(context, payload) {
   const { auth } = context;
-  const { portfolioAccountId, currency } = payload || {};
+  const { portfolioAccountId, currency, limit } = payload || {};
 
   console.log(`[queryHandlers][getBalanceLedger] userId: ${auth.uid}, account: ${portfolioAccountId}, currency: ${currency}`);
 
   if (!portfolioAccountId || !currency) {
     throw new HttpsError('invalid-argument', 'portfolioAccountId y currency son requeridos');
   }
+
+  // El replay tiene que ser completo —el saldo corriente y el promedio
+  // ponderado se acumulan hacia adelante y no son reversibles—, pero lo que
+  // viaja al cliente no: una cuenta con años de operaciones son cientos de
+  // filas que ni caben en pantalla ni aportan nada al abrir la tarjeta. Se
+  // recortan **después** de calcular, así que las cifras de las filas que sí
+  // se envían son las mismas que serían con el historial entero.
+  const requested = Number(limit);
+  const rowLimit = Number.isFinite(requested) && requested > 0
+    ? Math.min(Math.trunc(requested), LEDGER_MAX_ROWS)
+    : LEDGER_DEFAULT_ROWS;
 
   try {
     const accountRef = db.collection('portfolioAccounts').doc(portfolioAccountId);
@@ -1427,10 +1449,19 @@ async function getBalanceLedger(context, payload) {
       },
     });
 
-    console.log(`[queryHandlers][getBalanceLedger] Éxito - ${projection.rows.length} movimientos, ${projection.reconciliation.status}`);
+    // `projection.rows` viene de más reciente a más antigua, así que el recorte
+    // por la cabeza deja justo los últimos movimientos, que es lo que se quiere.
+    const totalCount = projection.rows.length;
+    const rows = projection.rows.slice(0, rowLimit);
+
+    console.log(`[queryHandlers][getBalanceLedger] Éxito - ${rows.length}/${totalCount} movimientos, ${projection.reconciliation.status}`);
 
     return {
-      rows: projection.rows,
+      rows,
+      /** Movimientos que tiene el saldo en total, más allá de los devueltos */
+      totalCount,
+      /** true si quedan movimientos más antiguos sin enviar */
+      hasMore: totalCount > rows.length,
       reconciliation: {
         ledgerBalance: projection.reconciliation.ledgerBalance,
         storedBalance: projection.reconciliation.storedBalance,

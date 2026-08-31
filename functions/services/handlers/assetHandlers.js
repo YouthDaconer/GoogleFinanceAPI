@@ -31,6 +31,7 @@ const { generateLogoUrl } = require('../../utils/logoGenerator');
 // HU 2.3: `deriveAverageRate` para derivar la tasa de compra desde el saldo
 const {
   buildBalanceUpdate,
+  convertedAmountOf,
   deriveAverageRate,
   getUserReferenceCurrency,
 } = require('../helpers/balanceCostBasis');
@@ -199,16 +200,35 @@ const resolveAcquisitionBasis = async ({
   let acquisitionRate = null;
   let acquisitionRateSource = 'unavailable';
 
+  // Qué parte del dinero con el que se paga esta compra se había **comprado**
+  // de verdad, entregando moneda de referencia.
+  //
+  // El activo hereda la exposición cambiaria del efectivo que lo pagó. Si esos
+  // pesos se consiguieron convirtiendo dólares, el movimiento del cambio sobre
+  // la posición es una ganancia o una pérdida real. Si ya eran pesos del
+  // usuario —su sueldo, un depósito—, no lo es: es el mismo dinero medido con
+  // otra regla, y presentarlo como resultado le dice que ganó algo que nadie
+  // ganó. Sin este dato, el desglose de una venta reparte contra una base
+  // traducida como si fuera un precio de compra.
+  //
+  // `null` significa "no aplica" (sin exposición cambiaria). Cero significa
+  // "nada de esto se compró", que es lo que se asume cuando no consta: el error
+  // seguro es callar una ganancia real, no fabricar una falsa.
+  let fundedConvertedFraction = null;
+
   if (assetCurrency === referenceCurrency) {
     // Sin exposición cambiaria no hay nada que derivar (RN-14).
     acquisitionRate = 1;
     acquisitionRateSource = 'identity';
   } else {
-    const averageRate = deriveAverageRate(
-      account?.balanceCostBasis?.[assetCurrency],
-      account?.balances?.[assetCurrency] || 0,
-      referenceCurrency
-    );
+    const basis = account?.balanceCostBasis?.[assetCurrency];
+    const balance = account?.balances?.[assetCurrency] || 0;
+    const averageRate = deriveAverageRate(basis, balance, referenceCurrency);
+
+    const convertedAmount = convertedAmountOf(basis);
+    fundedConvertedFraction = Math.abs(balance) > 0
+      ? Math.min(Math.max(convertedAmount / Math.abs(balance), 0), 1)
+      : 0;
 
     if (averageRate !== null) {
       acquisitionRate = averageRate;
@@ -219,6 +239,8 @@ const resolveAcquisitionBasis = async ({
         acquisitionRate = resolved.rate;
         acquisitionRateSource = 'market-date';
       }
+      // Sin base de costo utilizable tampoco consta que se comprara nada.
+      fundedConvertedFraction = 0;
     }
   }
 
@@ -248,7 +270,13 @@ const resolveAcquisitionBasis = async ({
     acquisitionDollarValue = marketRate?.rate ?? (Number(declaredRate) || 1);
   }
 
-  return { acquisitionRate, acquisitionRateSource, acquisitionDollarValue, anchorCurrency };
+  return {
+    acquisitionRate,
+    acquisitionRateSource,
+    acquisitionDollarValue,
+    anchorCurrency,
+    fundedConvertedFraction,
+  };
 };
 
 /**
@@ -469,6 +497,7 @@ async function createAsset(context, payload) {
       acquisitionRateSource,
       acquisitionDollarValue,
       anchorCurrency,
+      fundedConvertedFraction,
     } = await resolveAcquisitionBasis({
       account,
       assetCurrency: data.currency,
@@ -509,6 +538,11 @@ async function createAsset(context, payload) {
       acquisitionRate: acquisitionRate !== null ? cleanDecimal(acquisitionRate) : null,
       acquisitionRateSource,
       acquisitionCost,
+      // Origen del dinero que pagó esta posición: qué fracción se había
+      // comprado entregando moneda de referencia. Sólo esa parte puede
+      // presentarse como ganancia o pérdida cambiaria (ni al valorar ni al
+      // vender). Ausente = no consta = se trata como cero.
+      fundedConvertedFraction,
       referenceCurrency,
       commission: commission,
       portfolioAccount: data.portfolioAccount,
@@ -945,6 +979,9 @@ async function sellAsset(context, payload) {
       invested: cleanDecimal(buyPrice * sellAmount),
       acquisitionRate,
       realizationRate,
+      // El activo hereda el origen del efectivo que lo pagó. Sin constancia se
+      // asume cero: no se afirma una compra de divisa que no consta.
+      fundedConvertedFraction: asset.fundedConvertedFraction,
     });
 
     // El producto NETO es el que entra al saldo, y entra con su propio costo
@@ -1046,6 +1083,7 @@ async function sellAsset(context, payload) {
       realizedFxAmount: decomposition.realizedFxAmount,
       realizedTotalAmount: decomposition.realizedTotalAmount,
       realizedFxAvailability: decomposition.availability,
+      fxIsRealGainLoss: decomposition.fxIsRealGainLoss,
     };
 
   } catch (error) {
@@ -1144,6 +1182,9 @@ async function sellPartialAssetsFIFO(context, payload) {
 
     /** Suma de los méritos de cada lote — la única cifra de mérito de la operación */
     let totalAssetMerit = 0;
+    // Basta un lote pagado con divisa que no se compró para que el componente
+    // cambiario de la operación deje de poder llamarse ganancia.
+    let allLotsConverted = true;
     /** Suma de los efectos divisa de cada lote */
     let totalRealizedFx = 0;
     /** `true` en cuanto un solo lote no pueda descomponerse: la operación entera
@@ -1189,9 +1230,13 @@ async function sellPartialAssetsFIFO(context, payload) {
         invested: cleanDecimal(buyPrice * unitsToSellFromAsset),
         acquisitionRate,
         realizationRate,
+        // Cada lote arrastra el origen del dinero con el que se compró: una
+        // venta FIFO puede tocar lotes pagados de formas distintas.
+        fundedConvertedFraction: asset.fundedConvertedFraction,
       });
 
       if (lotDecomposition.availability === 'available') {
+        if (!lotDecomposition.fxIsRealGainLoss) allLotsConverted = false;
         totalAssetMerit = cleanDecimal(totalAssetMerit + lotDecomposition.assetMeritAmount, 2);
         totalRealizedFx = cleanDecimal(totalRealizedFx + lotDecomposition.realizedFxAmount, 2);
       } else {
@@ -1311,6 +1356,10 @@ async function sellPartialAssetsFIFO(context, payload) {
         ? null
         : cleanDecimal(totalAssetMerit + totalRealizedFx, 2),
       realizedFxAvailability: anyLotUnavailable ? 'unavailable' : 'available',
+      // Toda la operación sólo puede llamarse ganancia cambiaria si TODOS los
+      // lotes se pagaron con divisa comprada. Basta uno traducido para que la
+      // cifra agregada deje de serlo.
+      fxIsRealGainLoss: !anyLotUnavailable && allLotsConverted,
     };
 
   } catch (error) {
@@ -1800,6 +1849,14 @@ async function convertAccountCurrency(context, payload) {
       amountDelta: toAmount,
       costDelta: destinationCost,
       referenceCurrency,
+      // Una conversión es la ÚNICA forma en que una divisa se compra de verdad:
+      // se entrega moneda de referencia (o su equivalente) para conseguirla. Es
+      // lo que la habilita a realizar diferencia en cambio cuando salga. El
+      // resto de entradas —ingreso, venta en su divisa, dividendo— sólo se
+      // traducen al cambio del día y no realizan nada.
+      convertedDelta: destinationCost !== null && Number.isFinite(destinationCost)
+        ? { amount: toAmount, cost: destinationCost }
+        : null,
     });
 
     batch.update(accountRef, { ...outflowUpdate, ...inflowUpdate });

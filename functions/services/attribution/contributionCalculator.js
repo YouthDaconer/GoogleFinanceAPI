@@ -416,11 +416,19 @@ async function calculateContributions(userId, period, currency = 'USD', accountI
     const snapshotAssets = snapshot.latestAssetPerformance;
     assetPerformance = mapSnapshotAssetPerformance(snapshotAssets);
     
+    // FIX-ATTR-WEIGHTS-001: los puntos del timeline son objetos {d, v, c},
+    // no tuplas [fecha, valor]. Leerlos por indice dejaba totalPortfolioValue
+    // en undefined -> pesos, portfolioValueStart/End y valueChange en 0.
     const timeline = snapshot.timeline || [];
     const lastPoint = timeline.length > 0 ? timeline[timeline.length - 1] : null;
-    totalPortfolioValue = lastPoint ? lastPoint[1] : 0;
+    totalPortfolioValue = lastPoint?.v ?? 0;
     totalPortfolioInvestment = Object.values(snapshotAssets).reduce((sum, a) => sum + (a.totalInvestment || 0), 0);
-    latestDate = lastPoint ? lastPoint[0] : null;
+    latestDate = lastPoint?.d ?? null;
+
+    // Respaldo: si el timeline no trae valor, sumar el valor de los activos del snapshot
+    if (!totalPortfolioValue) {
+      totalPortfolioValue = Object.values(snapshotAssets).reduce((sum, a) => sum + (a.totalValue || 0), 0);
+    }
     
     const startData = await findNearestPerformanceData(userId, periodStartStr, 'overall', 'asc');
     if (startData) {

@@ -25,7 +25,11 @@
  * @see platform-docs/stories/2.5-diferencia-cambio-salidas-efectivo/refinamiento.md (D1, D2, D3, D4, D11)
  */
 
-const { deriveAverageRate } = require('./balanceCostBasis');
+const {
+  deriveAverageRate,
+  deriveConvertedAverageRate,
+  convertedAmountOf,
+} = require('./balanceCostBasis');
 
 // ============================================================================
 // CONSTANTES
@@ -165,11 +169,40 @@ function computeOutflowRealizedFx({ account, currency, amount, outflowRate, refe
   const outflowValue = movedAmount * outflowRate;
   const releasedCost = movedAmount * averageRate;
 
+  // Sólo realiza la porción **comprada**.
+  //
+  // Realizar una diferencia en cambio supone haber entregado moneda de
+  // referencia para conseguir esta divisa y recuperarla ahora a otro cambio.
+  // La divisa que llegó por un ingreso, una venta en su propia moneda o un
+  // dividendo nunca costó moneda de referencia: sacarla de la cartera no cierra
+  // ninguna posición cambiaria —el dinero sigue siendo del usuario, en la misma
+  // divisa, sólo que fuera del producto—. Contarla realizaba un resultado que
+  // nadie tuvo.
+  //
+  // Lo que sale arrastra su parte proporcional de lo comprado, igual que el
+  // costo sale a la tasa promedio.
+  const basis = account?.balanceCostBasis?.[currency];
+  const convertedTotal = convertedAmountOf(basis);
+  const convertedRate = deriveConvertedAverageRate(basis, referenceCurrency);
+
+  const outflowFraction = Math.abs(currentBalance) > 0
+    ? Math.min(movedAmount / Math.abs(currentBalance), 1)
+    : 1;
+  const convertedOut = convertedTotal * outflowFraction;
+
+  const realizedFxAmount = convertedRate === null || convertedOut === 0
+    ? 0
+    : round2(convertedOut * (outflowRate - convertedRate));
+
   return {
     averageRate,
     releasedCost: round2(releasedCost),
     outflowValue: round2(outflowValue),
-    realizedFxAmount: round2(outflowValue - releasedCost),
+    realizedFxAmount,
+    /** Unidades de la salida que procedían de una conversión real */
+    convertedAmountOut: round2(convertedOut),
+    /** Tasa media a la que se compró esa porción */
+    convertedAverageRate: convertedRate,
     availability: OUTFLOW_FX_AVAILABILITY.AVAILABLE,
     unavailableReason: null,
   };
