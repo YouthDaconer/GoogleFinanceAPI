@@ -289,7 +289,12 @@ const calculateAccountPerformance = (assets, currentPrices, currencies, totalVal
         });
 
         const daysSinceAcquisition = calculateDaysInvested(asset.acquisitionDate);
-        const roi = (assetValue - assetInvestment) / assetInvestment;
+        // FIX-NAN-ROI: un activo ya vendido llega con inversion 0; 0/0 daba NaN y el
+        // NaN contaminaba dailyReturns[] -> dailyReturn/monthlyReturn/annualReturn
+        // del grupo entero (el reduce ponderado no filtra no-finitos).
+        const roi = assetInvestment > 0
+          ? (assetValue - assetInvestment) / assetInvestment
+          : 0;
         const dailyReturn = daysSinceAcquisition > 0 ? Math.pow(1 + roi, 1 / daysSinceAcquisition) - 1 : 0;
         const monthlyReturn = daysSinceAcquisition >= 30 ? Math.pow(1 + dailyReturn, 30) - 1 : 0;
         const yearlyReturn = daysSinceAcquisition >= 365 ? Math.pow(1 + dailyReturn, 365) - 1 : 0;
@@ -314,7 +319,12 @@ const calculateAccountPerformance = (assets, currentPrices, currencies, totalVal
       // NOTA: totalCashFlow se suma después del fix de cashflow implícito (más abajo)
       totalDividends += groupDividends;
 
-      const groupROI = (groupValue - groupInvestment) / groupInvestment;
+      // FIX-NAN-ROI: un grupo totalmente vendido llega con inversion 0; 0/0 daba NaN
+      // y el NaN viajaba a assetPerformance -> snapshot -> respuesta callable, que
+      // falla al serializar ("Data cannot be encoded in JSON: NaN") y devuelve INTERNAL.
+      const groupROI = groupInvestment > 0
+        ? (groupValue - groupInvestment) / groupInvestment
+        : 0;
 
       const dailyWeightedReturn = groupInvestment > 0
         ? groupReturns.dailyReturns.reduce((sum, ret, idx) => sum + ret * (groupReturns.dailyWeights[idx] / groupInvestment), 0)

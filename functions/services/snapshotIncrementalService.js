@@ -478,15 +478,18 @@ function appendToPerformanceByYear(existing, dailyData) {
  * @returns {Object} Compact latestAssetPerformance
  */
 function buildLatestAssetPerformance(assetPerformance) {
+  // FIX-NAN-ROI: mismo saneo que extractAssetPerformanceFields en snapshotGenerator.
+  // `?? 0` deja pasar NaN/Infinity y rompe la serializacion JSON de la respuesta.
+  const finiteOrZero = (value) => (Number.isFinite(value) ? value : 0);
   const result = {};
   for (const [assetKey, data] of Object.entries(assetPerformance)) {
     result[assetKey] = {
-      totalValue: data.totalValue ?? 0,
-      totalInvestment: data.totalInvestment ?? 0,
-      units: data.units ?? 0,
-      unrealizedPnL: data.unrealizedProfitAndLoss ?? 0,
-      totalROI: data.totalROI ?? 0,
-      dailyChangePercentage: data.dailyChangePercentage ?? 0,
+      totalValue: finiteOrZero(data.totalValue),
+      totalInvestment: finiteOrZero(data.totalInvestment),
+      units: finiteOrZero(data.units),
+      unrealizedPnL: finiteOrZero(data.unrealizedProfitAndLoss),
+      totalROI: finiteOrZero(data.totalROI),
+      dailyChangePercentage: finiteOrZero(data.dailyChangePercentage),
     };
   }
   return result;

@@ -555,6 +555,28 @@ describe('PERF-SNAP-003: snapshotGenerator', () => {
     it('should return empty object for empty assetPerformance', () => {
       expect(extractAssetPerformanceFields({})).toEqual({});
     });
+
+    // FIX-NAN-ROI: Firestore admite NaN/Infinity en doubles, pero la respuesta
+    // callable no se puede serializar y el cliente recibe INTERNAL.
+    it('should coerce non-finite values to 0 so the response stays JSON-encodable', () => {
+      const result = extractAssetPerformanceFields({
+        'META_stock': {
+          totalValue: 0, totalInvestment: 0, units: 0,
+          unrealizedProfitAndLoss: 0, totalROI: NaN, dailyChangePercentage: -100,
+        },
+        'PFCIBEST.CL_stock': {
+          totalValue: Infinity, totalInvestment: 0, units: 0,
+          unrealizedProfitAndLoss: -Infinity, totalROI: NaN, dailyChangePercentage: 0,
+        },
+      });
+      expect(result['META_stock'].totalROI).toBe(0);
+      expect(result['META_stock'].dailyChangePercentage).toBe(-100);
+      expect(result['PFCIBEST.CL_stock']).toEqual({
+        totalValue: 0, totalInvestment: 0, units: 0,
+        unrealizedPnL: 0, totalROI: 0, dailyChangePercentage: 0,
+      });
+      expect(() => JSON.stringify(result)).not.toThrow();
+    });
   });
 
   // ==========================================================================

@@ -178,16 +178,23 @@ function buildMonthlyCompoundFromDailyDocs(docs, currency, ticker, assetType) {
 
 const ASSET_PERF_FIELDS = ['totalValue', 'totalInvestment', 'units', 'unrealizedPnL', 'totalROI', 'dailyChangePercentage'];
 
+// FIX-NAN-ROI: `?? 0` no atrapa NaN/Infinity, y Firestore si los admite en doubles.
+// Un daily doc historico con totalROI: NaN acababa en el snapshot y rompia la
+// serializacion de la respuesta callable. Saneamos al construir el snapshot.
+function finiteOrZero(value) {
+  return Number.isFinite(value) ? value : 0;
+}
+
 function extractAssetPerformanceFields(assetPerformance) {
   const result = {};
   for (const [assetKey, assetData] of Object.entries(assetPerformance)) {
     result[assetKey] = {
-      totalValue: assetData.totalValue ?? 0,
-      totalInvestment: assetData.totalInvestment ?? 0,
-      units: assetData.units ?? 0,
-      unrealizedPnL: assetData.unrealizedProfitAndLoss ?? 0,
-      totalROI: assetData.totalROI ?? 0,
-      dailyChangePercentage: assetData.dailyChangePercentage ?? 0,
+      totalValue: finiteOrZero(assetData.totalValue),
+      totalInvestment: finiteOrZero(assetData.totalInvestment),
+      units: finiteOrZero(assetData.units),
+      unrealizedPnL: finiteOrZero(assetData.unrealizedProfitAndLoss),
+      totalROI: finiteOrZero(assetData.totalROI),
+      dailyChangePercentage: finiteOrZero(assetData.dailyChangePercentage),
     };
   }
   return result;
