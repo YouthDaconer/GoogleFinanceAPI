@@ -134,6 +134,19 @@ function toRate(value) {
  */
 function toDateOnly(date) {
   if (!date) return '';
+
+  // HU 2.7: `openingCorrectedAt` es un Timestamp de Firestore, no una cadena
+  // como `date`. Convertirlo con `String()` daría basura silenciosa.
+  if (typeof date.toDate === 'function') {
+    return date.toDate().toISOString().substring(0, 10);
+  }
+
+  if (date instanceof Date) return date.toISOString().substring(0, 10);
+
+  if (typeof date._seconds === 'number') {
+    return new Date(date._seconds * 1000).toISOString().substring(0, 10);
+  }
+
   return String(date).substring(0, 10);
 }
 
@@ -219,7 +232,8 @@ function applyUpdate(state, update, currency) {
  * @returns {{kind: string, amount: number, appliedRate: number|null,
  *   costDelta: number|null, counterpartCurrency: string|null,
  *   assetName: string|null, adjustmentReason: string|null,
- *   estimated: boolean}|null}
+ *   estimated: boolean, correctedAt: string|null,
+ *   previousAmount: number|null}|null}
  */
 function resolveCashImpact(transaction, currency) {
   if (!transaction || !currency) return null;
@@ -237,6 +251,9 @@ function resolveCashImpact(transaction, currency) {
     assetName: transaction.assetName || transaction.symbol || null,
     adjustmentReason: null,
     estimated: false,
+    // HU 2.7: sólo una apertura corregida los trae (RN-2.7-G).
+    correctedAt: null,
+    previousAmount: null,
   };
 
   // --- Conversión: un documento, dos saldos (RN-2.2-A) --------------------
@@ -318,6 +335,11 @@ function resolveCashImpact(transaction, currency) {
         costDelta: acquisitionCost,
         adjustmentReason: transaction.adjustmentReason || ADJUSTMENT_REASONS.MANUAL,
         estimated: transaction.costBasisEstimated === true,
+        // HU 2.7: una apertura corregida dice cuándo se corrigió y cuánto
+        // decía antes, para que la cifra de partida nunca quede sin explicación
+        // (RN-2.7-G, AC-8). Ausentes en la apertura que nadie tocó.
+        correctedAt: isOpening ? toDateOnly(transaction.openingCorrectedAt) || null : null,
+        previousAmount: isOpening ? toNumber(transaction.openingCorrectedFrom) : null,
       };
     }
 
@@ -429,6 +451,9 @@ function projectBalanceLedger({ transactions, currency, referenceCurrency, balan
       assetName: impact.assetName,
       adjustmentReason: impact.adjustmentReason,
       estimated: impact.estimated,
+      // HU 2.7: la apertura corregida se declara corregida (RN-2.7-G, AC-8).
+      correctedAt: impact.correctedAt,
+      previousAmount: impact.previousAmount,
       description: transaction.description || null,
     });
   }

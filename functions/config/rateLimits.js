@@ -35,6 +35,8 @@ const RATE_LIMITS = {
   // HU 2.6: migracion del libro mayor. Limite bajo a proposito: se dispara una
   // vez por usuario y cada pasada barre sus cuentas consultando tasas historicas
   migrateBalanceLedger: { limit: 10, windowMs: 60000 },
+  // HU 2.7: corregir el saldo inicial reescribe la apertura y replaya el saldo
+  correctOpeningBalance: { limit: 30, windowMs: 60000 },
 
   // ═══════════════════════════════════════════════════════════════
   // 🟡 Operaciones de Lectura
@@ -47,6 +49,8 @@ const RATE_LIMITS = {
   getBalanceCostBasisEstimate: { limit: 30, windowMs: 60000 },
   // HU 2.6: el historial de un saldo se pide al desplegar su tarjeta
   getBalanceLedger: { limit: 30, windowMs: 60000 },
+  // HU 2.7: el plan de la correccion se pide al abrir el dialogo de correccion
+  getOpeningCorrectionPlan: { limit: 30, windowMs: 60000 },
 
   // ═══════════════════════════════════════════════════════════════
   // 🟡 Operaciones de Escritura Normales

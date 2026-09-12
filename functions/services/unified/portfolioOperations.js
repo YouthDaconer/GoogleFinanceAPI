@@ -67,6 +67,8 @@ const ACTION_HANDLERS = {
   backfillRealizedFxDecomposition: assetHandlers.backfillRealizedFxDecomposition,
   // HU 2.6: el ajuste manual del saldo deja su asiento (RN-06)
   registerBalanceAdjustment: assetHandlers.registerBalanceAdjustment,
+  // HU 2.7: corregir el saldo con el que empezo la cuenta
+  correctOpeningBalance: assetHandlers.correctOpeningBalance,
   // HU 2.6: migracion de los saldos preexistentes al libro mayor (RN-12)
   migrateBalanceLedger: assetHandlers.migrateBalanceLedger,
   updateStockSector: assetHandlers.updateStockSector,

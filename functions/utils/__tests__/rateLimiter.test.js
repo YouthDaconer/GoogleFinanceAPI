@@ -237,6 +237,8 @@ describe('getRateLimitConfig', () => {
       'backfillRealizedFxDecomposition',
       // HU 2.6: libro mayor del saldo, ajuste manual y migracion
       'getBalanceLedger', 'registerBalanceAdjustment', 'migrateBalanceLedger',
+      // HU 2.7: plan y correccion del saldo inicial
+      'getOpeningCorrectionPlan', 'correctOpeningBalance',
       'createCheckoutSession', 'createPortalSession',
     ];
     
@@ -246,6 +248,6 @@ describe('getRateLimitConfig', () => {
       expect(RATE_LIMITS[fn].windowMs).toBe(60000);
     });
     
-    expect(Object.keys(RATE_LIMITS).length).toBe(33);
+    expect(Object.keys(RATE_LIMITS).length).toBe(35);
   });
 });

@@ -68,6 +68,14 @@ const {
 const { projectBalanceLedger, resolveCashImpact } = require('../helpers/balanceLedger');
 const { migrateBalanceLedgerForUser } = require('../balanceLedgerMigration');
 
+// HU 2.7: corregir el saldo inicial es corregir el movimiento de apertura del
+// que ese saldo nace, no editar el saldo (RN-06)
+const {
+  planOpeningCorrection,
+  applyOpeningCorrection,
+  MIN_CORRECTION_SHIFT,
+} = require('../helpers/openingBalanceCorrection');
+
 // ============================================================================
 // UTILIDADES
 // ============================================================================
@@ -2487,6 +2495,231 @@ async function recheckBalanceReconciliation({ accountId, currency, referenceCurr
 }
 
 /**
+ * HU 2.7 — Corregir el saldo con el que empezó la cuenta (AC-4).
+ *
+ * 2.6 dejó una sola vía para corregir un saldo: un ajuste fechado hoy. Sirve
+ * cuando faltaban movimientos; miente cuando lo que estaba mal era el primer
+ * número. Esta acción abre la segunda vía sin reabrir la edición directa de
+ * saldos que 2.6 cerró: no toca `balances`, corrige el **movimiento de
+ * apertura** y vuelve a proyectar el saldo desde su historial (RN-06).
+ *
+ * Cuatro cosas que pasan aquí y en ningún otro sitio:
+ *
+ * 1. El saldo objetivo se despeja contra el saldo del **historial**, no contra
+ *    el guardado, así que la corrección deja el saldo de hoy exactamente en la
+ *    cifra escrita y cierra la deriva en la misma operación (D3, AC-10).
+ * 2. El saldo y la base que se persisten salen del **replay** del recorrido
+ *    corregido, porque mover el primer movimiento cambia la tasa promedio con
+ *    la que cada salida posterior consumió base (D2).
+ * 3. Ninguna corrección puede dejar el saldo bajo cero en ningún punto del
+ *    pasado, y el rechazo dice **en qué fecha** y **cuál es el mínimo**
+ *    admisible (RN-2.7-D, AC-3).
+ * 4. La fecha y el tipo de cambio de la apertura no se tocan: corregir cuánto
+ *    había no cambia desde cuándo lo había, y el monto nuevo es del mismo día
+ *    (RN-2.7-E, AC-7, AC-9).
+ *
+ * @param {Object} context - Contexto de ejecución
+ * @param {Object} payload - { portfolioAccountId, currency, newBalance, exchangeRate }
+ * @returns {Promise<Object>} Resultado con la apertura anterior y la nueva
+ */
+async function correctOpeningBalance(context, payload) {
+  const { auth } = context;
+  const data = payload || {};
+
+  console.log(`[assetHandlers][correctOpeningBalance] userId: ${auth.uid}, account: ${data.portfolioAccountId}, currency: ${data.currency}`);
+
+  try {
+    if (!data.portfolioAccountId || !data.currency) {
+      throw new HttpsError('invalid-argument', 'portfolioAccountId y currency son requeridos');
+    }
+
+    const targetBalance = Number(data.newBalance);
+
+    if (!Number.isFinite(targetBalance)) {
+      throw new HttpsError('invalid-argument', 'Indica el saldo correcto según tu bróker');
+    }
+
+    const account = await validateAccountOwnership(data.portfolioAccountId, auth.uid);
+    const currency = data.currency;
+    const currentBalance = account.balances?.[currency] || 0;
+    const referenceCurrency = await getUserReferenceCurrency(auth.uid);
+
+    // Una sola lectura de transacciones para planear, validar y replayar (D9).
+    const snapshot = await db.collection('transactions')
+      .where('portfolioAccountId', '==', data.portfolioAccountId)
+      .get();
+
+    const transactions = snapshot.docs.map((doc) => ({ id: doc.id, ...doc.data() }));
+
+    const plan = planOpeningCorrection({
+      transactions,
+      currency,
+      referenceCurrency,
+      storedBalance: currentBalance,
+      accountCreatedAt: account.createdAt || null,
+    });
+
+    const shift = cleanDecimal(targetBalance - plan.ledgerBalance);
+
+    if (Math.abs(shift) < MIN_CORRECTION_SHIFT) {
+      throw new HttpsError(
+        'failed-precondition',
+        'Ese es el saldo al que ya llega el historial de este saldo: no hay nada que corregir'
+      );
+    }
+
+    const newOpeningAmount = cleanDecimal(plan.openingAmount + shift);
+    const openingDate = plan.hasOpening ? plan.openingDate : plan.newOpeningDate;
+    const opening = plan.hasOpening
+      ? transactions.find((transaction) => transaction.id === plan.openingId)
+      : null;
+
+    // RN-2.7-E: la tasa de la apertura se reutiliza tal cual, porque el monto
+    // nuevo es del mismo día. Sólo se resuelve cuando la apertura no la tenía o
+    // la tenía estimada — y cuando hay que crear la apertura entera (D7, D8).
+    const needsRate = plan.openingRateMissing && newOpeningAmount > 0;
+
+    let acquisitionRate;
+    let acquisitionRateSource;
+    let dollarPriceToDate;
+    let estimated;
+
+    if (!plan.hasOpening || needsRate) {
+      const resolved = await resolveAdjustmentRate({
+        currency,
+        referenceCurrency,
+        date: openingDate,
+        declaredRate: data.exchangeRate,
+      });
+
+      if (requiresExchangeRate({ delta: newOpeningAmount, currency, referenceCurrency })
+        && resolved.acquisitionRate === null) {
+        throw new HttpsError(
+          'failed-precondition',
+          `No se pudo obtener el tipo de cambio de ${currency} a ${referenceCurrency} para el ${openingDate}. Indícalo manualmente para corregir el saldo inicial.`
+        );
+      }
+
+      acquisitionRate = resolved.acquisitionRate;
+      acquisitionRateSource = resolved.acquisitionRateSource;
+      dollarPriceToDate = resolved.dollarPriceToDate;
+      // Una tasa de la fecha real de la apertura —la del mercado o la que
+      // declaró el usuario— ya no es la estimación que dejó la migración.
+      estimated = false;
+    } else {
+      acquisitionRate = plan.openingRate;
+      acquisitionRateSource = opening?.acquisitionRateSource || null;
+      dollarPriceToDate = Number(opening?.dollarPriceToDate) || 1;
+      // Nada se preguntó, así que nada cambia sobre si la base era estimada.
+      estimated = opening?.costBasisEstimated === true;
+    }
+
+    const openingRef = plan.hasOpening
+      ? db.collection('transactions').doc(plan.openingId)
+      : db.collection('transactions').doc();
+
+    const correction = applyOpeningCorrection({
+      plan,
+      transactions,
+      currency,
+      referenceCurrency,
+      targetBalance,
+      accountId: data.portfolioAccountId,
+      userId: auth.uid,
+      openingId: openingRef.id,
+      acquisitionRate,
+      acquisitionRateSource,
+      dollarPriceToDate,
+      estimated,
+      openingTime: new Date().toISOString().substring(11),
+    });
+
+    // RN-2.7-D: el recorrido no puede bajar de cero en ningún punto, y el
+    // rechazo nombra la fecha y el mínimo en lugar de un error genérico (AC-3).
+    if (correction.conflict) {
+      throw new HttpsError(
+        'failed-precondition',
+        `Con ese saldo inicial, el ${correction.conflict.date} tu saldo quedaría en ${correction.conflict.balance} ${currency}. El mínimo que puedes poner es ${correction.conflict.minimumBalance} ${currency}.`,
+        { reason: 'negative-path', ...correction.conflict, currency }
+      );
+    }
+
+    const batch = db.batch();
+
+    if (correction.creates) {
+      // RN-2.7-F: un saldo sin apertura la recibe. El modo nunca falla por no
+      // haber punto de partida (AC-6).
+      batch.set(openingRef, correction.transactionData);
+    } else {
+      batch.update(openingRef, {
+        ...correction.transactionPatch,
+        // RN-2.7-G: corregir el origen no puede ser el camino por el que un
+        // número cambia sin dejar constancia (AC-8).
+        openingCorrectedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    }
+
+    const accountUpdate = {
+      ...correction.accountUpdate,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    };
+
+    const basisPath = `balanceCostBasis.${currency}`;
+    if (accountUpdate[basisPath]) {
+      accountUpdate[basisPath] = {
+        ...accountUpdate[basisPath],
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      };
+    }
+
+    const reconciliationPath = `balanceReconciliation.${currency}`;
+    accountUpdate[reconciliationPath] = {
+      ...accountUpdate[reconciliationPath],
+      checkedAt: admin.firestore.FieldValue.serverTimestamp(),
+    };
+
+    batch.update(db.collection('portfolioAccounts').doc(data.portfolioAccountId), accountUpdate);
+
+    await batch.commit();
+
+    // Mover el primer movimiento del saldo cambia toda la serie histórica: no
+    // declararla obsoleta dejaría el rendimiento pintado sobre una apertura que
+    // ya no existe (D10).
+    checkAndMarkStaleIfRetroactive(auth.uid, `${openingDate}T00:00:00.000Z`, {
+      reason: 'retroactive_transaction',
+      transactionType: 'cash_adjustment',
+      portfolioAccount: data.portfolioAccountId,
+    });
+
+    invalidateDistributionCache(auth.uid);
+
+    console.log(`[assetHandlers][correctOpeningBalance] Éxito - apertura ${correction.creates ? 'creada' : 'corregida'} del ${openingDate}: ${correction.previousOpeningAmount} -> ${correction.newOpeningAmount}; saldo ${currentBalance} -> ${correction.newBalance}`);
+
+    return {
+      success: true,
+      transactionId: openingRef.id,
+      created: correction.creates,
+      openingDate,
+      previousOpeningAmount: correction.previousOpeningAmount,
+      newOpeningAmount: correction.newOpeningAmount,
+      shift,
+      previousBalance: currentBalance,
+      newBalance: correction.newBalance,
+      movementCountAfter: plan.movementCountAfter,
+      exchangeRate: acquisitionRate,
+      referenceCurrency,
+      reconciliation: correction.accountUpdate[`balanceReconciliation.${currency}`],
+    };
+  } catch (error) {
+    console.error(`[assetHandlers][correctOpeningBalance] Error - userId: ${auth.uid}`, error);
+
+    if (error instanceof HttpsError) throw error;
+
+    throw new HttpsError('internal', `Error al corregir el saldo inicial: ${error.message}`);
+  }
+}
+
+/**
  * HU 2.6 — Migra los saldos preexistentes del usuario al libro mayor (AC-6).
  *
  * Reconstruye lo que puede del historial y, sólo donde no puede, estima y deja
@@ -2582,6 +2815,8 @@ module.exports = {
   // HU 2.6: el ajuste manual del saldo deja su asiento
   registerBalanceAdjustment,
   recheckBalanceReconciliation,
+  // HU 2.7: corregir el saldo con el que empezo la cuenta
+  correctOpeningBalance,
   // HU 2.6: migracion de los saldos preexistentes al libro mayor
   migrateBalanceLedger,
   // Utilidades exportadas para posible reutilización

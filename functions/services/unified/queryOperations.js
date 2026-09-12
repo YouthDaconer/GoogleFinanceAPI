@@ -82,6 +82,8 @@ const ACTION_HANDLERS = {
   getBalanceCostBasisEstimate: queryHandlers.getBalanceCostBasisEstimate,
   // HU 2.6: libro mayor de un saldo y su reconciliacion
   getBalanceLedger: queryHandlers.getBalanceLedger,
+  // HU 2.7: plan de la correccion del saldo inicial
+  getOpeningCorrectionPlan: queryHandlers.getOpeningCorrectionPlan,
   // COST-OPT-001: Nuevas acciones para rendimientos optimizados (V2)
   getHistoricalReturnsOptimized: queryHandlers.getHistoricalReturnsOptimized,
   getConsolidatedDataStatus: queryHandlers.getConsolidatedDataStatus,

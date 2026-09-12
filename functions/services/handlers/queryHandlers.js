@@ -54,6 +54,8 @@ const historicalRateService = require('../historicalRateService');
 const { getUserReferenceCurrency } = require('../helpers/balanceCostBasis');
 // HU 2.6: proyeccion del saldo a partir de sus movimientos
 const { projectBalanceLedger } = require('../helpers/balanceLedger');
+// HU 2.7: todo lo que hace falta saber antes de corregir el saldo inicial
+const { planOpeningCorrection } = require('../helpers/openingBalanceCorrection');
 
 // PERF-SNAP-007: Importar helper para construir ID de snapshot
 // PERF-SNAP-009: Importar generatePerformanceSnapshot para on-demand generation
@@ -1481,6 +1483,74 @@ async function getBalanceLedger(context, payload) {
 }
 
 /**
+ * HU 2.7 — Todo lo que el diálogo necesita saber antes de corregir la apertura.
+ *
+ * Se pide una sola vez al abrir el diálogo. Con estas cifras el cliente deriva
+ * el monto nuevo de la apertura y el mínimo admisible con dos restas, sin una
+ * llamada por tecla y sin que el usuario calcule nada (RN-2.7-B, D5).
+ *
+ * No puede salir de `getBalanceLedger`: ése **recorta filas** después de
+ * calcular, así que no ve el punto más bajo del recorrido, que es justo lo que
+ * decide si la corrección es admisible (AC-3).
+ *
+ * No escribe nada. El plan **nunca es la autoridad**: el servidor revalida el
+ * recorrido entero al guardar.
+ *
+ * @param {Object} context - Contexto de ejecución
+ * @param {Object} payload - { portfolioAccountId, currency }
+ * @returns {Promise<Object>} El plan, más si hay que pedir tipo de cambio
+ */
+async function getOpeningCorrectionPlan(context, payload) {
+  const { auth } = context;
+  const { portfolioAccountId, currency } = payload || {};
+
+  console.log(`[queryHandlers][getOpeningCorrectionPlan] userId: ${auth.uid}, account: ${portfolioAccountId}, currency: ${currency}`);
+
+  if (!portfolioAccountId || !currency) {
+    throw new HttpsError('invalid-argument', 'portfolioAccountId y currency son requeridos');
+  }
+
+  try {
+    const accountDoc = await db.collection('portfolioAccounts').doc(portfolioAccountId).get();
+
+    if (!accountDoc.exists || accountDoc.data()?.userId !== auth.uid) {
+      throw new HttpsError('permission-denied', 'No tienes acceso a esta cuenta');
+    }
+
+    const accountData = accountDoc.data();
+    const referenceCurrency = await getUserReferenceCurrency(auth.uid);
+
+    // Una sola lectura, con el índice que ya existe desde 2.6.
+    const snapshot = await db.collection('transactions')
+      .where('portfolioAccountId', '==', portfolioAccountId)
+      .get();
+
+    const plan = planOpeningCorrection({
+      transactions: snapshot.docs.map((doc) => ({ id: doc.id, ...doc.data() })),
+      currency,
+      referenceCurrency,
+      storedBalance: accountData.balances?.[currency] || 0,
+      accountCreatedAt: accountData.createdAt || null,
+    });
+
+    console.log(`[queryHandlers][getOpeningCorrectionPlan] Éxito - apertura: ${plan.hasOpening ? plan.openingDate : 'no existe'}, ${plan.movementCountAfter} movimientos posteriores`);
+
+    return {
+      ...plan,
+      currency,
+      referenceCurrency,
+      // Fecha para la que el cliente propone la tasa cuando hay que declararla:
+      // la de la apertura, porque el monto nuevo es del mismo día (RN-2.7-E).
+      proposedRateDate: plan.hasOpening ? plan.openingDate : plan.newOpeningDate,
+    };
+  } catch (error) {
+    if (error instanceof HttpsError) throw error;
+    console.error('[queryHandlers][getOpeningCorrectionPlan] Error:', error);
+    throw new HttpsError('internal', 'Error preparando la corrección del saldo inicial');
+  }
+}
+
+/**
  * Obtiene rendimientos históricos usando períodos consolidados (V2)
  *
  * COST-OPT-001: Versión optimizada que reduce lecturas de Firestore
@@ -1616,6 +1686,8 @@ module.exports = {
   getBalanceCostBasisEstimate,
   // HU 2.6: libro mayor de un saldo
   getBalanceLedger,
+  // HU 2.7: plan de la correccion del saldo inicial
+  getOpeningCorrectionPlan,
   // COST-OPT-001: Nuevos handlers para rendimientos optimizados
   getHistoricalReturnsOptimized,
   getConsolidatedDataStatus,
