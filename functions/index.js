@@ -11,6 +11,7 @@ const { reconcileStalePerformance } = require('./services/reconcileStalePerforma
 
 // PERF-SNAP-028: Snapshot lifecycle cleanup & archival
 const { scheduledSnapshotCleanup, scheduledSnapshotArchival } = require('./services/snapshotCleanup');
+const { scheduledAlertRetention } = require('./services/alertRetention');
 
 /**
  * SEC-TOKEN-001: Secret para autenticación server-to-server con API finance-query
@@ -194,6 +195,14 @@ exports.scheduledSnapshotCleanup = scheduledSnapshotCleanup;
  * @see docs/stories/PERF-SNAP-028.story.md
  */
 exports.scheduledSnapshotArchival = scheduledSnapshotArchival;
+
+/**
+ * Purga userNotifications (>90d) y alertHistory (>365d), que hasta ahora
+ * crecían sin límite.
+ * Schedule: Sunday 05:00 ET
+ * @see services/alertRetention.js
+ */
+exports.scheduledAlertRetention = scheduledAlertRetention;
 
 exports.weeklyProfitableWeeksCalculation = onSchedule({
   schedule: "every sunday 23:00",
