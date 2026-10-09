@@ -19,7 +19,7 @@ const app = express();
 const port = 3100;
 
 corsOptions = {
-  origin: ["https://portafolio-inversiones.web.app", "https://portafolio-inversiones.firebaseapp.com", "http://localhost:3000", "http://localhost:3001"],
+  origin: ["https://portastock.net", "https://www.portastock.net", "https://portafolio-inversiones.web.app", "https://portafolio-inversiones.firebaseapp.com", "http://localhost:3000", "http://localhost:3001"],
   optionsSuccessStatus: 200
 };
 

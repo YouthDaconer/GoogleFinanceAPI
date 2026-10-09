@@ -73,7 +73,11 @@ const convertCurrency = (amount, fromCurrency, toCurrency, currencies, defaultCu
   const fromRate = currencies.find(c => c.code === fromCurrency)?.exchangeRate || 1;
   const toRate = currencies.find(c => c.code === toCurrency)?.exchangeRate || 1;
 
-  if (fromCurrency === 'USD' && toCurrency === defaultCurrency && acquisitionDollarValue) {
+  // FIX-CURRENCY-003: Solo usar acquisitionDollarValue cuando:
+  // 1. Convertimos DE USD a la moneda de adquisición del asset (defaultCurrency)
+  // 2. Y esa moneda NO es USD (para evitar multiplicar cuando no debe)
+  // Ejemplo: USD -> COP con acquisitionDollarValue=3750.75 => amount * 3750.75
+  if (fromCurrency === 'USD' && toCurrency === defaultCurrency && defaultCurrency !== 'USD' && acquisitionDollarValue) {
     return amount * acquisitionDollarValue;
   }
   return (amount * toRate) / fromRate;
@@ -174,6 +178,8 @@ const calculateAccountPerformance = (assets, currentPrices, currencies, totalVal
       let groupUnits = 0;
       let groupCashFlow = 0;
       let groupDividends = 0;
+      // FIX-DUP-CF-001: Rastrear si hubo transacciones de compra del día para este grupo
+      let groupHasBuyTransactionsToday = false;
       const groupReturns = {
         dailyReturns: [],
         monthlyReturns: [],
@@ -196,7 +202,22 @@ const calculateAccountPerformance = (assets, currentPrices, currencies, totalVal
         const priceCurrency = priceData?.currency || 'USD';
         const assetValueInPriceCurrency = currentPrice * asset.units;
 
-        const initialInvestmentUSD = asset.unitValue * asset.units;
+        // FIX-CURRENCY-002: El unitValue está en la moneda del asset (asset.currency), NO en USD
+        // Para activos comprados en monedas extranjeras (COP, EUR, etc.), el unitValue es en esa moneda
+        // Debemos convertir de asset.currency a USD usando acquisitionDollarValue
+        const assetCurrency = asset.currency || 'USD';
+        const initialInvestmentInAssetCurrency = asset.unitValue * asset.units;
+        
+        // Si el asset fue comprado en moneda extranjera, convertir a USD usando la tasa de adquisición
+        let initialInvestmentUSD;
+        if (assetCurrency !== 'USD' && asset.acquisitionDollarValue) {
+          // acquisitionDollarValue es la tasa USD/XXX al momento de compra (ej: 3750.75 para COP)
+          initialInvestmentUSD = initialInvestmentInAssetCurrency / asset.acquisitionDollarValue;
+        } else {
+          // El asset ya está en USD
+          initialInvestmentUSD = initialInvestmentInAssetCurrency;
+        }
+        
         const assetInvestment = convertCurrency(initialInvestmentUSD, 'USD', currency.code, currencies, asset.defaultCurrencyForAdquisitionDollar, asset.acquisitionDollarValue);
         // FIX-CURRENCY-001: Convertir desde la moneda real del precio, no asumir USD
         const assetValue = convertCurrency(assetValueInPriceCurrency, priceCurrency, currency.code, currencies);
@@ -208,6 +229,11 @@ const calculateAccountPerformance = (assets, currentPrices, currencies, totalVal
         // Acumular transacciones para el grupo
         const assetBuyTransactions = buyTransactions.filter(t => t.assetId === asset.id);
         const assetSellTransactions = sellTransactions.filter(t => t.assetId === asset.id);
+        
+        // FIX-DUP-CF-001: Marcar si hubo compras del día para este grupo
+        if (assetBuyTransactions.length > 0) {
+          groupHasBuyTransactionsToday = true;
+        }
         
         assetBuyTransactions.forEach(t => {
           const convertedAmount = convertCurrency(
@@ -263,7 +289,12 @@ const calculateAccountPerformance = (assets, currentPrices, currencies, totalVal
         });
 
         const daysSinceAcquisition = calculateDaysInvested(asset.acquisitionDate);
-        const roi = (assetValue - assetInvestment) / assetInvestment;
+        // FIX-NAN-ROI: un activo ya vendido llega con inversion 0; 0/0 daba NaN y el
+        // NaN contaminaba dailyReturns[] -> dailyReturn/monthlyReturn/annualReturn
+        // del grupo entero (el reduce ponderado no filtra no-finitos).
+        const roi = assetInvestment > 0
+          ? (assetValue - assetInvestment) / assetInvestment
+          : 0;
         const dailyReturn = daysSinceAcquisition > 0 ? Math.pow(1 + roi, 1 / daysSinceAcquisition) - 1 : 0;
         const monthlyReturn = daysSinceAcquisition >= 30 ? Math.pow(1 + dailyReturn, 30) - 1 : 0;
         const yearlyReturn = daysSinceAcquisition >= 365 ? Math.pow(1 + dailyReturn, 365) - 1 : 0;
@@ -288,7 +319,12 @@ const calculateAccountPerformance = (assets, currentPrices, currencies, totalVal
       // NOTA: totalCashFlow se suma después del fix de cashflow implícito (más abajo)
       totalDividends += groupDividends;
 
-      const groupROI = (groupValue - groupInvestment) / groupInvestment;
+      // FIX-NAN-ROI: un grupo totalmente vendido llega con inversion 0; 0/0 daba NaN
+      // y el NaN viajaba a assetPerformance -> snapshot -> respuesta callable, que
+      // falla al serializar ("Data cannot be encoded in JSON: NaN") y devuelve INTERNAL.
+      const groupROI = groupInvestment > 0
+        ? (groupValue - groupInvestment) / groupInvestment
+        : 0;
 
       const dailyWeightedReturn = groupInvestment > 0
         ? groupReturns.dailyReturns.reduce((sum, ret, idx) => sum + ret * (groupReturns.dailyWeights[idx] / groupInvestment), 0)
@@ -324,36 +360,41 @@ const calculateAccountPerformance = (assets, currentPrices, currencies, totalVal
       const groupDailyChangePercentage = calculateDailyChangePercentage(groupValue, previousGroupData?.totalValue || 0);
 
       // ========================================================================
-      // FIX: Detectar cashflow implícito por diferencia de unidades
-      // Cuando hay diferencia de unidades pero no hay transacciones del día,
-      // significa que la compra/venta se hizo fuera del horario del job
+      // FIX-LATE-REG-002: ELIMINADO bloque de cashflow implícito (2026-02-20)
+      // 
+      // PROBLEMA ANTERIOR: El código intentaba detectar diferencias de unidades
+      // sin transacciones del día y asumía un "cashflow implícito" usando el
+      // precio actual. Esto causaba cálculos incorrectos cuando:
+      // 
+      // 1. Se registraban transacciones RETROACTIVAS (con fechas pasadas pero
+      //    creadas después de que corrió el job del día anterior)
+      // 2. Se creaban nuevos assets con fechas de adquisición anteriores
+      // 
+      // SOLUCIÓN: NO asumir cashflow cuando no hay transacciones del día actual.
+      // Si hay diferencia de units sin transacciones del día, es un caso de
+      // LATE-REGISTRATION que NO debe contarse como cashflow del día actual.
+      // 
+      // El cálculo correcto de cashflow se basa ÚNICAMENTE en transacciones
+      // reales del día (groupTransactions), no en inferencias por diferencia
+      // de unidades que pueden deberse a transacciones retroactivas.
+      // 
+      // @see docs/architecture/LATE-REGISTRATION-001-retroactive-transactions-analysis.md
       // ========================================================================
-      let effectiveGroupTransactions = [...groupTransactions];
+      const effectiveGroupTransactions = [...groupTransactions];
+      // Solo para debugging: detectar diferencias de units sin transacciones
       const unitsDifference = groupUnits - previousGroupUnits;
+      const hasUnitsDifferenceWithoutTransactions = 
+        Math.abs(unitsDifference) > 0.00000001 && 
+        groupTransactions.length === 0 && 
+        previousGroupUnits > 0;
       
-      if (Math.abs(unitsDifference) > 0.00000001 && groupTransactions.length === 0 && previousGroupUnits > 0) {
-        // Obtener precio actual del asset del grupo
-        const groupAssetName = groupKey.split('_')[0]; // Ej: "BTC-USD" de "BTC-USD_crypto"
-        const priceDataForGroup = currentPrices.find(cp => cp.symbol === groupAssetName);
-        const currentAssetPrice = priceDataForGroup?.price || 0;
-        // FIX-CURRENCY-001: Obtener la moneda real del precio
-        const assetPriceCurrency = priceDataForGroup?.currency || 'USD';
-        
-        if (currentAssetPrice > 0) {
-          // Calcular cashflow implícito:
-          // - unitsDifference > 0 = compra = cashflow negativo
-          // - unitsDifference < 0 = venta = cashflow positivo
-          // FIX-CURRENCY-001: Usar la moneda real del precio
-          const implicitCashFlowInPriceCurrency = -unitsDifference * currentAssetPrice;
-          const implicitCashFlowConverted = convertCurrency(implicitCashFlowInPriceCurrency, assetPriceCurrency, currency.code, currencies);
-          
-          effectiveGroupTransactions.push({
-            amount: implicitCashFlowConverted
-          });
-          
-          // Actualizar groupCashFlow también para que se guarde correctamente
-          groupCashFlow += implicitCashFlowConverted;
-        }
+      // Log de advertencia para detección de LATE-REGISTRATION (solo en modo debug)
+      // No se aplica cashflow implícito - el cambio de units se reflejará en el valor
+      // pero no distorsionará el adjustedDailyChangePercentage
+      if (hasUnitsDifferenceWithoutTransactions) {
+        // El cambio de units sin transacciones del día indica LATE-REGISTRATION
+        // El adjustedDailyChangePercentage será 0 para este grupo (sin cashflow)
+        // lo cual es correcto porque no hubo actividad real ese día
       }
 
       // Calcular adjusted daily change percentage usando las transacciones acumuladas y dividendos
@@ -372,9 +413,27 @@ const calculateAccountPerformance = (assets, currentPrices, currencies, totalVal
         groupValue
       );
 
-      // Sumar el cashflow del grupo DESPUÉS del fix de cashflow implícito
-      // para que totalCashFlow incluya también los cashflows detectados por diferencia de unidades
+      // Sumar el cashflow del grupo (solo transacciones reales del día)
+      // FIX-LATE-REG-002: Ya NO incluye cashflows implícitos por diferencia de units
       totalCashFlow += groupCashFlow;
+
+      // ========================================================================
+      // FIX LATE-REG-001: Neutralizar cashflow de nuevas inversiones (TWR-compliant)
+      // Según GIPS/TWR, cuando un activo aparece por primera vez (isNewInvestment),
+      // su inversión inicial es un cashflow entrante ($CF_in) que debe restarse
+      // para neutralizar su efecto en adjustedDailyChangePercentage del portafolio.
+      // Fórmula TWR: r = (MVE - MVB - CF_in) / MVB
+      // @see docs/architecture/LATE-REGISTRATION-001-retroactive-transactions-analysis.md
+      //
+      // FIX-DUP-CF-001: Solo aplicar cuando NO hay transacciones de compra del día.
+      // Si hay compras del día, el cashflow ya está incluido en groupCashFlow
+      // (sumado arriba). Agregar -groupInvestment duplicaría el cashflow.
+      // Esto ocurre cuando la compra se registra el mismo día → groupCashFlow < 0
+      // ========================================================================
+      if (isNewInvestment && groupInvestment > 0 && !groupHasBuyTransactionsToday) {
+        // Cashflow negativo = dinero que "entró" al portafolio (solo para registros retroactivos)
+        totalCashFlow += -groupInvestment;
+      }
 
       assetPerformance[groupKey] = {
         totalInvestment: groupInvestment,

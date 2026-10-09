@@ -1,5 +1,6 @@
 const express = require("express");
 const cors = require('cors');
+const crypto = require('crypto'); // SEC-AUDIT-002: C-MED-04 - For timing-safe comparison
 const rateLimit = require("express-rate-limit");
 // Agregar multer para manejar la carga de archivos
 const multer = require('multer');
@@ -25,7 +26,6 @@ const { scrapeSimpleCurrencie } = require("./services/scrapeCurrencies");
 const { scrapeGainers } = require("./services/scrapeGainers");
 const { scrapeLosers } = require("./services/scrapeLosers");
 const { scrapeNews } = require("./services/scrapeNews");
-const fetchHistoricalExchangeRate = require('./services/fetchHistoricalExchangeRate');
 const { getQuotes, getSimpleQuotes, getNewsFromSymbol, search } = require('./services/financeQuery');
 
 // Crear la app Express
@@ -45,9 +45,33 @@ app.use((req, res, next) => {
 
 // Configurar CORS
 const corsOptions = {
-  origin: ["https://portafolio-inversiones.web.app", "https://portafolio-inversiones.firebaseapp.com", "http://localhost:3000", "http://localhost:3001"],
+  origin: ["https://portastock.net", "https://www.portastock.net", "https://portafolio-inversiones.web.app", "https://portafolio-inversiones.firebaseapp.com", "http://localhost:3000", "http://localhost:3001"],
   optionsSuccessStatus: 200
 };
+
+// SEC-AUDIT-002: C-MED-03 - Helper para sanitizar errores sin exponer detalles internos
+function sanitizeError(error, context = 'operation') {
+  // Log completo server-side
+  console.error(`[${context}] Error:`, error.message, error.stack);
+  // Retornar mensaje genérico al cliente
+  return `Error during ${context}`;
+}
+
+// SEC-AUDIT-002: C-MED-04 - Comparación timing-safe para API keys
+function safeCompareApiKey(providedKey, expectedKey) {
+  if (!providedKey || !expectedKey) return false;
+  try {
+    const a = Buffer.from(providedKey);
+    const b = Buffer.from(expectedKey);
+    // Si longitudes diferentes, usar misma longitud para evitar timing leak
+    if (a.length !== b.length) {
+      return crypto.timingSafeEqual(a, a.slice(0, a.length)) && false;
+    }
+    return crypto.timingSafeEqual(a, b);
+  } catch {
+    return false;
+  }
+}
 app.use(cors(corsOptions));
 
 // Parsear JSON en el body de las peticiones
@@ -67,7 +91,8 @@ app.use((req, res, next) => {
     apiKey = demoApiKey;
     req.headers['x-api-key'] = demoApiKey;
     demoApiLimiter(req, res, next);
-  } else if (apiKey === process.env.API_KEY) {
+  } else if (safeCompareApiKey(apiKey, process.env.API_KEY)) {
+    // SEC-AUDIT-002: C-MED-04 - Use timing-safe comparison
     next();
   } else {
     demoApiLimiter(req, res, next);
@@ -104,7 +129,7 @@ app.get("/indices", async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({
-      error: "Ocurrió un error al raspar el sitio web: " + error.message,
+      error: sanitizeError(error, 'scraping indices'),
     });
   }
 });
@@ -123,7 +148,7 @@ app.get("/fullQuote", async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({
-      error: "Ocurrió un error al buscar la acción: " + error.message,
+      error: sanitizeError(error, 'fetching quote'),
     });
   }
 });
@@ -143,11 +168,11 @@ app.get("/quote", async (req, res) => {
     console.error(error);
     if (error.message.includes("no es un número válido")) {
       res.status(400).json({
-        error: "Datos inválidos devueltos por el API: " + error.message,
+        error: sanitizeError(error, 'invalid data'),
       });
     } else {
       res.status(500).json({
-        error: "Ocurrió un error al buscar la acción: " + error.message,
+        error: sanitizeError(error, 'simple quote'),
       });
     }
   }
@@ -181,7 +206,7 @@ app.get("/apiQuote", async (req, res) => {
       });
     } else {
       res.status(500).json({
-        error: "Ocurrió un error al buscar la acción: " + error.message,
+        error: sanitizeError(error, 'api quote'),
       });
     }
   }
@@ -201,7 +226,7 @@ app.get("/currencie", async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({
-      error: "Ocurrió un error al buscar la moneda: " + error.message,
+      error: sanitizeError(error, 'currency'),
     });
   }
 });
@@ -213,7 +238,7 @@ app.get("/active", async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({
-      error: "Ocurrió un error al raspar el sitio web: " + error.message,
+      error: sanitizeError(error, 'active stocks'),
     });
   }
 });
@@ -225,7 +250,7 @@ app.get("/gainers", async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({
-      error: "Ocurrió un error al raspar el sitio web: " + error.message,
+      error: sanitizeError(error, 'gainers'),
     });
   }
 });
@@ -237,7 +262,7 @@ app.get("/losers", async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({
-      error: "Ocurrió un error al raspar el sitio web: " + error.message,
+      error: sanitizeError(error, 'losers'),
     });
   }
 });
@@ -256,39 +281,15 @@ app.get("/news", async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({
-      error: "Ocurrió un error al buscar la acción: " + error.message,
+      error: sanitizeError(error, 'news'),
     });
   }
 });
 
-app.get("/api/historicalExchangeRate", async (req, res) => {
-  const { currency, date } = req.query;
-
-  if (!currency || !date) {
-    res.status(400).json({
-      error: 'Faltan parámetros requeridos: currency y date',
-    });
-    return;
-  }
-
-  try {
-    const dateObj = new Date(date);
-    const exchangeRate = await fetchHistoricalExchangeRate(currency, dateObj);
-
-    if (exchangeRate !== null) {
-      res.status(200).json({ exchangeRate });
-    } else {
-      res.status(404).json({
-        error: `No se pudo obtener el tipo de cambio para ${currency} en la fecha especificada`,
-      });
-    }
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({
-      error: 'Error al obtener el tipo de cambio histórico desde la API',
-    });
-  }
-});
+// HU #3: el endpoint `/api/historicalExchangeRate` se retiró junto con el camino
+// directo a Yahoo. Las tasas de cualquier fecha se piden por rango al canal de
+// datos de mercado: `GET /v1/exchange-rates?currencies=…&start=…&end=…`.
+// @see platform-docs/stories/3-tasa-vigente-canal-mercado/refinamiento.md (T10)
 
 app.get('/quotes', async (req, res) => {
   const { symbols } = req.query;
@@ -305,7 +306,7 @@ app.get('/quotes', async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({
-      error: 'Ocurrió un error al obtener las cotizaciones: ' + error.message,
+      error: sanitizeError(error, 'quotes'),
     });
   }
 });
@@ -325,7 +326,7 @@ app.get('/simple-quotes', async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({
-      error: 'Ocurrió un error al obtener las cotizaciones simplificadas: ' + error.message,
+      error: sanitizeError(error, 'simple quotes'),
     });
   }
 });
@@ -345,7 +346,7 @@ app.get('/news-from-quote', async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({
-      error: 'Ocurrió un error al obtener las noticias del símbolo: ' + error.message,
+      error: sanitizeError(error, 'news from quote'),
     });
   }
 });
@@ -365,7 +366,7 @@ app.get('/search', async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({
-      error: 'Ocurrió un error al obtener resultados de la búsqueda: ' + error.message,
+      error: sanitizeError(error, 'search'),
     });
   }
 });
@@ -688,7 +689,7 @@ app.post('/process-etf-excel', uploadMiddleware, async (req, res) => {
       console.error(`📊 [${requestId}] Error al leer archivo Excel:`, xlsxError);
       return res.status(422).json({ 
         error: 'No se pudo leer el archivo Excel', 
-        details: xlsxError.message 
+        details: sanitizeError(xlsxError, 'xlsx parsing') 
       });
     }
     
@@ -748,7 +749,7 @@ app.post('/process-etf-excel', uploadMiddleware, async (req, res) => {
       console.error(`📊 [${requestId}] Error al convertir hoja a JSON:`, jsonError);
       return res.status(422).json({ 
         error: 'Error al convertir los datos de Excel', 
-        details: jsonError.message 
+        details: sanitizeError(jsonError, 'json parsing') 
       });
     }
     
@@ -820,7 +821,7 @@ app.post('/process-etf-excel', uploadMiddleware, async (req, res) => {
       console.error(`📊 [${requestId}] Error al procesar datos ETF:`, procError);
       return res.status(500).json({ 
         error: 'Error al procesar los datos ETF', 
-        details: procError.message 
+        details: sanitizeError(procError, 'processing') 
       });
     }
     
@@ -921,7 +922,7 @@ app.post('/process-etf-excel', uploadMiddleware, async (req, res) => {
     }
     return res.status(500).json({ 
       error: 'Error procesando los datos', 
-      details: error.message,
+      details: sanitizeError(error, 'processing'),
       stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
     });
   }
@@ -986,7 +987,7 @@ app.post('/process-etf-excel-lite', uploadMiddleware, async (req, res) => {
       console.error(`📊 [${requestId}] Error al leer archivo Excel:`, xlsxError);
       return res.status(422).json({ 
         error: 'No se pudo leer el archivo Excel', 
-        details: xlsxError.message 
+        details: sanitizeError(xlsxError, 'xlsx parsing') 
       });
     }
     
@@ -1033,7 +1034,7 @@ app.post('/process-etf-excel-lite', uploadMiddleware, async (req, res) => {
     } catch (jsonError) {
       return res.status(422).json({ 
         error: 'Error al convertir los datos de Excel', 
-        details: jsonError.message 
+        details: sanitizeError(jsonError, 'json parsing') 
       });
     }
     
@@ -1111,7 +1112,7 @@ app.post('/process-etf-excel-lite', uploadMiddleware, async (req, res) => {
     } catch (procError) {
       return res.status(500).json({ 
         error: 'Error al procesar los datos ETF', 
-        details: procError.message 
+        details: sanitizeError(procError, 'processing') 
       });
     }
     
@@ -1190,7 +1191,7 @@ app.post('/process-etf-excel-lite', uploadMiddleware, async (req, res) => {
     
     return res.status(500).json({ 
       error: 'Error procesando los datos (versión lite)', 
-      details: error.message
+      details: sanitizeError(error, 'processing')
     });
   }
 });
@@ -1222,24 +1223,33 @@ const {
  * Obtiene la atribución completa del portafolio.
  * Calcula la contribución de cada activo al rendimiento total.
  * 
+ * INTRADAY-001: Ahora incluye rendimiento intraday en tiempo real por defecto.
+ * FEAT-UX-001: Ahora acepta startDate/endDate opcionales para rangos exactos.
+ * 
  * Query params:
  * - userId: (required) ID del usuario
  * - period: Período de análisis ('YTD', '1M', '3M', '6M', '1Y', '2Y', 'ALL')
+ * - startDate: (optional) Fecha inicio explícita (YYYY-MM-DD). Sobreescribe period.
+ * - endDate: (optional) Fecha fin explícita (YYYY-MM-DD). Default: hoy.
  * - currency: Moneda para cálculos ('USD', 'COP', 'EUR', etc.)
  * - accountIds: Comma-separated list de IDs de cuenta o 'overall'
  * - benchmarkReturn: Retorno del benchmark para comparar
  * - maxBars: Máximo de barras en waterfall (default: 8)
  * - portfolioReturn: (optional) TWR pre-calculado del frontend para consistencia
+ * - includeIntraday: (optional) Incluir rendimiento intraday (default: 'true')
  */
 app.get("/attribution", async (req, res) => {
   const { 
     userId, 
     period = 'YTD', 
+    startDate: startDateParam,
+    endDate: endDateParam,
     currency = 'USD',
     accountIds = 'overall',
     benchmarkReturn = '0',
     maxBars = '8',
-    portfolioReturn
+    portfolioReturn,
+    includeIntraday = 'true'
   } = req.query;
   
   try {
@@ -1249,16 +1259,30 @@ app.get("/attribution", async (req, res) => {
       });
     }
     
+    // FEAT-UX-001: Construir dateRange si se proporcionan fechas explícitas
+    let dateRange = undefined;
+    if (startDateParam) {
+      const startDate = new Date(startDateParam + 'T00:00:00');
+      const endDate = endDateParam ? new Date(endDateParam + 'T23:59:59') : new Date();
+      if (!isNaN(startDate.getTime()) && !isNaN(endDate.getTime())) {
+        dateRange = { startDate, endDate };
+      }
+    }
+    
+    // FIX: Reconocer tanto 'overall' como 'all' como "todas las cuentas"
+    const isAllAccounts = accountIds === 'overall' || accountIds === 'all'
     const result = await getPortfolioAttribution({
       userId,
       period,
       currency,
-      accountIds: accountIds === 'overall' ? ['overall'] : accountIds.split(','),
+      accountIds: isAllAccounts ? ['overall'] : accountIds.split(','),
+      dateRange,
       options: {
         benchmarkReturn: parseFloat(benchmarkReturn) || 0,
         maxWaterfallBars: parseInt(maxBars) || 8,
         includeMetadata: true,
-        portfolioReturn: portfolioReturn ? parseFloat(portfolioReturn) : undefined
+        portfolioReturn: portfolioReturn ? parseFloat(portfolioReturn) : undefined,
+        includeIntraday: includeIntraday !== 'false' // INTRADAY-001: true por defecto
       }
     });
     
@@ -1273,7 +1297,7 @@ app.get("/attribution", async (req, res) => {
   } catch (error) {
     console.error('[/attribution] Error:', error);
     res.status(500).json({
-      error: "Error calculando atribución: " + error.message
+      error: sanitizeError(error, 'attribution')
     });
   }
 });
@@ -1323,7 +1347,7 @@ app.get("/attribution/top", async (req, res) => {
   } catch (error) {
     console.error('[/attribution/top] Error:', error);
     res.status(500).json({
-      error: "Error obteniendo top contributors: " + error.message
+      error: sanitizeError(error, 'contributors')
     });
   }
 });
@@ -1352,7 +1376,7 @@ app.get("/attribution/check", async (req, res) => {
   } catch (error) {
     console.error('[/attribution/check] Error:', error);
     res.status(500).json({
-      error: "Error verificando disponibilidad: " + error.message
+      error: sanitizeError(error, 'availability')
     });
   }
 });
@@ -1362,6 +1386,7 @@ app.get("/attribution/check", async (req, res) => {
 // ============================================================================
 
 const { calculateRiskMetrics } = require('./services/riskMetrics');
+const { buildRiskCacheKey, getCachedRiskMetrics, setCachedRiskMetrics } = require('./services/riskMetrics/riskMetricsCache');
 
 /**
  * @swagger
@@ -1451,6 +1476,13 @@ app.get("/risk-metrics", async (req, res) => {
       ? accountIds.split(',').map(id => id.trim()).filter(Boolean)
       : [];
     
+    const cacheKey = buildRiskCacheKey(userId, period, currency, parsedAccountIds);
+    const cached = getCachedRiskMetrics(cacheKey);
+    if (cached) {
+      console.log(`[/risk-metrics] Cache hit: ${requestId}`);
+      return res.status(200).json(cached);
+    }
+    
     const result = await calculateRiskMetrics(userId, {
       period,
       currency,
@@ -1472,6 +1504,7 @@ app.get("/risk-metrics", async (req, res) => {
       return res.status(statusCode).json(result);
     }
     
+    setCachedRiskMetrics(cacheKey, result);
     res.status(200).json(result);
     
   } catch (error) {
@@ -1479,7 +1512,7 @@ app.get("/risk-metrics", async (req, res) => {
     res.status(500).json({
       success: false,
       error: "SERVER_ERROR",
-      message: "Error calculando métricas de riesgo: " + error.message,
+      message: sanitizeError(error, 'risk metrics'),
       requestId
     });
   }
@@ -1627,7 +1660,7 @@ app.get("/closed-positions", async (req, res) => {
     res.status(500).json({
       success: false,
       error: "SERVER_ERROR",
-      message: "Error obteniendo posiciones cerradas: " + error.message,
+      message: sanitizeError(error, 'closed positions'),
       requestId
     });
   }
@@ -1779,7 +1812,7 @@ app.get("/news/batch", async (req, res) => {
     res.status(500).json({
       success: false,
       error: "SERVER_ERROR",
-      message: "Error obteniendo noticias: " + error.message,
+      message: sanitizeError(error, 'news'),
       requestId
     });
   }

@@ -10,6 +10,7 @@ const attributionService = require('./attributionService');
 const contributionCalculator = require('./contributionCalculator');
 const waterfallGenerator = require('./waterfallGenerator');
 const summaryGenerator = require('./summaryGenerator');
+const intradayCalculator = require('./intradayCalculator');
 const types = require('./types');
 
 module.exports = {
@@ -20,6 +21,7 @@ module.exports = {
   contributionCalculator,
   waterfallGenerator,
   summaryGenerator,
+  intradayCalculator,
   
   // Tipos y utilidades
   types,

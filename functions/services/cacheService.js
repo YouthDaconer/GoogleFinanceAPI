@@ -1,14 +1,22 @@
 /**
  * Cache Service for Circuit Breaker Fallbacks
  * 
- * Provides fallback data from Firestore when external APIs are unavailable.
- * Used by circuit breakers to return cached data instead of failing.
+ * OPT-DEMAND-CLEANUP: Refactorizado para arquitectura On-Demand pura.
  * 
- * Collections used:
- * - currentPrices: Stock/ETF prices (updated every 2 min)
- * - markets: Market status (updated every 30 min)
- * - currencies: Exchange rates (updated every 2 min)
+ * FUNCIONES DEPRECADAS (2026-01-17):
+ * - getCachedPrices(): Ya no lee de Firestore. El frontend tiene polling
+ *   que obtiene datos frescos del API Lambda. Cachear precios obsoletos
+ *   es peor que mostrar un error y reintentar.
+ * - getCachedCurrencyRates(): Las tasas de cambio vienen con los precios
+ *   del API Lambda. No se requiere fallback separado.
  * 
+ * FUNCIONES ACTIVAS:
+ * - getCachedMarketStatus(): Estado del mercado (open/closed) es predecible
+ *   y cambia poco, útil como fallback.
+ * - getCachedEtfData(): Holdings de ETFs no cambian frecuentemente,
+ *   cache de 24h es válido.
+ * 
+ * @see docs/architecture/OPT-DEMAND-CLEANUP-firestore-fallback-removal.md
  * @see SCALE-BE-003 - Circuit Breaker para APIs Externas
  */
 
@@ -21,49 +29,42 @@ const logger = new StructuredLogger('CacheService');
 const etfMemoryCache = new Map();
 const ETF_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
 
+// ============================================================================
+// OPT-DEMAND-CLEANUP (2026-01-17): Funciones de cache de precios DEPRECADAS
+// ============================================================================
+// getCachedPrices() y getCachedCurrencyRates() retornan arrays vacíos porque:
+// - El frontend usa polling al API Lambda para datos frescos
+// - Cachear precios obsoletos de Firestore es peor que mostrar error + retry
+// - Las tasas de cambio vienen del API Lambda junto con los precios
+// 
+// NOTA: Estas funciones DEBEN existir porque financeQuery.js las importa
+// para usarlas como fallback del circuit breaker. Si no existen, el circuit
+// breaker falla con TypeError cuando el API no responde.
+// ============================================================================
+
+/**
+ * @deprecated OPT-DEMAND-CLEANUP - Retorna array vacío.
+ * Mantenida para compatibilidad con circuit breaker en financeQuery.js
+ * 
+ * @param {string[]} symbols - Lista de símbolos (ignorada)
+ * @returns {Promise<Array>} Array vacío siempre
+ */
 async function getCachedPrices(symbols) {
-  if (!symbols || symbols.length === 0) {
-    return [];
-  }
-
-  logger.info('Fetching cached prices from Firestore', { 
-    symbolCount: symbols.length 
+  logger.warn('getCachedPrices called (deprecated, returning empty array)', {
+    symbolCount: symbols?.length || 0,
   });
+  return [];
+}
 
-  const pricesRef = db.collection('currentPrices');
-  const prices = [];
-  const batchSize = 10;
-
-  for (let i = 0; i < symbols.length; i += batchSize) {
-    const batch = symbols.slice(i, i + batchSize);
-    const promises = batch.map(symbol => pricesRef.doc(symbol).get());
-    
-    const docs = await Promise.all(promises);
-    
-    docs.forEach((doc, idx) => {
-      if (doc.exists) {
-        const data = doc.data();
-        prices.push({
-          symbol: batch[idx],
-          price: data.price,
-          name: data.name,
-          change: data.change,
-          percentChange: data.percentChange,
-          currency: data.currency,
-          lastUpdated: data.lastUpdated,
-          fromCache: true,
-          cacheAge: data.lastUpdated ? Date.now() - data.lastUpdated : null,
-        });
-      }
-    });
-  }
-
-  logger.info('Returned cached prices', { 
-    requested: symbols.length, 
-    found: prices.length 
-  });
-
-  return prices;
+/**
+ * @deprecated OPT-DEMAND-CLEANUP - Retorna objeto vacío.
+ * Mantenida para compatibilidad con imports en otros módulos.
+ * 
+ * @returns {Promise<Object>} Objeto vacío siempre
+ */
+async function getCachedCurrencyRates() {
+  logger.warn('getCachedCurrencyRates called (deprecated, returning empty object)');
+  return {};
 }
 
 async function getCachedMarketStatus() {
@@ -117,43 +118,6 @@ async function cacheMarketStatus(marketData) {
   }
 }
 
-async function getCachedCurrencyRates(currencyCodes) {
-  if (!currencyCodes || currencyCodes.length === 0) {
-    return {};
-  }
-
-  const rates = {};
-  const currenciesRef = db.collection('currencies');
-
-  try {
-    const snapshot = await currenciesRef
-      .where('isActive', '==', true)
-      .get();
-
-    snapshot.docs.forEach(doc => {
-      const data = doc.data();
-      if (currencyCodes.includes(data.code)) {
-        rates[data.code] = {
-          rate: data.exchangeRate,
-          lastUpdated: data.lastUpdated,
-          fromCache: true,
-        };
-      }
-    });
-
-    logger.info('Returned cached currency rates', {
-      requested: currencyCodes.length,
-      found: Object.keys(rates).length,
-    });
-  } catch (error) {
-    logger.warn('Error fetching cached currency rates', { 
-      error: error.message 
-    });
-  }
-
-  return rates;
-}
-
 function getCachedEtfData(ticker) {
   const cached = etfMemoryCache.get(ticker);
   
@@ -188,10 +152,12 @@ function getEtfCacheStats() {
 }
 
 module.exports = {
+  // Funciones deprecadas (OPT-DEMAND-CLEANUP) - retornan vacío pero existen para compatibilidad
   getCachedPrices,
+  getCachedCurrencyRates,
+  // Funciones activas
   getCachedMarketStatus,
   cacheMarketStatus,
-  getCachedCurrencyRates,
   getCachedEtfData,
   cacheEtfData,
   clearEtfCache,

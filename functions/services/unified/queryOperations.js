@@ -20,28 +20,43 @@
  * - getPortfolioDistribution
  * - getAvailableSectors
  * - getConsolidatedDataStatus (COST-OPT-001: Diagnóstico de datos)
- * 
+ * - getPerformanceOnDemand (OPT-DEMAND-102: Rendimiento con precios live)
+ *
  * @module unified/queryOperations
  * @see docs/stories/56.story.md
  * @see docs/stories/62.story.md (COST-OPT-001)
+ * @see docs/stories/74.story.md (OPT-DEMAND-102)
  */
 
 const { onCall, HttpsError } = require("firebase-functions/v2/https");
+const { defineSecret } = require("firebase-functions/params");
 const { rateLimiter } = require('../../utils/rateLimiter');
 const { getRateLimitConfig } = require('../../config/rateLimits');
 
 // Importar handlers individuales
 const queryHandlers = require('../handlers/queryHandlers');
+const { getPerformanceOnDemand } = require('../handlers/performanceOnDemandHandler');
 
 // ============================================================================
 // CONFIGURACIÓN
 // ============================================================================
 
 /**
+ * SEC-TOKEN-001: Secret para autenticación server-to-server con API finance-query
+ * Este secret permite a Cloud Functions autenticarse con el API via Cloudflare Tunnel.
+ * 
+ * @see docs/architecture/SEC-TOKEN-001-api-security-hardening-plan.md
+ */
+const cfServiceToken = defineSecret('CF_SERVICE_TOKEN');
+
+/**
  * Configuración de Cloud Function
  * 
  * Memory: 512MiB (requerido por getHistoricalReturns)
  * MaxInstances: 20 (alto tráfico esperado ~1500 invocaciones/día)
+ * 
+ * SEC-TOKEN-001: CF_SERVICE_TOKEN se bindea desde Secret Manager para
+ * autenticación server-to-server con el API finance-query via Cloudflare Tunnel.
  */
 const FUNCTION_CONFIG = {
   cors: true,
@@ -49,6 +64,7 @@ const FUNCTION_CONFIG = {
   timeoutSeconds: 60,
   maxInstances: 20,
   minInstances: 0,
+  secrets: [cfServiceToken],  // SEC-TOKEN-001: Binding del secret para API auth
 };
 
 /**
@@ -61,9 +77,18 @@ const ACTION_HANDLERS = {
   getIndexHistory: queryHandlers.getIndexHistory,
   getPortfolioDistribution: queryHandlers.getPortfolioDistribution,
   getAvailableSectors: queryHandlers.getAvailableSectors,
+  // HU 2.1: Tipo de cambio de una fecha concreta para el diálogo de efectivo
+  getHistoricalExchangeRate: queryHandlers.getHistoricalExchangeRate,
+  getBalanceCostBasisEstimate: queryHandlers.getBalanceCostBasisEstimate,
+  // HU 2.6: libro mayor de un saldo y su reconciliacion
+  getBalanceLedger: queryHandlers.getBalanceLedger,
+  // HU 2.7: plan de la correccion del saldo inicial
+  getOpeningCorrectionPlan: queryHandlers.getOpeningCorrectionPlan,
   // COST-OPT-001: Nuevas acciones para rendimientos optimizados (V2)
   getHistoricalReturnsOptimized: queryHandlers.getHistoricalReturnsOptimized,
   getConsolidatedDataStatus: queryHandlers.getConsolidatedDataStatus,
+  // OPT-DEMAND-102: Rendimiento on-demand con precios en vivo del API Lambda
+  getPerformanceOnDemand: getPerformanceOnDemand,
 };
 
 /**

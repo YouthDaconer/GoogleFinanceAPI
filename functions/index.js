@@ -1,12 +1,25 @@
 require('dotenv').config();
 const { onRequest } = require("firebase-functions/v2/https");
+const { defineSecret } = require("firebase-functions/params");
 const httpApp = require('./httpApi');
 
-// Nueva función unificada que combina updateCurrencyRates, updateCurrentPrices y calculateDailyPortfolioPerformance
+// Función unificada EOD que calcula performance y riesgo del portafolio
 const { unifiedMarketDataUpdate } = require('./services/unifiedMarketDataUpdate');
 
-// Función para actualizaciones completas de datos de activos (mantener para ISINs y optionalKeys)
-const { scheduledUpdatePrices } = require('./services/updateCurrentPrices');
+// LATE-REG-003: Reconciliación automática de performance stale
+const { reconcileStalePerformance } = require('./services/reconcileStalePerformance');
+
+// PERF-SNAP-028: Snapshot lifecycle cleanup & archival
+const { scheduledSnapshotCleanup, scheduledSnapshotArchival } = require('./services/snapshotCleanup');
+const { scheduledAlertRetention } = require('./services/alertRetention');
+
+/**
+ * SEC-TOKEN-001: Secret para autenticación server-to-server con API finance-query
+ * Usado por httpApi para endpoints /quotes, /simple-quotes, /search, etc.
+ * 
+ * @see docs/architecture/SEC-TOKEN-001-api-security-hardening-plan.md
+ */
+const cfServiceToken = defineSecret('CF_SERVICE_TOKEN');
 
 const processDividendPayments = require('./services/processDividendPayments');
 const marketStatusService = require('./services/marketStatusService');
@@ -14,7 +27,8 @@ const marketStatusService = require('./services/marketStatusService');
 // COST-OPT-004: Funciones optimizadas para datos de mercado (reemplazan saveAllIndicesAndSectorsHistoryData)
 const { 
   saveIndicesHistoryData, 
-  saveSectorsSnapshot 
+  saveSectorsSnapshot,
+  updateRiskFreeRate
 } = require("./services/marketDataScheduled");
 
 // RBAC-001: Auth Triggers para asignar Custom Claims a nuevos usuarios
@@ -30,11 +44,13 @@ const {
 const { onSchedule } = require("firebase-functions/v2/scheduler");
 const { calculateProfitableWeeks } = require('./services/calculateProfitableWeeks');
 
-// Cloud Functions Callable para operaciones de assets (REF-002)
-const assetOperations = require('./services/assetOperations');
+// DEPRECATED: Cloud Functions Callable para operaciones de assets (REF-002)
+// Consolidadas en portfolioOperations (SCALE-CF-001) - ya no se requiere este import
+// const assetOperations = require('./services/assetOperations');
 
-// Cloud Function Callable para precios filtrados por usuario (OPT-001)
-const userPricesService = require('./services/userPricesService');
+// DEPRECATED: Cloud Function Callable para precios filtrados por usuario (OPT-001)
+// Consolidada en queryOperations (SCALE-CF-001) - ya no se requiere este import
+// const userPricesService = require('./services/userPricesService');
 
 // Cloud Function Callable para rendimientos históricos pre-calculados (OPT-002)
 const historicalReturnsService = require('./services/historicalReturnsService');
@@ -78,17 +94,27 @@ const etfProcessingOpts = {
   },
   // Sin instancias mínimas para evitar cargos continuos
   minInstances: 0, 
-  cpu: 1 // Asignar 1 CPU completo 
+  cpu: 1, // Asignar 1 CPU completo
+  secrets: [cfServiceToken],  // SEC-TOKEN-001: Binding del secret para API auth
 };
 
 // Exportar la app HTTP con las configuraciones específicas
 exports.app = onRequest(etfProcessingOpts, httpApp);
 
-// Nueva función unificada que reemplaza las tres funciones individuales
+// ============================================================================
+// DEPRECATED - OPT-DEMAND-302
+// ============================================================================
+/**
+ * @deprecated OPT-DEMAND-302: Esta función está DEPRECADA desde 2026-01-15.
+ * 
+ * Reemplazada por:
+ * - dailyEODSnapshot (precios/currencies - 2x/día)
+ * - scheduledPortfolioCalculations (cálculos - 2x/día)
+ * 
+ * Se mantiene con schedule deshabilitado para posible rollback.
+ * Se eliminará después de 2 semanas de estabilidad.
+ */
 exports.unifiedMarketDataUpdateV2 = unifiedMarketDataUpdate;
-
-// Función específica para actualizaciones completas de datos (ISINs y metadatos)
-exports.scheduledUpdatePricesV2 = scheduledUpdatePrices;
 
 // ============================================================================
 // COST-OPT-004: Funciones Optimizadas para Datos de Mercado
@@ -121,18 +147,68 @@ exports.saveIndicesHistoryData = saveIndicesHistoryData;
  */
 exports.saveSectorsSnapshot = saveSectorsSnapshot;
 
+/**
+ * Actualiza la tasa libre de riesgo desde ^IRX / ^TNX
+ * Schedule: 1x/día — 17:00 ET (L-V)
+ * @see docs/architecture/RISK-METRICS-DYNAMIC-BENCHMARKS-analysis.md
+ */
+exports.updateRiskFreeRate = updateRiskFreeRate;
+
 // DEPRECATED: Función legacy reemplazada por saveIndicesHistoryData + saveSectorsSnapshot
 // exports.saveAllIndicesAndSectorsHistoryDataV2 = saveAllIndicesAndSectorsHistoryData;
 
 exports.processDividendPaymentsV2 = processDividendPayments.processDividendPayments;
 exports.scheduledMarketStatusUpdateV2 = marketStatusService.scheduledMarketStatusUpdate;
-exports.scheduledMarketStatusUpdateAdditionalV2 = marketStatusService.scheduledMarketStatusUpdateAdditional;
+exports.scheduledMarketStatusUpdateTransitionsV2 = marketStatusService.scheduledMarketStatusUpdateTransitions;
 exports.updateMarketStatusHttpV2 = marketStatusService.updateMarketStatusHttp;
+
+// OPT-DEMAND-400-FIX: Sincronización de festivos de NYSE desde Finnhub
+exports.scheduledHolidaySyncV2 = marketStatusService.scheduledHolidaySync;
+exports.syncHolidaysHttpV2 = marketStatusService.syncHolidaysHttp;
+
+// ============================================================================
+// LATE-REG-003: Reconciliación de Performance Stale
+// ============================================================================
+/**
+ * Recalcula portfolioPerformance para usuarios con datos marcados como stale
+ * debido a transacciones retroactivas.
+ * 
+ * Schedule: 02:00 ET, martes a sábado
+ * 
+ * @see docs/architecture/LATE-REGISTRATION-001-retroactive-transactions-analysis.md
+ */
+exports.reconcileStalePerformance = reconcileStalePerformance;
+
+// ============================================================================
+// PERF-SNAP-028: Snapshot Lifecycle Cleanup & Archival
+// ============================================================================
+/**
+ * Deletes asset snapshots sold >365 days ago with no re-purchase.
+ * Schedule: Sunday 03:00 ET
+ * @see docs/stories/PERF-SNAP-028.story.md
+ */
+exports.scheduledSnapshotCleanup = scheduledSnapshotCleanup;
+
+/**
+ * Archives snapshots for users inactive >365 days to archivedSnapshots/.
+ * Schedule: 1st of each month, 04:00 ET
+ * @see docs/stories/PERF-SNAP-028.story.md
+ */
+exports.scheduledSnapshotArchival = scheduledSnapshotArchival;
+
+/**
+ * Purga userNotifications (>90d) y alertHistory (>365d), que hasta ahora
+ * crecían sin límite.
+ * Schedule: Sunday 05:00 ET
+ * @see services/alertRetention.js
+ */
+exports.scheduledAlertRetention = scheduledAlertRetention;
 
 exports.weeklyProfitableWeeksCalculation = onSchedule({
   schedule: "every sunday 23:00",
   timeZone: "America/New_York",
   retryCount: 3,
+  memory: "512MiB",  // OOM fix: default 256MiB se excedía (275 MiB usados)
 }, async (event) => {
   try {
     console.log('Iniciando cálculo semanal de semanas rentables');
@@ -210,8 +286,9 @@ exports.weeklyProfitableWeeksCalculation = onSchedule({
 // DEPRECATED: Estas funciones fueron consolidadas en settingsOperations (SCALE-CF-001)
 // TODO: Eliminar después de 2 semanas de uso exitoso (2025-01-07)
 
-// Cloud Functions para currencies y userData
-const settingsOperations = require('./services/settingsOperations');
+// DEPRECATED: Cloud Functions para currencies y userData
+// Consolidadas en unified/settingsOperations.js (SCALE-CF-001)
+// const settingsOperations = require('./services/settingsOperations');
 
 /*
  * Agrega una nueva moneda al sistema
@@ -261,8 +338,9 @@ const settingsOperations = require('./services/settingsOperations');
 // DEPRECATED: Estas funciones fueron consolidadas en accountOperations (SCALE-CF-001)
 // TODO: Eliminar después de 2 semanas de uso exitoso (2025-01-07)
 
-// Cloud Functions para portfolioAccounts
-const portfolioAccountOperations = require('./services/portfolioAccountOperations');
+// DEPRECATED: Cloud Functions para portfolioAccounts
+// Consolidadas en unified/accountOperations.js (SCALE-CF-001)
+// const portfolioAccountOperations = require('./services/portfolioAccountOperations');
 
 /*
  * Crea una nueva cuenta de portafolio
@@ -355,7 +433,8 @@ exports.refreshIndexCache = indexHistoryService.refreshIndexCache;
 // TODO: Eliminar después de 2 semanas de uso exitoso (2025-01-07)
 
 const { onCall, HttpsError } = require('firebase-functions/v2/https');
-const portfolioDistributionService = require('./services/portfolioDistributionService');
+// DEPRECATED: portfolioDistributionService consolidado en unified/queryOperations
+// const portfolioDistributionService = require('./services/portfolioDistributionService');
 const { withRateLimit } = require('./utils/rateLimiter');
 
 /*
@@ -462,7 +541,9 @@ const { RATE_LIMITS_COLLECTION } = require('./utils/rateLimiter');
  */
 exports.cleanupRateLimits = onSchedule(
   {
-    schedule: '0 * * * *',
+    // OPT-FIRESTORE-002: Reducido de cada hora a cada 12h.
+    // Con pocos usuarios activos, los rate limits apenas se acumulan.
+    schedule: '0 */12 * * *',
     timeZone: 'America/New_York',
     retryCount: 1,
     memory: '256MiB',
@@ -612,3 +693,198 @@ exports.consolidateYearlyPerformance = consolidateYearlyPerformance;
  * @see docs/architecture/role-based-access-control-design.md
  */
 // exports.onUserCreate = onUserCreate;
+
+// ============================================================================
+// OPT-DEMAND-101: Market Data Token Service
+// ============================================================================
+
+/**
+ * Genera tokens temporales HMAC-SHA256 para acceder al API Lambda finance-query.
+ * El frontend usa estos tokens para llamadas directas (sin proxy Cloud Function).
+ * 
+ * Flujo:
+ * 1. Frontend llama a getMarketDataToken() (autenticado con Firebase)
+ * 2. Cloud Function genera token firmado con secret compartido
+ * 3. Frontend usa token para llamar API Lambda directamente
+ * 4. Token expira en 5 minutos, frontend renueva automáticamente
+ * 
+ * @see docs/stories/71.story.md (OPT-DEMAND-101)
+ * @see docs/architecture/on-demand-pricing-architecture.md
+ */
+const { getMarketDataToken } = require('./services/marketDataTokenService');
+exports.getMarketDataToken = getMarketDataToken;
+
+// ============================================================================
+// OPT-DEMAND-CLEANUP: Funciones EOD Consolidadas
+// ============================================================================
+// NOTA: Las funciones dailyEODSnapshot y scheduledPortfolioCalculations fueron
+// eliminadas (2026-01-17). La funcionalidad está consolidada en:
+// - unifiedMarketDataUpdate: Ejecuta 1x/día a las 17:05 ET
+// - queryOperations: Para cálculos on-demand
+//
+// @see docs/architecture/OPT-DEMAND-CLEANUP-firestore-fallback-removal.md
+
+// ============================================================================
+// FEAT-IMPORT: Transaction Import Module (IMPORT-001, IMPORT-002)
+// ============================================================================
+
+/**
+ * Cloud Function: analyzeTransactionFile
+ * 
+ * Analyzes uploaded transaction files (Excel/CSV) and returns automatic
+ * column mappings with confidence levels. Supports known broker formats
+ * (Interactive Brokers, TD Ameritrade, Fidelity, eToro) and generic detection.
+ * 
+ * @see docs/stories/89.story.md (IMPORT-001)
+ * @see docs/architecture/FEAT-IMPORT-001-smart-transaction-import-design.md
+ */
+const {
+  analyzeTransactionFile,
+  importTransactionBatch,
+  saveImportMemory,
+  classifyTransactionRows,
+} = require('./services/transactions');
+exports.analyzeTransactionFile = analyzeTransactionFile;
+
+/**
+ * Cloud Function: importTransactionBatch
+ * 
+ * Imports a batch of validated transactions to Firestore. Creates assets
+ * if they don't exist, enriches with market data, detects duplicates,
+ * and updates asset balances atomically.
+ * 
+ * @see docs/stories/90.story.md (IMPORT-002)
+ * @see docs/architecture/FEAT-IMPORT-001-smart-transaction-import-design.md
+ */
+exports.importTransactionBatch = importTransactionBatch;
+
+/**
+ * Cloud Function: saveImportMemory
+ *
+ * HU 1.1: Persiste la memoria interna del canal de importación (mapeo de columnas
+ * confirmado por formato de origen) después de una importación confirmada.
+ * Único punto de escritura de esa memoria.
+ *
+ * @see platform-docs/stories/1.1-perfil-importacion-recordado/
+ */
+exports.saveImportMemory = saveImportMemory;
+
+/**
+ * Cloud Function: classifyTransactionRows
+ *
+ * HU 1.3: clasifica las filas de una reimportacion en nuevas / ya registradas
+ * ANTES de confirmar, para que el usuario decida que se importa. Solo lectura.
+ *
+ * @see platform-docs/stories/1.3-reimportacion-clasificada/
+ */
+exports.classifyTransactionRows = classifyTransactionRows;
+
+// ============================================================================
+// GATE-001: Mock Subscription Provider (Feature Gating)
+// ============================================================================
+
+/**
+ * Cloud Function Callable para cambiar plan de suscripción en desarrollo.
+ * Protegida por variable PAYMENT_MOCK_ENABLED — NO habilitar en producción.
+ *
+ * @see docs/architecture/FEAT-GATE-001-feature-gating-subscription-plans-design.md
+ */
+const { mockSetSubscription } = require("./services/payment/mockSubscriptionService");
+exports.mockSetSubscription = mockSetSubscription;
+
+// GATE-008: Cancel/Downgrade Subscription
+const { cancelSubscription } = require("./services/payment/cancelSubscriptionService");
+exports.cancelSubscription = cancelSubscription;
+
+// PAY-REACT-001: Reactivate Subscription (undo pending cancellation)
+const { reactivateSubscription } = require("./services/payment/reactivateSubscriptionService");
+exports.reactivateSubscription = reactivateSubscription;
+
+// ============================================================================
+// WHOP: Payment & Subscription Management
+// WHOP-005: Whop secrets wired via string references in CF options
+// ============================================================================
+const subscriptionService = require("./services/payment/subscriptionService");
+const { handleWebhook } = require("./services/payment/webhookHandler");
+const { TRIAL_CONFIG } = require("./services/payment/planFeatures");
+
+const PLAN_RANKS = { free: 0, trial: 0, pro: 1, lifetime: 2 };
+
+exports.createCheckoutSession = onCall(
+  { cors: true, memory: "256MiB", timeoutSeconds: 30, minInstances: 0,
+    secrets: ["WHOP_API_KEY", "WHOP_WEBHOOK_SECRET", "WHOP_COMPANY_ID"] },
+  withRateLimit('createCheckoutSession')(async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "Autenticación requerida");
+    }
+    const { planId, interval, trial } = request.data || {};
+    if (!["pro", "lifetime"].includes(planId)) {
+      throw new HttpsError("invalid-argument", "Plan no válido. Usa: pro o lifetime");
+    }
+    if (planId === "pro" && !["month", "year"].includes(interval)) {
+      throw new HttpsError("invalid-argument", "Intervalo no válido para Pro. Usa: month o year");
+    }
+
+    const userDoc = await admin.firestore().collection("userData").doc(request.auth.uid).get();
+    const subscription = userDoc.data()?.subscription || {};
+    const currentPlan = subscription.planId || "free";
+    const currentRank = PLAN_RANKS[currentPlan] ?? 0;
+    const targetRank = PLAN_RANKS[planId] ?? 0;
+
+    // WHOP-010: Trial validation
+    let trialDays = 0;
+    if (trial === true) {
+      if (planId !== "pro" || interval !== "month") {
+        throw new HttpsError("failed-precondition", "El trial solo está disponible para el Plan PRO mensual");
+      }
+      if (currentPlan !== "free") {
+        throw new HttpsError("failed-precondition", "El trial solo está disponible para usuarios Free");
+      }
+      if (subscription.hasUsedTrial) {
+        throw new HttpsError("failed-precondition", "Ya utilizaste tu periodo de prueba gratuito");
+      }
+      trialDays = TRIAL_CONFIG.PERIOD_DAYS;
+    }
+
+    // WHOP-010: Allow trial→paid conversion (same rank but different origin)
+    const isTrialConversion = currentPlan === planId && subscription.subscriptionOrigin === "trial";
+
+    // WHOP-005 AC-13: PLAN_RANK guard — reject downgrade or same-plan checkout
+    if (currentRank >= targetRank && !isTrialConversion) {
+      throw new HttpsError("failed-precondition", "No puedes hacer downgrade ni renovar el mismo plan desde checkout");
+    }
+
+    return await subscriptionService.initiateCheckout(
+      request.auth.uid, request.auth.token.email, planId, interval || "lifetime", { trialDays }
+    );
+  })
+);
+
+exports.createPortalSession = onCall(
+  { cors: true, memory: "256MiB", timeoutSeconds: 30, minInstances: 0,
+    secrets: ["WHOP_API_KEY", "WHOP_WEBHOOK_SECRET", "WHOP_COMPANY_ID"] },
+  withRateLimit('createPortalSession')(async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "Autenticación requerida");
+    }
+    return await subscriptionService.createPortalSession(request.auth.uid);
+  })
+);
+
+exports.handlePaymentWebhook = onRequest(
+  { cors: false, memory: "256MiB", timeoutSeconds: 60, minInstances: 0,
+    secrets: ["AWS_SES_ACCESS_KEY_ID", "AWS_SES_SECRET_ACCESS_KEY", "WHOP_API_KEY", "WHOP_WEBHOOK_SECRET", "WHOP_COMPANY_ID"] },
+  handleWebhook
+);
+
+// PAY-005: Reconciliación automática de suscripciones vencidas
+const { reconcileSubscriptions } = require("./services/payment/reconcileSubscriptions");
+exports.reconcileSubscriptions = reconcileSubscriptions;
+
+// PAY-BILLING-001: Invoice History
+const { getSubscriptionInvoices } = require("./services/payment/invoiceService");
+exports.getSubscriptionInvoices = getSubscriptionInvoices;
+
+// PAY-PAYMENT-001: Payment Method Info
+const { getPaymentMethod } = require("./services/payment/paymentMethodService");
+exports.getPaymentMethod = getPaymentMethod;

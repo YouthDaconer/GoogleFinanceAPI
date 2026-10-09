@@ -1,18 +1,80 @@
 const { onSchedule } = require("firebase-functions/v2/scheduler");
+const { defineSecret } = require("firebase-functions/params");
 const admin = require('firebase-admin');
 const axios = require('axios');
 const { calculateAccountPerformance, convertCurrency } = require('../utils/portfolioCalculations');
 const { calculatePortfolioRisk } = require('./calculatePortfolioRisk');
-const { invalidatePerformanceCacheBatch } = require('./historicalReturnsService');
+const { invalidatePerformanceCacheBatch } = require('./cacheInvalidationService');
 const { DateTime } = require('luxon');
+const pLimit = require("p-limit");
 
 // Importar generador de logos
 const { generateLogoUrl } = require('../utils/logoGenerator');
 
+// PERF-SNAP-004: Importar generador de snapshots pre-computados
+// PERF-SNAP-024: Importar generador de snapshots per-asset
+const { fetchAllDailyDocs, generatePerformanceSnapshot, generateAssetSnapshot, buildSnapshotDocId } = require('./snapshotGenerator');
+
+// OPT-SNAP-INCR: Importar servicio de actualización incremental de snapshots
+const { updateSnapshotIncremental, updateAssetSnapshotIncremental } = require('./snapshotIncrementalService');
+
+// VS-009: Importar servicio de benchmark snapshots
+const { updateBenchmarkSnapshots } = require('./benchmarkSnapshotService');
+
+// OPT-SNAP-INCR Fase 3: Funciones internas para consolidación del pipeline nocturno
+const { saveIndicesHistoryDataInternal } = require('./marketDataScheduled');
+const { refreshIndexCacheInternal } = require('./indexHistoryService');
+
+/**
+ * SCALE-001: Máximo de usuarios procesados en paralelo.
+ * Calibrado para no exceder throughput de Firestore (~500 writes/sec).
+ * 5 usuarios × ~8 writes/usuario = ~40 writes simultáneos.
+ *
+ * @see docs/architecture/SCALE-PERF-001-consolidation-sustainability-diagnosis.md §6.1
+ */
+const MAX_PARALLEL_USERS = 5;
+
+/**
+ * SEC-TOKEN-001: Secret para autenticación server-to-server con API finance-query
+ * Usado por getPricesFromApi/getCurrencyRatesFromApi para obtener datos EOD.
+ * 
+ * @see docs/architecture/SEC-TOKEN-001-api-security-hardening-plan.md
+ */
+const cfServiceToken = defineSecret('CF_SERVICE_TOKEN');
+
 // Importar logger estructurado (SCALE-CORE-002)
 const { StructuredLogger } = require('../utils/logger');
 
-const API_BASE_URL = 'https://dmn46d7xas3rvio6tugd2vzs2q0hxbmb.lambda-url.us-east-1.on.aws/v1';
+// OPT-DEMAND-CLEANUP: Importar helper para obtener precios y currencies del API Lambda
+const { getPricesFromApi, getCurrencyRatesFromApi } = require('./marketDataHelper');
+
+/**
+ * End-of-Day Portfolio Update
+ * 
+ * OPT-DEMAND-CLEANUP: Refactorizada como el único punto de cálculos EOD.
+ * 
+ * CAMBIOS desde 2026-01-16:
+ * - Se ejecuta 1x/día a las 17:05 ET (5 min después del cierre)
+ * - Lee símbolos de `assets` (no de `currentPrices`)
+ * - Obtiene precios del API Lambda (no de Firestore)
+ * - NO escribe a `currentPrices` ni `currencies`
+ * - Calcula performance del portafolio
+ * - Calcula riesgo del portafolio
+ * - Invalida cache de performance
+ * 
+ * Reemplaza las funciones redundantes:
+ * - dailyEODSnapshot (deprecada)
+ * - scheduledPortfolioCalculations (deprecada)
+ * 
+ * @see docs/architecture/OPT-DEMAND-CLEANUP-phase4-closure-subplan.md
+ * @see docs/architecture/SEC-CF-001-cloudflare-tunnel-migration-plan.md
+ * @see docs/stories/85.story.md (OPT-DEMAND-302)
+ */
+
+const { FINANCE_QUERY_API_URL } = require('./config');
+
+// SEC-CF-001: API URL via Cloudflare Tunnel
+const API_BASE_URL = FINANCE_QUERY_API_URL;
 
 // Flag para habilitar logs detallados (puede causar mucho ruido en producción)
 const ENABLE_DETAILED_LOGS = process.env.ENABLE_DETAILED_LOGS === 'true';
@@ -119,6 +181,98 @@ function isInClosingWindow(closeHour = NYSE_CLOSE_HOUR) {
 }
 
 /**
+ * OPT-DEMAND-400-FIX: Lista de festivos de NYSE como fallback
+ * 
+ * NOTA: Esta lista es un FALLBACK en caso de que marketHolidays no esté disponible.
+ * La fuente principal de verdad es la colección marketHolidays/US sincronizada
+ * desde Finnhub mediante scheduledHolidaySync.
+ * 
+ * @see marketStatusService.js - syncMarketHolidays()
+ */
+const NYSE_HOLIDAYS_FALLBACK = new Set([
+  // 2025
+  '2025-01-01', '2025-01-20', '2025-02-17', '2025-04-18', '2025-05-26',
+  '2025-06-19', '2025-07-04', '2025-09-01', '2025-11-27', '2025-12-25',
+  // 2026
+  '2026-01-01', '2026-01-19', '2026-02-16', '2026-04-03', '2026-05-25',
+  '2026-06-19', '2026-07-03', '2026-09-07', '2026-11-26', '2026-12-25',
+  // 2027
+  '2027-01-01', '2027-01-18', '2027-02-15', '2027-03-26', '2027-05-31',
+  '2027-06-18', '2027-07-05', '2027-09-06', '2027-11-25', '2027-12-24',
+]);
+
+/**
+ * OPT-DEMAND-400-FIX: Verifica si una fecha fue un día de trading válido de NYSE
+ * 
+ * Un día es válido para guardar en portfolioPerformance si:
+ * 1. NO fue fin de semana (sábado o domingo)
+ * 2. NO fue un día festivo de NYSE
+ * 
+ * Orden de consulta para festivos:
+ * 1. marketHolidays/US (sincronizado desde Finnhub - fuente principal)
+ * 2. NYSE_HOLIDAYS_FALLBACK (lista estática - respaldo)
+ * 
+ * @param {FirebaseFirestore.Firestore} db - Instancia de Firestore
+ * @param {DateTime} date - Fecha a verificar (Luxon DateTime)
+ * @returns {Promise<{isValid: boolean, reason: string, holiday?: string}>}
+ */
+async function isValidTradingDay(db, date) {
+  const dayOfWeek = date.weekday; // 1=Monday, 7=Sunday
+  const formattedDate = date.toISODate();
+  
+  // 1. Verificar fin de semana
+  if (dayOfWeek === 6) {
+    return { isValid: false, reason: 'saturday', formattedDate };
+  }
+  if (dayOfWeek === 7) {
+    return { isValid: false, reason: 'sunday', formattedDate };
+  }
+  
+  // 2. Verificar festivo en marketHolidays/US (fuente principal - sincronizado desde Finnhub)
+  try {
+    const holidaysDoc = await db.collection('marketHolidays').doc('US').get();
+    
+    if (holidaysDoc.exists) {
+      const holidaysData = holidaysDoc.data();
+      
+      // El campo 'holidays' es un mapa: { "2026-01-19": "Martin Luther King Jr. Day", ... }
+      if (holidaysData.holidays && holidaysData.holidays[formattedDate]) {
+        const holidayName = holidaysData.holidays[formattedDate];
+        logInfo(`🎄 Holiday detected from marketHolidays: ${holidayName} (${formattedDate})`);
+        return { 
+          isValid: false, 
+          reason: 'holiday-marketHolidays', 
+          holiday: holidayName,
+          formattedDate 
+        };
+      }
+      
+      // Si llegamos aquí, marketHolidays existe pero la fecha no es festivo
+      return { isValid: true, reason: 'trading-day', formattedDate };
+    }
+    
+    // Si marketHolidays no existe, usar fallback estático
+    logWarn('⚠️ marketHolidays/US no encontrado, usando lista estática como fallback');
+    
+  } catch (error) {
+    logWarn(`⚠️ Error consultando marketHolidays: ${error.message}, usando fallback`);
+  }
+  
+  // 3. Fallback: Verificar en lista estática
+  if (NYSE_HOLIDAYS_FALLBACK.has(formattedDate)) {
+    return { 
+      isValid: false, 
+      reason: 'holiday-fallback-list', 
+      holiday: 'NYSE Holiday',
+      formattedDate 
+    };
+  }
+  
+  // Si pasó todas las validaciones, es un día de trading válido
+  return { isValid: true, reason: 'trading-day', formattedDate };
+}
+
+/**
  * 🚀 OPTIMIZACIÓN: Función unificada que obtiene todos los datos de mercado en una sola llamada
  * Combina monedas y símbolos de activos para minimizar llamadas a la API Lambda
  */
@@ -175,128 +329,21 @@ async function getAllMarketDataBatch(currencyCodes, assetSymbols) {
   }
 }
 
-/**
- * Actualiza las tasas de cambio de monedas usando datos ya obtenidos
- */
-async function updateCurrencyRates(db, currencyRates) {
-  logDebug('🔄 Actualizando tasas de cambio...');
-  
-  const currenciesRef = db.collection('currencies');
-  const snapshot = await currenciesRef.where('isActive', '==', true).get();
-  const batch = db.batch();
-  let updatesCount = 0;
-  let invalidCount = 0;
-
-  const activeCurrencies = snapshot.docs.map(doc => ({
-    code: doc.data().code,
-    ref: doc.ref,
-    data: doc.data()
-  }));
-  
-  activeCurrencies.forEach(currency => {
-    const { code, ref, data } = currency;
-    const newRate = currencyRates[code];
-    
-    if (newRate && !isNaN(newRate) && newRate > 0) {
-      const updatedData = {
-        code: code,
-        name: data.name,
-        symbol: data.symbol,
-        exchangeRate: newRate,
-        lastUpdated: admin.firestore.FieldValue.serverTimestamp()
-      };
-
-      batch.update(ref, updatedData);
-      updatesCount++;
-      
-      // 🚀 OPTIMIZACIÓN: Solo log detallado si está habilitado
-      if (ENABLE_DETAILED_LOGS) {
-        logDebug(`Actualizada tasa de cambio para USD:${code} a ${newRate}`);
-      }
-    } else {
-      invalidCount++;
-      logWarn(`Valor inválido para USD:${code}: ${newRate}`);
-    }
-  });
-
-  if (updatesCount > 0) {
-    await batch.commit();
-    logInfo(`✅ ${updatesCount} tasas de cambio actualizadas${invalidCount > 0 ? ` (${invalidCount} inválidas)` : ''}`);
-  }
-  
-  return updatesCount;
-}
-
-/**
- * Actualiza los precios actuales de los activos usando datos ya obtenidos
- */
-async function updateCurrentPrices(db, assetQuotes) {
-  logDebug('🔄 Actualizando precios actuales...');
-  
-  const currentPricesRef = db.collection('currentPrices');
-  const snapshot = await currentPricesRef.get();
-  const batch = db.batch();
-  let updatesCount = 0;
-  let failedUpdates = 0;
-
-  snapshot.docs.forEach(doc => {
-    const docData = doc.data();
-    const symbol = docData.symbol;
-    const quote = assetQuotes.get(symbol);
-    
-    if (quote && quote.regularMarketPrice) {
-      const updatedData = {
-        symbol: symbol,
-        price: quote.regularMarketPrice,
-        lastUpdated: Date.now(),
-        change: quote.regularMarketChange,
-        percentChange: quote.regularMarketChangePercent,
-        previousClose: quote.regularMarketPreviousClose,
-        currency: quote.currency,
-        marketState: quote.marketState,
-        quoteType: quote.quoteType,
-        exchange: quote.exchange,
-        fullExchangeName: quote.fullExchangeName
-      };
-      
-      // Mantener campos existentes
-      if (docData.name) updatedData.name = docData.name;
-      if (docData.isin) updatedData.isin = docData.isin;
-      if (docData.type) updatedData.type = docData.type;
-      if (docData.logo) updatedData.logo = docData.logo;
-      if (docData.website) updatedData.website = docData.website;
-      
-      // Generar logo si no existe en el documento
-      if (!docData.logo) {
-        const generatedLogo = generateLogoUrl(symbol, { 
-          website: docData.website, 
-          assetType: docData.type || 'stock' 
-        });
-        if (generatedLogo) {
-          updatedData.logo = generatedLogo;
-          logDebug(`Logo generado para ${symbol}`);
-        }
-      }
-      
-      batch.update(doc.ref, updatedData);
-      updatesCount++;
-      
-      // 🚀 OPTIMIZACIÓN: Solo log detallado si está habilitado
-      if (ENABLE_DETAILED_LOGS) {
-        logDebug(`Actualizado precio para ${symbol}: ${quote.regularMarketPrice} ${quote.currency}`);
-      }
-    } else {
-      failedUpdates++;
-    }
-  });
-
-  if (updatesCount > 0) {
-    await batch.commit();
-    logInfo(`✅ ${updatesCount} precios actualizados${failedUpdates > 0 ? ` (${failedUpdates} fallidos)` : ''}`);
-  }
-  
-  return updatesCount;
-}
+// ============================================================================
+// OPT-DEMAND-CLEANUP: Funciones eliminadas (2026-01-17)
+// ============================================================================
+// Las siguientes funciones fueron ELIMINADAS porque ya no se usan:
+//
+// - updateCurrencyRates(db, currencyRates)
+//   Razón: Las tasas de cambio ahora vienen del API Lambda on-demand.
+//   No se escriben a Firestore.
+//
+// - updateCurrentPrices(db, assetQuotes)
+//   Razón: Los precios ahora vienen del API Lambda on-demand.
+//   No se escriben a Firestore.
+//
+// Ver: docs/architecture/OPT-DEMAND-CLEANUP-firestore-fallback-removal.md
+// ============================================================================
 
 /**
  * 🚀 OPTIMIZACIÓN: Sistema de caché para datos históricos
@@ -373,6 +420,62 @@ class PerformanceDataCache {
     logInfo(`✅ Caché precargado: ${this.userLastPerformance.size} usuarios, ${this.accountLastPerformance.size} cuentas`);
   }
 
+  /**
+   * OPT-DEMAND-500: Valida consistencia entre datos de usuario y cuentas.
+   * 
+   * Detecta situaciones donde el overall tiene datos más recientes que las cuentas,
+   * lo cual causaría cálculos incorrectos de adjustedDailyChangePercentage.
+   * 
+   * @param {string} userId - ID del usuario
+   * @param {string[]} accountIds - IDs de las cuentas del usuario
+   * @returns {{isConsistent: boolean, userDate: string|null, accountDates: Object, gap: number}}
+   */
+  validateDataConsistency(userId, accountIds) {
+    const userData = this.userLastPerformance.get(userId);
+    const userDate = userData?.date || null;
+    
+    const accountDates = {};
+    let minAccountDate = null;
+    let maxAccountDate = null;
+    
+    for (const accountId of accountIds) {
+      const accountData = this.accountLastPerformance.get(accountId);
+      const accountDate = accountData?.date || null;
+      accountDates[accountId] = accountDate;
+      
+      if (accountDate) {
+        if (!minAccountDate || accountDate < minAccountDate) {
+          minAccountDate = accountDate;
+        }
+        if (!maxAccountDate || accountDate > maxAccountDate) {
+          maxAccountDate = accountDate;
+        }
+      }
+    }
+    
+    // Calcular gap en días entre overall y la cuenta más antigua
+    let gap = 0;
+    if (userDate && minAccountDate && userDate !== minAccountDate) {
+      const userDateTime = DateTime.fromISO(userDate);
+      const minAccountDateTime = DateTime.fromISO(minAccountDate);
+      gap = Math.abs(userDateTime.diff(minAccountDateTime, 'days').days);
+    }
+    
+    // Es inconsistente si:
+    // 1. El overall tiene fecha más reciente que alguna cuenta
+    // 2. Hay un gap de más de 1 día entre cuentas
+    const isConsistent = gap <= 1 && (!userDate || !minAccountDate || userDate <= maxAccountDate);
+    
+    return {
+      isConsistent,
+      userDate,
+      accountDates,
+      minAccountDate,
+      maxAccountDate,
+      gap
+    };
+  }
+
   getUserLastPerformance(userId, currencies) {
     const data = this.userLastPerformance.get(userId);
     if (!data) {
@@ -425,30 +528,550 @@ class PerformanceDataCache {
 }
 
 /**
- * 🚀 OPTIMIZACIÓN: Calcula el rendimiento diario del portafolio con caché
+ * SCALE-001: Procesa el rendimiento de un solo usuario.
+ * Aislado para paralelización. Atómico por WriteBatch local.
+ *
+ * @param {Object} params
+ * @param {FirebaseFirestore.Firestore} params.db
+ * @param {string} params.userId
+ * @param {Array} params.accounts - Cuentas activas del usuario
+ * @param {Array} params.currentPrices
+ * @param {Array} params.currencies
+ * @param {PerformanceDataCache} params.cache
+ * @param {Array} params.allAssets
+ * @param {Array} params.assetsToInclude
+ * @param {Array} params.sellTransactions
+ * @param {Object} params.sellTransactionsByAccount
+ * @param {Array} params.inactiveAssets
+ * @param {Array} params.activeAssets
+ * @param {Array} params.todaysTransactions
+ * @param {string} params.formattedDate
+ * @returns {Promise<{userId: string, success: boolean, error?: string}>}
+ * @see docs/architecture/SCALE-PERF-001-consolidation-sustainability-diagnosis.md §6.1
  */
-async function calculateDailyPortfolioPerformance(db) {
-  logInfo('🔄 Calculando rendimiento diario del portafolio (OPTIMIZADO)...');
+async function processUserPerformance({
+  db, userId, accounts, currentPrices, currencies,
+  cache, allAssets, assetsToInclude, sellTransactions,
+  sellTransactionsByAccount, inactiveAssets, activeAssets,
+  todaysTransactions, formattedDate
+}) {
+  const startMs = Date.now();
+  try {
+    logDebug(`👤 Procesando usuario ${userId} con ${accounts.length} cuentas`);
+    const lastOverallTotalValue = cache.getUserLastPerformance(userId, currencies);
+
+    const allUserAssets = assetsToInclude.filter(asset =>
+      accounts.some(account => account.id === asset.portfolioAccount)
+    );
+
+    const userTransactions = todaysTransactions.filter(t =>
+      accounts.some(account => account.id === t.portfolioAccountId)
+    );
+
+    const overallPerformance = calculateAccountPerformance(
+      allUserAssets,
+      currentPrices,
+      currencies,
+      lastOverallTotalValue,
+      userTransactions
+    );
+
+    // Calcular doneProfitAndLoss para cada moneda
+    const userDoneProfitAndLossByCurrency = {};
+    const userSellTransactions = sellTransactions.filter(t =>
+      accounts.some(account => account.id === t.portfolioAccountId)
+    );
+
+    for (const currency of currencies) {
+      let totalDoneProfitAndLoss = 0;
+      const assetDoneProfitAndLoss = {};
+
+      userSellTransactions.forEach(sellTx => {
+        if (sellTx.assetId) {
+          const asset = allAssets.find(a => a.id === sellTx.assetId);
+          if (asset) {
+            const assetKey = `${asset.name}_${asset.assetType}`;
+            if (!assetDoneProfitAndLoss[assetKey]) {
+              assetDoneProfitAndLoss[assetKey] = 0;
+            }
+
+            let profitAndLoss = 0;
+
+            if (sellTx.valuePnL !== undefined && sellTx.valuePnL !== null) {
+              profitAndLoss = convertCurrency(
+                sellTx.valuePnL,
+                sellTx.currency,
+                currency.code,
+                currencies,
+                sellTx.defaultCurrencyForAdquisitionDollar,
+                parseFloat(sellTx.dollarPriceToDate.toString())
+              );
+            } else {
+              const sellAmountConverted = convertCurrency(
+                sellTx.amount * sellTx.price,
+                sellTx.currency,
+                currency.code,
+                currencies,
+                sellTx.defaultCurrencyForAdquisitionDollar,
+                parseFloat(sellTx.dollarPriceToDate.toString())
+              );
+
+              const buyTxsForAsset = cache.getBuyTransactionsForAsset(sellTx.assetId);
+
+              if (buyTxsForAsset.length > 0) {
+                let totalBuyCost = 0;
+                let totalBuyUnits = 0;
+
+                buyTxsForAsset.forEach(buyTx => {
+                  totalBuyCost += buyTx.amount * buyTx.price;
+                  totalBuyUnits += buyTx.amount;
+                });
+
+                const avgCostPerUnit = totalBuyCost / totalBuyUnits;
+                const costOfSoldUnits = sellTx.amount * avgCostPerUnit;
+
+                const costOfSoldUnitsConverted = convertCurrency(
+                  costOfSoldUnits,
+                  sellTx.currency,
+                  currency.code,
+                  currencies,
+                  sellTx.defaultCurrencyForAdquisitionDollar,
+                  parseFloat(sellTx.dollarPriceToDate.toString())
+                );
+
+                profitAndLoss = sellAmountConverted - costOfSoldUnitsConverted;
+              }
+            }
+
+            assetDoneProfitAndLoss[assetKey] += profitAndLoss;
+            totalDoneProfitAndLoss += profitAndLoss;
+          }
+        }
+      });
+
+      userDoneProfitAndLossByCurrency[currency.code] = {
+        doneProfitAndLoss: totalDoneProfitAndLoss,
+        assetDoneProfitAndLoss
+      };
+    }
+
+    // Agregar doneProfitAndLoss a overallPerformance
+    for (const [currencyCode, data] of Object.entries(userDoneProfitAndLossByCurrency)) {
+      if (overallPerformance[currencyCode]) {
+        overallPerformance[currencyCode].doneProfitAndLoss = data.doneProfitAndLoss;
+
+        const unrealizedProfitAndLoss = overallPerformance[currencyCode].totalValue - overallPerformance[currencyCode].totalInvestment;
+        overallPerformance[currencyCode].unrealizedProfitAndLoss = unrealizedProfitAndLoss;
+
+        if (overallPerformance[currencyCode].assetPerformance) {
+          for (const [assetKey, pnl] of Object.entries(data.assetDoneProfitAndLoss)) {
+            if (overallPerformance[currencyCode].assetPerformance[assetKey]) {
+              overallPerformance[currencyCode].assetPerformance[assetKey].doneProfitAndLoss = pnl;
+            }
+          }
+
+          for (const [assetKey, assetData] of Object.entries(overallPerformance[currencyCode].assetPerformance)) {
+            const assetTotalValue = assetData.totalValue || 0;
+            const assetTotalInvestment = assetData.totalInvestment || 0;
+            const assetUnrealizedPnL = assetTotalValue - assetTotalInvestment;
+
+            overallPerformance[currencyCode].assetPerformance[assetKey].unrealizedProfitAndLoss = assetUnrealizedPnL;
+          }
+        }
+      }
+    }
+
+    // SCALE-001: WriteBatch local — atómico por usuario
+    const batch = db.batch();
+
+    const userPerformanceRef = db.collection("portfolioPerformance").doc(userId);
+    batch.set(userPerformanceRef, { userId }, { merge: true });
+
+    const userOverallPerformanceRef = userPerformanceRef.collection("dates").doc(formattedDate);
+    batch.set(userOverallPerformanceRef, {
+      date: formattedDate,
+      ...overallPerformance
+    });
+
+    // OPT-SNAP-INCR: Collect account performances for incremental snapshot update
+    const accountPerformancesMap = new Map();
+
+    // Procesar cada cuenta del usuario
+    for (const account of accounts) {
+      const accountSellTransactions = sellTransactionsByAccount[account.id] || [];
+      const inactiveAccountAssetsWithSells = inactiveAssets.filter(asset =>
+        asset.portfolioAccount === account.id &&
+        accountSellTransactions.some(t => t.assetId === asset.id)
+      );
+
+      const accountAssets = [
+        ...activeAssets.filter(asset => asset.portfolioAccount === account.id),
+        ...inactiveAccountAssetsWithSells
+      ];
+
+      const lastAccountTotalValue = cache.getAccountLastPerformance(account.id, currencies);
+
+      const accountTransactions = userTransactions.filter(t => t.portfolioAccountId === account.id);
+      const accountPerformance = calculateAccountPerformance(
+        accountAssets,
+        currentPrices,
+        currencies,
+        lastAccountTotalValue,
+        accountTransactions
+      );
+
+      // Calcular doneProfitAndLoss para la cuenta
+      const accountDoneProfitAndLossByCurrency = {};
+
+      for (const currency of currencies) {
+        let accountDoneProfitAndLoss = 0;
+        const accountAssetDoneProfitAndLoss = {};
+
+        accountSellTransactions.forEach(sellTx => {
+          if (sellTx.assetId) {
+            const asset = allAssets.find(a => a.id === sellTx.assetId);
+            if (asset) {
+              const assetKey = `${asset.name}_${asset.assetType}`;
+              if (!accountAssetDoneProfitAndLoss[assetKey]) {
+                accountAssetDoneProfitAndLoss[assetKey] = 0;
+              }
+
+              let profitAndLoss = 0;
+
+              if (sellTx.valuePnL !== undefined && sellTx.valuePnL !== null) {
+                profitAndLoss = convertCurrency(
+                  sellTx.valuePnL,
+                  sellTx.currency,
+                  currency.code,
+                  currencies,
+                  sellTx.defaultCurrencyForAdquisitionDollar,
+                  parseFloat(sellTx.dollarPriceToDate.toString())
+                );
+              } else {
+                const sellAmountConverted = convertCurrency(
+                  sellTx.amount * sellTx.price,
+                  sellTx.currency,
+                  currency.code,
+                  currencies,
+                  sellTx.defaultCurrencyForAdquisitionDollar,
+                  parseFloat(sellTx.dollarPriceToDate.toString())
+                );
+
+                const buyTxsForAsset = cache.getBuyTransactionsForAsset(sellTx.assetId);
+
+                if (buyTxsForAsset.length > 0) {
+                  let totalBuyCost = 0;
+                  let totalBuyUnits = 0;
+
+                  buyTxsForAsset.forEach(buyTx => {
+                    totalBuyCost += buyTx.amount * buyTx.price;
+                    totalBuyUnits += buyTx.amount;
+                  });
+
+                  const avgCostPerUnit = totalBuyCost / totalBuyUnits;
+                  const costOfSoldUnits = sellTx.amount * avgCostPerUnit;
+
+                  const costOfSoldUnitsConverted = convertCurrency(
+                    costOfSoldUnits,
+                    sellTx.currency,
+                    currency.code,
+                    currencies,
+                    sellTx.defaultCurrencyForAdquisitionDollar,
+                    parseFloat(sellTx.dollarPriceToDate.toString())
+                  );
+
+                  profitAndLoss = sellAmountConverted - costOfSoldUnitsConverted;
+                }
+              }
+
+              accountAssetDoneProfitAndLoss[assetKey] += profitAndLoss;
+              accountDoneProfitAndLoss += profitAndLoss;
+            }
+          }
+        });
+
+        accountDoneProfitAndLossByCurrency[currency.code] = {
+          doneProfitAndLoss: accountDoneProfitAndLoss,
+          assetDoneProfitAndLoss: accountAssetDoneProfitAndLoss
+        };
+      }
+
+      // Agregar doneProfitAndLoss a accountPerformance
+      for (const [currencyCode, data] of Object.entries(accountDoneProfitAndLossByCurrency)) {
+        if (accountPerformance[currencyCode]) {
+          accountPerformance[currencyCode].doneProfitAndLoss = data.doneProfitAndLoss;
+
+          const accountUnrealizedPnL = accountPerformance[currencyCode].totalValue - accountPerformance[currencyCode].totalInvestment;
+          accountPerformance[currencyCode].unrealizedProfitAndLoss = accountUnrealizedPnL;
+
+          if (accountPerformance[currencyCode].assetPerformance) {
+            for (const [assetKey, pnl] of Object.entries(data.assetDoneProfitAndLoss)) {
+              if (accountPerformance[currencyCode].assetPerformance[assetKey]) {
+                accountPerformance[currencyCode].assetPerformance[assetKey].doneProfitAndLoss = pnl;
+              }
+            }
+
+            for (const [assetKey, assetData] of Object.entries(accountPerformance[currencyCode].assetPerformance)) {
+              const accountAssetTotalValue = assetData.totalValue || 0;
+              const accountAssetTotalInvestment = assetData.totalInvestment || 0;
+              const accountAssetUnrealizedPnL = accountAssetTotalValue - accountAssetTotalInvestment;
+
+              accountPerformance[currencyCode].assetPerformance[assetKey].unrealizedProfitAndLoss = accountAssetUnrealizedPnL;
+            }
+          }
+        }
+      }
+
+      const accountRef = userPerformanceRef.collection("accounts").doc(account.id);
+      batch.set(accountRef, { accountId: account.id }, { merge: true });
+
+      const accountPerformanceRef = accountRef.collection("dates").doc(formattedDate);
+      batch.set(accountPerformanceRef, {
+        date: formattedDate,
+        ...accountPerformance
+      });
+
+      // OPT-SNAP-INCR: Store for incremental snapshot update
+      accountPerformancesMap.set(account.id, accountPerformance);
+    }
+
+    await batch.commit();
+
+    // FIX-READS-001: Capture timestamp BEFORE snapshot loop starts.
+    // Snapshots write lastUpdated: new Date() DURING the loop, so pipelineTs <= snapshot.lastUpdated always.
+    // This prevents the staleness check (signal > snapshot.lastUpdated) from false-positive marking fresh snapshots as stale.
+    const pipelineTs = new Date().toISOString();
+
+    // OPT-SNAP-INCR: Snapshot incremental append (1 read + 1 write per snapshot)
+    // Feature flag allows instant rollback to legacy full-rebuild path
+    try {
+      // PERF-SNAP-026: Smart Currency — solo USD + defaultCurrency del usuario
+      let snapshotCurrencies = ['USD'];
+      try {
+        const userDataDoc = await db.collection('userData').doc(userId).get();
+        const defaultCurrency = userDataDoc.exists ? userDataDoc.data()?.defaultCurrency : null;
+        if (defaultCurrency && defaultCurrency !== 'USD') {
+          snapshotCurrencies.push(defaultCurrency);
+        }
+      } catch (currencyReadError) {
+        logWarn(`[EOD][Snapshot] Could not read defaultCurrency for ${userId}, using USD only: ${currencyReadError.message}`);
+      }
+
+      const accountIds = accounts.map(a => a.id);
+
+      // OPT-SNAP-INCR: Incremental snapshot append (1 read + 1 write per snapshot)
+      const allAccountIds = ['overall', ...accountIds];
+      let snapshotSuccess = 0;
+      let snapshotFailed = 0;
+      const methods = { incremental: 0, 'full-rebuild': 0, skipped: 0 };
+
+      // Portfolio snapshots (overall + per-account)
+      for (const accountId of allAccountIds) {
+        const perfData = accountId === 'overall'
+          ? overallPerformance
+          : accountPerformancesMap.get(accountId);
+
+        if (!perfData) continue;
+
+        for (const currency of snapshotCurrencies) {
+          try {
+            // M3-FIX: Guard against currency not existing in perfData
+            const currencyData = perfData[currency];
+            if (!currencyData || (currencyData.totalValue === undefined && currencyData.totalInvestment === undefined)) {
+              continue;
+            }
+
+            const dailyData = {
+              date: formattedDate,
+              totalValue: currencyData.totalValue ?? 0,
+              totalInvestment: currencyData.totalInvestment ?? 0,
+              adjustedDailyChangePercentage: currencyData.adjustedDailyChangePercentage ?? 0,
+              dailyChangePercentage: currencyData.dailyChangePercentage ?? 0,
+              totalCashFlow: currencyData.totalCashFlow ?? 0,
+              doneProfitAndLoss: currencyData.doneProfitAndLoss ?? 0,
+              unrealizedProfitAndLoss: currencyData.unrealizedProfitAndLoss ?? 0,
+              assetPerformance: currencyData.assetPerformance || {},
+            };
+
+            const docId = buildSnapshotDocId(userId, accountId, currency);
+            const result = await updateSnapshotIncremental(db, docId, dailyData);
+
+            if (result.method === 'full-rebuild') {
+              const dailyDocs = await fetchAllDailyDocs(db, userId, accountId);
+              await generatePerformanceSnapshot(db, userId, accountId, currency, { dailyDocs });
+              methods['full-rebuild']++;
+            } else {
+              methods[result.method]++;
+            }
+            snapshotSuccess++;
+          } catch (err) {
+            snapshotFailed++;
+            logWarn(`[OPT-SNAP-INCR] Portfolio snapshot failed ${userId}/${accountId}/${currency}: ${err.message}`);
+          }
+        }
+      }
+
+      // Asset snapshots (overall only, incremental)
+      // H2-FIX: Cache dailyDocs to avoid re-fetching for each asset on first deploy
+      let cachedOverallDailyDocs = null;
+
+      for (const currency of snapshotCurrencies) {
+        const overallCurrencyData = overallPerformance[currency] || {};
+        const assetPerf = overallCurrencyData.assetPerformance || {};
+
+        for (const [assetKey, assetData] of Object.entries(assetPerf)) {
+          const parts = assetKey.split('_');
+          if (parts.length < 2) continue;
+          const assetType = parts.pop();
+          const ticker = parts.join('_');
+
+          try {
+            const docId = buildSnapshotDocId(userId, 'overall', currency, ticker, assetType);
+            const result = await updateAssetSnapshotIncremental(db, docId, assetData, formattedDate);
+
+            if (result.method === 'full-rebuild') {
+              // H2-FIX: Reuse cached dailyDocs across all assets needing full rebuild
+              if (!cachedOverallDailyDocs) {
+                cachedOverallDailyDocs = await fetchAllDailyDocs(db, userId, 'overall');
+              }
+              await generateAssetSnapshot(db, userId, 'overall', currency, ticker, assetType, { dailyDocs: cachedOverallDailyDocs });
+              methods['full-rebuild']++;
+            } else {
+              methods[result.method]++;
+            }
+            snapshotSuccess++;
+          } catch (err) {
+            snapshotFailed++;
+          }
+        }
+      }
+
+      logInfo(`[OPT-SNAP-INCR] User ${userId}: success=${snapshotSuccess}, failed=${snapshotFailed}, methods=${JSON.stringify(methods)}`);
+    } catch (snapshotError) {
+      logWarn(`[EOD][Snapshot] Error en snapshot para ${userId}: ${snapshotError.message}`);
+    }
+
+    // IMPORTANTE: Fuera del try/catch de snapshots para que SIEMPRE se escriba,
+    // IndexedDB cache aunque los snapshots no se hayan regenerado.
+    // FIX-READS-001: Use pipelineTs (captured pre-loop) to guarantee signal <= snapshot.lastUpdated.
+    try {
+      await db.collection("portfolioPerformance").doc(userId).set({
+        lastSnapshotUpdate: pipelineTs
+      }, { merge: true });
+      // R-08: Also write to userData so the frontend onSnapshot(userData) picks it up
+      // without a separate getDoc to portfolioPerformance. Saves 1 read + eliminates 30s poll.
+      await db.collection("userData").doc(userId).set({
+        lastSnapshotUpdate: pipelineTs
+      }, { merge: true });
+      logInfo(`[EOD][Snapshot] lastSnapshotUpdate written for ${userId}: ${pipelineTs}`);
+    } catch (signalError) {
+      logWarn(`[EOD][Snapshot] Error writing lastSnapshotUpdate for ${userId}: ${signalError.message}`);
+    }
+
+    return { userId, success: true, durationMs: Date.now() - startMs };
+  } catch (error) {
+    logError(`Error procesando usuario ${userId} (${Date.now() - startMs}ms)`, error);
+    return { userId, success: false, error: error.message, durationMs: Date.now() - startMs };
+  }
+}
+
+/**
+ * SCALE-004: Marca usuarios con inconsistencias de datos (gap > 1 día) como _stale
+ * para que reconcileStalePerformance los recalcule automáticamente.
+ *
+ * @param {FirebaseFirestore.Firestore} db
+ * @param {Array<{userId: string, gap: number, minAccountDate: string, maxAccountDate: string, userDate: string|null}>} inconsistentUsers
+ * @returns {Promise<number>} Número de usuarios marcados como _stale
+ * @see docs/architecture/SCALE-PERF-001-consolidation-sustainability-diagnosis.md §6.6
+ */
+async function markInconsistentUsersAsStale(db, inconsistentUsers) {
+  let consistencyStaleMarked = 0;
+
+  if (inconsistentUsers.length === 0) {
+    return consistencyStaleMarked;
+  }
+
+  logWarn(`⚠️ SCALE-004: Detectados ${inconsistentUsers.length} usuarios con datos inconsistentes`);
+
+  for (const user of inconsistentUsers) {
+    logWarn(`   Usuario ${user.userId}: overall=${user.userDate}, min=${user.minAccountDate}, max=${user.maxAccountDate}, gap=${user.gap} días`);
+
+    if (user.gap <= 1) {
+      continue;
+    }
+
+    try {
+      const perfDoc = await db.collection("portfolioPerformance").doc(user.userId).get();
+      const existingStale = perfDoc.data()?._stale;
+
+      if (existingStale) {
+        logInfo(`   ↳ ${user.userId}: Ya tiene _stale (since=${existingStale.since}), omitiendo re-marca`);
+      } else {
+        await db.collection("portfolioPerformance").doc(user.userId).set({
+          _stale: {
+            since: user.minAccountDate,
+            reason: "auto-detected-inconsistency",
+            source: "consistency-monitor",
+            retryCount: 0,
+            lastAttempt: new Date().toISOString()
+          }
+        }, { merge: true });
+        consistencyStaleMarked++;
+        logWarn(`   ↳ ${user.userId}: Marcado como _stale (since=${user.minAccountDate}) para reconciliación automática`);
+      }
+    } catch (staleError) {
+      logError(`   ↳ Error marcando ${user.userId} como stale`, staleError);
+    }
+  }
+
+  return consistencyStaleMarked;
+}
+
+/**
+ * OPT-DEMAND-CLEANUP: Calcula el rendimiento diario del portafolio.
+ * 
+ * Modificada para recibir precios y currencies como parámetros
+ * en lugar de leer de Firestore.
+ * 
+ * @param {FirebaseFirestore.Firestore} db - Instancia de Firestore
+ * @param {Array} currentPrices - Precios actuales del API Lambda
+ * @param {Array} currencies - Tasas de cambio del API Lambda
+ * @param {Object} [options] - Opciones adicionales
+ * @param {FirebaseFirestore.QuerySnapshot} [options.activeAssetsSnapshot] - FIX-READS-002: Pre-fetched active assets to avoid redundant global scan
+ */
+async function calculateDailyPortfolioPerformance(db, currentPrices, currencies, options = {}) {
+  logInfo('🔄 Calculando rendimiento diario del portafolio (API Lambda)...');
   
+  // OPT-DEMAND-400-FIX: Usar fecha del DÍA ANTERIOR para el cálculo
+  // Esta función se ejecuta a las 00:05 ET del día siguiente,
+  // por lo que los precios corresponden al día de trading anterior
   const now = DateTime.now().setZone('America/New_York');
-  const formattedDate = now.toISODate();
-  let calculationsCount = 0;
+  const yesterday = now.minus({ days: 1 });
+  const formattedDate = yesterday.toISODate();
   
-  logDebug(`📅 Fecha de cálculo (NY): ${formattedDate}`);
+  // FIX-TIMESTAMP-002: Rango de fechas para soportar campo date con timestamp completo
+  const dateRangeStart = `${formattedDate}T00:00:00.000Z`;
+  const dateRangeEnd = `${formattedDate}T23:59:59.999Z`;
   
-  // ✨ OPTIMIZACIÓN: Todas las consultas iniciales en paralelo
+  logDebug(`📅 Fecha de cálculo (día anterior): ${formattedDate}`);
+  logDebug(`📅 Hora actual de ejecución (NY): ${now.toISO()}`);
+  
+  // OPT-DEMAND-CLEANUP: Solo consultar datos que NO vienen del API
+  // FIX-TIMESTAMP-002: Usar rango de fechas para soportar timestamps completos
+  // FIX-READS-002: Use injected assets if available to avoid redundant global scan
   const [
     transactionsSnapshot,
     activeAssetsSnapshot,
-    currenciesSnapshot,
-    portfolioAccountsSnapshot,
-    currentPricesSnapshot
+    portfolioAccountsSnapshot
   ] = await Promise.all([
-    db.collection('transactions').where('date', '==', formattedDate).get(),
-    db.collection('assets').where('isActive', '==', true).get(),
-    db.collection('currencies').where('isActive', '==', true).get(),
-    db.collection('portfolioAccounts').where('isActive', '==', true).get(),
-    db.collection('currentPrices').get()
+    db.collection('transactions')
+      .where('date', '>=', dateRangeStart)
+      .where('date', '<=', dateRangeEnd)
+      .get(),
+    options.activeAssetsSnapshot
+      ? Promise.resolve(options.activeAssetsSnapshot)
+      : db.collection('assets').where('isActive', '==', true).get(),
+    db.collection('portfolioAccounts').where('isActive', '==', true).get()
   ]);
   
   const todaysTransactions = transactionsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
@@ -457,11 +1080,10 @@ async function calculateDailyPortfolioPerformance(db) {
   
   // 🚀 OPTIMIZACIÓN: Log consolidado de transacciones
   logInfo(`📊 Transacciones para ${formattedDate}: ${todaysTransactions.length} total (${sellTransactions.length} ventas)`);
+  logInfo(`📊 Datos de mercado: ${currentPrices.length} precios, ${currencies.length} currencies (fuente: API Lambda)`);
   
   const activeAssets = activeAssetsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-  const currencies = currenciesSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
   const portfolioAccounts = portfolioAccountsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-  const currentPrices = currentPricesSnapshot.docs.map(doc => ({ symbol: doc.id.split(':')[0], ...doc.data() }));
   
   // Obtener activos inactivos involucrados en ventas
   let inactiveAssets = [];
@@ -512,454 +1134,262 @@ async function calculateDailyPortfolioPerformance(db) {
   const cache = new PerformanceDataCache();
   await cache.preloadHistoricalData(db, formattedDate, userPortfolios, sellTransactions);
 
-  // ✨ OPTIMIZACIÓN: Batch único para todas las operaciones
-  const BATCH_SIZE = 450;
-  let batch = db.batch();
-  let batchCount = 0;
-  let totalBatchesCommitted = 0;
+  // OPT-DEMAND-500: Validar consistencia de datos antes de calcular
+  // Esto previene corrupciones cuando overall y cuentas tienen fechas diferentes
+  const inconsistentUsers = [];
+  for (const [userId, accounts] of Object.entries(userPortfolios)) {
+    const accountIds = accounts.map(acc => acc.id);
+    const consistency = cache.validateDataConsistency(userId, accountIds);
+    
+    if (!consistency.isConsistent) {
+      inconsistentUsers.push({
+        userId,
+        ...consistency
+      });
+    }
+  }
+  
+  // SCALE-004: Auto-reparación de inconsistencias detectadas
+  const consistencyStaleMarked = await markInconsistentUsersAsStale(db, inconsistentUsers);
 
-  // 🚀 OPTIMIZACIÓN: Log consolidado de procesamiento
+  const perfStartMs = Date.now();
+
+  // 🚀 SCALE-001: Log consolidado de procesamiento
   const userCount = Object.keys(userPortfolios).length;
   const totalAccounts = Object.values(userPortfolios).flat().length;
-  logInfo(`👥 Procesando ${userCount} usuarios con ${totalAccounts} cuentas activas`);
-  
-  for (const [userId, accounts] of Object.entries(userPortfolios)) {
-    logDebug(`👤 Procesando usuario ${userId} con ${accounts.length} cuentas`);
-    // ✨ OPTIMIZACIÓN: Usar datos del caché en lugar de consultas individuales
-    const lastOverallTotalValue = cache.getUserLastPerformance(userId, currencies);
+  logInfo(`👥 Procesando ${userCount} usuarios con ${totalAccounts} cuentas activas (paralelo, max ${MAX_PARALLEL_USERS})`);
 
-    const allUserAssets = assetsToInclude.filter(asset => 
-      accounts.some(account => account.id === asset.portfolioAccount)
-    );
-    
-    const userTransactions = todaysTransactions.filter(t => 
-      accounts.some(account => account.id === t.portfolioAccountId)
-    );
+  // SCALE-001: Procesar usuarios en paralelo controlado
+  const limit = pLimit(MAX_PARALLEL_USERS);
+  const results = await Promise.allSettled(
+    Object.entries(userPortfolios).map(([userId, accounts]) =>
+      limit(() => processUserPerformance({
+        db, userId, accounts, currentPrices, currencies,
+        cache, allAssets, assetsToInclude, sellTransactions,
+        sellTransactionsByAccount, inactiveAssets, activeAssets,
+        todaysTransactions, formattedDate
+      }))
+    )
+  );
 
-    const overallPerformance = calculateAccountPerformance(
-      allUserAssets,
-      currentPrices,
-      currencies,
-      lastOverallTotalValue,
-      userTransactions
-    );
-
-    // Calcular doneProfitAndLoss para cada moneda
-    const userDoneProfitAndLossByCurrency = {};
-    const userSellTransactions = sellTransactions.filter(t => 
-      accounts.some(account => account.id === t.portfolioAccountId)
-    );
-    
-    for (const currency of currencies) {
-      let totalDoneProfitAndLoss = 0;
-      const assetDoneProfitAndLoss = {};
-      
-      userSellTransactions.forEach(sellTx => {
-        if (sellTx.assetId) {
-          const asset = allAssets.find(a => a.id === sellTx.assetId);
-          if (asset) {
-            const assetKey = `${asset.name}_${asset.assetType}`;
-            if (!assetDoneProfitAndLoss[assetKey]) {
-              assetDoneProfitAndLoss[assetKey] = 0;
-            }
-            
-            let profitAndLoss = 0;
-            
-            // ✨ OPTIMIZACIÓN: Usar valuePnL si está disponible
-            if (sellTx.valuePnL !== undefined && sellTx.valuePnL !== null) {
-              // Usar PnL precalculada y convertir a moneda objetivo
-              profitAndLoss = convertCurrency(
-                sellTx.valuePnL,
-                sellTx.currency,
-                currency.code,
-                currencies,
-                sellTx.defaultCurrencyForAdquisitionDollar,
-                parseFloat(sellTx.dollarPriceToDate.toString())
-              );
-            } else {
-              // Fallback: calcular PnL manualmente (método anterior)
-              const sellAmountConverted = convertCurrency(
-                sellTx.amount * sellTx.price,
-                sellTx.currency,
-                currency.code,
-                currencies,
-                sellTx.defaultCurrencyForAdquisitionDollar,
-                parseFloat(sellTx.dollarPriceToDate.toString())
-              );
-              
-              const buyTxsForAsset = cache.getBuyTransactionsForAsset(sellTx.assetId);
-              
-              if (buyTxsForAsset.length > 0) {
-                let totalBuyCost = 0;
-                let totalBuyUnits = 0;
-                
-                buyTxsForAsset.forEach(buyTx => {
-                  totalBuyCost += buyTx.amount * buyTx.price;
-                  totalBuyUnits += buyTx.amount;
-                });
-                
-                const avgCostPerUnit = totalBuyCost / totalBuyUnits;
-                const costOfSoldUnits = sellTx.amount * avgCostPerUnit;
-                
-                const costOfSoldUnitsConverted = convertCurrency(
-                  costOfSoldUnits,
-                  sellTx.currency,
-                  currency.code,
-                  currencies,
-                  sellTx.defaultCurrencyForAdquisitionDollar,
-                  parseFloat(sellTx.dollarPriceToDate.toString())
-                );
-                
-                profitAndLoss = sellAmountConverted - costOfSoldUnitsConverted;
-              }
-            }
-            
-            assetDoneProfitAndLoss[assetKey] += profitAndLoss;
-            totalDoneProfitAndLoss += profitAndLoss;
-          }
-        }
-      });
-      
-      userDoneProfitAndLossByCurrency[currency.code] = { 
-        doneProfitAndLoss: totalDoneProfitAndLoss,
-        assetDoneProfitAndLoss
-      };
+  // SCALE-001: Agregar resultados
+  const successResults = results.filter(r => r.status === "fulfilled" && r.value.success);
+  const failedResults = results.filter(r => r.status === "rejected" || (r.status === "fulfilled" && !r.value.success));
+  const successUserIds = successResults.map(r => r.value.userId);
+  const failedUserIds = failedResults.map(r => {
+    if (r.status === "rejected") {
+      logWarn("SCALE-001: Promise rejected inesperadamente", r.reason);
+      return null;
     }
+    return r.value.userId;
+  }).filter(Boolean);
 
-    // Agregar doneProfitAndLoss a overallPerformance
-    for (const [currencyCode, data] of Object.entries(userDoneProfitAndLossByCurrency)) {
-      if (overallPerformance[currencyCode]) {
-        overallPerformance[currencyCode].doneProfitAndLoss = data.doneProfitAndLoss;
-        
-        const unrealizedProfitAndLoss = overallPerformance[currencyCode].totalValue - overallPerformance[currencyCode].totalInvestment;
-        overallPerformance[currencyCode].unrealizedProfitAndLoss = unrealizedProfitAndLoss;
-        
-        if (overallPerformance[currencyCode].assetPerformance) {
-          for (const [assetKey, pnl] of Object.entries(data.assetDoneProfitAndLoss)) {
-            if (overallPerformance[currencyCode].assetPerformance[assetKey]) {
-              overallPerformance[currencyCode].assetPerformance[assetKey].doneProfitAndLoss = pnl;
-            }
+  // SCALE-001: Marcar usuarios fallidos como _stale para reconciliación automática
+  if (failedUserIds.length > 0) {
+    logWarn(`⚠️ SCALE-001: ${failedUserIds.length} usuarios fallaron, marcando como _stale`);
+    for (const failedUserId of failedUserIds) {
+      try {
+        await db.collection("portfolioPerformance").doc(failedUserId).set({
+          _stale: {
+            since: formattedDate,
+            reason: "eod-parallel-processing-failure",
+            source: "unifiedMarketDataUpdate",
+            retryCount: 0,
+            lastAttempt: new Date().toISOString()
           }
-          
-          for (const [assetKey, assetData] of Object.entries(overallPerformance[currencyCode].assetPerformance)) {
-            const assetTotalValue = assetData.totalValue || 0;
-            const assetTotalInvestment = assetData.totalInvestment || 0;
-            const assetUnrealizedPnL = assetTotalValue - assetTotalInvestment;
-            
-            overallPerformance[currencyCode].assetPerformance[assetKey].unrealizedProfitAndLoss = assetUnrealizedPnL;
-          }
-        }
+        }, { merge: true });
+      } catch (staleError) {
+        logError(`Error marcando usuario ${failedUserId} como stale`, staleError);
       }
     }
-
-    // ✨ OPTIMIZACIÓN: Asegurar documento de usuario (idempotente)
-    const userPerformanceRef = db.collection('portfolioPerformance').doc(userId);
-    batch.set(userPerformanceRef, { userId }, { merge: true });
-    batchCount++;
-
-    // Guardar rendimiento general del usuario
-    const userOverallPerformanceRef = userPerformanceRef.collection('dates').doc(formattedDate);
-    batch.set(userOverallPerformanceRef, {
-      date: formattedDate,
-      ...overallPerformance
-    });
-    batchCount++;
-
-    // Procesar cada cuenta del usuario
-    for (const account of accounts) {
-      const accountSellTransactions = sellTransactionsByAccount[account.id] || [];
-      const inactiveAccountAssetsWithSells = inactiveAssets.filter(asset => 
-        asset.portfolioAccount === account.id && 
-        accountSellTransactions.some(t => t.assetId === asset.id)
-      );
-      
-      const accountAssets = [
-        ...activeAssets.filter(asset => asset.portfolioAccount === account.id),
-        ...inactiveAccountAssetsWithSells
-      ];
-
-      // ✨ OPTIMIZACIÓN: Usar datos del caché para la cuenta
-      const lastAccountTotalValue = cache.getAccountLastPerformance(account.id, currencies);
-
-      const accountTransactions = userTransactions.filter(t => t.portfolioAccountId === account.id);
-      const accountPerformance = calculateAccountPerformance(
-        accountAssets,
-        currentPrices,
-        currencies,
-        lastAccountTotalValue,
-        accountTransactions
-      );
-
-      // Calcular doneProfitAndLoss para la cuenta (similar al usuario)
-      const accountDoneProfitAndLossByCurrency = {};
-      
-      for (const currency of currencies) {
-        let accountDoneProfitAndLoss = 0;
-        const accountAssetDoneProfitAndLoss = {};
-        
-        accountSellTransactions.forEach(sellTx => {
-          if (sellTx.assetId) {
-            const asset = allAssets.find(a => a.id === sellTx.assetId);
-            if (asset) {
-              const assetKey = `${asset.name}_${asset.assetType}`;
-              if (!accountAssetDoneProfitAndLoss[assetKey]) {
-                accountAssetDoneProfitAndLoss[assetKey] = 0;
-              }
-              
-              let profitAndLoss = 0;
-              
-              // ✨ OPTIMIZACIÓN: Usar valuePnL si está disponible
-              if (sellTx.valuePnL !== undefined && sellTx.valuePnL !== null) {
-                // Usar PnL precalculada y convertir a moneda objetivo
-                profitAndLoss = convertCurrency(
-                  sellTx.valuePnL,
-                  sellTx.currency,
-                  currency.code,
-                  currencies,
-                  sellTx.defaultCurrencyForAdquisitionDollar,
-                  parseFloat(sellTx.dollarPriceToDate.toString())
-                );
-              } else {
-                // Fallback: calcular PnL manualmente (método anterior)
-                const sellAmountConverted = convertCurrency(
-                  sellTx.amount * sellTx.price,
-                  sellTx.currency,
-                  currency.code,
-                  currencies,
-                  sellTx.defaultCurrencyForAdquisitionDollar,
-                  parseFloat(sellTx.dollarPriceToDate.toString())
-                );
-                
-                const buyTxsForAsset = cache.getBuyTransactionsForAsset(sellTx.assetId);
-                
-                if (buyTxsForAsset.length > 0) {
-                  let totalBuyCost = 0;
-                  let totalBuyUnits = 0;
-                  
-                  buyTxsForAsset.forEach(buyTx => {
-                    totalBuyCost += buyTx.amount * buyTx.price;
-                    totalBuyUnits += buyTx.amount;
-                  });
-                  
-                  const avgCostPerUnit = totalBuyCost / totalBuyUnits;
-                  const costOfSoldUnits = sellTx.amount * avgCostPerUnit;
-                  
-                  const costOfSoldUnitsConverted = convertCurrency(
-                    costOfSoldUnits,
-                    sellTx.currency,
-                    currency.code,
-                    currencies,
-                    sellTx.defaultCurrencyForAdquisitionDollar,
-                    parseFloat(sellTx.dollarPriceToDate.toString())
-                  );
-                  
-                  profitAndLoss = sellAmountConverted - costOfSoldUnitsConverted;
-                }
-              }
-              
-              accountAssetDoneProfitAndLoss[assetKey] += profitAndLoss;
-              accountDoneProfitAndLoss += profitAndLoss;
-            }
-          }
-        });
-        
-        accountDoneProfitAndLossByCurrency[currency.code] = { 
-          doneProfitAndLoss: accountDoneProfitAndLoss,
-          assetDoneProfitAndLoss: accountAssetDoneProfitAndLoss
-        };
-      }
-
-      // Agregar doneProfitAndLoss a accountPerformance
-      for (const [currencyCode, data] of Object.entries(accountDoneProfitAndLossByCurrency)) {
-        if (accountPerformance[currencyCode]) {
-          accountPerformance[currencyCode].doneProfitAndLoss = data.doneProfitAndLoss;
-          
-          const accountUnrealizedPnL = accountPerformance[currencyCode].totalValue - accountPerformance[currencyCode].totalInvestment;
-          accountPerformance[currencyCode].unrealizedProfitAndLoss = accountUnrealizedPnL;
-          
-          if (accountPerformance[currencyCode].assetPerformance) {
-            for (const [assetKey, pnl] of Object.entries(data.assetDoneProfitAndLoss)) {
-              if (accountPerformance[currencyCode].assetPerformance[assetKey]) {
-                accountPerformance[currencyCode].assetPerformance[assetKey].doneProfitAndLoss = pnl;
-              }
-            }
-            
-            for (const [assetKey, assetData] of Object.entries(accountPerformance[currencyCode].assetPerformance)) {
-              const accountAssetTotalValue = assetData.totalValue || 0;
-              const accountAssetTotalInvestment = assetData.totalInvestment || 0;
-              const accountAssetUnrealizedPnL = accountAssetTotalValue - accountAssetTotalInvestment;
-              
-              accountPerformance[currencyCode].assetPerformance[assetKey].unrealizedProfitAndLoss = accountAssetUnrealizedPnL;
-            }
-          }
-        }
-      }
-
-      // ✨ OPTIMIZACIÓN: Asegurar documento de cuenta (idempotente)
-      const accountRef = userPerformanceRef.collection('accounts').doc(account.id);
-      batch.set(accountRef, { accountId: account.id }, { merge: true });
-      batchCount++;
-
-      // Guardar rendimiento de la cuenta
-      const accountPerformanceRef = accountRef.collection('dates').doc(formattedDate);
-      batch.set(accountPerformanceRef, {
-        date: formattedDate,
-        ...accountPerformance
-      });
-      batchCount++;
-
-      // ✨ Commit batch si se acerca al límite
-      if (batchCount >= BATCH_SIZE) {
-        await batch.commit();
-        totalBatchesCommitted++;
-        logDebug(`📦 Batch ${totalBatchesCommitted} de ${batchCount} operaciones completado`);
-        batch = db.batch();
-        batchCount = 0;
-      }
-    }
-
-    calculationsCount++;
   }
 
-  // ✨ Commit final del batch
-  if (batchCount > 0) {
-    await batch.commit();
-    totalBatchesCommitted++;
-    logDebug(`📦 Batch final ${totalBatchesCommitted} de ${batchCount} operaciones completado`);
-  }
-
-  logInfo(`✅ Rendimiento calculado para ${calculationsCount} usuarios (${totalBatchesCommitted} batches)`);
-  return { count: calculationsCount, userIds: Object.keys(userPortfolios) };
+  const totalDurationMs = Date.now() - perfStartMs;
+  logInfo(`✅ Rendimiento calculado para ${successUserIds.length} usuarios (${failedUserIds.length} fallidos) en ${totalDurationMs}ms`);
+  return {
+    count: successUserIds.length,
+    userIds: successUserIds,
+    userPortfolios,  // OPT-SNAP-INCR Fase 2: Exponer para inyección a calculatePortfolioRisk
+    failedCount: failedUserIds.length,
+    failedUserIds,
+    consistencyStaleMarked,
+    totalDurationMs
+  };
 }
 
-// Constante del intervalo de actualización (debe coincidir con el cron schedule)
-const REFRESH_INTERVAL_MINUTES = 5;
-
 /**
- * Función principal unificada que ejecuta todas las actualizaciones
+ * End-of-Day Portfolio Update
  * 
- * COST-OPT-001: Frecuencia reducida de 2 a 5 minutos para optimizar costos
- * - Ahorro estimado: ~60% en lecturas/escrituras de Firestore
- * - Impacto UX: Precios actualizados cada 5 min en lugar de 2 min (aceptable)
+ * OPT-DEMAND-CLEANUP: Función consolidada que ejecuta 1x/día al cierre del mercado.
+ * 
+ * Schedule: 00:05 ET del día siguiente (Ma-Sa para cubrir L-V)
+ * 
+ * Flujo:
+ * 1. Obtener símbolos únicos de assets activos
+ * 2. Consultar precios del API Lambda (precios de cierre del día anterior)
+ * 3. Consultar currencies del API Lambda
+ * 4. Calcular performance del portafolio (EOD del día anterior)
+ * 5. Calcular riesgo del portafolio
+ * 6. Invalidar cache de performance
+ * 
+ * NOTA: Se ejecuta después de medianoche para garantizar precios de cierre definitivos.
+ * La fecha de cálculo es el DÍA ANTERIOR (el día de trading que cerró).
+ * 
+ * @see docs/architecture/OPT-DEMAND-CLEANUP-phase4-closure-subplan.md
  */
 exports.unifiedMarketDataUpdate = onSchedule({
-  schedule: `*/${REFRESH_INTERVAL_MINUTES} 9-17 * * 1-5`,  // COST-OPT-001: Cada 5 minutos (antes: */2)
+  // OPT-DEMAND-400-FIX: Ejecutar a las 00:05 ET del día siguiente para precios de cierre definitivos
+  // Martes-Sábado para cubrir trading days Lunes-Viernes
+  schedule: '5 0 * * 2-6',  // 00:05 Ma-Sa (guarda datos de L-V)
   timeZone: 'America/New_York',
-  retryCount: 3,
+  memory: '512MiB',
+  timeoutSeconds: 540,  // 9 minutos
+  retryCount: 2,
+  secrets: [cfServiceToken],  // SEC-TOKEN-001: Binding del secret para API auth
+  labels: {
+    status: 'active',
+    purpose: 'eod-portfolio-calculations',
+    updated: '2026-01-28'
+  }
 }, async (event) => {
   // Inicializar logger estructurado (SCALE-CORE-002)
-  logger = StructuredLogger.forScheduled('unifiedMarketDataUpdate');
+  logger = StructuredLogger.forScheduled('endOfDayPortfolioUpdate');
   
   const db = admin.firestore();
-  
-  // Verificar si estamos en la ventana de cierre del mercado
-  // Esto permite una última actualización para capturar precios de cierre
-  const closingWindowCheck = isInClosingWindow(NYSE_CLOSE_HOUR);
-  const isInClosingGrace = closingWindowCheck.inWindow;
-  
-  // OPT-SYNC-001: Verificar estado del mercado desde Firestore (incluye festivos)
-  // El documento markets/US es actualizado por marketStatusService que consulta Finnhub
-  try {
-    const marketDoc = await db.collection('markets').doc('US').get();
-    if (marketDoc.exists) {
-      const marketData = marketDoc.data();
-      
-      // Verificar si es festivo (siempre respetar festivos)
-      if (marketData.holiday) {
-        logger.info('Market holiday - skipping update', { 
-          holiday: marketData.holiday,
-          marketStatus: 'holiday'
-        });
-        return null;
-      }
-      
-      // Verificar si el mercado está cerrado (usando dato de Finnhub)
-      if (marketData.isOpen === false) {
-        // MEJORA: Si estamos en la ventana de cierre, ejecutar una última actualización
-        // para capturar los precios de cierre del día
-        if (isInClosingGrace) {
-          logger.info('Market just closed - executing final update to capture closing prices', { 
-            session: marketData.session,
-            marketStatus: 'closing-grace',
-            closingWindow: closingWindowCheck,
-            graceMinutes: CLOSING_GRACE_WINDOW_MINUTES
-          });
-          // Continuar con la ejecución (no return)
-        } else {
-          logger.info('Market closed (Finnhub) - skipping update', { 
-            session: marketData.session,
-            marketStatus: 'closed'
-          });
-          return null;
-        }
-      }
-    }
-  } catch (marketCheckError) {
-    // Si falla la consulta, continuar con la verificación local de horario
-    logger.warn('Failed to check market status from Firestore, using local check', {
-      error: marketCheckError.message
-    });
-  }
-  
-  // Fallback: verificación local de horario (por si la consulta a markets/US falla)
-  // También considerar la ventana de cierre
-  if (!isNYSEMarketOpen() && !isInClosingGrace) {
-    logger.info('Market closed (local check) - skipping update', { marketStatus: 'closed' });
-    return null;
-  }
-
-  logger.info('Starting unified market data update', { marketStatus: 'open' });
-  
   const startTime = Date.now();
-  
-  // Calcular el minuto programado (el scheduler debería haber disparado en un múltiplo de REFRESH_INTERVAL_MINUTES)
-  // Esto nos da el momento exacto cuando SE PROGRAMÓ esta ejecución
   const now = DateTime.now().setZone('America/New_York');
-  const scheduledMinute = Math.floor(now.minute / REFRESH_INTERVAL_MINUTES) * REFRESH_INTERVAL_MINUTES;
-  const scheduledAt = now.set({ minute: scheduledMinute, second: 0, millisecond: 0 });
-  const nextScheduledUpdate = scheduledAt.plus({ minutes: REFRESH_INTERVAL_MINUTES });
-  const mainOp = logger.startOperation('fullUpdate');
+  const yesterday = now.minus({ days: 1 });
   
-      try {
-    // Paso 1: Obtener códigos de monedas y símbolos de activos dinámicamente
-    const dataFetchOp = logger.startOperation('fetchInitialData');
-    const [currenciesSnapshot, currentPricesSnapshot] = await Promise.all([
-      db.collection('currencies').where('isActive', '==', true).get(),
-      db.collection('currentPrices').get()
+  logger.info('🚀 Starting End-of-Day Portfolio Update', {
+    trigger: 'scheduled',
+    currentTime: now.toISO(),
+    targetDate: yesterday.toISODate()
+  });
+
+  const mainOp = logger.startOperation('eodPortfolioUpdate');
+  
+  try {
+    // =========================================================================
+    // OPT-DEMAND-400-FIX: Verificar si el día anterior fue un día de trading válido
+    // Solo guardamos en portfolioPerformance si NO fue fin de semana y NO fue festivo
+    // =========================================================================
+    const tradingDayCheck = await isValidTradingDay(db, yesterday);
+    
+    if (!tradingDayCheck.isValid) {
+      logger.info('⏭️ Skipping EOD update - not a valid trading day', {
+        date: tradingDayCheck.formattedDate,
+        reason: tradingDayCheck.reason,
+        holiday: tradingDayCheck.holiday || null
+      });
+      
+      mainOp.success({
+        skipped: true,
+        reason: tradingDayCheck.reason,
+        date: tradingDayCheck.formattedDate
+      });
+      
+      return null;
+    }
+    
+    logger.info('✅ Valid trading day confirmed', {
+      date: tradingDayCheck.formattedDate,
+      reason: tradingDayCheck.reason
+    });
+    
+    // Paso 1: Obtener símbolos únicos de assets activos
+    const assetsOp = logger.startOperation('fetchAssetSymbols');
+    const assetsSnapshot = await db.collection('assets').where('isActive', '==', true).get();
+    const symbols = [...new Set(assetsSnapshot.docs.map(d => d.data().name).filter(Boolean))];
+    assetsOp.success({ assetCount: assetsSnapshot.size, uniqueSymbols: symbols.length });
+    
+    logger.info('📊 Assets fetched', { assets: assetsSnapshot.size, symbols: symbols.length });
+    
+    // Paso 2: Obtener precios y currencies del API Lambda
+    const marketDataOp = logger.startOperation('fetchMarketData');
+    const [currentPrices, currencies] = await Promise.all([
+      getPricesFromApi(symbols),
+      getCurrencyRatesFromApi()
     ]);
+    marketDataOp.success({ pricesReceived: currentPrices.length, currenciesReceived: currencies.length });
     
-    const currencyCodes = currenciesSnapshot.docs.map(doc => doc.data().code);
-    const assetSymbols = currentPricesSnapshot.docs.map(doc => doc.data().symbol);
-    dataFetchOp.success({ currencyCount: currencyCodes.length, assetCount: assetSymbols.length });
+    logger.info('💹 Market data fetched from API Lambda', {
+      prices: currentPrices.length,
+      currencies: currencies.length,
+      source: 'api-lambda'
+    });
     
-    logger.info('Fetching market data', { currencies: currencyCodes.length, assets: assetSymbols.length });
-    
-    // Paso 2: Obtener TODOS los datos de mercado en llamadas optimizadas
-    const marketDataOp = logger.startOperation('getAllMarketDataBatch');
-    const marketData = await getAllMarketDataBatch(currencyCodes, assetSymbols);
-    marketDataOp.success({ currenciesReceived: Object.keys(marketData.currencies).length, assetsReceived: marketData.assets.size });
-    
-    // Paso 3: Actualizar tasas de cambio con datos ya obtenidos
-    const currencyOp = logger.startOperation('updateCurrencyRates');
-    const currencyUpdates = await updateCurrencyRates(db, marketData.currencies);
-    currencyOp.success({ updated: currencyUpdates });
-    
-    // Paso 4: Actualizar precios actuales con datos ya obtenidos
-    const pricesOp = logger.startOperation('updateCurrentPrices');
-    const priceUpdates = await updateCurrentPrices(db, marketData.assets);
-    pricesOp.success({ updated: priceUpdates });
-    
-    // Paso 5: Calcular rendimiento del portafolio
+    // HU #3: el cierre diario ya NO archiva las tasas del día.
+    // Ninguna tasa se guarda (RN-3-A): las de cualquier fecha se piden por rango
+    // al canal de datos de mercado cuando hacen falta, y la que un movimiento ya
+    // aplicó vive en el propio movimiento desde la épica #2 (RN-3-B).
+    // @see platform-docs/stories/3-tasa-vigente-canal-mercado/refinamiento.md (T6)
+
+    // Paso 3: Calcular performance del portafolio
+    // FIX-READS-002: Pass pre-fetched assetsSnapshot to avoid redundant global scan inside
     const perfOp = logger.startOperation('calculateDailyPortfolioPerformance');
-    const portfolioResult = await calculateDailyPortfolioPerformance(db);
-    perfOp.success({ portfoliosCalculated: portfolioResult.count });
+    const portfolioResult = await calculateDailyPortfolioPerformance(db, currentPrices, currencies, { activeAssetsSnapshot: assetsSnapshot });
+    perfOp.success({ portfoliosCalculated: portfolioResult.count, failed: portfolioResult.failedCount || 0 });
     
-    // Paso 6: Calcular riesgo del portafolio (usando datos actualizados)
+    logger.info('📈 Portfolio performance calculated', {
+      users: portfolioResult.count,
+      failed: portfolioResult.failedCount || 0,
+      userIds: portfolioResult.userIds?.length || 0
+    });
+    
+    // Paso 4: Calcular riesgo del portafolio
+    // OPT-SNAP-INCR Fase 2: Inyectar datos ya en memoria para evitar re-reads
     const riskOp = logger.startOperation('calculatePortfolioRisk');
-    await calculatePortfolioRisk();
+    const currentPricesMap = {};
+    currentPrices.forEach(quote => {
+      currentPricesMap[quote.symbol] = { beta: quote.beta ?? 1.0, price: quote.price || 0 };
+    });
+    // OPT-SNAP-INCR Fase 2: Solo calculamos riesgo para usuarios exitosos.
+    // Usuarios fallidos están marcados _stale y serán reconciliados en el siguiente ciclo.
+    if (portfolioResult.failedCount > 0) {
+      logger.warn(`⚠️ Risk calculation excludes ${portfolioResult.failedCount} failed users`, {
+        failedUserIds: portfolioResult.failedUserIds
+      });
+    }
+    await calculatePortfolioRisk({
+      allAssets: assetsSnapshot.docs.map(d => ({ id: d.id, ...d.data() })),
+      userPortfolios: portfolioResult.userPortfolios,
+      userIds: portfolioResult.userIds,
+      currentPricesMap,
+      currencies,
+      calculationDate: yesterday.toISODate()
+    });
     riskOp.success();
     
-    // Paso 7: Invalidar cache de rendimientos históricos (OPT-010)
+    logger.info('⚠️ Portfolio risk calculated');
+
+    // =========================================================================
+    // OPT-SNAP-INCR Fase 3: Consolidated Index Pipeline
+    // Previously 2 separate scheduled functions with independent cold-starts.
+    // Now runs in-process, inheriting the trading-day guard above.
+    // =========================================================================
+
+    // Paso 4.1: Save indices history data (EOD close prices)
+    try {
+      const indicesOp = logger.startOperation('saveIndicesHistoryData');
+      // skipCacheInvalidation: refreshIndexCacheInternal runs immediately after and handles freshness
+      const indicesResult = await saveIndicesHistoryDataInternal({ formattedDate: yesterday.toISODate(), skipCacheInvalidation: true });
+      indicesOp.success({ count: indicesResult.count, durationMs: indicesResult.durationMs });
+    } catch (indicesError) {
+      // Non-critical: index history is independent of portfolio calculations
+      logger.warn('[OPT-SNAP-INCR Fase 3] saveIndicesHistoryData failed (non-critical)', { error: indicesError.message });
+    }
+
+    // Paso 4.2: Refresh index cache (incremental merge)
+    try {
+      const indexCacheOp = logger.startOperation('refreshIndexCache');
+      const cacheResult = await refreshIndexCacheInternal();
+      indexCacheOp.success({ refreshed: cacheResult.refreshed, errors: cacheResult.errors, duration: cacheResult.duration });
+    } catch (indexCacheError) {
+      // Non-critical: cache will rebuild on next on-demand request
+      logger.warn('[OPT-SNAP-INCR Fase 3] refreshIndexCache failed (non-critical)', { error: indexCacheError.message });
+    }
+    
+    // Paso 5: Invalidar cache de performance
     let cacheInvalidationResult = { usersProcessed: 0, cachesDeleted: 0 };
     if (portfolioResult.userIds && portfolioResult.userIds.length > 0) {
       try {
@@ -971,44 +1401,61 @@ exports.unifiedMarketDataUpdate = onSchedule({
       }
     }
     
-    const endTime = Date.now();
-    const executionTime = (endTime - startTime) / 1000;
+    // VS-009 Paso 5.5: Generar benchmarkSnapshots (best-effort)
+    try {
+      const benchmarkOp = logger.startOperation('generateBenchmarkSnapshots');
+      const benchmarkResult = await updateBenchmarkSnapshots(db, currentPrices, currencies, yesterday, logger);
+      benchmarkOp.success({ written: benchmarkResult.success, failed: benchmarkResult.failed, skipped: benchmarkResult.skipped });
+    } catch (benchmarkError) {
+      logger.warn('[VS-009] benchmarkSnapshots generation failed (non-critical)', { error: benchmarkError.message });
+    }
+
+    const executionTime = (Date.now() - startTime) / 1000;
     
-    // Paso 8: Notificar al frontend que todo el pipeline completó (OPT-016)
-    // Incluimos metadata para sincronización precisa del countdown
+    // Paso 6: Actualizar systemStatus
     try {
       await db.collection('systemStatus').doc('marketData').set({
-        // Timestamps
         lastCompleteUpdate: admin.firestore.FieldValue.serverTimestamp(),
-        lastUpdateDate: new Date().toISOString(),
-        
-        // Metadata de sincronización para el frontend
-        refreshIntervalMinutes: REFRESH_INTERVAL_MINUTES,
-        scheduledAt: scheduledAt.toISO(),           // Cuando se programó esta ejecución
-        nextScheduledUpdate: nextScheduledUpdate.toISO(), // Próxima ejecución programada
-        
-        // Estadísticas del pipeline
-        pricesUpdated: priceUpdates,
+        lastUpdateDate: DateTime.now().toISO(),
+        source: 'api-lambda',
         performanceCalculated: portfolioResult.count,
+        failedUsers: portfolioResult.failedCount || 0,
         cachesInvalidated: cacheInvalidationResult.cachesDeleted,
         executionTimeMs: Math.round(executionTime * 1000),
-        marketOpen: true
+        marketOpen: false
       }, { merge: true });
     } catch (signalError) {
-      logger.warn('Frontend signal failed (non-critical)', { error: signalError.message });
+      logger.warn('SystemStatus update failed (non-critical)', { error: signalError.message });
     }
     
     mainOp.success({
-      currencyUpdates,
-      priceUpdates,
       portfoliosCalculated: portfolioResult.count,
       cachesInvalidated: cacheInvalidationResult.cachesDeleted,
-      executionTimeSec: executionTime
+      executionTimeSec: executionTime,
+      source: 'api-lambda'
+    });
+    
+    logger.info('✅ End-of-Day Portfolio Update completed', {
+      executionTime: `${executionTime.toFixed(2)}s`,
+      portfolios: portfolioResult.count
     });
     
     return null;
+    
   } catch (error) {
     mainOp.failure(error);
-    return null;
+    logger.error('❌ End-of-Day Portfolio Update failed', error);
+    throw error;
   }
-}); 
+});
+
+// SCALE-001: Exportar para testing
+if (process.env.NODE_ENV === "test" || process.env.FUNCTIONS_EMULATOR) {
+  exports._testExports = {
+    processUserPerformance,
+    calculateDailyPortfolioPerformance,
+    PerformanceDataCache,
+    MAX_PARALLEL_USERS,
+    markInconsistentUsersAsStale,
+  };
+}

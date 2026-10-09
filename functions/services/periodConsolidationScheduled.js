@@ -43,7 +43,7 @@ const SCHEDULED_CONFIG = {
  */
 const NON_CURRENCY_FIELDS = [
   'periodType', 'periodKey', 'startDate', 'endDate', 
-  'docsCount', 'version', 'lastUpdated'
+  'docsCount', 'version', 'lastUpdated', '_meta'
 ];
 
 // ============================================================================
@@ -80,7 +80,10 @@ const consolidateMonthlyPerformance = onSchedule(
       accountsProcessed: 0,
       consolidationsWritten: 0,
       errors: 0,
-      errorDetails: []
+      errorDetails: [],
+      // SCALE-002: Tracking por usuario
+      userDetails: [],
+      partialConsolidations: 0
     };
     
     try {
@@ -93,11 +96,20 @@ const consolidateMonthlyPerformance = onSchedule(
       for (const userDoc of usersSnapshot.docs) {
         const userId = userDoc.id;
         
+        // SCALE-002: Tracking por usuario
+        const userDetail = {
+          userId,
+          overallConsolidated: false,
+          accountsConsolidated: [],
+          accountsFailed: []
+        };
+        
         try {
           // 2a. Consolidar nivel "overall"
           const overallResult = await consolidateUserMonth(userId, null, periodKey, periodStart, periodEnd);
           if (overallResult) {
             metrics.consolidationsWritten++;
+            userDetail.overallConsolidated = true;
           }
           
           // 2b. Obtener cuentas del usuario
@@ -113,10 +125,12 @@ const consolidateMonthlyPerformance = onSchedule(
                 metrics.consolidationsWritten++;
               }
               metrics.accountsProcessed++;
+              userDetail.accountsConsolidated.push(accountId);
             } catch (accountError) {
               console.error(`[consolidateMonthlyPerformance] Error cuenta ${accountId}:`, accountError.message);
               metrics.errors++;
               metrics.errorDetails.push({ userId, accountId, error: accountError.message });
+              userDetail.accountsFailed.push(accountId);
             }
           }
           
@@ -126,6 +140,8 @@ const consolidateMonthlyPerformance = onSchedule(
           metrics.errors++;
           metrics.errorDetails.push({ userId, error: userError.message });
         }
+        
+        metrics.userDetails.push(userDetail);
       }
       
       const duration = Date.now() - startTime;
@@ -174,7 +190,10 @@ const consolidateYearlyPerformance = onSchedule(
       accountsProcessed: 0,
       consolidationsWritten: 0,
       errors: 0,
-      errorDetails: []
+      errorDetails: [],
+      // SCALE-002: Tracking por usuario
+      userDetails: [],
+      partialConsolidations: 0
     };
     
     try {
@@ -187,11 +206,23 @@ const consolidateYearlyPerformance = onSchedule(
       for (const userDoc of usersSnapshot.docs) {
         const userId = userDoc.id;
         
+        // SCALE-002: Tracking por usuario
+        const userDetail = {
+          userId,
+          overallConsolidated: false,
+          accountsConsolidated: [],
+          accountsFailed: []
+        };
+        
         try {
           // 2a. Consolidar nivel "overall" desde documentos mensuales
           const overallResult = await consolidateUserYear(userId, null, yearKey);
           if (overallResult) {
             metrics.consolidationsWritten++;
+            userDetail.overallConsolidated = true;
+            if (overallResult._meta?.status === 'partial') {
+              metrics.partialConsolidations++;
+            }
           }
           
           // 2b. Obtener cuentas del usuario
@@ -205,12 +236,17 @@ const consolidateYearlyPerformance = onSchedule(
               const accountResult = await consolidateUserYear(userId, accountId, yearKey);
               if (accountResult) {
                 metrics.consolidationsWritten++;
+                if (accountResult._meta?.status === 'partial') {
+                  metrics.partialConsolidations++;
+                }
               }
               metrics.accountsProcessed++;
+              userDetail.accountsConsolidated.push(accountId);
             } catch (accountError) {
               console.error(`[consolidateYearlyPerformance] Error cuenta ${accountId}:`, accountError.message);
               metrics.errors++;
               metrics.errorDetails.push({ userId, accountId, error: accountError.message });
+              userDetail.accountsFailed.push(accountId);
             }
           }
           
@@ -220,6 +256,8 @@ const consolidateYearlyPerformance = onSchedule(
           metrics.errors++;
           metrics.errorDetails.push({ userId, error: userError.message });
         }
+        
+        metrics.userDetails.push(userDetail);
       }
       
       const duration = Date.now() - startTime;
@@ -320,11 +358,24 @@ async function consolidateUserYear(userId, accountId, yearKey) {
     return null;
   }
   
+  // SCALE-002: Determinar primer mes con datos para este usuario/cuenta
+  const firstMonthKey = monthlySnapshot.docs[0].data().periodKey;
+  const firstMonthWithData = parseInt(firstMonthKey.split('-')[1], 10);
+  
   // Encadenar factores de los meses para obtener el año completo
-  const consolidated = consolidateMonthsToYear(monthlySnapshot.docs, yearKey);
+  const consolidated = consolidateMonthsToYear(monthlySnapshot.docs, yearKey, { firstMonthWithData });
   
   if (!consolidated) {
     return null;
+  }
+  
+  // SCALE-002: Alertar si hay meses faltantes
+  if (consolidated._meta?.status === 'partial') {
+    const target = accountId || 'OVERALL';
+    console.warn(
+      `[consolidateYearlyPerformance] \u26A0\uFE0F Consolidaci\u00F3n parcial: user=${userId}, target=${target}, year=${yearKey}, ` +
+      `missing=${consolidated._meta.missingMonths.join(', ')}`
+    );
   }
   
   // Guardar documento consolidado anual (idempotente)
@@ -338,17 +389,35 @@ async function consolidateUserYear(userId, accountId, yearKey) {
  * 
  * @param {Array} monthlyDocs - Documentos mensuales ordenados
  * @param {string} yearKey - Año del período
+ * @param {Object} [options] - Opciones de consolidación
+ * @param {number} [options.firstMonthWithData=1] - Primer mes con datos (1-12)
  * @returns {Object|null} Documento anual consolidado
  */
-function consolidateMonthsToYear(monthlyDocs, yearKey) {
+function consolidateMonthsToYear(monthlyDocs, yearKey, options = {}) {
   if (!monthlyDocs || monthlyDocs.length === 0) {
     return null;
   }
+  
+  const { firstMonthWithData = 1 } = options;
   
   const firstDoc = monthlyDocs[0].data ? monthlyDocs[0].data() : monthlyDocs[0];
   const lastDoc = monthlyDocs[monthlyDocs.length - 1].data 
     ? monthlyDocs[monthlyDocs.length - 1].data() 
     : monthlyDocs[monthlyDocs.length - 1];
+  
+  // SCALE-002: Calcular meses esperados vs encontrados
+  const monthsFound = monthlyDocs.map(doc => {
+    const data = doc.data ? doc.data() : doc;
+    return data.periodKey;
+  });
+  
+  const monthsExpected = [];
+  for (let m = firstMonthWithData; m <= 12; m++) {
+    monthsExpected.push(`${yearKey}-${String(m).padStart(2, '0')}`);
+  }
+  
+  const missingMonths = monthsExpected.filter(m => !monthsFound.includes(m));
+  const isComplete = missingMonths.length === 0;
   
   // Obtener todas las monedas
   const currencies = new Set();
@@ -371,7 +440,16 @@ function consolidateMonthsToYear(monthlyDocs, yearKey) {
       return sum + (data.docsCount || 0);
     }, 0),
     version: CONSOLIDATED_SCHEMA_VERSION,
-    lastUpdated: new Date().toISOString()
+    lastUpdated: new Date().toISOString(),
+    // SCALE-002: Checkpointing metadata
+    _meta: {
+      status: isComplete ? 'success' : 'partial',
+      monthsExpected: monthsExpected.length,
+      monthsFound: monthsFound.length,
+      missingMonths: isComplete ? [] : missingMonths,
+      consolidatedAt: new Date().toISOString(),
+      schemaVersion: CONSOLIDATED_SCHEMA_VERSION
+    }
   };
   
   // Procesar cada moneda

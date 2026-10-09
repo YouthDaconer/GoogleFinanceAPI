@@ -60,7 +60,7 @@ const db = admin.firestore();
 // ============================================================================
 
 const CONFIG = {
-  HISTORICAL_API_BASE: 'https://dmn46d7xas3rvio6tugd2vzs2q0hxbmb.lambda-url.us-east-1.on.aws/v1',
+  HISTORICAL_API_BASE: 'https://354sdh5hcrnztw5vquw6sxiduu0gigku.lambda-url.us-east-1.on.aws/v1',
   DEFAULT_USER_ID: 'DDeR8P5hYgfuN8gcU4RsQfdTJqx2',
   
   // Monedas soportadas

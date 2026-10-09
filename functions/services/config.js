@@ -1,0 +1,118 @@
+/**
+ * Configuración centralizada de URLs de API
+ * 
+ * LM-008: Migración a AWS Lambda + API Gateway
+ * SEC-TOKEN-001: Token de servicio para autenticación server-to-server
+ * Fecha: 10 de Febrero de 2026
+ * 
+ * Este archivo centraliza la configuración de URLs del API de finanzas
+ * para facilitar cambios futuros y permitir configuración por entorno.
+ * 
+ * @module services/config
+ * @see docs/architecture/lambda-decoupled-architecture-analysis.md
+ * @see docs/architecture/SEC-TOKEN-001-api-security-hardening-plan.md
+ */
+
+/**
+ * URL base del API de finanzas (finance-query)
+ * 
+ * En producción: via AWS API Gateway (https://api.portastock.top)
+ * En desarrollo: localhost o variable de entorno
+ * 
+ * La variable de entorno FINANCE_QUERY_API_URL puede configurarse en:
+ * - Firebase Functions: firebase functions:config:set api.finance_query_url="..."
+ * - Archivo .env: FINANCE_QUERY_API_URL=...
+ * 
+ * @type {string}
+ */
+const FINANCE_QUERY_API_URL = process.env.FINANCE_QUERY_API_URL || 
+  'https://api.portastock.net/v1';
+
+/**
+ * LM-008: Migración completada a Lambda (10-Feb-2026)
+ * El endpoint ahora es api.portastock.top via API Gateway HTTP v2.
+ */
+
+/**
+ * SEC-TOKEN-003: Token de servicio para autenticación server-to-server
+ * 
+ * Este token se envía en el header x-service-token para que el API
+ * pueda identificar llamadas desde Cloud Functions sin requerir
+ * el token HMAC de usuario.
+ * 
+ * Usa CF_SERVICE_TOKEN como nombre de variable para evitar conflicto con
+ * secrets previamente configurados en Cloud Run.
+ * 
+ * FIX-SECRET-001: En Firebase Functions v2, los secrets se inyectan en 
+ * process.env DESPUÉS de que los módulos se cargan (durante cold start).
+ * Por eso usamos una función getter en lugar de una constante.
+ * 
+ * @returns {string} El token de servicio limpio (sin caracteres extraños)
+ */
+function getServiceTokenSecret() {
+  const rawToken = process.env.CF_SERVICE_TOKEN || 
+    process.env.SERVICE_TOKEN_SECRET || '';
+  
+  // FIX-SECRET-001: Limpiar exhaustivamente cualquier carácter no válido para headers HTTP
+  // - trim() elimina espacios/tabs/newlines al inicio y final
+  // - El regex elimina cualquier carácter que no sea hexadecimal (el token es hex)
+  // - Esto previene errores "Invalid character in header content"
+  return rawToken
+    .trim()
+    .replace(/[^a-fA-F0-9]/g, ''); // Solo caracteres hexadecimales válidos
+}
+
+// DEPRECATED: Mantener para compatibilidad con código existente
+// Pero el valor puede estar vacío si el módulo se carga antes de la inyección del secret
+const SERVICE_TOKEN_SECRET = getServiceTokenSecret();
+
+/**
+ * Genera headers de autenticación para llamadas al API
+ * 
+ * SEC-TOKEN-004: Todas las llamadas server-to-server deben incluir
+ * el header x-service-token para pasar el middleware de autenticación.
+ * 
+ * SEC-CF-002: Incluye Referer y User-Agent para pasar Cloudflare WAF.
+ * 
+ * FIX-SECRET-001: Lee el secret dinámicamente en cada llamada para asegurar
+ * que esté disponible después de la inyección de Firebase Functions v2.
+ * 
+ * @param {Object} additionalHeaders - Headers adicionales a incluir
+ * @returns {Object} Headers con autenticación
+ */
+function getServiceHeaders(additionalHeaders = {}) {
+  // FIX-SECRET-001: Leer dinámicamente y limpiar caracteres inválidos
+  const serviceToken = getServiceTokenSecret();
+  
+  const headers = {
+    'Content-Type': 'application/json',
+    // SEC-CF-002: Cloudflare WAF requiere User-Agent y Referer válidos
+    'User-Agent': 'google-cloud-functions/1.0 portafolio-inversiones',
+    'Referer': 'https://us-central1-portafolio-inversiones.cloudfunctions.net',
+    ...additionalHeaders,
+  };
+  
+  // Solo agregar si está configurado y limpio
+  if (serviceToken) {
+    headers['x-service-token'] = serviceToken;
+  }
+  
+  return headers;
+}
+
+/**
+ * Verifica si la autenticación de servicio está configurada
+ * FIX-SECRET-001: Usa la función getter para verificación dinámica
+ * @returns {boolean}
+ */
+function isServiceAuthConfigured() {
+  return Boolean(getServiceTokenSecret());
+}
+
+module.exports = {
+  FINANCE_QUERY_API_URL,
+  SERVICE_TOKEN_SECRET, // DEPRECATED: usar getServiceTokenSecret() para garantizar valor actual
+  getServiceTokenSecret,
+  getServiceHeaders,
+  isServiceAuthConfigured,
+};

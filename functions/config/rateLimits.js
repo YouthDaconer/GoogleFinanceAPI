@@ -23,12 +23,34 @@ const RATE_LIMITS = {
   sellAsset: { limit: 30, windowMs: 60000 },
   sellPartialAssetsFIFO: { limit: 30, windowMs: 60000 },
   addCashTransaction: { limit: 30, windowMs: 60000 },
+  // HU 2.2: la conversión afecta dos saldos en una escritura
+  convertAccountCurrency: { limit: 30, windowMs: 60000 },
+  // HU 2.3: confirmacion unica de la base de costo de un saldo
+  confirmBalanceCostBasis: { limit: 30, windowMs: 60000 },
+  // HU 2.4: recalculo del historico. Limite bajo a proposito: se dispara una vez
+  // por usuario y cada pasada barre sus ventas y consulta tasas historicas
+  backfillRealizedFxDecomposition: { limit: 10, windowMs: 60000 },
+  // HU 2.6: el ajuste manual de un saldo deja su asiento
+  registerBalanceAdjustment: { limit: 30, windowMs: 60000 },
+  // HU 2.6: migracion del libro mayor. Limite bajo a proposito: se dispara una
+  // vez por usuario y cada pasada barre sus cuentas consultando tasas historicas
+  migrateBalanceLedger: { limit: 10, windowMs: 60000 },
+  // HU 2.7: corregir el saldo inicial reescribe la apertura y replaya el saldo
+  correctOpeningBalance: { limit: 30, windowMs: 60000 },
 
   // ═══════════════════════════════════════════════════════════════
   // 🟡 Operaciones de Lectura
   // ═══════════════════════════════════════════════════════════════
   getCurrentPricesForUser: { limit: 30, windowMs: 60000 },
   getIndexHistory: { limit: 30, windowMs: 60000 },
+  // HU 2.1: el diálogo de efectivo la consulta al abrirse y al cambiar la fecha
+  getHistoricalExchangeRate: { limit: 30, windowMs: 60000 },
+  // HU 2.3: estimacion de la base de un saldo sin historia conocida
+  getBalanceCostBasisEstimate: { limit: 30, windowMs: 60000 },
+  // HU 2.6: el historial de un saldo se pide al desplegar su tarjeta
+  getBalanceLedger: { limit: 30, windowMs: 60000 },
+  // HU 2.7: el plan de la correccion se pide al abrir el dialogo de correccion
+  getOpeningCorrectionPlan: { limit: 30, windowMs: 60000 },
 
   // ═══════════════════════════════════════════════════════════════
   // 🟡 Operaciones de Escritura Normales
@@ -49,12 +71,23 @@ const RATE_LIMITS = {
   updateUserDisplayName: { limit: 5, windowMs: 60000 },
 
   // ═══════════════════════════════════════════════════════════════
+  // 🟡 On-Demand Performance (OPT-DEMAND-102)
+  // ═══════════════════════════════════════════════════════════════
+  getPerformanceOnDemand: { limit: 20, windowMs: 60000 },
+
+  // ═══════════════════════════════════════════════════════════════
   // 🟢 Portfolio Accounts
   // ═══════════════════════════════════════════════════════════════
   addPortfolioAccount: { limit: 10, windowMs: 60000 },
   updatePortfolioAccount: { limit: 20, windowMs: 60000 },
   deletePortfolioAccount: { limit: 5, windowMs: 60000 },
   updatePortfolioAccountBalance: { limit: 30, windowMs: 60000 },
+
+  // ═══════════════════════════════════════════════════════════════
+  // 💳 Payment Functions (PAY-005 F5-02)
+  // ═══════════════════════════════════════════════════════════════
+  createCheckoutSession: { limit: 3, windowMs: 60000 },
+  createPortalSession: { limit: 5, windowMs: 60000 },
 };
 
 const DEFAULT_LIMIT = { limit: 30, windowMs: 60000 };

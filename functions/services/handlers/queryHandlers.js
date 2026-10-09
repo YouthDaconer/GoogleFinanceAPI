@@ -8,10 +8,15 @@
  * - indexHistoryService.js
  * - index.js (inline: getPortfolioDistribution, getAvailableSectors)
  * 
+ * OPT-DEMAND-CLEANUP: getCurrentPricesForUser migrado para usar API Lambda
+ * en lugar de Firestore collection('currentPrices').
+ * 
  * @module handlers/queryHandlers
  * @see docs/stories/56.story.md
+ * @see docs/architecture/OPT-DEMAND-CLEANUP-firestore-fallback-removal.md
  */
 
+const crypto = require('crypto');
 const { HttpsError } = require("firebase-functions/v2/https");
 const admin = require('../firebaseAdmin');
 const db = admin.firestore();
@@ -24,9 +29,9 @@ const db = admin.firestore();
 const portfolioDistributionService = require('../portfolioDistributionService');
 const { 
   calculateHistoricalReturns, 
-  calculateDynamicTTL,
   getHistoricalReturnsInternal 
 } = require('../historicalReturnsService');
+const { calculateDynamicTTL } = require('../cacheInvalidationService');
 const { calculateIndexData } = require('../indexHistoryService');
 const { DateTime } = require('luxon');
 
@@ -42,12 +47,131 @@ const {
   calculateModifiedDietzReturn
 } = require('../../utils/mwrCalculations');
 
+// OPT-DEMAND-CLEANUP: Importar helper para obtener precios del API Lambda
+const { getPricesFromApi } = require('../marketDataHelper');
+
+// HU 2.1: Tasa de cambio de una fecha concreta para el diálogo de efectivo
+const historicalRateService = require('../historicalRateService');
+const { getUserReferenceCurrency } = require('../helpers/balanceCostBasis');
+// HU 2.6: proyeccion del saldo a partir de sus movimientos
+const { projectBalanceLedger } = require('../helpers/balanceLedger');
+// HU 2.7: todo lo que hace falta saber antes de corregir el saldo inicial
+const { planOpeningCorrection } = require('../helpers/openingBalanceCorrection');
+
+// FEAT-EXCLUDE-001: Rendimiento del portafolio excluyendo tickers
+const { getCarveOutHistoricalReturns } = require('../carveOutReturnsService');
+const { buildExcludeSet } = require('../../utils/carveOutReturns');
+
+// PERF-SNAP-007: Importar helper para construir ID de snapshot
+// PERF-SNAP-009: Importar generatePerformanceSnapshot para on-demand generation
+// PERF-SNAP-024: Importar generateAssetSnapshot para on-demand per-asset
+const { buildSnapshotDocId, generatePerformanceSnapshot, generateAssetSnapshot } = require('../snapshotGenerator');
+
+// PERF-SNAP-021: Importar funciones de mercado para TTL inteligente
+const { isNYSEMarketOpen, calculateTTLUntilNextEOD, MARKET_CACHE_TTL_MS } = require('../riskMetrics/riskMetricsCache');
+
 // ============================================================================
 // CONSTANTES
 // ============================================================================
 
+/**
+ * Movimientos que devuelve `getBalanceLedger` si el cliente no pide otra cosa.
+ *
+ * Cubre de sobra lo que la tarjeta muestra al desplegarse; el resto se pide
+ * cuando el usuario decide mirar más atrás.
+ */
+const LEDGER_DEFAULT_ROWS = 50;
+
+/** Tope duro por petición: nadie lee mil filas de una tabla plegable. */
+const LEDGER_MAX_ROWS = 500;
+
 const VALID_INDEX_RANGES = ["1M", "3M", "6M", "YTD", "1Y", "5Y", "MAX"];
 const INDEX_CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 horas
+// OPT-FIRESTORE-002: Aumentado de 5min a 1h (consistente con indexHistoryService)
+const INDEX_INTRADAY_CACHE_TTL_MS = 60 * 60 * 1000; // 1 hora (cuando falta punto de hoy)
+
+// PERF-SNAP-021: In-memory cache para snapshots a nivel de módulo (sobrevive warm starts)
+const SNAPSHOT_MEM_CACHE_MAX_SIZE = 100;
+const snapshotMemCache = new Map();
+
+function getSnapshotCacheTTL() {
+  return isNYSEMarketOpen() ? MARKET_CACHE_TTL_MS : calculateTTLUntilNextEOD();
+}
+
+// R-03: Read the lastSnapshotUpdate signal once per CF invocation, reuse across N calls.
+async function readSnapshotSignal(userId) {
+  if (!userId) return null;
+  try {
+    const userPerfDoc = await db.doc(`portfolioPerformance/${userId}`).get();
+    return userPerfDoc.exists ? userPerfDoc.data()?.lastSnapshotUpdate || null : null;
+  } catch {
+    return null;
+  }
+}
+
+async function getSnapshotWithCache(snapshotId, userId, preloadedSignal) {
+  // R-03: Accept pre-loaded signal to avoid N reads of the same doc per CF invocation.
+  // If preloadedSignal is provided (string or null), skip Firestore read entirely.
+  // If preloadedSignal is undefined, read from Firestore (backwards-compatible).
+  let lastSnapshotUpdate = null;
+  if (preloadedSignal !== undefined) {
+    lastSnapshotUpdate = preloadedSignal;
+  } else if (userId) {
+    try {
+      const userPerfDoc = await db.doc(`portfolioPerformance/${userId}`).get();
+      lastSnapshotUpdate = userPerfDoc.exists ? userPerfDoc.data()?.lastSnapshotUpdate || null : null;
+    } catch {
+      // Graceful degradation — rely on TTL if read fails
+    }
+  }
+
+  const cached = snapshotMemCache.get(snapshotId);
+  if (cached && Date.now() - cached.cachedAt < getSnapshotCacheTTL()) {
+    // PERF-SNAP-023: Invalidate if EOD generated newer data
+    if (lastSnapshotUpdate && new Date(lastSnapshotUpdate).getTime() > cached.cachedAt) {
+      snapshotMemCache.delete(snapshotId);
+    } else {
+      snapshotMemCache.delete(snapshotId);
+      snapshotMemCache.set(snapshotId, cached);
+      return { data: cached.data, lastSnapshotUpdate };
+    }
+  }
+
+  const doc = await db.doc(`performanceSnapshots/${snapshotId}`).get();
+  if (!doc.exists) {
+    console.log(`[SNAPSHOT-MISS] ${JSON.stringify({ snapshotId, userId, reason: 'not-found' })}`);
+    return { data: null, lastSnapshotUpdate };
+  }
+
+  const data = doc.data();
+
+  // OPT-FX-001: Detect stale Firestore snapshot (generated before last EOD run).
+  // Snapshots for non-default currencies (e.g. COP when defaultCurrency=USD) are
+  // only generated on-demand and never refreshed by the scheduled EOD pipeline.
+  // Without this check, the stale snapshot is served indefinitely.
+  if (lastSnapshotUpdate && data.lastUpdated &&
+      new Date(lastSnapshotUpdate).getTime() > new Date(data.lastUpdated).getTime()) {
+    console.log(`[SNAPSHOT-MISS] ${JSON.stringify({ snapshotId, userId, reason: 'stale', snapshotLastUpdated: data.lastUpdated, signalLastUpdate: lastSnapshotUpdate })}`);
+    return { data: null, lastSnapshotUpdate };
+  }
+
+  snapshotMemCache.set(snapshotId, { data, cachedAt: Date.now() });
+
+  if (snapshotMemCache.size > SNAPSHOT_MEM_CACHE_MAX_SIZE) {
+    const oldestKey = snapshotMemCache.keys().next().value;
+    snapshotMemCache.delete(oldestKey);
+  }
+
+  return { data, lastSnapshotUpdate };
+}
+
+function clearSnapshotMemCache() {
+  snapshotMemCache.clear();
+}
+
+function getSnapshotMemCacheSize() {
+  return snapshotMemCache.size;
+}
 
 // ============================================================================
 // HANDLERS
@@ -56,90 +180,245 @@ const INDEX_CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 horas
 /**
  * Obtiene precios actuales filtrados por los símbolos que el usuario posee
  * 
+ * OPT-DEMAND-CLEANUP: Migrado para usar API Lambda en lugar de Firestore.
+ * Ya NO lee de collection('currentPrices').
+ * 
  * @param {Object} context - Contexto de ejecución
  * @param {Object} payload - Opciones de consulta (vacío para este handler)
- * @returns {Promise<{prices: Array, symbols: Array, timestamp: number}>}
+ * @returns {Promise<{prices: Array, symbols: Array, timestamp: number, source: string}>}
  */
 async function getCurrentPricesForUser(context, payload) {
   const { auth } = context;
   const userId = auth.uid;
 
-  console.log(`[queryHandlers][getCurrentPricesForUser] userId: ${userId}`);
+  // OPT-FIRESTORE-002 P0-B+: Frontend hook useUserCurrentPrices is dead code (0 imports).
+  // Remaining 396 calls/week come from stale browser bundles with polling.
+  // Short-circuit: return empty result without Firestore reads (-16K reads/mes).
+  // Main price path uses marketDataPollingManager → API Lambda directly.
+  console.log(`[queryHandlers][getCurrentPricesForUser] DEPRECATED — userId: ${userId} (stale client)`);
+  return {
+    prices: [],
+    symbols: [],
+    timestamp: Date.now(),
+    source: 'deprecated',
+    _deprecated: true,
+    _message: 'getCurrentPricesForUser is deprecated. Use marketDataPollingManager for current prices.',
+  };
+}
 
-  try {
-    // 1. Obtener portfolioAccounts activas del usuario
-    const accountsSnapshot = await db.collection('portfolioAccounts')
-      .where('userId', '==', userId)
-      .where('isActive', '==', true)
-      .get();
-    
-    if (accountsSnapshot.empty) {
-      console.log(`[queryHandlers][getCurrentPricesForUser] Usuario sin cuentas activas`);
-      return { prices: [], symbols: [], timestamp: Date.now() };
-    }
-    
-    const accountIds = accountsSnapshot.docs.map(doc => doc.id);
-    
-    // 2. Obtener símbolos únicos de assets activos
-    const symbolsSet = new Set();
-    
-    for (let i = 0; i < accountIds.length; i += 10) {
-      const batchAccountIds = accountIds.slice(i, i + 10);
-      
-      const assetsSnapshot = await db.collection('assets')
-        .where('portfolioAccount', 'in', batchAccountIds)
-        .where('isActive', '==', true)
-        .get();
-      
-      assetsSnapshot.docs.forEach(doc => {
-        const name = doc.data().name;
-        if (name) {
-          symbolsSet.add(name);
-        }
-      });
-    }
-    
-    const symbols = Array.from(symbolsSet);
-    
-    if (symbols.length === 0) {
-      console.log(`[queryHandlers][getCurrentPricesForUser] Usuario sin assets activos`);
-      return { prices: [], symbols: [], timestamp: Date.now() };
-    }
-    
-    // 3. Obtener precios en batches
-    const prices = [];
-    
-    for (let i = 0; i < symbols.length; i += 10) {
-      const batchSymbols = symbols.slice(i, i + 10);
-      
-      const pricesSnapshot = await db.collection('currentPrices')
-        .where('symbol', 'in', batchSymbols)
-        .get();
-      
-      pricesSnapshot.docs.forEach(doc => {
-        prices.push({ id: doc.id, ...doc.data() });
-      });
-    }
-    
-    console.log(`[queryHandlers][getCurrentPricesForUser] Éxito - ${prices.length} precios`);
-    
-    return {
-      prices,
-      symbols,
-      timestamp: Date.now(),
-    };
+// ============================================================================
+// PERF-SNAP-008: Agregación de snapshots para multi-cuenta
+// ============================================================================
 
-  } catch (error) {
-    console.error(`[queryHandlers][getCurrentPricesForUser] Error:`, error);
-    throw new HttpsError('internal', 'Error al obtener precios del usuario');
+/**
+ * PERF-SNAP-008: Agrega N snapshots de cuentas individuales en un resultado
+ * multi-cuenta unificado. Alinea timelines por fecha, pondera dailyChangePercentage
+ * por valor pre-cambio (TWR multi-cuenta) y pasa "fake docs" a
+ * calculateHistoricalReturns() para producir el formato final.
+ *
+ * @param {Array<Object>} snapshots - Snapshots individuales (cada uno con timeline, returns, etc.)
+ * @param {string} currency - Código de moneda (e.g. 'USD')
+ * @returns {Object} Resultado en formato idéntico al que produce la ruta legacy
+ */
+function aggregateSnapshotTimelines(snapshots, currency) {
+  const dateMap = new Map();
+
+  for (const snapshot of snapshots) {
+    for (const entry of snapshot.timeline || []) {
+      const { d: date, v: totalValue, c: dailyChangePercentage } = entry;
+
+      if (!dateMap.has(date)) {
+        dateMap.set(date, []);
+      }
+      dateMap.get(date).push({ totalValue, dailyChangePercentage });
+    }
   }
+
+  const sortedDates = Array.from(dateMap.keys()).sort();
+
+  const aggregatedDocs = sortedDates.map(date => {
+    const contributions = dateMap.get(date);
+
+    const aggregatedTotalValue = contributions.reduce((sum, c) => sum + c.totalValue, 0);
+
+    const contributionsWithPreValue = contributions.map(c => {
+      const change = c.dailyChangePercentage || 0;
+      const preChangeValue = change !== 0
+        ? c.totalValue / (1 + change / 100)
+        : c.totalValue;
+      return { ...c, preChangeValue };
+    });
+
+    const totalWeight = contributionsWithPreValue.reduce((sum, c) => sum + c.preChangeValue, 0);
+
+    let weightedChange = 0;
+    if (totalWeight > 0) {
+      weightedChange = contributionsWithPreValue.reduce((sum, c) => {
+        return sum + (c.dailyChangePercentage || 0) * (c.preChangeValue / totalWeight);
+      }, 0);
+    }
+
+    return {
+      data: () => ({
+        date,
+        [currency]: {
+          totalValue: aggregatedTotalValue,
+          dailyChangePercentage: weightedChange,
+          adjustedDailyChangePercentage: weightedChange,
+        },
+      }),
+    };
+  });
+
+  return calculateHistoricalReturns(aggregatedDocs, currency);
+}
+
+/**
+ * Aggregate monthlyCompound from multiple snapshots by summing P&L fields.
+ * For percentage fields (returnPct), uses value-weighted average.
+ */
+function aggregateMonthlyCompounds(snapshots) {
+  const result = {};
+
+  for (const snapshot of snapshots) {
+    const mc = snapshot.monthlyCompound || {};
+    for (const [year, months] of Object.entries(mc)) {
+      if (!result[year]) result[year] = {};
+      for (const [month, data] of Object.entries(months)) {
+        if (!result[year][month]) {
+          result[year][month] = {
+            returnPct: 0,
+            startTotalValue: 0,
+            startTotalInvestment: 0,
+            endTotalValue: 0,
+            endTotalInvestment: 0,
+            totalCashFlow: 0,
+            profit: 0,
+            doneProfitAndLoss: 0,
+            unrealizedProfitAndLoss: 0,
+            lastDayOfMonth: data.lastDayOfMonth || false,
+          };
+        }
+        const acc = result[year][month];
+        acc.startTotalValue += data.startTotalValue || 0;
+        acc.startTotalInvestment += data.startTotalInvestment || 0;
+        acc.endTotalValue += data.endTotalValue || 0;
+        acc.endTotalInvestment += data.endTotalInvestment || 0;
+        acc.totalCashFlow += data.totalCashFlow || 0;
+        acc.profit += data.profit || 0;
+        acc.doneProfitAndLoss += data.doneProfitAndLoss || 0;
+        acc.unrealizedProfitAndLoss += data.unrealizedProfitAndLoss || 0;
+        if (data.lastDayOfMonth) acc.lastDayOfMonth = true;
+      }
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Aggregate performanceByYear from multiple snapshots.
+ * Months get their TWR re-computed from the aggregated timeline (result.performanceByYear),
+ * but P&L-related totals come from the snapshot compounds.
+ */
+function aggregatePerformanceByYear(snapshots, basePerformanceByYear) {
+  const result = {};
+
+  // Start from the base (computed from aggregated timeline — has correct TWR returns)
+  for (const [year, data] of Object.entries(basePerformanceByYear || {})) {
+    result[year] = { ...data };
+  }
+
+  // For each year, merge personalMonths/personalTotal from snapshots by summing
+  for (const snapshot of snapshots) {
+    const pby = snapshot.performanceByYear || {};
+    for (const [year, data] of Object.entries(pby)) {
+      if (!result[year]) {
+        result[year] = { months: {}, personalMonths: {}, total: 0, personalTotal: 0 };
+      }
+    }
+  }
+
+  return result;
+}
+
+/**
+ * PERF-SNAP-007: Transforma un snapshot pre-computado al formato de respuesta
+ * que el frontend espera (idéntico a getHistoricalReturnsV2).
+ */
+function transformSnapshotToResponse(snapshot) {
+  const dates = [];
+  const values = [];
+  const percentChanges = [];
+
+  for (const entry of snapshot.timeline || []) {
+    dates.push(entry.d);
+    values.push(entry.v);
+    percentChanges.push(entry.c);
+  }
+
+  const firstValue = values[0] || 0;
+  const lastValue = values[values.length - 1] || 0;
+  const overallPercentChange = firstValue > 0
+    ? ((lastValue - firstValue) / firstValue) * 100
+    : 0;
+
+  const isDailyTimeline = snapshot.timelineGranularity === 'daily';
+
+  // PERF-SNAP-025: Computar soldRanges y soldCompletelyDate desde timeline
+  let soldCompletelyDate = null;
+  const soldRanges = []; // Array de { from, to } — períodos sin posición
+  if (isDailyTimeline) {
+    const timeline = snapshot.timeline || [];
+    const lastEntry = timeline[timeline.length - 1];
+
+    // Detectar rangos vendidos: secuencias de entries con u<=0 seguidas de re-compra
+    let soldStart = null;
+    for (let i = 0; i < timeline.length; i++) {
+      const e = timeline[i];
+      if (e.u <= 0 && soldStart === null) {
+        soldStart = e.d;
+      } else if (e.u > 0 && soldStart !== null) {
+        soldRanges.push({ from: soldStart, to: e.d });
+        soldStart = null;
+      }
+    }
+    // Si termina vendido, es venta permanente
+    if (soldStart !== null) {
+      soldCompletelyDate = soldStart;
+    }
+  }
+
+  return {
+    returns: snapshot.returns || {},
+    validDocsCountByPeriod: snapshot.validDocsCountByPeriod || {},
+    totalValueData: {
+      dates,
+      values,
+      percentChanges,
+      overallPercentChange,
+      ...(isDailyTimeline && { timelineGranularity: 'daily' }),
+      ...(isDailyTimeline && { soldCompletelyDate }),
+      ...(isDailyTimeline && soldRanges.length > 0 && { soldRanges }),
+    },
+    performanceByYear: snapshot.performanceByYear || {},
+    monthlyCompoundData: snapshot.monthlyCompound || {},
+    availableYears: snapshot.availableYears || [],
+    startDate: snapshot.startDate || '',
+    latestAssetPerformance: snapshot.latestAssetPerformance || {},
+    _metadata: {
+      version: 'snapshot',
+      schemaVersion: snapshot.schemaVersion,
+      snapshotLastUpdated: snapshot.lastUpdated,
+    },
+  };
 }
 
 /**
  * Obtiene rendimientos históricos del portafolio
  * 
- * COST-OPT-003: Ahora usa V2 (períodos consolidados) con fallback automático a V1
- * si no hay datos consolidados. Esto reduce lecturas de ~300 a ~20 documentos.
+ * PERF-SNAP-007: Intenta leer snapshot pre-computado (1 read).
+ * Si no existe o es request por ticker/assetType, cae a ruta legacy (V2/V1).
  * 
  * @param {Object} context - Contexto de ejecución
  * @param {Object} payload - Opciones de consulta
@@ -156,76 +435,291 @@ async function getHistoricalReturns(context, payload) {
     forceRefresh = false 
   } = payload || {};
 
-  // Generar clave de cache
-  const cacheKey = `${currency}_${accountId}${ticker ? `_${ticker}` : ''}${assetType ? `_${assetType}` : ''}`;
-  
-  console.log(`[queryHandlers][getHistoricalReturns] userId: ${userId}, cacheKey: ${cacheKey}`);
+  console.log(`[queryHandlers][getHistoricalReturns] userId: ${userId}, currency: ${currency}, accountId: ${accountId}`);
 
   try {
-    // 1. Verificar cache (si no forceRefresh)
-    if (!forceRefresh) {
-      const cacheRef = db.doc(`userData/${userId}/performanceCache/${cacheKey}`);
-      const cacheDoc = await cacheRef.get();
+    // FEAT-EXCLUDE-001: los snapshots son agregados y no permiten quitar
+    // activos; la exclusión se calcula aparte, desde los docs diarios.
+    if (payload?.excludeTickers !== undefined && payload?.excludeTickers !== null) {
+      return await getHistoricalReturnsExcluding(context, payload);
+    }
 
-      if (cacheDoc.exists) {
-        const cacheData = cacheDoc.data();
-        const validUntil = new Date(cacheData.validUntil);
+    // R-03: Read signal once, reuse across all snapshot lookups in this CF invocation.
+    const signal = await readSnapshotSignal(userId);
 
-        if (validUntil > new Date()) {
-          console.log(`[queryHandlers][getHistoricalReturns] Cache hit`);
+    // PERF-SNAP-024: Per-asset snapshot read path (antes del bypass legacy)
+    if (ticker && assetType && !forceRefresh) {
+      const assetSnapshotId = buildSnapshotDocId(userId, accountId, currency, ticker, assetType);
+      const assetSnapshotResult = await getSnapshotWithCache(assetSnapshotId, userId, signal);
+      const assetSnapshot = assetSnapshotResult.data;
+
+      if (assetSnapshot) {
+        const result = transformSnapshotToResponse(assetSnapshot);
+        console.log(`[PERF] Asset snapshot hit - ${assetSnapshotId}`);
+
+        const now = new Date();
+        return {
+          ...result,
+          cacheHit: false,
+          lastCalculated: now.toISOString(),
+          validUntil: calculateDynamicTTL().toISOString(),
+          lastSnapshotUpdate: assetSnapshotResult.lastSnapshotUpdate || null,
+        };
+      }
+
+      // OPT-FIRESTORE-002 P2-A: Await snapshot generation to avoid double-read with legacy.
+      // Previously fire-and-forget + legacy read the same daily docs twice (~27K reads/mes).
+      console.log(`[PERF] Asset snapshot miss - ${assetSnapshotId}, generating on-demand`);
+      try {
+        const generatedSnapshot = await generateAssetSnapshot(db, userId, accountId, currency, ticker, assetType);
+        if (generatedSnapshot) {
+          snapshotMemCache.set(assetSnapshotId, { data: generatedSnapshot, cachedAt: Date.now() });
+          const result = transformSnapshotToResponse(generatedSnapshot);
+          const now = new Date();
+          console.log(`[PERF] Asset snapshot generated on-demand - ${assetSnapshotId}`);
           return {
-            ...cacheData.data,
-            cacheHit: true,
-            lastCalculated: cacheData.lastCalculated,
-            validUntil: cacheData.validUntil
+            ...result,
+            cacheHit: false,
+            lastCalculated: now.toISOString(),
+            validUntil: calculateDynamicTTL().toISOString(),
+            lastSnapshotUpdate: assetSnapshotResult.lastSnapshotUpdate || null,
           };
         }
+      } catch (err) {
+        console.warn(`[PERF] On-demand asset snapshot generation failed for ${assetSnapshotId}: ${err.message}`);
       }
     }
 
-    // COST-OPT-003: Usar V2 (períodos consolidados) con fallback a V1
-    // Esto reduce lecturas de ~300+ documentos a ~20 documentos
-    const result = await getHistoricalReturnsV2(userId, {
-      currency,
-      accountId,
-      ticker,
-      assetType,
-      forceRefresh,
-      fallbackToV1: true  // Fallback automático si no hay datos consolidados
-    });
-
-    // 2. Guardar en cache
-    const now = new Date();
-    const validUntil = calculateDynamicTTL();
-
-    const cacheData = {
-      data: result,
-      lastCalculated: now.toISOString(),
-      validUntil: validUntil.toISOString()
-    };
-
-    try {
-      const cacheRef = db.doc(`userData/${userId}/performanceCache/${cacheKey}`);
-      await cacheRef.set(cacheData);
-    } catch (cacheWriteError) {
-      console.error(`[queryHandlers][getHistoricalReturns] Error guardando cache:`, cacheWriteError);
+    // PERF-SNAP-007: Ticker/AssetType → ruta legacy
+    if (ticker || assetType) {
+      return await getHistoricalReturnsLegacy(context, payload);
     }
 
-    const version = result._metadata?.version || 'v1';
-    console.log(`[queryHandlers][getHistoricalReturns] Éxito - version: ${version}`);
-    
-    return {
-      ...result,
-      cacheHit: false,
-      lastCalculated: now.toISOString(),
-      validUntil: validUntil.toISOString()
-    };
+    // PERF-SNAP-007/021: Intentar leer snapshot (cache in-memory → Firestore)
+    if (!forceRefresh) {
+      const snapshotDocId = buildSnapshotDocId(userId, accountId, currency);
+      const snapshotResult = await getSnapshotWithCache(snapshotDocId, userId, signal);
+      const snapshot = snapshotResult.data;
+
+      if (snapshot) {
+        const result = transformSnapshotToResponse(snapshot);
+
+        console.log(`[queryHandlers][getHistoricalReturns] Snapshot hit - ${snapshotDocId}`);
+
+        const now = new Date();
+        return {
+          ...result,
+          cacheHit: false,
+          lastCalculated: now.toISOString(),
+          validUntil: calculateDynamicTTL().toISOString(),
+          lastSnapshotUpdate: snapshotResult.lastSnapshotUpdate || null,
+        };
+      }
+
+      // PERF-SNAP-009: Log estandarizado con snapshotId para monitoreo
+      console.log(`[PERF] Snapshot not found for ${snapshotDocId}, generating on-demand`);
+
+      // OPT-FIRESTORE-002 P2-A: Await snapshot generation to avoid double-read.
+      // Previously fire-and-forget + legacy both read all daily docs (~27K reads/mes).
+      // Now: generate snapshot → use directly. Legacy only on failure.
+      try {
+        const generatedSnapshot = await generatePerformanceSnapshot(db, userId, accountId, currency);
+        if (generatedSnapshot) {
+          snapshotMemCache.set(snapshotDocId, { data: generatedSnapshot, cachedAt: Date.now() });
+          const result = transformSnapshotToResponse(generatedSnapshot);
+          const now = new Date();
+          console.log(`[PERF] Snapshot generated on-demand - ${snapshotDocId}`);
+          return {
+            ...result,
+            cacheHit: false,
+            lastCalculated: now.toISOString(),
+            validUntil: calculateDynamicTTL().toISOString(),
+            lastSnapshotUpdate: snapshotResult.lastSnapshotUpdate || null,
+          };
+        }
+      } catch (err) {
+        console.warn(`[PERF] On-demand snapshot generation failed for ${snapshotDocId}: ${err.message}`);
+      }
+    }
+
+    // Fallback a ruta legacy (V2/V1 + cache)
+    return await getHistoricalReturnsLegacy(context, payload);
 
   } catch (error) {
     console.error(`[queryHandlers][getHistoricalReturns] Error:`, error);
     if (error instanceof HttpsError) throw error;
     throw new HttpsError('internal', 'Error calculando rendimientos históricos');
   }
+}
+
+/**
+ * FEAT-EXCLUDE-001: Rendimientos del portafolio (o de una cuenta) excluyendo
+ * tickers, ej: el portafolio sin VUAA.L para compararlo contra el S&P 500.
+ *
+ * Responde con la misma forma que getHistoricalReturns más un bloque
+ * `carveOut` (método, tickers excluidos, cobertura). Cachea en
+ * performanceCache con la exclusión en la clave; invalidatePerformanceCache
+ * borra toda la colección, así que también la invalida.
+ *
+ * @param {Object} context - Contexto de ejecución
+ * @param {Object} payload - { currency, accountId, excludeTickers, forceRefresh }
+ * @returns {Promise<Object>}
+ */
+async function getHistoricalReturnsExcluding(context, payload) {
+  const userId = context.auth.uid;
+  const {
+    currency = "USD",
+    accountId = "overall",
+    ticker = null,
+    assetType = null,
+    excludeTickers,
+    forceRefresh = false,
+  } = payload || {};
+
+  if (ticker || assetType) {
+    throw new HttpsError('invalid-argument',
+      'excludeTickers aplica al portafolio o a una cuenta; no se combina con ticker/assetType');
+  }
+
+  let excludeSet;
+  try {
+    excludeSet = buildExcludeSet(excludeTickers);
+  } catch (error) {
+    throw new HttpsError('invalid-argument', error.message);
+  }
+  if (excludeSet.size === 0) {
+    throw new HttpsError('invalid-argument', 'excludeTickers no puede estar vacío');
+  }
+
+  const exclusionHash = crypto.createHash('sha1')
+    .update([...excludeSet].sort().join(','))
+    .digest('hex')
+    .slice(0, 12);
+  const cacheKey = `${currency}_${accountId}_ex_${exclusionHash}`;
+  const cacheRef = db.doc(`userData/${userId}/performanceCache/${cacheKey}`);
+
+  if (!forceRefresh) {
+    const cacheDoc = await cacheRef.get();
+    if (cacheDoc.exists) {
+      const cacheData = cacheDoc.data();
+      if (new Date(cacheData.validUntil) > new Date()) {
+        return {
+          ...cacheData.data,
+          cacheHit: true,
+          lastCalculated: cacheData.lastCalculated,
+          validUntil: cacheData.validUntil,
+        };
+      }
+    }
+  }
+
+  const result = await getCarveOutHistoricalReturns({ db, userId, currency, accountId, excludeSet });
+
+  const now = new Date();
+  const validUntil = calculateDynamicTTL();
+  try {
+    await cacheRef.set({
+      data: result,
+      lastCalculated: now.toISOString(),
+      validUntil: validUntil.toISOString(),
+    });
+  } catch (cacheWriteError) {
+    console.error(`[queryHandlers][getHistoricalReturnsExcluding] Error guardando cache:`, cacheWriteError);
+  }
+
+  return {
+    ...result,
+    cacheHit: false,
+    lastCalculated: now.toISOString(),
+    validUntil: validUntil.toISOString(),
+  };
+}
+
+/**
+ * FEAT-EXCLUDE-001: Los endpoints que no soportan exclusión la rechazan en
+ * lugar de ignorarla, para no devolver el portafolio completo como si fuera
+ * el filtrado.
+ */
+function rejectExcludeTickers(payload, endpoint) {
+  if (payload?.excludeTickers !== undefined && payload?.excludeTickers !== null) {
+    throw new HttpsError('invalid-argument',
+      `excludeTickers no está soportado en ${endpoint}; usa getHistoricalReturns`);
+  }
+}
+
+/**
+ * Ruta legacy de rendimientos históricos (V2 consolidados + cache Firestore).
+ * Usada como fallback cuando no hay snapshot, para ticker/assetType, o forceRefresh.
+ */
+async function getHistoricalReturnsLegacy(context, payload) {
+  const { auth } = context;
+  const userId = auth.uid;
+  const { 
+    currency = "USD", 
+    accountId = "overall", 
+    ticker = null, 
+    assetType = null, 
+    forceRefresh = false 
+  } = payload || {};
+
+  const cacheKey = `${currency}_${accountId}${ticker ? `_${ticker}` : ''}${assetType ? `_${assetType}` : ''}`;
+
+  // 1. Verificar cache (si no forceRefresh)
+  if (!forceRefresh) {
+    const cacheRef = db.doc(`userData/${userId}/performanceCache/${cacheKey}`);
+    const cacheDoc = await cacheRef.get();
+
+    if (cacheDoc.exists) {
+      const cacheData = cacheDoc.data();
+      const validUntil = new Date(cacheData.validUntil);
+
+      if (validUntil > new Date()) {
+        console.log(`[queryHandlers][getHistoricalReturnsLegacy] Cache hit`);
+        return {
+          ...cacheData.data,
+          cacheHit: true,
+          lastCalculated: cacheData.lastCalculated,
+          validUntil: cacheData.validUntil
+        };
+      }
+    }
+  }
+
+  const result = await getHistoricalReturnsV2(userId, {
+    currency,
+    accountId,
+    ticker,
+    assetType,
+    forceRefresh,
+    fallbackToV1: true
+  });
+
+  // 2. Guardar en cache
+  const now = new Date();
+  const validUntil = calculateDynamicTTL();
+
+  const cacheData = {
+    data: result,
+    lastCalculated: now.toISOString(),
+    validUntil: validUntil.toISOString()
+  };
+
+  try {
+    const cacheRef = db.doc(`userData/${userId}/performanceCache/${cacheKey}`);
+    await cacheRef.set(cacheData);
+  } catch (cacheWriteError) {
+    console.error(`[queryHandlers][getHistoricalReturnsLegacy] Error guardando cache:`, cacheWriteError);
+  }
+
+  const version = result._metadata?.version || 'v1';
+  console.log(`[queryHandlers][getHistoricalReturnsLegacy] Éxito - version: ${version}`);
+  
+  return {
+    ...result,
+    cacheHit: false,
+    lastCalculated: now.toISOString(),
+    validUntil: validUntil.toISOString()
+  };
 }
 
 /**
@@ -250,6 +744,8 @@ async function getMultiAccountHistoricalReturns(context, payload) {
   } = payload || {};
 
   console.log(`[queryHandlers][getMultiAccountHistoricalReturns] userId: ${userId}, accounts: ${accountIds.length}`);
+
+  rejectExcludeTickers(payload, 'getMultiAccountHistoricalReturns');
 
   try {
     // Validación de parámetros
@@ -304,262 +800,354 @@ async function getMultiAccountHistoricalReturns(context, payload) {
     }
 
     // ============================================================================
-    // MULTI-CUENTA REAL: Agregar datos de múltiples cuentas
+    // PERF-SNAP-008: Snapshot path — N reads en vez de N full collection scans
+    // Uses getSnapshotWithCache for in-memory cache + lastSnapshotUpdate invalidation
+    // R-03: Read signal once, reuse across all N snapshot lookups.
     // ============================================================================
-    
-    // Generar clave de cache
-    const sortedIds = [...accountIds].sort().join('_');
-    const cacheKey = `multi_${currency}_${sortedIds}${ticker ? `_${ticker}` : ''}${assetType ? `_${assetType}` : ''}`;
+    if (!forceRefresh && !ticker && !assetType) {
+      const signal = await readSnapshotSignal(userId);
+      const snapshotPromises = accountIds.map(accountId =>
+        getSnapshotWithCache(buildSnapshotDocId(userId, accountId, currency), userId, signal)
+      );
+      const snapshotResults = await Promise.all(snapshotPromises);
 
-    console.log(`[queryHandlers][getMultiAccountHistoricalReturns] Multi-cuenta, cache key: ${cacheKey}`);
+      if (snapshotResults.every(r => r.data !== null)) {
+        const snapshots = snapshotResults.map(r => r.data);
+        const result = aggregateSnapshotTimelines(snapshots, currency);
 
-    // Verificar cache (si no forceRefresh)
-    if (!forceRefresh) {
-      try {
-        const cacheRef = db.doc(`userData/${userId}/performanceCache/${cacheKey}`);
-        const cacheDoc = await cacheRef.get();
+        // FIX-SNAP-008c: Los snapshots individuales tienen validDocsCountByPeriod correcto
+        // (calculado por V2 chainFactorsForPeriods con docsCount de consolidated periods).
+        // Pero aggregateSnapshotTimelines → calculateHistoricalReturns recalcula desde
+        // "fake docs" del timeline, que tiene 1 punto por período consolidado = counts bajísimos.
+        // Fix: usar el MAX de validDocsCountByPeriod de los snapshots individuales.
+        const aggregatedValidDocs = snapshots.reduce((acc, snap) => {
+          const vd = snap.validDocsCountByPeriod || {};
+          return {
+            ytd: Math.max(acc.ytd, vd.ytd || 0),
+            oneMonth: Math.max(acc.oneMonth, vd.oneMonth || 0),
+            threeMonths: Math.max(acc.threeMonths, vd.threeMonths || 0),
+            sixMonths: Math.max(acc.sixMonths, vd.sixMonths || 0),
+            oneYear: Math.max(acc.oneYear, vd.oneYear || 0),
+            twoYears: Math.max(acc.twoYears, vd.twoYears || 0),
+            fiveYears: Math.max(acc.fiveYears, vd.fiveYears || 0),
+          };
+        }, { ytd: 0, oneMonth: 0, threeMonths: 0, sixMonths: 0, oneYear: 0, twoYears: 0, fiveYears: 0 });
 
-        if (cacheDoc.exists) {
-          const cache = cacheDoc.data();
-          const validUntil = new Date(cache.validUntil);
+        // FIX-SNAP-008c: Los has*Data flags también necesitan reflejar los datos reales
+        const aggregatedReturns = { ...result.returns };
+        aggregatedReturns.hasYtdData = aggregatedValidDocs.ytd >= 1;
+        aggregatedReturns.hasOneMonthData = aggregatedValidDocs.oneMonth >= 5;
+        aggregatedReturns.hasThreeMonthData = aggregatedValidDocs.threeMonths >= 15;
+        aggregatedReturns.hasSixMonthData = aggregatedValidDocs.sixMonths >= 30;
+        aggregatedReturns.hasOneYearData = aggregatedValidDocs.oneYear >= 60;
+        aggregatedReturns.hasTwoYearData = aggregatedValidDocs.twoYears >= 120;
+        aggregatedReturns.hasFiveYearData = aggregatedValidDocs.fiveYears >= 250;
 
-          if (validUntil > new Date()) {
-            console.log(`[queryHandlers][getMultiAccountHistoricalReturns] Cache HIT`);
-            return {
-              ...cache.data,
-              cacheHit: true,
-              lastCalculated: cache.lastCalculated,
-              validUntil: cache.validUntil
-            };
-          }
-        }
-      } catch (cacheError) {
-        console.warn(`[queryHandlers][getMultiAccountHistoricalReturns] Error leyendo cache:`, cacheError.message);
+        console.log(`[queryHandlers][getMultiAccountHistoricalReturns] Snapshot path - ${accountIds.length} snapshots agregados, validDocs: ytd=${aggregatedValidDocs.ytd}, 1M=${aggregatedValidDocs.oneMonth}, 3M=${aggregatedValidDocs.threeMonths}, 6M=${aggregatedValidDocs.sixMonths}, 1Y=${aggregatedValidDocs.oneYear}`);
+
+        // FIX-SNAP-008b: Propagar lastSnapshotUpdate para invalidación de cache frontend
+        const lastSnapshotUpdate = snapshotResults[0]?.lastSnapshotUpdate || null;
+
+        // Aggregate monthlyCompound from individual snapshots (P&L fields)
+        const aggregatedMonthlyCompound = aggregateMonthlyCompounds(snapshots);
+
+        const now = new Date();
+        return {
+          ...result,
+          returns: aggregatedReturns,
+          validDocsCountByPeriod: aggregatedValidDocs,
+          monthlyCompoundData: aggregatedMonthlyCompound,
+          cacheHit: false,
+          lastCalculated: now.toISOString(),
+          validUntil: calculateDynamicTTL().toISOString(),
+          lastSnapshotUpdate,
+          _metadata: { ...(result._metadata || {}), version: 'snapshot-multi' },
+        };
       }
-    }
 
-    console.log(`[queryHandlers][getMultiAccountHistoricalReturns] Cache MISS - Agregando ${accountIds.length} cuentas`);
+      // PERF-SNAP-009: Log estandarizado con IDs de snapshots faltantes
+      const missingIds = snapshotResults
+        .map((r, i) => r.data !== null ? null : buildSnapshotDocId(userId, accountIds[i], currency))
+        .filter(Boolean);
+      console.log(`[PERF] Snapshot not found for [${missingIds.join(', ')}], falling back to legacy`);
 
-    // Leer datos de cada cuenta en paralelo
-    const accountDataPromises = accountIds.map(accountId => 
-      db.collection(`portfolioPerformance/${userId}/accounts/${accountId}/dates`)
-        .orderBy("date", "asc")
-        .get()
-    );
-    
-    const accountSnapshots = await Promise.all(accountDataPromises);
-
-    // Verificar si hay datos
-    const totalDocs = accountSnapshots.reduce((sum, snap) => sum.size + snap.size, 0);
-    if (totalDocs === 0) {
-      console.log(`[queryHandlers][getMultiAccountHistoricalReturns] Sin datos de performance`);
-      return {
-        returns: {
-          ytdReturn: 0, oneMonthReturn: 0, threeMonthReturn: 0, sixMonthReturn: 0,
-          oneYearReturn: 0, twoYearReturn: 0, fiveYearReturn: 0,
-          hasYtdData: false, hasOneMonthData: false, hasThreeMonthData: false,
-          hasSixMonthData: false, hasOneYearData: false, hasTwoYearData: false,
-          hasFiveYearData: false
-        },
-        validDocsCountByPeriod: {
-          ytd: 0, oneMonth: 0, threeMonths: 0, sixMonths: 0,
-          oneYear: 0, twoYears: 0, fiveYears: 0
-        },
-        totalValueData: {
-          dates: [], values: [], percentChanges: [], overallPercentChange: 0
-        },
-        performanceByYear: {},
-        availableYears: [],
-        startDate: "",
-        monthlyCompoundData: {},
-        cacheHit: false,
-        lastCalculated: new Date().toISOString()
-      };
-    }
-
-    // Agregar datos por fecha
-    const aggregatedByDate = new Map();
-
-    accountSnapshots.forEach(snapshot => {
-      snapshot.docs.forEach(doc => {
-        const data = doc.data();
-        const date = data.date;
-        
-        if (!aggregatedByDate.has(date)) {
-          aggregatedByDate.set(date, {
-            date,
-            currencies: {}
-          });
-        }
-        
-        const existing = aggregatedByDate.get(date);
-        
-        // Agregar métricas por moneda
-        Object.keys(data).forEach(key => {
-          if (key === 'date') return;
-          
-          const currencyCode = key;
-          const currencyData = data[currencyCode];
-          
-          if (!currencyData || typeof currencyData !== 'object') return;
-          
-          if (!existing.currencies[currencyCode]) {
-            existing.currencies[currencyCode] = {
-              totalInvestment: 0,
-              totalValue: 0,
-              totalCashFlow: 0,
-              unrealizedProfitAndLoss: 0,
-              doneProfitAndLoss: 0,
-              assetPerformance: {},
-              _accountContributions: []
-            };
-          }
-          
-          // Guardar contribución de esta cuenta para ponderar el cambio diario
-          existing.currencies[currencyCode]._accountContributions.push({
-            totalValue: currencyData.totalValue || 0,
-            adjustedDailyChangePercentage: currencyData.adjustedDailyChangePercentage || 0,
-            rawDailyChangePercentage: currencyData.rawDailyChangePercentage || currencyData.dailyChangePercentage || 0
-          });
-          
-          // Sumar métricas aditivas
-          existing.currencies[currencyCode].totalInvestment += currencyData.totalInvestment || 0;
-          existing.currencies[currencyCode].totalValue += currencyData.totalValue || 0;
-          existing.currencies[currencyCode].totalCashFlow += currencyData.totalCashFlow || 0;
-          existing.currencies[currencyCode].unrealizedProfitAndLoss += currencyData.unrealizedProfitAndLoss || 0;
-          existing.currencies[currencyCode].doneProfitAndLoss += currencyData.doneProfitAndLoss || 0;
-          
-          // Agregar assets para detalle
-          if (currencyData.assetPerformance) {
-            Object.entries(currencyData.assetPerformance).forEach(([assetKey, assetData]) => {
-              if (!existing.currencies[currencyCode].assetPerformance[assetKey]) {
-                existing.currencies[currencyCode].assetPerformance[assetKey] = {
-                  totalInvestment: 0,
-                  totalValue: 0,
-                  totalCashFlow: 0,
-                  units: 0,
-                  unrealizedProfitAndLoss: 0,
-                  doneProfitAndLoss: 0
-                };
-              }
-              
-              const existingAsset = existing.currencies[currencyCode].assetPerformance[assetKey];
-              existingAsset.totalInvestment += assetData.totalInvestment || 0;
-              existingAsset.totalValue += assetData.totalValue || 0;
-              existingAsset.totalCashFlow += assetData.totalCashFlow || 0;
-              existingAsset.units += assetData.units || 0;
-              existingAsset.unrealizedProfitAndLoss += assetData.unrealizedProfitAndLoss || 0;
-              existingAsset.doneProfitAndLoss += assetData.doneProfitAndLoss || 0;
-            });
-          }
-        });
+      // PERF-SNAP-009: Generación on-demand fire-and-forget solo para cuentas sin snapshot
+      const missingAccountIds = snapshotResults
+        .map((r, i) => r.data !== null ? null : accountIds[i])
+        .filter(Boolean);
+      missingAccountIds.forEach(accountId => {
+        generatePerformanceSnapshot(db, userId, accountId, currency).catch(err =>
+          console.warn(`[PERF] On-demand snapshot generation failed for ${buildSnapshotDocId(userId, accountId, currency)}: ${err.message}`)
+        );
       });
-    });
-
-    // Calcular rendimiento ponderado por valor para cada día
-    // Usar el VALOR PRE-CAMBIO para ponderar correctamente
-    const sortedDates = Array.from(aggregatedByDate.keys()).sort();
-    
-    sortedDates.forEach(date => {
-      const dateData = aggregatedByDate.get(date);
-      
-      Object.keys(dateData.currencies).forEach(currencyCode => {
-        const c = dateData.currencies[currencyCode];
-        
-        // ROI total
-        c.totalROI = c.totalInvestment > 0 
-          ? ((c.totalValue - c.totalInvestment) / c.totalInvestment) * 100 
-          : 0;
-        
-        // Calcular valor PRE-CAMBIO de cada cuenta para ponderar
-        const contributions = c._accountContributions || [];
-        
-        const contributionsWithPreValue = contributions.map(acc => {
-          const change = acc.adjustedDailyChangePercentage || 0;
-          const currentValue = acc.totalValue || 0;
-          const preChangeValue = change !== 0 ? currentValue / (1 + change / 100) : currentValue;
-          return { ...acc, preChangeValue };
-        });
-        
-        const totalWeight = contributionsWithPreValue.reduce((sum, acc) => sum + acc.preChangeValue, 0);
-        
-        if (totalWeight > 0 && contributionsWithPreValue.length > 0) {
-          const weightedAdjustedChange = contributionsWithPreValue.reduce((sum, acc) => {
-            const weight = acc.preChangeValue / totalWeight;
-            return sum + (acc.adjustedDailyChangePercentage || 0) * weight;
-          }, 0);
-          
-          const weightedRawChange = contributionsWithPreValue.reduce((sum, acc) => {
-            const weight = acc.preChangeValue / totalWeight;
-            return sum + (acc.rawDailyChangePercentage || 0) * weight;
-          }, 0);
-          
-          c.dailyChangePercentage = weightedRawChange;
-          c.rawDailyChangePercentage = weightedRawChange;
-          c.adjustedDailyChangePercentage = weightedAdjustedChange;
-        } else {
-          c.dailyChangePercentage = 0;
-          c.rawDailyChangePercentage = 0;
-          c.adjustedDailyChangePercentage = 0;
-        }
-        
-        delete c._accountContributions;
-        
-        // Calcular ROI para cada asset
-        Object.values(c.assetPerformance).forEach(assetData => {
-          assetData.totalROI = assetData.totalInvestment > 0
-            ? ((assetData.totalValue - assetData.totalInvestment) / assetData.totalInvestment) * 100
-            : 0;
-        });
-      });
-    });
-
-    // Convertir a formato de docs para usar calculateHistoricalReturns
-    const aggregatedDocs = sortedDates.map(date => {
-      const dateData = aggregatedByDate.get(date);
-      return {
-        data: () => ({
-          date: dateData.date,
-          ...dateData.currencies
-        })
-      };
-    });
-
-    console.log(`[queryHandlers][getMultiAccountHistoricalReturns] Procesando ${aggregatedDocs.length} fechas agregadas`);
-
-    // Usar función existente para calcular rendimientos
-    const result = calculateHistoricalReturns(aggregatedDocs, currency, ticker, assetType);
-
-    // Guardar en cache
-    const now = new Date();
-    const validUntil = calculateDynamicTTL();
-
-    const cacheData = {
-      data: result,
-      lastCalculated: now.toISOString(),
-      validUntil: validUntil.toISOString()
-    };
-
-    try {
-      const cacheRef = db.doc(`userData/${userId}/performanceCache/${cacheKey}`);
-      await cacheRef.set(cacheData);
-      console.log(`[queryHandlers][getMultiAccountHistoricalReturns] Cache guardado`);
-    } catch (cacheWriteError) {
-      console.error(`[queryHandlers][getMultiAccountHistoricalReturns] Error guardando cache:`, cacheWriteError.message);
     }
 
-    return {
-      ...result,
-      cacheHit: false,
-      lastCalculated: now.toISOString(),
-      validUntil: validUntil.toISOString()
-    };
+    // Fallback a ruta legacy (full collection scan + cache)
+    return await getMultiAccountHistoricalReturnsLegacy(context, payload);
 
   } catch (error) {
     console.error(`[queryHandlers][getMultiAccountHistoricalReturns] Error:`, error);
     if (error instanceof HttpsError) throw error;
     throw new HttpsError('internal', 'Error calculando rendimientos multi-cuenta');
   }
+}
+
+/**
+ * PERF-SNAP-008: Ruta legacy de rendimientos históricos multi-cuenta.
+ * Full collection scan por cada cuenta + agregación en memoria + cache Firestore.
+ * Usada como fallback cuando no hay snapshots, para ticker/assetType, o forceRefresh.
+ */
+async function getMultiAccountHistoricalReturnsLegacy(context, payload) {
+  const { auth } = context;
+  const userId = auth.uid;
+  const {
+    accountIds = [],
+    currency = "USD",
+    ticker = null,
+    assetType = null,
+    forceRefresh = false
+  } = payload || {};
+
+  // ============================================================================
+  // MULTI-CUENTA REAL: Agregar datos de múltiples cuentas
+  // ============================================================================
+    
+  // Generar clave de cache
+  const sortedIds = [...accountIds].sort().join('_');
+  const cacheKey = `multi_${currency}_${sortedIds}${ticker ? `_${ticker}` : ''}${assetType ? `_${assetType}` : ''}`;
+
+  console.log(`[queryHandlers][getMultiAccountHistoricalReturnsLegacy] Multi-cuenta, cache key: ${cacheKey}`);
+
+  // Verificar cache (si no forceRefresh)
+  if (!forceRefresh) {
+    try {
+      const cacheRef = db.doc(`userData/${userId}/performanceCache/${cacheKey}`);
+      const cacheDoc = await cacheRef.get();
+
+      if (cacheDoc.exists) {
+        const cache = cacheDoc.data();
+        const validUntil = new Date(cache.validUntil);
+
+        if (validUntil > new Date()) {
+          console.log(`[queryHandlers][getMultiAccountHistoricalReturnsLegacy] Cache HIT`);
+          return {
+            ...cache.data,
+            cacheHit: true,
+            lastCalculated: cache.lastCalculated,
+            validUntil: cache.validUntil
+          };
+        }
+      }
+    } catch (cacheError) {
+      console.warn(`[queryHandlers][getMultiAccountHistoricalReturnsLegacy] Error leyendo cache:`, cacheError.message);
+    }
+  }
+
+  console.log(`[queryHandlers][getMultiAccountHistoricalReturnsLegacy] Cache MISS - Agregando ${accountIds.length} cuentas`);
+
+  // Leer datos de cada cuenta en paralelo
+  const accountDataPromises = accountIds.map(accountId => 
+    db.collection(`portfolioPerformance/${userId}/accounts/${accountId}/dates`)
+      .orderBy("date", "asc")
+      .get()
+  );
+  
+  const accountSnapshots = await Promise.all(accountDataPromises);
+
+  const totalDocs = accountSnapshots.reduce((sum, snap) => sum + snap.size, 0);
+  const docsDetail = accountSnapshots.map((snap, i) => `${accountIds[i].substring(0, 8)}...:${snap.size}`).join(', ');
+  console.log(`[queryHandlers][getMultiAccountHistoricalReturnsLegacy] Docs por cuenta: [${docsDetail}], Total: ${totalDocs}`);
+
+  if (totalDocs === 0) {
+    console.log(`[queryHandlers][getMultiAccountHistoricalReturnsLegacy] Sin datos de performance`);
+    return {
+      returns: {
+        ytdReturn: 0, oneMonthReturn: 0, threeMonthReturn: 0, sixMonthReturn: 0,
+        oneYearReturn: 0, twoYearReturn: 0, fiveYearReturn: 0,
+        hasYtdData: false, hasOneMonthData: false, hasThreeMonthData: false,
+        hasSixMonthData: false, hasOneYearData: false, hasTwoYearData: false,
+        hasFiveYearData: false
+      },
+      validDocsCountByPeriod: {
+        ytd: 0, oneMonth: 0, threeMonths: 0, sixMonths: 0,
+        oneYear: 0, twoYears: 0, fiveYears: 0
+      },
+      totalValueData: {
+        dates: [], values: [], percentChanges: [], overallPercentChange: 0
+      },
+      performanceByYear: {},
+      availableYears: [],
+      startDate: "",
+      monthlyCompoundData: {},
+      cacheHit: false,
+      lastCalculated: new Date().toISOString()
+    };
+  }
+
+  const aggregatedByDate = new Map();
+
+  accountSnapshots.forEach(snapshot => {
+    snapshot.docs.forEach(doc => {
+      const data = doc.data();
+      const date = data.date;
+      
+      if (!aggregatedByDate.has(date)) {
+        aggregatedByDate.set(date, {
+          date,
+          currencies: {}
+        });
+      }
+      
+      const existing = aggregatedByDate.get(date);
+      
+      Object.keys(data).forEach(key => {
+        if (key === 'date') return;
+        
+        const currencyCode = key;
+        const currencyData = data[currencyCode];
+        
+        if (!currencyData || typeof currencyData !== 'object') return;
+        
+        if (!existing.currencies[currencyCode]) {
+          existing.currencies[currencyCode] = {
+            totalInvestment: 0,
+            totalValue: 0,
+            totalCashFlow: 0,
+            unrealizedProfitAndLoss: 0,
+            doneProfitAndLoss: 0,
+            assetPerformance: {},
+            _accountContributions: []
+          };
+        }
+        
+        existing.currencies[currencyCode]._accountContributions.push({
+          totalValue: currencyData.totalValue || 0,
+          adjustedDailyChangePercentage: currencyData.adjustedDailyChangePercentage || 0,
+          rawDailyChangePercentage: currencyData.rawDailyChangePercentage || currencyData.dailyChangePercentage || 0
+        });
+        
+        existing.currencies[currencyCode].totalInvestment += currencyData.totalInvestment || 0;
+        existing.currencies[currencyCode].totalValue += currencyData.totalValue || 0;
+        existing.currencies[currencyCode].totalCashFlow += currencyData.totalCashFlow || 0;
+        existing.currencies[currencyCode].unrealizedProfitAndLoss += currencyData.unrealizedProfitAndLoss || 0;
+        existing.currencies[currencyCode].doneProfitAndLoss += currencyData.doneProfitAndLoss || 0;
+        
+        if (currencyData.assetPerformance) {
+          Object.entries(currencyData.assetPerformance).forEach(([assetKey, assetData]) => {
+            if (!existing.currencies[currencyCode].assetPerformance[assetKey]) {
+              existing.currencies[currencyCode].assetPerformance[assetKey] = {
+                totalInvestment: 0,
+                totalValue: 0,
+                totalCashFlow: 0,
+                units: 0,
+                unrealizedProfitAndLoss: 0,
+                doneProfitAndLoss: 0
+              };
+            }
+            
+            const existingAsset = existing.currencies[currencyCode].assetPerformance[assetKey];
+            existingAsset.totalInvestment += assetData.totalInvestment || 0;
+            existingAsset.totalValue += assetData.totalValue || 0;
+            existingAsset.totalCashFlow += assetData.totalCashFlow || 0;
+            existingAsset.units += assetData.units || 0;
+            existingAsset.unrealizedProfitAndLoss += assetData.unrealizedProfitAndLoss || 0;
+            existingAsset.doneProfitAndLoss += assetData.doneProfitAndLoss || 0;
+          });
+        }
+      });
+    });
+  });
+
+  const sortedDates = Array.from(aggregatedByDate.keys()).sort();
+  
+  sortedDates.forEach(date => {
+    const dateData = aggregatedByDate.get(date);
+    
+    Object.keys(dateData.currencies).forEach(currencyCode => {
+      const c = dateData.currencies[currencyCode];
+      
+      c.totalROI = c.totalInvestment > 0 
+        ? ((c.totalValue - c.totalInvestment) / c.totalInvestment) * 100 
+        : 0;
+      
+      const contributions = c._accountContributions || [];
+      
+      const contributionsWithPreValue = contributions.map(acc => {
+        const change = acc.adjustedDailyChangePercentage || 0;
+        const currentValue = acc.totalValue || 0;
+        const preChangeValue = change !== 0 ? currentValue / (1 + change / 100) : currentValue;
+        return { ...acc, preChangeValue };
+      });
+      
+      const totalWeight = contributionsWithPreValue.reduce((sum, acc) => sum + acc.preChangeValue, 0);
+      
+      if (totalWeight > 0 && contributionsWithPreValue.length > 0) {
+        const weightedAdjustedChange = contributionsWithPreValue.reduce((sum, acc) => {
+          const weight = acc.preChangeValue / totalWeight;
+          return sum + (acc.adjustedDailyChangePercentage || 0) * weight;
+        }, 0);
+        
+        const weightedRawChange = contributionsWithPreValue.reduce((sum, acc) => {
+          const weight = acc.preChangeValue / totalWeight;
+          return sum + (acc.rawDailyChangePercentage || 0) * weight;
+        }, 0);
+        
+        c.dailyChangePercentage = weightedRawChange;
+        c.rawDailyChangePercentage = weightedRawChange;
+        c.adjustedDailyChangePercentage = weightedAdjustedChange;
+      } else {
+        c.dailyChangePercentage = 0;
+        c.rawDailyChangePercentage = 0;
+        c.adjustedDailyChangePercentage = 0;
+      }
+      
+      delete c._accountContributions;
+      
+      Object.values(c.assetPerformance).forEach(assetData => {
+        assetData.totalROI = assetData.totalInvestment > 0
+          ? ((assetData.totalValue - assetData.totalInvestment) / assetData.totalInvestment) * 100
+          : 0;
+      });
+    });
+  });
+
+  const aggregatedDocs = sortedDates.map(date => {
+    const dateData = aggregatedByDate.get(date);
+    return {
+      data: () => ({
+        date: dateData.date,
+        ...dateData.currencies
+      })
+    };
+  });
+
+  console.log(`[queryHandlers][getMultiAccountHistoricalReturnsLegacy] Procesando ${aggregatedDocs.length} fechas agregadas`);
+
+  const result = calculateHistoricalReturns(aggregatedDocs, currency, ticker, assetType);
+
+  const now = new Date();
+  const validUntil = calculateDynamicTTL();
+
+  const cacheData = {
+    data: result,
+    lastCalculated: now.toISOString(),
+    validUntil: validUntil.toISOString()
+  };
+
+  try {
+    const cacheRef = db.doc(`userData/${userId}/performanceCache/${cacheKey}`);
+    await cacheRef.set(cacheData);
+    console.log(`[queryHandlers][getMultiAccountHistoricalReturnsLegacy] Cache guardado`);
+  } catch (cacheWriteError) {
+    console.error(`[queryHandlers][getMultiAccountHistoricalReturnsLegacy] Error guardando cache:`, cacheWriteError.message);
+  }
+
+  return {
+    ...result,
+    cacheHit: false,
+    lastCalculated: now.toISOString(),
+    validUntil: validUntil.toISOString()
+  };
 }
 
 /**
@@ -602,8 +1190,15 @@ async function getIndexHistory(context, payload) {
       const cacheData = cacheDoc.data();
       const cacheAge = Date.now() - (cacheData.lastUpdated || 0);
 
-      if (cacheAge < INDEX_CACHE_TTL_MS) {
-        console.log(`[queryHandlers][getIndexHistory] Cache hit para ${cacheKey}`);
+      // FIX-INDEX-INTRADAY: Use shorter TTL if cached data doesn't include today
+      const todayStr = new Date().toISOString().split('T')[0];
+      const lastCachedDate = (cacheData.chartData || []).length > 0
+        ? cacheData.chartData[cacheData.chartData.length - 1].date
+        : '';
+      const effectiveTTL = lastCachedDate === todayStr ? INDEX_CACHE_TTL_MS : INDEX_INTRADAY_CACHE_TTL_MS;
+
+      if (cacheAge < effectiveTTL) {
+        console.log(`[queryHandlers][getIndexHistory] Cache hit para ${cacheKey} (TTL=${effectiveTTL/1000}s)`);
         return {
           chartData: cacheData.chartData || [],
           overallChange: cacheData.overallChange || 0,
@@ -651,9 +1246,9 @@ async function getIndexHistory(context, payload) {
 async function getPortfolioDistribution(context, payload) {
   const { auth } = context;
   const userId = auth.uid;
-  const { accountIds, accountId, currency, includeHoldings } = payload || {};
+  const { accountIds, accountId, currency, includeHoldings, forceRefresh } = payload || {};
 
-  console.log(`[queryHandlers][getPortfolioDistribution] userId: ${userId}`);
+  console.log(`[queryHandlers][getPortfolioDistribution] userId: ${userId}, forceRefresh: ${forceRefresh}`);
 
   try {
     const result = await portfolioDistributionService.getPortfolioDistribution(
@@ -662,7 +1257,8 @@ async function getPortfolioDistribution(context, payload) {
         accountIds, 
         accountId, 
         currency: currency || 'USD', 
-        includeHoldings: includeHoldings ?? true 
+        includeHoldings: includeHoldings ?? true,
+        forceRefresh: forceRefresh ?? false
       }
     );
 
@@ -692,7 +1288,7 @@ async function getAvailableSectors(context, payload) {
     const sectors = await portfolioDistributionService.getAvailableSectors();
     
     console.log(`[queryHandlers][getAvailableSectors] Éxito - ${sectors.length} sectores`);
-    
+
     return { sectors };
   } catch (error) {
     console.error(`[queryHandlers][getAvailableSectors] Error:`, error);
@@ -701,8 +1297,370 @@ async function getAvailableSectors(context, payload) {
 }
 
 /**
+ * HU 2.1 — Tipo de cambio de una fecha concreta entre dos divisas.
+ *
+ * Lo consume el diálogo de movimiento de efectivo para proponer la tasa de la
+ * fecha del ingreso, no la de hoy. La tasa se expresa como el usuario la
+ * entiende: cuántas unidades de `toCurrency` cuesta 1 unidad de `fromCurrency`.
+ *
+ * Cuando no hay tasa, devuelve `rate: null` en lugar de lanzar: la ausencia es
+ * una respuesta legítima que la interfaz traduce en "escríbela tú" (RN-05).
+ *
+ * @param {Object} context - Contexto de ejecución
+ * @param {Object} payload - { date, fromCurrency, toCurrency? }
+ * @returns {Promise<{rate: number|null, rateDate: string|null, isExactDate: boolean, source: string|null, fromCurrency: string, toCurrency: string}>}
+ */
+async function getHistoricalExchangeRate(context, payload) {
+  const { auth } = context;
+  const { date, fromCurrency } = payload || {};
+
+  console.log(`[queryHandlers][getHistoricalExchangeRate] userId: ${auth.uid}, date: ${date}, from: ${fromCurrency}`);
+
+  if (!date || !fromCurrency) {
+    throw new HttpsError('invalid-argument', 'date y fromCurrency son requeridos');
+  }
+
+  try {
+    // La moneda de referencia se resuelve en servidor: es una preferencia del
+    // usuario, no un dato que el cliente deba poder suplantar.
+    const toCurrency = payload.toCurrency || await getUserReferenceCurrency(auth.uid);
+
+    const result = await historicalRateService.getCrossRate(fromCurrency, toCurrency, date);
+
+    if (result === null) {
+      console.warn(`[queryHandlers][getHistoricalExchangeRate] Sin tasa - ${fromCurrency}/${toCurrency} en ${date}`);
+      return {
+        rate: null,
+        rateDate: null,
+        isExactDate: false,
+        source: null,
+        fromCurrency,
+        toCurrency,
+      };
+    }
+
+    console.log(`[queryHandlers][getHistoricalExchangeRate] Éxito - ${result.rate} (${result.source})`);
+
+    return {
+      rate: result.rate,
+      rateDate: result.rateDate,
+      isExactDate: result.rateDate === date,
+      source: result.source,
+      fromCurrency,
+      toCurrency,
+    };
+  } catch (error) {
+    if (error instanceof HttpsError) throw error;
+    console.error(`[queryHandlers][getHistoricalExchangeRate] Error:`, error);
+    throw new HttpsError('internal', 'Error obteniendo el tipo de cambio de la fecha');
+  }
+}
+
+/**
+ * HU 2.3 — Estimación de la base de costo de un saldo sin historia conocida.
+ *
+ * Cuando el usuario va a comprar pagando con un saldo cuyo tipo de cambio de
+ * adquisición el sistema no pudo determinar, se le pide **una sola vez** que lo
+ * confirme (RN-12). Para no obligarle a inventar nada, se le propone una
+ * estimación: la tasa de mercado de la fecha de su **primer movimiento** en esa
+ * cuenta y esa divisa, que es lo más cercano a "cuándo llegó ese dinero" que el
+ * sistema puede saber sin el libro mayor de 2.6.
+ *
+ * Si no hay ningún movimiento registrado, se cae a la fecha que indique el
+ * cliente (la de la compra que se está registrando).
+ *
+ * Devuelve `estimatedRate: null` en lugar de lanzar cuando no hay tasa: la
+ * ausencia es una respuesta legítima que la interfaz convierte en "escríbela
+ * tú" (RN-13).
+ *
+ * @param {Object} context - Contexto de ejecución
+ * @param {Object} payload - { portfolioAccountId, currency, fallbackDate? }
+ * @returns {Promise<{estimatedRate: number|null, rateDate: string|null, firstMovementDate: string|null, currency: string, referenceCurrency: string}>}
+ */
+async function getBalanceCostBasisEstimate(context, payload) {
+  const { auth } = context;
+  const { portfolioAccountId, currency, fallbackDate } = payload || {};
+
+  console.log(`[queryHandlers][getBalanceCostBasisEstimate] userId: ${auth.uid}, account: ${portfolioAccountId}, currency: ${currency}`);
+
+  if (!portfolioAccountId || !currency) {
+    throw new HttpsError('invalid-argument', 'portfolioAccountId y currency son requeridos');
+  }
+
+  try {
+    // Ownership: la cuenta tiene que ser del usuario que pregunta.
+    const accountDoc = await db.collection('portfolioAccounts').doc(portfolioAccountId).get();
+
+    if (!accountDoc.exists || accountDoc.data()?.userId !== auth.uid) {
+      throw new HttpsError('permission-denied', 'No tienes acceso a esta cuenta');
+    }
+
+    const referenceCurrency = await getUserReferenceCurrency(auth.uid);
+
+    // Sin exposición cambiaria no hay nada que estimar (RN-14).
+    if (currency === referenceCurrency) {
+      return {
+        estimatedRate: 1,
+        rateDate: null,
+        firstMovementDate: null,
+        currency,
+        referenceCurrency,
+      };
+    }
+
+    // Primer movimiento de efectivo de esa cuenta que tocó esa divisa. Se
+    // reutiliza EXACTAMENTE la query que ya usa el historial de saldo —
+    // `portfolioAccountId` + `assetType == 'cash'`— y la divisa se filtra en
+    // memoria, para no exigir un índice compuesto nuevo. El conjunto es el
+    // efectivo de una sola cuenta: cabe de sobra.
+    //
+    // HU 2.2: una conversión entró a esta divisa aunque su campo `currency` sea
+    // la de origen, así que cuenta como movimiento de las dos puntas.
+    let firstMovementDate = null;
+
+    const snapshot = await db.collection('transactions')
+      .where('portfolioAccountId', '==', portfolioAccountId)
+      .where('assetType', '==', 'cash')
+      .get();
+
+    snapshot.docs.forEach((doc) => {
+      const tx = doc.data() || {};
+
+      if (tx.currency !== currency && tx.toCurrency !== currency) return;
+      if (!tx.date) return;
+
+      const txDate = String(tx.date).substring(0, 10);
+
+      if (firstMovementDate === null || txDate < firstMovementDate) {
+        firstMovementDate = txDate;
+      }
+    });
+
+    const rateDateRequested = firstMovementDate
+      || (fallbackDate ? String(fallbackDate).substring(0, 10) : null);
+
+    if (!rateDateRequested) {
+      return {
+        estimatedRate: null,
+        rateDate: null,
+        firstMovementDate,
+        currency,
+        referenceCurrency,
+      };
+    }
+
+    const result = await historicalRateService.getCrossRate(currency, referenceCurrency, rateDateRequested);
+
+    if (result === null) {
+      console.warn(`[queryHandlers][getBalanceCostBasisEstimate] Sin tasa - ${currency}/${referenceCurrency} en ${rateDateRequested}`);
+      return {
+        estimatedRate: null,
+        rateDate: null,
+        firstMovementDate,
+        currency,
+        referenceCurrency,
+      };
+    }
+
+    console.log(`[queryHandlers][getBalanceCostBasisEstimate] Éxito - ${result.rate} (${result.source})`);
+
+    return {
+      estimatedRate: result.rate,
+      rateDate: result.rateDate,
+      firstMovementDate,
+      currency,
+      referenceCurrency,
+    };
+  } catch (error) {
+    if (error instanceof HttpsError) throw error;
+    console.error(`[queryHandlers][getBalanceCostBasisEstimate] Error:`, error);
+    throw new HttpsError('internal', 'Error estimando la base de costo del saldo');
+  }
+}
+
+/**
+ * HU 2.6 — El libro mayor de un saldo (AC-1) y su reconciliación (AC-3).
+ *
+ * Devuelve los movimientos que llevaron a ese saldo hasta donde está, de más
+ * reciente a más antiguo, con la tasa de cada uno y el saldo y la tasa promedio
+ * acumulados después de él. La aritmética vive en `balanceLedger`, que es el
+ * mismo módulo con el que la migración replaya el histórico (D1).
+ *
+ * **Persiste el veredicto de conciliación** en la propia cuenta (D4). AC-3 pide
+ * la marca de "no conciliado" al entrar a la gestión de cuentas, y recalcularla
+ * en cada visita obligaría a leer todas las transacciones de todas las cuentas.
+ * Como esta historia cierra los caminos que movían el saldo sin asiento, la
+ * deriva sólo puede venir de datos anteriores: basta con anotar el veredicto
+ * cada vez que el libro mayor se replaya de todas formas.
+ *
+ * La lectura reutiliza el índice `portfolioAccountId ASC + date DESC` que ya
+ * existe y filtra la divisa en memoria — la misma decisión que tomaron 2.3 y
+ * 2.4 para no exigir un índice compuesto nuevo. El conjunto es el de una sola
+ * cuenta.
+ *
+ * @param {Object} context - Contexto de ejecución
+ * @param {Object} payload - { portfolioAccountId, currency }
+ * @returns {Promise<{rows: Array<Object>, reconciliation: Object,
+ *   hasFxExposure: boolean, currency: string, referenceCurrency: string}>}
+ */
+async function getBalanceLedger(context, payload) {
+  const { auth } = context;
+  const { portfolioAccountId, currency, limit } = payload || {};
+
+  console.log(`[queryHandlers][getBalanceLedger] userId: ${auth.uid}, account: ${portfolioAccountId}, currency: ${currency}`);
+
+  if (!portfolioAccountId || !currency) {
+    throw new HttpsError('invalid-argument', 'portfolioAccountId y currency son requeridos');
+  }
+
+  // El replay tiene que ser completo —el saldo corriente y el promedio
+  // ponderado se acumulan hacia adelante y no son reversibles—, pero lo que
+  // viaja al cliente no: una cuenta con años de operaciones son cientos de
+  // filas que ni caben en pantalla ni aportan nada al abrir la tarjeta. Se
+  // recortan **después** de calcular, así que las cifras de las filas que sí
+  // se envían son las mismas que serían con el historial entero.
+  const requested = Number(limit);
+  const rowLimit = Number.isFinite(requested) && requested > 0
+    ? Math.min(Math.trunc(requested), LEDGER_MAX_ROWS)
+    : LEDGER_DEFAULT_ROWS;
+
+  try {
+    const accountRef = db.collection('portfolioAccounts').doc(portfolioAccountId);
+    const accountDoc = await accountRef.get();
+
+    if (!accountDoc.exists || accountDoc.data()?.userId !== auth.uid) {
+      throw new HttpsError('permission-denied', 'No tienes acceso a esta cuenta');
+    }
+
+    const accountData = accountDoc.data();
+    const referenceCurrency = await getUserReferenceCurrency(auth.uid);
+
+    const snapshot = await db.collection('transactions')
+      .where('portfolioAccountId', '==', portfolioAccountId)
+      .get();
+
+    const transactions = snapshot.docs.map((doc) => ({ id: doc.id, ...doc.data() }));
+
+    const projection = projectBalanceLedger({
+      transactions,
+      currency,
+      referenceCurrency,
+      balance: accountData.balances?.[currency] || 0,
+    });
+
+    // El veredicto se guarda para que la página lo lea del documento de cuenta
+    // que ya tiene en memoria, sin una sola lectura nueva por visita (D4).
+    await accountRef.update({
+      [`balanceReconciliation.${currency}`]: {
+        ledgerBalance: projection.reconciliation.ledgerBalance,
+        difference: projection.reconciliation.difference,
+        status: projection.reconciliation.status,
+        checkedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+    });
+
+    // `projection.rows` viene de más reciente a más antigua, así que el recorte
+    // por la cabeza deja justo los últimos movimientos, que es lo que se quiere.
+    const totalCount = projection.rows.length;
+    const rows = projection.rows.slice(0, rowLimit);
+
+    console.log(`[queryHandlers][getBalanceLedger] Éxito - ${rows.length}/${totalCount} movimientos, ${projection.reconciliation.status}`);
+
+    return {
+      rows,
+      /** Movimientos que tiene el saldo en total, más allá de los devueltos */
+      totalCount,
+      /** true si quedan movimientos más antiguos sin enviar */
+      hasMore: totalCount > rows.length,
+      reconciliation: {
+        ledgerBalance: projection.reconciliation.ledgerBalance,
+        storedBalance: projection.reconciliation.storedBalance,
+        difference: projection.reconciliation.difference,
+        status: projection.reconciliation.status,
+        movementCount: projection.reconciliation.movementCount,
+      },
+      hasFxExposure: projection.hasFxExposure,
+      currency,
+      referenceCurrency,
+    };
+  } catch (error) {
+    if (error instanceof HttpsError) throw error;
+    console.error('[queryHandlers][getBalanceLedger] Error:', error);
+    throw new HttpsError('internal', 'Error obteniendo el historial del saldo');
+  }
+}
+
+/**
+ * HU 2.7 — Todo lo que el diálogo necesita saber antes de corregir la apertura.
+ *
+ * Se pide una sola vez al abrir el diálogo. Con estas cifras el cliente deriva
+ * el monto nuevo de la apertura y el mínimo admisible con dos restas, sin una
+ * llamada por tecla y sin que el usuario calcule nada (RN-2.7-B, D5).
+ *
+ * No puede salir de `getBalanceLedger`: ése **recorta filas** después de
+ * calcular, así que no ve el punto más bajo del recorrido, que es justo lo que
+ * decide si la corrección es admisible (AC-3).
+ *
+ * No escribe nada. El plan **nunca es la autoridad**: el servidor revalida el
+ * recorrido entero al guardar.
+ *
+ * @param {Object} context - Contexto de ejecución
+ * @param {Object} payload - { portfolioAccountId, currency }
+ * @returns {Promise<Object>} El plan, más si hay que pedir tipo de cambio
+ */
+async function getOpeningCorrectionPlan(context, payload) {
+  const { auth } = context;
+  const { portfolioAccountId, currency } = payload || {};
+
+  console.log(`[queryHandlers][getOpeningCorrectionPlan] userId: ${auth.uid}, account: ${portfolioAccountId}, currency: ${currency}`);
+
+  if (!portfolioAccountId || !currency) {
+    throw new HttpsError('invalid-argument', 'portfolioAccountId y currency son requeridos');
+  }
+
+  try {
+    const accountDoc = await db.collection('portfolioAccounts').doc(portfolioAccountId).get();
+
+    if (!accountDoc.exists || accountDoc.data()?.userId !== auth.uid) {
+      throw new HttpsError('permission-denied', 'No tienes acceso a esta cuenta');
+    }
+
+    const accountData = accountDoc.data();
+    const referenceCurrency = await getUserReferenceCurrency(auth.uid);
+
+    // Una sola lectura, con el índice que ya existe desde 2.6.
+    const snapshot = await db.collection('transactions')
+      .where('portfolioAccountId', '==', portfolioAccountId)
+      .get();
+
+    const plan = planOpeningCorrection({
+      transactions: snapshot.docs.map((doc) => ({ id: doc.id, ...doc.data() })),
+      currency,
+      referenceCurrency,
+      storedBalance: accountData.balances?.[currency] || 0,
+      accountCreatedAt: accountData.createdAt || null,
+    });
+
+    console.log(`[queryHandlers][getOpeningCorrectionPlan] Éxito - apertura: ${plan.hasOpening ? plan.openingDate : 'no existe'}, ${plan.movementCountAfter} movimientos posteriores`);
+
+    return {
+      ...plan,
+      currency,
+      referenceCurrency,
+      // Fecha para la que el cliente propone la tasa cuando hay que declararla:
+      // la de la apertura, porque el monto nuevo es del mismo día (RN-2.7-E).
+      proposedRateDate: plan.hasOpening ? plan.openingDate : plan.newOpeningDate,
+    };
+  } catch (error) {
+    if (error instanceof HttpsError) throw error;
+    console.error('[queryHandlers][getOpeningCorrectionPlan] Error:', error);
+    throw new HttpsError('internal', 'Error preparando la corrección del saldo inicial');
+  }
+}
+
+/**
  * Obtiene rendimientos históricos usando períodos consolidados (V2)
- * 
+ *
  * COST-OPT-001: Versión optimizada que reduce lecturas de Firestore
  * de ~1,825 a ~40 documentos para consultas de 5 años.
  * 
@@ -726,6 +1684,8 @@ async function getHistoricalReturnsOptimized(context, payload) {
   const cacheKey = `v2_${currency}_${accountId}${ticker ? `_${ticker}` : ''}${assetType ? `_${assetType}` : ''}`;
   
   console.log(`[queryHandlers][getHistoricalReturnsOptimized] userId: ${userId}, cacheKey: ${cacheKey}`);
+
+  rejectExcludeTickers(payload, 'getHistoricalReturnsOptimized');
 
   try {
     // 1. Verificar cache (si no forceRefresh)
@@ -831,7 +1791,27 @@ module.exports = {
   getIndexHistory,
   getPortfolioDistribution,
   getAvailableSectors,
+  // HU 2.1: Tipo de cambio de una fecha concreta
+  getHistoricalExchangeRate,
+  getBalanceCostBasisEstimate,
+  // HU 2.6: libro mayor de un saldo
+  getBalanceLedger,
+  // HU 2.7: plan de la correccion del saldo inicial
+  getOpeningCorrectionPlan,
   // COST-OPT-001: Nuevos handlers para rendimientos optimizados
   getHistoricalReturnsOptimized,
   getConsolidatedDataStatus,
+  // PERF-SNAP-007: Funciones expuestas para testing
+  transformSnapshotToResponse,
+  getHistoricalReturnsLegacy,
+  // FEAT-EXCLUDE-001
+  getHistoricalReturnsExcluding,
+  // PERF-SNAP-008: Funciones expuestas para testing
+  aggregateSnapshotTimelines,
+  getMultiAccountHistoricalReturnsLegacy,
+  // PERF-SNAP-021: Cache in-memory helpers para testing
+  clearSnapshotMemCache,
+  getSnapshotMemCacheSize,
+  getSnapshotWithCache,
+  getSnapshotCacheTTL,
 };

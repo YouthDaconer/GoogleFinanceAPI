@@ -1,17 +1,23 @@
 /**
  * Finance Query Service with Circuit Breaker
  * 
- * Client for the finance-query AWS Lambda API.
+ * Client for the finance-query API via Cloudflare Tunnel.
  * Now protected by circuit breaker pattern for resilience.
  * 
+ * SEC-CF-001: Migrated from Lambda URL to Cloudflare Tunnel
+ * SEC-TOKEN-004: Includes service token for authentication
  * @see SCALE-BE-003 - Circuit Breaker para APIs Externas
+ * @see docs/architecture/SEC-CF-001-cloudflare-tunnel-migration-plan.md
+ * @see docs/architecture/SEC-TOKEN-001-api-security-hardening-plan.md
  */
 
 const { getCircuit } = require('../utils/circuitBreaker');
 const { getCachedPrices, getCachedCurrencyRates } = require('./cacheService');
 const { StructuredLogger } = require('../utils/logger');
+const { FINANCE_QUERY_API_URL, getServiceHeaders } = require('./config');
 
-const API_BASE_URL = 'https://dmn46d7xas3rvio6tugd2vzs2q0hxbmb.lambda-url.us-east-1.on.aws/v1';
+// SEC-CF-001: URL centralizada via Cloudflare Tunnel
+const API_BASE_URL = FINANCE_QUERY_API_URL;
 const logger = new StructuredLogger('financeQuery');
 
 // Circuit breakers per endpoint type
@@ -36,9 +42,22 @@ const fetchData = async (endpoint, maxRetries = 3, delay = 1000) => {
 
   while (attempts < maxRetries) {
     try {
-      const response = await fetch(`${API_BASE_URL}${endpoint}`);
+      // SEC-TOKEN-004: Incluir headers de autenticación de servicio
+      const headers = getServiceHeaders();
+      const url = `${API_BASE_URL}${endpoint}`;
+      
+      // DEBUG: Log request details (solo primeros 3 intentos de la sesión)
+      if (attempts === 0) {
+        console.log(`[FinanceQuery] Calling: ${url.substring(0, 100)}...`);
+        console.log(`[FinanceQuery] Headers: x-service-token=${headers['x-service-token'] ? 'SET' : 'NOT SET'}`);
+      }
+      
+      const response = await fetch(url, { headers });
+      
       if (!response.ok) {
-        throw new Error('Network response was not ok');
+        const errorText = await response.text().catch(() => 'Unable to read response body');
+        console.error(`[FinanceQuery] HTTP ${response.status}: ${errorText.substring(0, 200)}`);
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
       }
       data = await response.json();
       return data;
@@ -139,9 +158,47 @@ const search = (query) => getWithGracefulDegradation(`/search?query=${query}`, [
 const getQuotes = (symbols) => getQuotesWithFallback(symbols);
 const getSimpleQuotes = (symbols) => getSimpleQuotesWithFallback(symbols);
 
+// Market quotes for currencies (COP=X, EUR=X, etc.) and indices
+// INTRADAY-001: Endpoint específico para tasas de cambio en tiempo real
+// Note: Returns [] on error so invalid tickers are properly detected
+const getMarketQuotes = (symbols) => getWithGracefulDegradation(`/market-quotes?symbols=${symbols}`, []);
+
+/**
+ * HU #3: tasas de cambio por el canal de datos de mercado, vigentes o por rango.
+ *
+ * Devuelve `null` —no un objeto vacío— cuando el canal no responde, para que
+ * quien pregunta pueda declarar la ausencia en lugar de confundirla con "no hay
+ * divisas" (RN-3-D).
+ *
+ * @param {string[]} currencies - Códigos de divisa (USD se ignora en el API)
+ * @param {string} [start] - Primer día del período (YYYY-MM-DD)
+ * @param {string} [end] - Último día del período (YYYY-MM-DD)
+ * @returns {Promise<Object|null>}
+ */
+const getExchangeRates = (currencies, start, end) => {
+  const codes = (Array.isArray(currencies) ? currencies : [currencies])
+    .filter(Boolean)
+    .join(',');
+  const range = start && end ? `&start=${start}&end=${end}` : '';
+  return getWithGracefulDegradation(
+    `/exchange-rates?currencies=${encodeURIComponent(codes)}${range}`,
+    null
+  );
+};
+
 // These don't have fallback - they throw on circuit open
 const getSimilarStocks = (symbol) => fetchData(`/similar-stocks/?symbol=${symbol}`);
 const getHistorical = (symbol, time, interval) => fetchData(`/historical/?symbol=${symbol}&time=${time}&interval=${interval}`);
+/**
+ * FEAT-EXCLUDE-001: Cierres diarios de un símbolo (acciones, ETFs, cripto o
+ * pares FX como EUR=X) en un rango amplio con una sola llamada.
+ * La API exige interval=1mo con range=max, así que el tope diario es 10y.
+ * @param {string} symbol
+ * @param {'1y'|'2y'|'5y'|'10y'} range
+ * @returns {Promise<Object<string, {close: number}>>} fecha -> OHLCV
+ */
+const getHistoricalPrices = (symbol, range) =>
+  fetchData(`/historical?symbol=${encodeURIComponent(symbol)}&range=${range}&interval=1d`);
 const getIndicators = (func, symbol) => fetchData(`/indicators/?function=${func}&symbol=${symbol}`);
 const getAnalysis = (symbol, time, interval) => fetchData(`/analysis/?symbol=${symbol}&time=${time}&interval=${interval}`);
 
@@ -153,10 +210,13 @@ module.exports = {
   getNews,
   getQuotes,
   getSimpleQuotes,
+  getMarketQuotes,
+  getExchangeRates,
   getSimilarStocks,
   getSectors,
   search,
   getHistorical,
+  getHistoricalPrices,
   getIndicators,
   getAnalysis,
   getData: () => data,

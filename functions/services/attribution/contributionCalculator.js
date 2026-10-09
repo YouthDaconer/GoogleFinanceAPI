@@ -7,12 +7,17 @@
  * MEJORADO: Ahora incluye P&L realizada de ventas en el período para
  * cálculos de atribución más precisos.
  * 
+ * OPT-DEMAND-CLEANUP: enrichWithCurrentPrices ahora usa API Lambda en lugar de Firestore
+ * 
  * @module services/attribution/contributionCalculator
  * @see docs/architecture/portfolio-attribution-coherence-analysis.md
+ * @see docs/architecture/OPT-DEMAND-CLEANUP-firestore-fallback-removal.md
  */
 
 const admin = require('../firebaseAdmin');
 const db = admin.firestore();
+// OPT-DEMAND-CLEANUP: Importar getQuotes para obtener datos de mercado
+const { getQuotes } = require('../financeQuery');
 
 /**
  * Obtiene datos de portfolioPerformance para una fecha
@@ -75,13 +80,18 @@ async function getLatestPerformanceData(userId, accountId = 'overall') {
 
 /**
  * Obtiene las transacciones de venta realizadas en un período
+ * 
+ * FIX-ATTR-CURRENCY-001: Ahora convierte valuePnL y totalSold a la moneda
+ * de solicitud usando dollarPriceToDate de la transacción.
+ * 
  * @param {string} userId - ID del usuario
  * @param {Date} startDate - Fecha de inicio del período
  * @param {Date} endDate - Fecha de fin del período
  * @param {string[]} accountIds - IDs de cuentas a filtrar
+ * @param {string} [currency='USD'] - Moneda de salida para los cálculos
  * @returns {Promise<Object>} Ventas agrupadas por activo con P&L
  */
-async function getSellTransactionsInPeriod(userId, startDate, endDate, accountIds = []) {
+async function getSellTransactionsInPeriod(userId, startDate, endDate, accountIds = [], currency = 'USD') {
   const startDateStr = startDate.toISOString().split('T')[0];
   const endDateStr = endDate.toISOString().split('T')[0];
   
@@ -97,21 +107,28 @@ async function getSellTransactionsInPeriod(userId, startDate, endDate, accountId
     targetAccountIds = accountsSnapshot.docs.map(d => d.id);
   }
   
-  // Obtener TODAS las transacciones de venta y filtrar en memoria
-  // (Evita necesitar índice compuesto type+date)
-  const transactionsSnapshot = await db.collection('transactions')
-    .where('type', '==', 'sell')
-    .get();
+  // FIX-PERF-001: Query por cuenta en paralelo en vez de full-scan de TODAS las transacciones sell.
+  // La query anterior descargaba todas las ventas de todos los usuarios y filtraba en memoria,
+  // lo que causaba tiempos de ~14s y posibles timeouts (HTTP 500) para períodos largos como 1Y.
+  const accountQueries = targetAccountIds.map(accId =>
+    db.collection('transactions')
+      .where('portfolioAccountId', '==', accId)
+      .where('type', '==', 'sell')
+      .get()
+  );
   
-  // Filtrar por fecha y cuentas del usuario
-  const userSellTransactions = transactionsSnapshot.docs
-    .map(doc => ({ id: doc.id, ...doc.data() }))
-    .filter(t => {
-      // Filtrar por fecha
-      if (t.date < startDateStr || t.date > endDateStr) return false;
-      // Filtrar por cuentas del usuario
-      return targetAccountIds.includes(t.portfolioAccountId);
-    });
+  const snapshots = await Promise.all(accountQueries);
+  
+  // Filtrar por fecha en memoria (evita necesitar índice compuesto)
+  const userSellTransactions = [];
+  for (const snapshot of snapshots) {
+    for (const doc of snapshot.docs) {
+      const data = doc.data();
+      if (data.date >= startDateStr && data.date <= endDateStr) {
+        userSellTransactions.push({ id: doc.id, ...data });
+      }
+    }
+  }
   
   console.log(`[Attribution] Encontradas ${userSellTransactions.length} ventas en el período`);
   
@@ -129,15 +146,47 @@ async function getSellTransactionsInPeriod(userId, startDate, endDate, accountId
       };
     }
     
-    // Usar valuePnL si está disponible, sino es 0
-    const pnl = tx.valuePnL || 0;
+    // FIX-ATTR-CURRENCY-001: Convertir valuePnL y totalSold a la moneda de solicitud
+    // Las transacciones pueden estar en COP, MXN, BRL, etc. pero el cálculo de
+    // atribución se hace en currency (default USD). Hay que convertir usando
+    // dollarPriceToDate de la transacción.
+    let pnl = tx.valuePnL || 0;
+    let txTotalValue = (parseFloat(tx.amount) || 0) * (parseFloat(tx.price) || 0);
+    const txCurrency = tx.currency || 'USD';
+    const dollarPrice = tx.dollarPriceToDate ? parseFloat(tx.dollarPriceToDate) : null;
+    
+    if (dollarPrice && dollarPrice > 0 && txCurrency !== currency) {
+      // Convertir de moneda local a USD (o a otra moneda objetivo)
+      // Ejemplo: COP → USD: dividir entre tipo de cambio
+      if (txCurrency === 'USD') {
+        // Ya está en USD, pero si currency es otra cosa, convertir
+        if (currency === 'COP') {
+          pnl = pnl * dollarPrice;
+          txTotalValue = txTotalValue * dollarPrice;
+        }
+        // Si currency es USD, no hacer nada
+      } else {
+        // Transacción en moneda local (COP, MXN, etc.) → convertir a currency
+        // dollarPriceToDate es precio del USD en moneda local
+        // Ejemplo: dollarPriceToDate=3575 significa 1 USD = 3575 COP
+        pnl = pnl / dollarPrice;
+        txTotalValue = txTotalValue / dollarPrice;
+      }
+      
+      console.log(`[Attribution] Conversión transacción ${tx.assetName}: ${txCurrency}→${currency}, valuePnL: ${tx.valuePnL} → ${pnl.toFixed(2)}, totalSold: ${txTotalValue.toFixed(2)}`);
+    } else if (txCurrency !== currency && !dollarPrice) {
+      // Advertir si no hay dollarPriceToDate para conversión
+      console.warn(`[Attribution] ⚠️ Sin dollarPriceToDate para convertir ${txCurrency}→${currency} para ${tx.assetName}. Usando valor original.`);
+    }
+    
     sellsByAsset[assetKey].totalRealizedPnL += pnl;
-    sellsByAsset[assetKey].totalSold += (parseFloat(tx.amount) || 0) * (parseFloat(tx.price) || 0);
+    sellsByAsset[assetKey].totalSold += txTotalValue;
     sellsByAsset[assetKey].transactions.push({
       date: tx.date,
       amount: tx.amount,
       price: tx.price,
-      pnl
+      pnl,
+      originalCurrency: txCurrency
     });
   }
   
@@ -155,100 +204,286 @@ async function getSellTransactionsInPeriod(userId, startDate, endDate, accountId
  * @param {string[]} accountIds - IDs de cuentas a incluir o ['overall']
  * @returns {Promise<Object>} Resultado con atribuciones calculadas
  */
-async function calculateContributions(userId, period, currency = 'USD', accountIds = ['overall']) {
+async function calculateContributions(userId, period, currency = 'USD', accountIds = ['overall'], dateRange, options = {}) {
+  const { snapshot } = options;
   // Determinar si usamos overall o cuentas específicas
   const useOverall = accountIds.length === 0 || accountIds.includes('overall');
   
-  // Para el cálculo, siempre usamos 'overall' que tiene los totales correctos
-  // Pero si hay cuentas específicas, filtramos los activos después
-  const accountId = 'overall';
+  // =========================================================================
+  // FIX-MULTI-ACCOUNT-001: Cuando hay cuentas específicas, debemos agregar
+  // los datos de cada cuenta individual, NO usar el documento 'overall'
+  // 
+  // El documento 'overall' tiene valores agregados de TODAS las cuentas.
+  // Si un ticker existe en cuentas no seleccionadas, el valor en 'overall'
+  // incluiría esas cuentas incorrectamente.
+  // 
+  // Solución: Obtener portfolioPerformance de cada cuenta seleccionada
+  // y agregar los datos manualmente.
+  // =========================================================================
   
-  // Si hay cuentas específicas (no overall), obtener los activos permitidos
+  // Variables para datos agregados de cuentas específicas
+  let aggregatedAssetPerformance = {};
+  let aggregatedStartAssetPerformance = {};
+  let aggregatedTotalValue = 0;
+  let aggregatedTotalInvestment = 0;
+  let aggregatedStartTotalValue = 0;
+  let latestDateUsed = null;
+  let startDateUsed = null;
+  
+  // Si hay cuentas específicas (no overall), obtener los activos permitidos Y agregar datos
   let allowedAssetKeys = null;
+  
   if (!useOverall && accountIds.length > 0) {
     allowedAssetKeys = new Set();
     
-    // Obtener activos de cada cuenta seleccionada
-    for (const accId of accountIds) {
-      const accData = await getLatestPerformanceData(userId, accId);
-      if (accData) {
-        const accCurrencyData = accData[currency] || accData.USD || {};
-        const accAssets = Object.keys(accCurrencyData.assetPerformance || {});
-        accAssets.forEach(key => allowedAssetKeys.add(key));
+    console.log(`[Attribution] FIX-MULTI-ACCOUNT-001: Agregando datos de ${accountIds.length} cuentas específicas`);
+    
+    const { getPeriodStartDate } = require('./types');
+    const periodStartDate = dateRange?.startDate || getPeriodStartDate(period);
+    const periodStartStr = periodStartDate.toISOString().split('T')[0];
+    const multiAccEndStr = dateRange?.endDate ? dateRange.endDate.toISOString().split('T')[0] : null;
+    
+    // FIX-PERF-002: Paralelizar queries por cuenta con Promise.all
+    const accountDataPromises = accountIds.map(async (accId) => {
+      console.log(`[Attribution] Procesando cuenta: ${accId}`);
+      
+      const accLatestData = multiAccEndStr
+        ? await findNearestPerformanceData(userId, multiAccEndStr, accId, 'desc')
+        : await getLatestPerformanceData(userId, accId);
+      
+      const accStartData = await findNearestPerformanceData(userId, periodStartStr, accId, 'asc');
+      
+      return { accId, accLatestData, accStartData };
+    });
+    
+    const accountResults = await Promise.all(accountDataPromises);
+    
+    // Agregar resultados de cada cuenta
+    for (const { accId, accLatestData, accStartData } of accountResults) {
+      if (!accLatestData) {
+        console.log(`[Attribution] Cuenta ${accId}: sin datos de performance`);
+        continue;
+      }
+      
+      const accDate = accLatestData.id || accLatestData.date;
+      if (!latestDateUsed || accDate > latestDateUsed) {
+        latestDateUsed = accDate;
+      }
+      
+      const accCurrencyData = accLatestData[currency] || accLatestData.USD || {};
+      const accAssetPerformance = accCurrencyData.assetPerformance || {};
+      
+      // Agregar totales de esta cuenta
+      aggregatedTotalValue += accCurrencyData.totalValue || 0;
+      aggregatedTotalInvestment += accCurrencyData.totalInvestment || 0;
+      
+      // Agregar assetPerformance de esta cuenta
+      for (const [assetKey, assetData] of Object.entries(accAssetPerformance)) {
+        allowedAssetKeys.add(assetKey);
+        
+        if (!aggregatedAssetPerformance[assetKey]) {
+          // Primera vez que vemos este activo - copiar datos
+          aggregatedAssetPerformance[assetKey] = { ...assetData };
+        } else {
+          // Activo ya existe en otra cuenta - sumar valores
+          const existing = aggregatedAssetPerformance[assetKey];
+          existing.totalValue = (existing.totalValue || 0) + (assetData.totalValue || 0);
+          existing.totalInvestment = (existing.totalInvestment || 0) + (assetData.totalInvestment || 0);
+          existing.units = (existing.units || 0) + (assetData.units || 0);
+          existing.unrealizedProfitAndLoss = (existing.unrealizedProfitAndLoss || 0) + (assetData.unrealizedProfitAndLoss || 0);
+          // El ROI se recalcula como promedio ponderado después
+        }
+      }
+      
+      // FIX-PERF-002: accStartData ya fue obtenida en paralelo arriba
+      if (accStartData) {
+        const accStartDate = accStartData.id || accStartData.date;
+        if (!startDateUsed || accStartDate < startDateUsed) {
+          startDateUsed = accStartDate;
+        }
+        
+        const accStartCurrencyData = accStartData[currency] || accStartData.USD || {};
+        const accStartAssetPerformance = accStartCurrencyData.assetPerformance || {};
+        
+        // Agregar totales iniciales de esta cuenta
+        aggregatedStartTotalValue += accStartCurrencyData.totalValue || 0;
+        
+        // Agregar startAssetPerformance de esta cuenta
+        for (const [assetKey, assetData] of Object.entries(accStartAssetPerformance)) {
+          if (!aggregatedStartAssetPerformance[assetKey]) {
+            aggregatedStartAssetPerformance[assetKey] = { ...assetData };
+          } else {
+            const existing = aggregatedStartAssetPerformance[assetKey];
+            existing.totalValue = (existing.totalValue || 0) + (assetData.totalValue || 0);
+            existing.totalInvestment = (existing.totalInvestment || 0) + (assetData.totalInvestment || 0);
+            existing.units = (existing.units || 0) + (assetData.units || 0);
+          }
+        }
+      }
+      
+      console.log(`[Attribution] Cuenta ${accId}: ${Object.keys(accAssetPerformance).length} activos, valor=$${(accCurrencyData.totalValue || 0).toFixed(2)}`);
+    }
+    
+    // Recalcular ROI para activos agregados
+    for (const [assetKey, assetData] of Object.entries(aggregatedAssetPerformance)) {
+      if (assetData.totalInvestment > 0) {
+        assetData.totalROI = ((assetData.totalValue - assetData.totalInvestment) / assetData.totalInvestment) * 100;
       }
     }
     
-    console.log(`[Attribution] Filtrando activos para ${accountIds.length} cuentas: ${allowedAssetKeys.size} activos permitidos`);
+    console.log(`[Attribution] FIX-MULTI-ACCOUNT-001: Agregados ${Object.keys(aggregatedAssetPerformance).length} activos únicos`);
+    console.log(`[Attribution] Valor total agregado: $${aggregatedTotalValue.toFixed(2)}, Inversión: $${aggregatedTotalInvestment.toFixed(2)}`);
+    console.log(`[Attribution] Valor inicial agregado: $${aggregatedStartTotalValue.toFixed(2)}`);
   }
+  
+  // Para overall, usar el flujo original
+  const accountId = useOverall ? 'overall' : accountIds[0]; // Solo para fallback
   
   console.log(`[Attribution] Usando datos de cuenta: ${accountId} (input: ${accountIds.join(',')})`);
+  console.log(`[Attribution] allowedAssetKeys es null? ${allowedAssetKeys === null}, size: ${allowedAssetKeys?.size || 0}`);
   
-  // 1. Obtener documento más reciente (valores actuales)
-  const latestData = await getLatestPerformanceData(userId, accountId);
-  if (!latestData) {
-    return {
-      attributions: [],
-      totalPortfolioValue: 0,
-      totalPortfolioInvestment: 0,
-      portfolioReturn: 0,
-      error: 'No performance data found'
-    };
+  // =========================================================================
+  // FIX-GHOST-ASSETS: Obtener activos activos del usuario para validar fantasmas
+  //
+  // Esto nos permite detectar activos que aparecen en portfolioPerformance
+  // pero no existen como activos activos (son datos corruptos/fantasmas).
+  // =========================================================================
+  const activeAssetKeys = new Set();
+  try {
+    // Obtener todas las cuentas del usuario
+    const accountsSnapshot = await db.collection('portfolioAccounts')
+      .where('userId', '==', userId)
+      .where('isActive', '==', true)
+      .get();
+    
+    const userAccountIds = accountsSnapshot.docs.map(doc => doc.id);
+    
+    // FIX-PERF-001: Consultar activos de todas las cuentas en paralelo
+    const assetQueries = userAccountIds.map(accId =>
+      db.collection('assets')
+        .where('portfolioAccount', '==', accId)
+        .where('isActive', '==', true)
+        .get()
+    );
+    
+    const assetSnapshots = await Promise.all(assetQueries);
+    
+    for (const assetsSnapshot of assetSnapshots) {
+      assetsSnapshot.docs.forEach(doc => {
+        const asset = doc.data();
+        if (asset.units > 0) {
+          const assetKey = `${asset.name}_${asset.assetType || 'stock'}`;
+          activeAssetKeys.add(assetKey);
+        }
+      });
+    }
+    console.log(`[Attribution] Activos activos del usuario: ${activeAssetKeys.size}`);
+  } catch (error) {
+    console.warn(`[Attribution] Error obteniendo activos activos: ${error.message}`);
   }
   
-  const latestDate = latestData.id || latestData.date;
-  const currencyData = latestData[currency] || latestData.USD || {};
-  const assetPerformance = currencyData.assetPerformance || {};
+  // =========================================================================
+  // FIX-MULTI-ACCOUNT-001: Usar datos agregados cuando hay cuentas específicas
+  // =========================================================================
+  let assetPerformance;
+  let startAssetPerformance;
+  let totalPortfolioValue;
+  let totalPortfolioInvestment;
+  let startTotalValue;
+  let latestDate;
   
-  // 2. Obtener valores de referencia
-  // Si hay cuentas específicas, calcular totales solo de los activos permitidos
-  let totalPortfolioValue = 0;
-  let totalPortfolioInvestment = 0;
-  
-  if (allowedAssetKeys) {
-    // Sumar solo activos de las cuentas seleccionadas
-    for (const [assetKey, assetData] of Object.entries(assetPerformance)) {
-      if (allowedAssetKeys.has(assetKey)) {
-        totalPortfolioValue += assetData.totalValue || 0;
-        totalPortfolioInvestment += assetData.totalInvestment || 0;
-      }
+  const { getPeriodStartDate } = require('./types');
+  const periodStartDate = dateRange?.startDate || getPeriodStartDate(period);
+  const periodStartStr = periodStartDate.toISOString().split('T')[0];
+  const periodEndDate = dateRange?.endDate || new Date();
+  const periodEndStr = dateRange?.endDate ? dateRange.endDate.toISOString().split('T')[0] : null;
+
+  if (!useOverall && allowedAssetKeys && Object.keys(aggregatedAssetPerformance).length > 0) {
+    // CUENTAS ESPECÍFICAS: Usar datos agregados
+    console.log(`[Attribution] Usando datos AGREGADOS de ${accountIds.length} cuentas`);
+    
+    assetPerformance = aggregatedAssetPerformance;
+    startAssetPerformance = aggregatedStartAssetPerformance;
+    totalPortfolioValue = aggregatedTotalValue;
+    totalPortfolioInvestment = aggregatedTotalInvestment;
+    startTotalValue = aggregatedStartTotalValue > 0 ? aggregatedStartTotalValue : aggregatedTotalValue;
+    latestDate = latestDateUsed;
+    
+  } else if (!periodEndStr && snapshot?.latestAssetPerformance && Object.keys(snapshot.latestAssetPerformance).length > 0) {
+    // PERF-SNAP-012: Overall sin dateRange — leer datos del snapshot (0 reads adicionales)
+    console.log(`[PERF] Attribution contributions from snapshot latestAssetPerformance`);
+    
+    const snapshotAssets = snapshot.latestAssetPerformance;
+    assetPerformance = mapSnapshotAssetPerformance(snapshotAssets);
+    
+    // FIX-ATTR-WEIGHTS-001: los puntos del timeline son objetos {d, v, c},
+    // no tuplas [fecha, valor]. Leerlos por indice dejaba totalPortfolioValue
+    // en undefined -> pesos, portfolioValueStart/End y valueChange en 0.
+    const timeline = snapshot.timeline || [];
+    const lastPoint = timeline.length > 0 ? timeline[timeline.length - 1] : null;
+    totalPortfolioValue = lastPoint?.v ?? 0;
+    totalPortfolioInvestment = Object.values(snapshotAssets).reduce((sum, a) => sum + (a.totalInvestment || 0), 0);
+    latestDate = lastPoint?.d ?? null;
+
+    // Respaldo: si el timeline no trae valor, sumar el valor de los activos del snapshot
+    if (!totalPortfolioValue) {
+      totalPortfolioValue = Object.values(snapshotAssets).reduce((sum, a) => sum + (a.totalValue || 0), 0);
     }
-    console.log(`[Attribution] Valor filtrado para ${accountIds.length} cuentas: $${totalPortfolioValue.toFixed(2)}`);
+    
+    const startData = await findNearestPerformanceData(userId, periodStartStr, 'overall', 'asc');
+    if (startData) {
+      startDateUsed = startData.id || startData.date;
+    }
+    const startCurrencyData = startData?.[currency] || startData?.USD || {};
+    startAssetPerformance = startCurrencyData.assetPerformance || {};
+    startTotalValue = startCurrencyData.totalValue || totalPortfolioValue;
+    
   } else {
+    // OVERALL: Usar documento overall (flujo original)
+    // FEAT-UX-001: Si hay endDate, buscar datos en esa fecha, no la más reciente
+    console.log(`[Attribution] Usando datos de documento 'overall'${periodEndStr ? ` (hasta ${periodEndStr})` : ''}`);
+    
+    const latestData = periodEndStr
+      ? await findNearestPerformanceData(userId, periodEndStr, 'overall', 'desc')
+      : await getLatestPerformanceData(userId, 'overall');
+    if (!latestData) {
+      return {
+        attributions: [],
+        totalPortfolioValue: 0,
+        totalPortfolioInvestment: 0,
+        portfolioReturn: 0,
+        error: 'No performance data found'
+      };
+    }
+    
+    latestDate = latestData.id || latestData.date;
+    const currencyData = latestData[currency] || latestData.USD || {};
+    assetPerformance = currencyData.assetPerformance || {};
     totalPortfolioValue = currencyData.totalValue || 0;
     totalPortfolioInvestment = currencyData.totalInvestment || 0;
+    
+    const startData = await findNearestPerformanceData(userId, periodStartStr, 'overall', 'asc');
+    // FIX-BENCH-004: Capture actual start date from Firestore (not the requested date)
+    if (startData) {
+      startDateUsed = startData.id || startData.date;
+    }
+    const startCurrencyData = startData?.[currency] || startData?.USD || {};
+    startAssetPerformance = startCurrencyData.assetPerformance || {};
+    startTotalValue = startCurrencyData.totalValue || totalPortfolioValue;
   }
   
   const portfolioROI = totalPortfolioInvestment > 0 
     ? ((totalPortfolioValue - totalPortfolioInvestment) / totalPortfolioInvestment) * 100 
     : 0;
   
-  // 3. Obtener datos de inicio del período
-  const { getPeriodStartDate } = require('./types');
-  const periodStartDate = getPeriodStartDate(period);
-  const periodStartStr = periodStartDate.toISOString().split('T')[0];
-  
-  const startData = await findNearestPerformanceData(userId, periodStartStr, accountId, 'asc');
-  const startCurrencyData = startData?.[currency] || startData?.USD || {};
-  const startAssetPerformance = startCurrencyData.assetPerformance || {};
-  
-  // Calcular valor inicial solo de activos permitidos
-  let startTotalValue = 0;
-  if (allowedAssetKeys) {
-    for (const [assetKey, assetData] of Object.entries(startAssetPerformance)) {
-      if (allowedAssetKeys.has(assetKey)) {
-        startTotalValue += assetData.totalValue || 0;
-      }
-    }
-  } else {
-    startTotalValue = startCurrencyData.totalValue || totalPortfolioValue;
-  }
-  
   // 4. NUEVO: Obtener ventas realizadas en el período
+  // FIX-ATTR-CURRENCY-001: Pasar currency para conversión de valuePnL
   const sellsByAsset = await getSellTransactionsInPeriod(
     userId, 
     periodStartDate, 
-    new Date(), 
-    accountIds
+    periodEndDate, 
+    accountIds,
+    currency
   );
   
   // Calcular P&L realizada total
@@ -258,13 +493,47 @@ async function calculateContributions(userId, period, currency = 'USD', accountI
   }
   console.log(`[Attribution] Total P&L realizada en período: $${totalRealizedPnL.toFixed(2)}`);
   
+  // =========================================================================
+  // 4.1 FIX-ATTR-CONSISTENCY: NO obtener precios de mercado actuales
+  // 
+  // IMPORTANTE: Las contribuciones históricas deben calcularse usando los datos
+  // del documento de portfolioPerformance (cierre del día anterior), NO precios actuales.
+  // 
+  // Los precios actuales se usan SOLO para las contribuciones intraday, que se
+  // calculan por separado en intradayCalculator.js y se suman después.
+  // 
+  // Esto garantiza:
+  // - Suma de contribuciones históricas ≈ TWR histórico
+  // - Suma de contribuciones históricas + intraday ≈ TWR ajustado
+  // 
+  // Para activos con cambio de unidades, usamos el precio implícito del documento:
+  // priceEnd = valueEnd / unitsEnd (precio promedio ponderado al cierre)
+  // =========================================================================
+  
+  // =========================================================================
   // 5. Calcular contribuciones para cada activo activo
+  // 
+  // MÉTODO: Brinson Attribution simplificado
+  // Contribución = (cambioValorActivo + P&L realizada) / valorInicialPortafolio × 100
+  // 
+  // Este método mide directamente cuánto contribuyó cada activo al rendimiento
+  // total del portafolio, sin necesidad de obtener retornos de mercado.
+  // =========================================================================
+  
   const attributions = [];
   const processedAssetKeys = new Set();
+  let skippedCount = 0;
+  let skippedGhostAssets = 0;
+  let includedCount = 0;
+  
+  console.log(`[Attribution] Procesando ${Object.keys(assetPerformance).length} activos de assetPerformance`);
+  console.log(`[Attribution] Usando datos de inicio del período: ${startDateUsed || periodStartStr}`);
+  console.log(`[Attribution] Valor inicial del portafolio: $${startTotalValue.toFixed(2)}`);
   
   for (const [assetKey, assetData] of Object.entries(assetPerformance)) {
-    // FILTRO: Si hay cuentas específicas, solo incluir activos de esas cuentas
+    // FILTRO: Ya no necesario cuando usamos datos agregados, pero mantenemos por si acaso
     if (allowedAssetKeys && !allowedAssetKeys.has(assetKey)) {
+      skippedCount++;
       continue; // Saltar activos que no pertenecen a las cuentas seleccionadas
     }
     
@@ -272,73 +541,234 @@ async function calculateContributions(userId, period, currency = 'USD', accountI
     const ticker = parts[0];
     const type = parts[1] || 'stock';
     
-    const assetValue = assetData.totalValue || 0;
-    const assetInvestment = assetData.totalInvestment || 0;
-    const assetROI = assetData.totalROI || 0;
-    
-    // Calcular peso actual
-    const weight = totalPortfolioValue > 0 ? assetValue / totalPortfolioValue : 0;
-    
-    // CONTRIBUCIÓN = peso × ROI del activo
-    let contribution = weight * assetROI;
-    
-    // P&L no realizada
-    const unrealizedPnL = assetData.unrealizedProfitAndLoss || 0;
-    
-    // NUEVO: Agregar P&L realizada de ventas parciales en el período
+    // =========================================================================
+    // FIX-GHOST-ASSETS: Detectar y excluir activos "fantasma"
+    // 
+    // Un activo fantasma es uno que:
+    // 1. NO existía al inicio del período (unitsStart = 0)
+    // 2. NO tiene transacciones que lo respalden
+    // 3. NO está activo actualmente en la colección assets
+    // 4. Pero aparece en el documento final con unidades > 0
+    // 
+    // Esto puede ocurrir por datos corruptos en portfolioPerformance.
+    // 
+    // IMPORTANTE: Si el activo ESTÁ activo actualmente (en activeAssetKeys),
+    // es válido aunque no tenga transacciones (fue importado manualmente).
+    // =========================================================================
+    const startAssetData = startAssetPerformance[assetKey];
+    const unitsStart = startAssetData?.units || 0;
+    const unitsEnd = assetData.units || 0;
     const sellData = sellsByAsset[assetKey];
+    const hasSellData = sellData && sellData.totalSold > 0;
+    
+    const isNewAssetInPeriod = unitsStart === 0 && unitsEnd > 0;
+    const hasNoTransactionSupport = !hasSellData; // No hay ventas registradas
+    const isCurrentlyActive = activeAssetKeys.has(assetKey); // Existe como activo activo
+    
+    // Si es "nuevo" pero no hay transacciones Y no está activo actualmente, es fantasma
+    if (isNewAssetInPeriod && hasNoTransactionSupport && !isCurrentlyActive) {
+      console.warn(`[Attribution] ⚠️ Activo fantasma detectado: ${ticker} - apareció con ${unitsEnd} unidades sin respaldo (inactivo en assets)`);
+      skippedGhostAssets++;
+      continue;
+    }
+    
+    includedCount++;
+    
+    const assetValueEnd = assetData.totalValue || 0;
+    const assetInvestment = assetData.totalInvestment || 0;
+    const assetTotalROI = assetData.totalROI || 0; // ROI total desde compra (para referencia)
+    
+    // =========================================================================
+    // MÉTODO BRINSON SIMPLIFICADO (sin dependencia de currentPrices)
+    // 
+    // Contribución al rendimiento = cambioValor / valorInicialPortafolio × 100
+    // 
+    // Este método es correcto tanto para assets sin cambios como con compras/ventas
+    // porque mide directamente cuánto contribuyó al rendimiento del portafolio.
+    // =========================================================================
+    const assetValueStart = startAssetData?.totalValue || 0;
+    
+    // P&L realizada de ventas parciales en el período
     const realizedPnLInPeriod = sellData?.totalRealizedPnL || 0;
     const totalSoldAmount = sellData?.totalSold || 0;
     
-    // Si hubo ventas parciales, ajustar la contribución
-    if (realizedPnLInPeriod !== 0) {
-      // La contribución de la venta es la P&L realizada como % del valor inicial del portafolio
-      const realizedContribution = startTotalValue > 0 
-        ? (realizedPnLInPeriod / startTotalValue) * 100 
-        : 0;
-      contribution += realizedContribution;
-      console.log(`[Attribution] ${ticker}: Agregando contribución realizada: ${realizedContribution.toFixed(2)}pp ($${realizedPnLInPeriod.toFixed(2)})`);
+    // =========================================================================
+    // CALCULAR CONTRIBUCIÓN CORRECTAMENTE
+    // 
+    // Para activos que EXISTÍAN al inicio del período:
+    //   Contribución = (valorFinal - valorInicial + PnL realizada) / valorInicialPortafolio
+    //   Esto mide cuánto aportó el cambio de precio del activo al rendimiento
+    //
+    // Para activos NUEVOS (comprados durante el período):
+    //   El "cambio de valor" no es ganancia/pérdida, es inyección de capital nuevo
+    //   Contribución = unrealizedPnL / valorInicialPortafolio
+    //   Esto mide la ganancia/pérdida real desde la compra
+    // =========================================================================
+    
+    const isNewAsset = assetValueStart === 0 && unitsStart === 0;
+    const unrealizedPnL = assetData.unrealizedProfitAndLoss || (assetValueEnd - assetInvestment);
+    const hasUnitChange = Math.abs(unitsEnd - unitsStart) > 0.0001;
+    const hasPartialSales = unitsEnd < unitsStart - 0.0001;  // Vendió unidades
+    const hasPartialBuys = unitsEnd > unitsStart + 0.0001;   // Compró unidades adicionales
+    
+    // =========================================================================
+    // FIX-ATTRIBUTION-001: CALCULAR RETORNO DEL PERÍODO
+    // 
+    // El retorno del período es el cambio de PRECIO del activo.
+    // 
+    // PROBLEMA: Cuando hay ventas, el cálculo valueEnd/unitsEnd vs valueStart/unitsStart
+    // puede dar resultados incorrectos porque los valores incluyen diferentes lotes.
+    // 
+    // SOLUCIÓN: Solo calculamos el retorno del precio cuando NO hay ventas.
+    // Para activos con ventas, mantenemos periodReturn = 0 y usamos la contribución
+    // basada en el cambio total del valor + P&L realizado.
+    // =========================================================================
+    let periodReturn = 0;
+    let priceStart = 0;
+    let priceEnd = 0;
+    
+    if (assetValueStart > 0 && unitsStart > 0) {
+      priceStart = assetValueStart / unitsStart;
+      
+      if (assetValueEnd > 0 && unitsEnd > 0) {
+        // =========================================================================
+        // FIX-ATTR-CONSISTENCY: Usar precio del documento de portfolioPerformance
+        // 
+        // Para contribuciones HISTÓRICAS, usamos el precio implícito del documento
+        // (valueEnd / unitsEnd). Este es el precio al cierre del día anterior.
+        // 
+        // Las contribuciones INTRADAY (cambio desde cierre de ayer hasta ahora)
+        // se calculan por separado en intradayCalculator.js usando precios actuales.
+        // 
+        // Esto garantiza que la suma de contribuciones coincida con el TWR del período.
+        // =========================================================================
+        priceEnd = assetValueEnd / unitsEnd;
+        periodReturn = ((priceEnd - priceStart) / priceStart) * 100;
+      } else if (hasPartialSales && unitsEnd === 0) {
+        // Vendió TODAS las unidades: priceEnd no aplica
+        priceEnd = 0;
+        periodReturn = 0; // Se calculará basado en el P&L realizado
+      }
+    } else if (assetValueEnd > 0 && assetInvestment > 0) {
+      // Asset nuevo en el período: usar el ROI desde la compra
+      periodReturn = assetTotalROI;
     }
     
-    const contributionAbsolute = unrealizedPnL + realizedPnLInPeriod;
-    const valueChange = assetValue - assetInvestment + realizedPnLInPeriod;
+    // =========================================================================
+    // FIX-ATTRIBUTION-002: CALCULAR CONTRIBUCIÓN CORRECTAMENTE
+    // 
+    // La contribución mide cuánto del rendimiento del portafolio se debe a este activo.
+    // La fórmula correcta SIEMPRE aísla el EFECTO DEL CAMBIO DE PRECIO sobre las
+    // unidades que teníamos al inicio del período.
+    // 
+    // CASOS:
+    // 1. Activo nuevo: contribution = unrealizedPnL / startTotalValue
+    // 2. Activo existente (con o sin cashflows):
+    //    contribution = [(priceEnd - priceStart) × unitsStart + realizedPnL] / startTotalValue
+    //    Esto aísla correctamente el efecto del cambio de precio
+    // =========================================================================
     
-    // Calcular ROI ajustado para activos con ventas parciales
-    // ROI = (P&L Total) / (Inversión actual + Costo de lo vendido)
-    // Costo de lo vendido = totalSold - realizedPnL
-    let displayROI = assetROI;
-    if (realizedPnLInPeriod !== 0 && totalSoldAmount > 0) {
+    let totalChange;
+    if (isNewAsset) {
+      // Activo nuevo: la contribución es el P&L desde la compra
+      totalChange = unrealizedPnL + realizedPnLInPeriod;
+    } else if (priceStart > 0 && (unitsEnd > 0 || !hasPartialSales)) {
+      // Activo existente con unidades restantes (o sin ventas):
+      // Aislar efecto del cambio de precio sobre unidades iniciales
+      const priceChange = priceEnd - priceStart;
+      const valueChangeFromPrice = priceChange * unitsStart;
+      totalChange = valueChangeFromPrice + realizedPnLInPeriod;
+    } else if (hasPartialSales && unitsEnd === 0 && totalSoldAmount > 0) {
+      // =========================================================================
+      // FIX-ATTR-003: Venta TOTAL de un activo existente (unitsEnd = 0)
+      //
+      // Fórmula: realizedPnLInPeriod - unrealizedPnLAtStart
+      //
+      // Esto funciona porque:
+      // - realizedPnL captura la ganancia real de TODAS las ventas (vs precio de compra)
+      // - unrealizedPnLAtStart descuenta la ganancia que ya existía al inicio del período
+      //   (que no es ganancia del período, sino de períodos anteriores)
+      //
+      // Ejemplo META: vendió 0.6137 unidades (0.202 originales + 0.4117 compradas en YTD)
+      //   - totalSoldRevenue = $420 (INCORRECTO si se resta de valueStart: $420-$131=$289)
+      //   - realizedPnL = $55.85 (ganancia real de todas las ventas)
+      //   - unrealizedPnLAtStart = $3.41 (ganancia pre-existente de las 0.202 unidades)
+      //   - totalChange = $55.85 - $3.41 = $52.44 (ganancia real del período)
+      //
+      // La fórmula anterior (totalSoldRevenue - valueStart) era incorrecta cuando
+      // hubo compras intermedias, porque contaba el capital inyectado como ganancia.
+      // =========================================================================
+      const unrealizedPnLAtStart = startAssetData?.unrealizedProfitAndLoss || 0;
+      totalChange = realizedPnLInPeriod - unrealizedPnLAtStart;
+    } else {
+      // Fallback para casos edge (ej: precio inicial 0)
+      const periodValueChange = assetValueEnd - assetValueStart;
+      totalChange = periodValueChange + realizedPnLInPeriod;
+    }
+    
+    // CONTRIBUCIÓN = cambioTotal / valorInicialPortafolio × 100
+    const contribution = startTotalValue > 0 
+      ? (totalChange / startTotalValue) * 100 
+      : 0;
+    
+    // Calcular peso actual (usando peso al final del período)
+    const weight = totalPortfolioValue > 0 ? assetValueEnd / totalPortfolioValue : 0;
+    // FIX-ATTR-003: Para activos vendidos completamente, usar peso al inicio del período
+    const weightAtStart = startTotalValue > 0 ? assetValueStart / startTotalValue : 0;
+    const isSold = unitsEnd === 0 && hasPartialSales;
+    
+    console.log(`[Attribution] ${ticker}: startVal=$${assetValueStart.toFixed(2)}, endVal=$${assetValueEnd.toFixed(2)}, units=${unitsStart.toFixed(4)}->${unitsEnd.toFixed(4)}${hasUnitChange ? ' (cambio)' : ''}${isNewAsset ? ' (NUEVO)' : ''}, periodReturn=${periodReturn.toFixed(2)}%, weight=${(weight*100).toFixed(2)}%, contribution=${contribution.toFixed(4)}pp`);
+    
+    // ROI para mostrar: usar el retorno del período calculado
+    let displayROI = periodReturn;
+    if (isSold && priceStart > 0 && totalSoldAmount > 0) {
+      // FIX-ATTR-003: Para ventas totales, calcular ROI basado en el precio promedio
+      // de venta vs el precio al inicio del período
+      const totalUnitsSold = sellData?.transactions?.reduce((sum, t) => sum + (parseFloat(t.amount) || 0), 0) || 0;
+      if (totalUnitsSold > 0) {
+        const avgSellPrice = totalSoldAmount / totalUnitsSold;
+        displayROI = ((avgSellPrice - priceStart) / priceStart) * 100;
+      }
+    } else if (realizedPnLInPeriod !== 0 && totalSoldAmount > 0) {
+      // Ajustar ROI si hubo ventas parciales para incluir P&L realizada
       const costOfSold = totalSoldAmount - realizedPnLInPeriod;
       const totalInvestmentIncludingSold = assetInvestment + costOfSold;
       const totalPnL = unrealizedPnL + realizedPnLInPeriod;
       displayROI = totalInvestmentIncludingSold > 0 
         ? (totalPnL / totalInvestmentIncludingSold) * 100 
-        : assetROI;
+        : periodReturn;
     }
     
     attributions.push({
       assetKey,
       ticker,
-      name: ticker,
+      name: ticker, // Se puede enriquecer después desde frontend con currentPrices on-demand
       sector: 'Unknown',
+      logo: null,
       type: type.toLowerCase(),
-      status: 'active',
-      weightStart: weight,
+      // FIX-ATTR-003: Marcar como 'sold' si no quedan unidades al final del período
+      status: isSold ? 'sold' : 'active',
+      weightStart: isSold ? weightAtStart : weight,
       weightEnd: weight,
-      weightAverage: weight,
-      returnPercent: displayROI, // ROI ajustado que incluye ganancias realizadas
+      weightAverage: isSold ? weightAtStart : weight,
+      returnPercent: displayROI, // Retorno del período (basado en precio si hubo cambio de unidades)
       contribution,
-      contributionAbsolute,
-      valueStart: assetInvestment,
-      valueEnd: assetValue,
-      valueChange,
+      contributionAbsolute: totalChange,
+      valueStart: assetValueStart, // Valor al inicio del período
+      valueEnd: assetValueEnd,     // Valor al final del período
+      valueChange: totalChange,
+      hasUnitChange,               // Flag: hubo compras/ventas durante el período
+      isNewAsset,                  // Flag: activo comprado durante el período (no existía al inicio)
       hasPartialSales: realizedPnLInPeriod !== 0,
       partialSalesPnL: realizedPnLInPeriod !== 0 ? realizedPnLInPeriod : undefined,
       partialSalesCount: sellData?.transactions?.length,
       _source: {
-        totalValue: assetValue,
+        totalValue: assetValueEnd,
         totalInvestment: assetInvestment,
-        totalROI: assetROI,
+        totalROI: assetTotalROI, // ROI total desde compra (para referencia)
+        periodReturn: periodReturn, // Retorno del período (basado en precio)
+        unitsStart,
+        unitsEnd,
         unrealizedPnL,
         realizedPnLInPeriod
       }
@@ -352,23 +782,45 @@ async function calculateContributions(userId, period, currency = 'USD', accountI
     if (processedAssetKeys.has(assetKey)) continue; // Ya procesado arriba
     
     const realizedPnL = sellData.totalRealizedPnL;
-    const costBasis = sellData.totalSold - realizedPnL; // Costo aproximado
+    const totalSoldRevenue = sellData.totalSold; // sellPrice × units (ingreso real)
+    const costBasis = totalSoldRevenue - realizedPnL; // Costo original
     
-    // Contribución = P&L realizada como % del valor inicial del portafolio
+    // =========================================================================
+    // FIX-ATTR-003: Contribución = realizedPnL - unrealizedPnLAtStart
+    //
+    // Misma fórmula que la sección 5 para ventas totales.
+    // Si el activo existía al inicio del período, descontamos la ganancia
+    // pre-existente (unrealizedPnL) para obtener solo la ganancia del período.
+    // Si no existía (comprado y vendido dentro del período), toda la
+    // realizedPnL es ganancia del período.
+    // =========================================================================
+    const startAssetData = startAssetPerformance[assetKey];
+    const assetValueAtStart = startAssetData?.totalValue || 0;
+    const unrealizedPnLAtStart = startAssetData?.unrealizedProfitAndLoss || 0;
+    const periodChange = realizedPnL - unrealizedPnLAtStart;
+    
     const contribution = startTotalValue > 0 
-      ? (realizedPnL / startTotalValue) * 100 
+      ? (periodChange / startTotalValue) * 100 
       : 0;
     
-    // ROI de la posición cerrada = P&L / Costo
-    const returnPercent = costBasis > 0 ? (realizedPnL / costBasis) * 100 : 0;
+    // ROI del período = precio promedio de venta vs precio al inicio del período
+    const startUnits = startAssetData?.units || 0;
+    const priceAtStart = startUnits > 0 ? assetValueAtStart / startUnits : 0;
+    const totalUnitsSold = sellData.transactions.reduce((sum, t) => sum + (parseFloat(t.amount) || 0), 0);
+    const avgSellPrice = totalUnitsSold > 0 ? totalSoldRevenue / totalUnitsSold : 0;
+    const returnPercent = (priceAtStart > 0 && avgSellPrice > 0)
+      ? ((avgSellPrice - priceAtStart) / priceAtStart) * 100
+      : (costBasis > 0 ? (realizedPnL / costBasis) * 100 : 0);
     
-    // Peso que tenía el activo al momento de venderlo (aproximado)
-    const weightAtSale = startTotalValue > 0 ? costBasis / startTotalValue : 0;
+    // Peso que tenía el activo al inicio del período
+    const weightAtStart = startTotalValue > 0 
+      ? (assetValueAtStart || costBasis) / startTotalValue 
+      : 0;
     
     // Solo agregar si la contribución es significativa
     if (Math.abs(contribution) < 0.01) continue;
     
-    console.log(`[Attribution] ${sellData.ticker}: Posición cerrada con contribución: ${contribution.toFixed(2)}pp ($${realizedPnL.toFixed(2)}) ROI: ${returnPercent.toFixed(1)}%`);
+    console.log(`[Attribution] ${sellData.ticker}: Posición cerrada - periodChange=$${periodChange.toFixed(2)}, contribution=${contribution.toFixed(2)}pp, realizedPnL=$${realizedPnL.toFixed(2)}, unrealizedPnLAtStart=$${unrealizedPnLAtStart.toFixed(2)}`);
     
     attributions.push({
       assetKey: `${assetKey}_sold`,
@@ -377,19 +829,22 @@ async function calculateContributions(userId, period, currency = 'USD', accountI
       sector: 'Unknown',
       type: sellData.assetType.toLowerCase(),
       status: 'sold',
-      weightStart: weightAtSale, // Peso aproximado al vender
+      weightStart: weightAtStart,
       weightEnd: 0,
-      weightAverage: weightAtSale / 2, // Aproximación
-      returnPercent, // ROI de la posición cerrada
+      weightAverage: weightAtStart / 2, // Aproximación
+      returnPercent,
       contribution,
-      contributionAbsolute: realizedPnL, // Valor absoluto de la ganancia/pérdida
-      valueStart: costBasis,
+      contributionAbsolute: periodChange,
+      valueStart: assetValueAtStart || costBasis,
       valueEnd: 0,
-      valueChange: realizedPnL,
+      valueChange: periodChange,
       hasPartialSales: false,
       _source: {
         realizedPnL,
         costBasis,
+        periodChange,
+        assetValueAtStart,
+        totalSoldRevenue,
         transactionCount: sellData.transactions.length
       }
     });
@@ -398,22 +853,20 @@ async function calculateContributions(userId, period, currency = 'USD', accountI
   // 7. Ordenar por contribución descendente
   attributions.sort((a, b) => b.contribution - a.contribution);
   
-  // 8. Validar suma de contribuciones vs ROI del portafolio
+  console.log(`[Attribution] Resumen: ${includedCount} activos incluidos, ${skippedCount} filtrados por cuenta, ${skippedGhostAssets} fantasmas excluidos de ${Object.keys(assetPerformance).length} totales`);
+  console.log(`[Attribution] Attributions generadas: ${attributions.length}`);
+  
+  // 8. Calcular suma de contribuciones (esto es el rendimiento del período basado en Brinson)
+  // La suma de las contribuciones ES el rendimiento del período (cambio de valor / valor inicial)
   const sumOfContributions = attributions.reduce((sum, a) => sum + a.contribution, 0);
+  
+  // NOTA: NO normalizamos aquí. La normalización se hace en attributionService.js
+  // usando el TWR del período que es más preciso que el portfolioROI.
+  // El portfolioROI es el ROI total desde compra, no el rendimiento del período.
+  const normalized = false;
   const discrepancy = Math.abs(sumOfContributions - portfolioROI);
   
-  // 9. Normalizar si hay discrepancia significativa (> 1pp)
-  // NOTA: Solo normalizamos la contribución (puntos porcentuales), 
-  // NO los valores absolutos (contributionAbsolute, valueChange) que son en USD
-  let normalized = false;
-  if (discrepancy > 1 && Math.abs(sumOfContributions) > 0.01) {
-    const normalizationFactor = portfolioROI / sumOfContributions;
-    for (const attr of attributions) {
-      attr.contribution *= normalizationFactor;
-      // NO normalizar contributionAbsolute ni valueChange - son valores absolutos en USD
-    }
-    normalized = true;
-  }
+  console.log(`[Attribution] Sum of contributions: ${sumOfContributions.toFixed(4)}%, portfolioROI: ${portfolioROI.toFixed(2)}%, discrepancy: ${discrepancy.toFixed(2)}pp`);
   
   return {
     attributions,
@@ -421,7 +874,9 @@ async function calculateContributions(userId, period, currency = 'USD', accountI
     totalPortfolioInvestment,
     portfolioReturn: portfolioROI,
     latestDate,
-    periodStartDate: periodStartStr,
+    // FIX-BENCH-004: Return actual data start date, not the theoretical request date.
+    // For ALL period, getPeriodStartDate returns 5y back but data may start much later.
+    periodStartDate: startDateUsed || periodStartStr,
     startTotalValue,
     sumOfContributions: normalized ? portfolioROI : sumOfContributions,
     discrepancy,
@@ -436,29 +891,53 @@ async function calculateContributions(userId, period, currency = 'USD', accountI
 }
 
 /**
- * Enriquece las atribuciones con datos de currentPrices
+ * OPT-DEMAND-CLEANUP: Enriquece las atribuciones con datos del API Lambda
+ * 
+ * Migrado desde Firestore (colección currentPrices) para cumplir con 
+ * arquitectura on-demand pura.
+ * 
  * @param {Array} attributions - Array de atribuciones
  * @returns {Promise<Array>} Atribuciones enriquecidas
  */
 async function enrichWithCurrentPrices(attributions) {
   const tickers = [...new Set(attributions.map(a => a.ticker))];
   
-  // Obtener precios en batches
+  if (tickers.length === 0) {
+    return attributions;
+  }
+  
+  // OPT-DEMAND-CLEANUP: Usar API Lambda en lugar de Firestore
   const pricesMap = new Map();
-  for (let i = 0; i < tickers.length; i += 30) {
-    const batch = tickers.slice(i, i + 30);
-    const snapshot = await db.collection('currentPrices')
-      .where('symbol', 'in', batch)
-      .get();
+  
+  try {
+    const symbolsString = tickers.join(',');
+    const quotes = await getQuotes(symbolsString);
     
-    for (const doc of snapshot.docs) {
-      const data = doc.data();
-      pricesMap.set(data.symbol, {
-        name: data.name || data.symbol,
-        sector: data.sector || 'Unknown',
-        logo: data.logo || null
-      });
+    if (quotes && Array.isArray(quotes)) {
+      for (const quote of quotes) {
+        if (quote && quote.symbol) {
+          pricesMap.set(quote.symbol, {
+            name: quote.name || quote.shortName || quote.symbol,
+            sector: quote.sector || 'Unknown',
+            logo: quote.logo || null
+          });
+        }
+      }
+    } else if (quotes && typeof quotes === 'object') {
+      // Formato objeto { AAPL: {...}, MSFT: {...} }
+      for (const [symbol, quote] of Object.entries(quotes)) {
+        if (quote) {
+          pricesMap.set(symbol, {
+            name: quote.name || quote.shortName || symbol,
+            sector: quote.sector || 'Unknown',
+            logo: quote.logo || null
+          });
+        }
+      }
     }
+  } catch (error) {
+    console.warn('[enrichWithCurrentPrices] Error fetching from API, continuing without enrichment:', error.message);
+    // No lanzar error, continuar sin enriquecer
   }
   
   // Enriquecer atribuciones
@@ -474,11 +953,28 @@ async function enrichWithCurrentPrices(attributions) {
   return attributions;
 }
 
+/**
+ * PERF-SNAP-012: Mapea el schema compacto del snapshot al formato esperado por calculateContributions
+ * @param {Object} snapshotAssets - latestAssetPerformance del snapshot
+ * @returns {Object} assetPerformance con campos mapeados
+ */
+function mapSnapshotAssetPerformance(snapshotAssets) {
+  const mapped = {};
+  for (const [assetKey, data] of Object.entries(snapshotAssets)) {
+    mapped[assetKey] = {
+      ...data,
+      unrealizedProfitAndLoss: data.unrealizedPnL ?? data.unrealizedProfitAndLoss ?? 0,
+    };
+  }
+  return mapped;
+}
+
 module.exports = {
   calculateContributions,
   enrichWithCurrentPrices,
   getLatestPerformanceData,
   findNearestPerformanceData,
   getPerformanceDataForDate,
-  getSellTransactionsInPeriod
+  getSellTransactionsInPeriod,
+  mapSnapshotAssetPerformance
 };
