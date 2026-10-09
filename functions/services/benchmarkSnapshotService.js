@@ -134,10 +134,17 @@ async function updateBenchmarkSnapshots(db, pipelineQuotes, currencies, tradingD
           ? quote.price
           : convertCurrency(quote.price, 'USD', currency, currencies);
 
+        // FEAT-EXCLUDE-001: c se deriva del v anterior de ESTA serie. Antes era
+        // quote.percentChange, que al correr el EOD (00:05 ET) a veces vale 0 y
+        // siempre es el de USD: 110 de 619 días de SPY quedaron en 0 y el 1Y
+        // guardado daba 4.86% con el real en 16.16%. En otras monedas además
+        // ignoraba el tipo de cambio. Con v también se cubren días saltados.
+        const v = Math.round(price * 100) / 100;
+        const prev = timeline[timeline.length - 1];
         timeline.push({
           d: dateStr,
-          v: Math.round(price * 100) / 100,
-          c: quote.percentChange,
+          v,
+          c: prev && prev.v > 0 ? (v / prev.v - 1) * 100 : 0,
         });
 
         const returns = computeReturnsFromTimeline(timeline);

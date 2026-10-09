@@ -259,6 +259,24 @@ describe('benchmarkSnapshotService', () => {
       expect(spyUsdWrite.timeline[1].v).toBe(530.25);
     });
 
+    test('c se deriva del v anterior de la serie, no del percentChange del quote', async () => {
+      const db = createMockDb({
+        'SPY_etf_USD': { timeline: [{ d: '2026-04-14', v: 528.00, c: -0.3 }] },
+      });
+      const logger = createMockLogger();
+      // percentChange 0: lo que devuelve el quote cuando el EOD corre fuera de sesión
+      const pipelineQuotes = [
+        createMockQuote('SPY', 530.25, 0),
+        createMockQuote('QQQ', 455.10, 0),
+      ];
+
+      await updateBenchmarkSnapshots(db, pipelineQuotes, MOCK_CURRENCIES, MOCK_TRADING_DAY, logger);
+
+      const last = db._writtenDocs['SPY_etf_USD'].timeline[1];
+      expect(last.c).toBeCloseTo((530.25 / 528 - 1) * 100, 10);
+      expect(db._writtenDocs['QQQ_etf_USD'].timeline[0].c).toBe(0);
+    });
+
     test('skip sin duplicar cuando mismo día ya está en timeline', async () => {
       const existingTimeline = [
         { d: '2026-04-15', v: 528.00, c: -0.3 },
