@@ -189,6 +189,16 @@ const getExchangeRates = (currencies, start, end) => {
 // These don't have fallback - they throw on circuit open
 const getSimilarStocks = (symbol) => fetchData(`/similar-stocks/?symbol=${symbol}`);
 const getHistorical = (symbol, time, interval) => fetchData(`/historical/?symbol=${symbol}&time=${time}&interval=${interval}`);
+/**
+ * FEAT-EXCLUDE-001: Cierres diarios de un símbolo (acciones, ETFs, cripto o
+ * pares FX como EUR=X) en un rango amplio con una sola llamada.
+ * La API exige interval=1mo con range=max, así que el tope diario es 10y.
+ * @param {string} symbol
+ * @param {'1y'|'2y'|'5y'|'10y'} range
+ * @returns {Promise<Object<string, {close: number}>>} fecha -> OHLCV
+ */
+const getHistoricalPrices = (symbol, range) =>
+  fetchData(`/historical?symbol=${encodeURIComponent(symbol)}&range=${range}&interval=1d`);
 const getIndicators = (func, symbol) => fetchData(`/indicators/?function=${func}&symbol=${symbol}`);
 const getAnalysis = (symbol, time, interval) => fetchData(`/analysis/?symbol=${symbol}&time=${time}&interval=${interval}`);
 
@@ -206,6 +216,7 @@ module.exports = {
   getSectors,
   search,
   getHistorical,
+  getHistoricalPrices,
   getIndicators,
   getAnalysis,
   getData: () => data,

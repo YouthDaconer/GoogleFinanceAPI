@@ -16,6 +16,7 @@
  * @see docs/architecture/OPT-DEMAND-CLEANUP-firestore-fallback-removal.md
  */
 
+const crypto = require('crypto');
 const { HttpsError } = require("firebase-functions/v2/https");
 const admin = require('../firebaseAdmin');
 const db = admin.firestore();
@@ -56,6 +57,10 @@ const { getUserReferenceCurrency } = require('../helpers/balanceCostBasis');
 const { projectBalanceLedger } = require('../helpers/balanceLedger');
 // HU 2.7: todo lo que hace falta saber antes de corregir el saldo inicial
 const { planOpeningCorrection } = require('../helpers/openingBalanceCorrection');
+
+// FEAT-EXCLUDE-001: Rendimiento del portafolio excluyendo tickers
+const { getCarveOutHistoricalReturns } = require('../carveOutReturnsService');
+const { buildExcludeSet } = require('../../utils/carveOutReturns');
 
 // PERF-SNAP-007: Importar helper para construir ID de snapshot
 // PERF-SNAP-009: Importar generatePerformanceSnapshot para on-demand generation
@@ -433,6 +438,12 @@ async function getHistoricalReturns(context, payload) {
   console.log(`[queryHandlers][getHistoricalReturns] userId: ${userId}, currency: ${currency}, accountId: ${accountId}`);
 
   try {
+    // FEAT-EXCLUDE-001: los snapshots son agregados y no permiten quitar
+    // activos; la exclusión se calcula aparte, desde los docs diarios.
+    if (payload?.excludeTickers !== undefined && payload?.excludeTickers !== null) {
+      return await getHistoricalReturnsExcluding(context, payload);
+    }
+
     // R-03: Read signal once, reuse across all snapshot lookups in this CF invocation.
     const signal = await readSnapshotSignal(userId);
 
@@ -542,6 +553,101 @@ async function getHistoricalReturns(context, payload) {
 }
 
 /**
+ * FEAT-EXCLUDE-001: Rendimientos del portafolio (o de una cuenta) excluyendo
+ * tickers, ej: el portafolio sin VUAA.L para compararlo contra el S&P 500.
+ *
+ * Responde con la misma forma que getHistoricalReturns más un bloque
+ * `carveOut` (método, tickers excluidos, cobertura). Cachea en
+ * performanceCache con la exclusión en la clave; invalidatePerformanceCache
+ * borra toda la colección, así que también la invalida.
+ *
+ * @param {Object} context - Contexto de ejecución
+ * @param {Object} payload - { currency, accountId, excludeTickers, forceRefresh }
+ * @returns {Promise<Object>}
+ */
+async function getHistoricalReturnsExcluding(context, payload) {
+  const userId = context.auth.uid;
+  const {
+    currency = "USD",
+    accountId = "overall",
+    ticker = null,
+    assetType = null,
+    excludeTickers,
+    forceRefresh = false,
+  } = payload || {};
+
+  if (ticker || assetType) {
+    throw new HttpsError('invalid-argument',
+      'excludeTickers aplica al portafolio o a una cuenta; no se combina con ticker/assetType');
+  }
+
+  let excludeSet;
+  try {
+    excludeSet = buildExcludeSet(excludeTickers);
+  } catch (error) {
+    throw new HttpsError('invalid-argument', error.message);
+  }
+  if (excludeSet.size === 0) {
+    throw new HttpsError('invalid-argument', 'excludeTickers no puede estar vacío');
+  }
+
+  const exclusionHash = crypto.createHash('sha1')
+    .update([...excludeSet].sort().join(','))
+    .digest('hex')
+    .slice(0, 12);
+  const cacheKey = `${currency}_${accountId}_ex_${exclusionHash}`;
+  const cacheRef = db.doc(`userData/${userId}/performanceCache/${cacheKey}`);
+
+  if (!forceRefresh) {
+    const cacheDoc = await cacheRef.get();
+    if (cacheDoc.exists) {
+      const cacheData = cacheDoc.data();
+      if (new Date(cacheData.validUntil) > new Date()) {
+        return {
+          ...cacheData.data,
+          cacheHit: true,
+          lastCalculated: cacheData.lastCalculated,
+          validUntil: cacheData.validUntil,
+        };
+      }
+    }
+  }
+
+  const result = await getCarveOutHistoricalReturns({ db, userId, currency, accountId, excludeSet });
+
+  const now = new Date();
+  const validUntil = calculateDynamicTTL();
+  try {
+    await cacheRef.set({
+      data: result,
+      lastCalculated: now.toISOString(),
+      validUntil: validUntil.toISOString(),
+    });
+  } catch (cacheWriteError) {
+    console.error(`[queryHandlers][getHistoricalReturnsExcluding] Error guardando cache:`, cacheWriteError);
+  }
+
+  return {
+    ...result,
+    cacheHit: false,
+    lastCalculated: now.toISOString(),
+    validUntil: validUntil.toISOString(),
+  };
+}
+
+/**
+ * FEAT-EXCLUDE-001: Los endpoints que no soportan exclusión la rechazan en
+ * lugar de ignorarla, para no devolver el portafolio completo como si fuera
+ * el filtrado.
+ */
+function rejectExcludeTickers(payload, endpoint) {
+  if (payload?.excludeTickers !== undefined && payload?.excludeTickers !== null) {
+    throw new HttpsError('invalid-argument',
+      `excludeTickers no está soportado en ${endpoint}; usa getHistoricalReturns`);
+  }
+}
+
+/**
  * Ruta legacy de rendimientos históricos (V2 consolidados + cache Firestore).
  * Usada como fallback cuando no hay snapshot, para ticker/assetType, o forceRefresh.
  */
@@ -638,6 +744,8 @@ async function getMultiAccountHistoricalReturns(context, payload) {
   } = payload || {};
 
   console.log(`[queryHandlers][getMultiAccountHistoricalReturns] userId: ${userId}, accounts: ${accountIds.length}`);
+
+  rejectExcludeTickers(payload, 'getMultiAccountHistoricalReturns');
 
   try {
     // Validación de parámetros
@@ -1577,6 +1685,8 @@ async function getHistoricalReturnsOptimized(context, payload) {
   
   console.log(`[queryHandlers][getHistoricalReturnsOptimized] userId: ${userId}, cacheKey: ${cacheKey}`);
 
+  rejectExcludeTickers(payload, 'getHistoricalReturnsOptimized');
+
   try {
     // 1. Verificar cache (si no forceRefresh)
     if (!forceRefresh) {
@@ -1694,6 +1804,8 @@ module.exports = {
   // PERF-SNAP-007: Funciones expuestas para testing
   transformSnapshotToResponse,
   getHistoricalReturnsLegacy,
+  // FEAT-EXCLUDE-001
+  getHistoricalReturnsExcluding,
   // PERF-SNAP-008: Funciones expuestas para testing
   aggregateSnapshotTimelines,
   getMultiAccountHistoricalReturnsLegacy,
