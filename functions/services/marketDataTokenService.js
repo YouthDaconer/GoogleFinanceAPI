@@ -86,9 +86,12 @@ const validateAuth = (auth) => {
  * @param {string} userId - UID del usuario
  * @param {string} secret - Secret para firmar
  * @param {number} ttlSeconds - Tiempo de vida en segundos
+ * @param {string} [audience] - Para quién es válido. HU 5.2: el orquestador del
+ *   Copilot firma con una audiencia propia que `getMarketDataToken` no emite,
+ *   de modo que un usuario no puede fabricarse uno y saltarse el cupo.
  * @returns {{ token: string, expiresAt: number }} Token y timestamp de expiración
  */
-const generateToken = (userId, secret, ttlSeconds) => {
+const generateToken = (userId, secret, ttlSeconds, audience = TOKEN_AUDIENCE) => {
   const now = Math.floor(Date.now() / 1000);
   const expiresAt = now + ttlSeconds;
   
@@ -97,7 +100,7 @@ const generateToken = (userId, secret, ttlSeconds) => {
     uid: userId,
     iat: now,           // Issued At
     exp: expiresAt,     // Expires At
-    aud: TOKEN_AUDIENCE // Audience
+    aud: audience     // Audience
   };
   
   // Codificar payload en base64url
@@ -212,6 +215,8 @@ const getMarketDataToken = onCall(
 
 module.exports = {
   getMarketDataToken,
+  // HU 5.2: el orquestador del Copilot acuña su propio token de servicio
+  generateToken,
   // Exportar para testing
   _generateToken: generateToken,
   _validateAuth: validateAuth,

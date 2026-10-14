@@ -240,6 +240,8 @@ describe('getRateLimitConfig', () => {
       // HU 2.7: plan y correccion del saldo inicial
       'getOpeningCorrectionPlan', 'correctOpeningBalance',
       'createCheckoutSession', 'createPortalSession',
+      // HU 5.2: lanzar un analisis del Copilot y consultar su estado
+      'startAnalysis', 'getAnalysisState',
     ];
     
     expectedFunctions.forEach(fn => {
@@ -248,6 +250,6 @@ describe('getRateLimitConfig', () => {
       expect(RATE_LIMITS[fn].windowMs).toBe(60000);
     });
     
-    expect(Object.keys(RATE_LIMITS).length).toBe(35);
+    expect(Object.keys(RATE_LIMITS).length).toBe(37);
   });
 });

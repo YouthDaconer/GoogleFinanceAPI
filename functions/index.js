@@ -663,6 +663,27 @@ const { queryOperations } = require('./services/unified/queryOperations');
 exports.queryOperations = queryOperations;
 
 /**
+ * HU 5.2: El Copilot trabaja en segundo plano.
+ *
+ * - copilotOperations: lanzar un analisis y consultar su estado (onCall).
+ * - copilotAnalysisWorker: corre las tres etapas cuando el usuario ya se fue.
+ * - scheduledCopilotWatchdog: 15 minutos sin avanzar de etapa es un fallo
+ *   (RN-5.2-Q), y el aviso en la campana no lo puede crear el navegador.
+ *
+ * El navegador ya no llama a la Lambda del Copilot: por eso desaparece el 502
+ * que la capa de entrada devolvia desde mayo de 2026.
+ *
+ * @see platform-docs/stories/5.2-copilot-segundo-plano-progreso/refinamiento.md
+ */
+const { copilotOperations } = require('./services/unified/copilotOperations');
+const { copilotAnalysisWorker } = require('./services/copilot/copilotWorker');
+const { scheduledCopilotWatchdog } = require('./services/copilot/copilotWatchdog');
+
+exports.copilotOperations = copilotOperations;
+exports.copilotAnalysisWorker = copilotAnalysisWorker;
+exports.scheduledCopilotWatchdog = scheduledCopilotWatchdog;
+
+/**
  * COST-OPT-002: Scheduled Functions para consolidación de períodos
  * 
  * - consolidateMonthlyPerformance: Día 1 de cada mes, 00:30 ET

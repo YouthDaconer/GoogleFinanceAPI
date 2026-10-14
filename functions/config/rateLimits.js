@@ -37,6 +37,10 @@ const RATE_LIMITS = {
   migrateBalanceLedger: { limit: 10, windowMs: 60000 },
   // HU 2.7: corregir el saldo inicial reescribe la apertura y replaya el saldo
   correctOpeningBalance: { limit: 30, windowMs: 60000 },
+  // HU 5.2: lanzar un analisis abre un documento y vuelve, pero dispara trabajo
+  // en segundo plano y consume cuota del motor de IA. Limite bajo a proposito
+  startAnalysis: { limit: 10, windowMs: 60000 },
+  getAnalysisState: { limit: 30, windowMs: 60000 },
 
   // ═══════════════════════════════════════════════════════════════
   // 🟡 Operaciones de Lectura

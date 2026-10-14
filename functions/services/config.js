@@ -34,6 +34,18 @@ const FINANCE_QUERY_API_URL = process.env.FINANCE_QUERY_API_URL ||
  */
 
 /**
+ * HU 5.2: URL de la Lambda que redacta el análisis del Copilot.
+ *
+ * El orquestador la llama en modo `generate` (servidor a servidor), ya no el
+ * navegador: por eso el análisis dejó de depender del Worker de Cloudflare que
+ * devolvía 502 y del tope de espera de la pasarela.
+ *
+ * @type {string}
+ */
+const COPILOT_ANALYZER_URL = process.env.COPILOT_ANALYZER_URL ||
+  'https://ifpsgd4emhza2s7lw2hqkkuhsy0djavb.lambda-url.us-east-2.on.aws';
+
+/**
  * SEC-TOKEN-003: Token de servicio para autenticación server-to-server
  * 
  * Este token se envía en el header x-service-token para que el API
@@ -111,6 +123,7 @@ function isServiceAuthConfigured() {
 
 module.exports = {
   FINANCE_QUERY_API_URL,
+  COPILOT_ANALYZER_URL,
   SERVICE_TOKEN_SECRET, // DEPRECATED: usar getServiceTokenSecret() para garantizar valor actual
   getServiceTokenSecret,
   getServiceHeaders,
