@@ -223,7 +223,12 @@ describe('lo que trae cada origen de la plataforma', () => {
 
     expect(buscar(hallazgos, 'Consenso de analistas').value).toBe('strongBuy');
     expect(buscar(hallazgos, 'Precio objetivo medio').value).toBe('520 (42 analistas)');
-    expect(buscar(hallazgos, 'Próxima fecha de resultados').value).toBe('2026-10-28');
+    // `endDate` es el cierre del trimestre estimado, no el día de publicación:
+    // etiquetarlo como "próxima fecha" anunciaba fechas ya pasadas.
+    const bpa = buscar(hallazgos, 'Estimación de BPA del trimestre en curso');
+    expect(bpa.value).toBe('3.1');
+    expect(bpa.period).toBe('Q4 2026');
+    expect(etiquetasDe(hallazgos)).not.toContain('Próxima fecha de resultados');
   });
 
   it('los titulares citan el enlace real del medio, no la plataforma', () => {

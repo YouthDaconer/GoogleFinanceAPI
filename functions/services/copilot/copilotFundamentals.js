@@ -77,7 +77,7 @@ const ETIQUETAS = {
     capitalizacion: 'Capitalización de mercado',
     consenso: 'Consenso de analistas',
     precioObjetivo: 'Precio objetivo medio',
-    proximosResultados: 'Próxima fecha de resultados',
+    estimacionBpa: 'Estimación de BPA del trimestre en curso',
     exDividendo: 'Fecha ex-dividendo',
     titular: 'Titular',
     analistas: 'analistas',
@@ -92,7 +92,7 @@ const ETIQUETAS = {
     capitalizacion: 'Market cap',
     consenso: 'Analyst consensus',
     precioObjetivo: 'Mean target price',
-    proximosResultados: 'Next earnings date',
+    estimacionBpa: 'EPS estimate for the current quarter',
     exDividendo: 'Ex-dividend date',
     titular: 'Headline',
     analistas: 'analysts',
@@ -407,12 +407,19 @@ function hallazgosDeAnalistas(analysis, language) {
     salida.push(hallazgo(t.precioObjetivo, `${objetivo.mean}${detalle}`, {}, lang));
   }
 
-  const proximo = (analysis.earningsEstimates || [])[0];
-  if (proximo && proximo.endDate) {
+  // `earningsEstimates[0].endDate` es el **cierre del trimestre estimado**, no
+  // el día en que se publican los resultados. Etiquetarlo como "próxima fecha
+  // de resultados" anunciaba como futura una fecha ya pasada: el informe del
+  // 14/10/2026 decía "próxima fecha de resultados: 2026-09-30". Lo que el dato
+  // es de verdad —la estimación de BPA del trimestre— sí es útil, y la fecha de
+  // publicación simplemente no la da este endpoint: se queda sin pedir antes
+  // que inventada.
+  const estimacion = (analysis.earningsEstimates || [])[0];
+  if (estimacion && typeof estimacion.avg === 'number') {
     salida.push(hallazgo(
-      t.proximosResultados,
-      String(proximo.endDate).slice(0, 10),
-      { period: enricher.formatEarningsPeriod(proximo.endDate) || null },
+      t.estimacionBpa,
+      String(estimacion.avg),
+      { period: enricher.formatEarningsPeriod(estimacion.endDate) || null },
       lang,
     ));
   }
