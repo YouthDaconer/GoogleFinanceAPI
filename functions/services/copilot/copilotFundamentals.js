@@ -103,6 +103,41 @@ const ETIQUETAS = {
 const MAX_TITULARES = 3;
 
 /**
+ * Cuántos activos se consultan a la vez.
+ *
+ * Cada activo son **cuatro** peticiones (las dos series de `/financials`,
+ * `/analysis` y `/news`), así que siete activos de golpe son veintiocho
+ * conexiones simultáneas. Medido el 14/10/2026 contra producción: de 28
+ * llamadas a la vez, **18 vuelven con HTTP 503**; de seis en seis, ninguna.
+ *
+ * Y un 503 aquí no se ve: el activo se queda sin cifras, cae a la búsqueda web
+ * y el informe sale igual — con los números que el modelo encuentre, que es
+ * exactamente lo que esta historia vino a evitar. En el análisis de las 17:01
+ * se perdieron así las cifras de MSFT, UNH, MELI y TMUS, los cuatro con datos
+ * disponibles en la plataforma.
+ *
+ * Dos activos son ocho conexiones, que es el orden del resto del proyecto
+ * (`copilotRelevance` usa 6, `copilotSources` 8).
+ */
+const ACTIVOS_EN_PARALELO = 2;
+
+/**
+ * Ejecuta en tandas, para no abrir una conexión por cada cosa que haga falta.
+ *
+ * @param {Array<*>} items
+ * @param {function(*): Promise<*>} fn
+ * @param {number} [limite]
+ * @returns {Promise<Array<*>>}
+ */
+async function enTandas(items, fn, limite = ACTIVOS_EN_PARALELO) {
+  const salida = [];
+  for (let i = 0; i < items.length; i += limite) {
+    salida.push(...(await Promise.all(items.slice(i, i + limite).map(fn))));
+  }
+  return salida;
+}
+
+/**
  * Margen de días con el que se busca "el mismo trimestre del año pasado".
  *
  * Los cierres fiscales no caen el mismo día cada año y alguna serie se salta un
@@ -472,7 +507,7 @@ async function obtenerDatosDePlataforma(
   const simbolos = holdings.map((h) => h.symbol);
   const quotes = await quotesPorSimbolo(simbolos, fetchers);
 
-  const resultados = await Promise.all(holdings.map(async (holding) => {
+  const resultados = await enTandas(holdings, async (holding) => {
     const { symbol } = holding;
     // RN-5.6-E: un ETF y una cripto no tienen 10-Q, así que preguntar por su
     // estado de resultados es una llamada garantizada a 404. Una acción de
@@ -512,7 +547,7 @@ async function obtenerDatosDePlataforma(
     }
 
     return [symbol, { findings, cubierto }];
-  }));
+  });
 
   return new Map(resultados);
 }
@@ -521,6 +556,8 @@ module.exports = {
   FUENTE_PLATAFORMA,
   ETIQUETAS,
   MAX_TITULARES,
+  ACTIVOS_EN_PARALELO,
+  enTandas,
   TOLERANCIA_INTERANUAL_DIAS,
   formatearImporte,
   periodosOrdenados,

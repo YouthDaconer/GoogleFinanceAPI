@@ -396,3 +396,46 @@ describe('la plataforma caída degrada, no cancela (Escenario 5, RN-5.6-D)', () 
     expect([...datos.keys()]).toEqual(['MSFT', 'BTC-USD']);
   });
 });
+
+describe('no se satura a finance-query (medido el 14/10/2026)', () => {
+  it('nunca hay más de ACTIVOS_EN_PARALELO activos en vuelo', async () => {
+    // Cada activo son cuatro peticiones: siete de golpe eran 28 conexiones, y
+    // de 28 volvían 18 con HTTP 503. Un 503 aquí no se ve — el activo se queda
+    // sin cifras y cae a la web, que es lo que esta historia vino a evitar.
+    let enVuelo = 0;
+    let maximo = 0;
+    const vigilado = async (valor) => {
+      enVuelo += 1;
+      maximo = Math.max(maximo, enVuelo);
+      await new Promise((r) => setTimeout(r, 3));
+      enVuelo -= 1;
+      return valor;
+    };
+
+    const fetchers = {
+      fetchIncome: jest.fn().mockImplementation(async (_s, f) =>
+        vigilado(f === 'annual' ? crearAnual() : crearIncome())),
+      fetchQuotes: jest.fn().mockResolvedValue([crearQuote()]),
+      fetchAnalysis: jest.fn().mockImplementation(async () => vigilado(crearAnalisis())),
+      fetchNews: jest.fn().mockImplementation(async () => vigilado(crearNoticias())),
+    };
+
+    const siete = ['A', 'B', 'C', 'D', 'E', 'F', 'G'].map((s) => crearHolding({ symbol: s }));
+    await fundamentals.obtenerDatosDePlataforma(siete, { language: 'es' }, fetchers, HOY);
+
+    // 2 activos × 4 peticiones = 8 conexiones, el orden del resto del proyecto.
+    expect(maximo).toBeLessThanOrEqual(fundamentals.ACTIVOS_EN_PARALELO * 4);
+  });
+
+  it('los siete activos se consultan igual, sólo que por tandas', async () => {
+    const fetchers = fetchersQueResponden();
+    const siete = ['A', 'B', 'C', 'D', 'E', 'F', 'G'].map((s) => crearHolding({ symbol: s }));
+
+    const datos = await fundamentals.obtenerDatosDePlataforma(
+      siete, { language: 'es' }, fetchers, HOY,
+    );
+
+    expect([...datos.keys()]).toEqual(['A', 'B', 'C', 'D', 'E', 'F', 'G']);
+    expect(fetchers.fetchAnalysis).toHaveBeenCalledTimes(7);
+  });
+});
