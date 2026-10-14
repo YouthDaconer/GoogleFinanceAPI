@@ -270,3 +270,41 @@ describe('HU 5.6 — una tanda se reparte por clave', () => {
     expect(repartida.get('MSFT').outcome).toBe(RESEARCH_OUTCOME.SIN_DATOS);
   });
 });
+
+describe('HU 5.6 — un salto de línea crudo no tira la tanda entera', () => {
+  it('rescata el JSON con un salto de línea dentro de un texto', () => {
+    // Medido el 14/10/2026: `gemini-2.5-flash` escribe el valor de un hallazgo
+    // largo con saltos de línea literales, y JSON.parse lo rechaza. Un carácter
+    // tiraba una tanda de siete activos que por lo demás vino perfecta.
+    const roto = '{"MSFT": {"findings": [{"label": "Qué pasa",'
+      + ' "value": "Primera línea\nsegunda línea", "sourceUrl": "https://x"}],'
+      + ' "notes": [], "conflicts": []}}';
+
+    const datos = parsearRespuesta(roto);
+
+    expect(datos).not.toBeNull();
+    expect(datos.MSFT.findings[0].value).toBe('Primera línea\nsegunda línea');
+  });
+
+  it('no toca el JSON que ya era válido', () => {
+    const bueno = '{"a": {"b": "con \n escapado"}}';
+
+    expect(parsearRespuesta(bueno)).toEqual({ a: { b: 'con \n escapado' } });
+  });
+
+  it('respeta las comillas escapadas al decidir qué está dentro de una cadena', () => {
+    const conComillas = '{"a": "dice \\"hola\\"\ny sigue"}';
+
+    expect(parsearRespuesta(conComillas).a).toBe('dice "hola"\ny sigue');
+  });
+
+  it('lo que no es JSON ni con reparación sigue siendo un fallo', () => {
+    expect(parsearRespuesta('esto no es JSON en absoluto')).toBeNull();
+    expect(parsearRespuesta('{roto sin cerrar')).toBeNull();
+  });
+
+  it('sigue tolerando el bloque de código y la prosa alrededor', () => {
+    expect(parsearRespuesta('```json\n{"a": 1}\n```')).toEqual({ a: 1 });
+    expect(parsearRespuesta('Aquí tienes:\n{"a": 1}\nespero que sirva')).toEqual({ a: 1 });
+  });
+});

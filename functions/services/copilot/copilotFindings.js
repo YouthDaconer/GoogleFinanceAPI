@@ -65,20 +65,62 @@ function parsearRespuesta(texto) {
     .replace(/\s*```\s*$/i, '')
     .trim();
 
-  try {
-    const datos = JSON.parse(limpio);
-    return datos && typeof datos === 'object' ? datos : null;
-  } catch (error) {
-    // Un JSON roto es un fallo de la rama, no una ausencia de datos.
-    const primero = limpio.indexOf('{');
-    const ultimo = limpio.lastIndexOf('}');
-    if (primero === -1 || ultimo <= primero) return null;
+  const intentar = (candidato) => {
     try {
-      return JSON.parse(limpio.slice(primero, ultimo + 1));
-    } catch (error2) {
+      const datos = JSON.parse(candidato);
+      return datos && typeof datos === 'object' ? datos : null;
+    } catch (error) {
       return null;
     }
+  };
+
+  const directo = intentar(limpio);
+  if (directo) return directo;
+
+  // Un JSON roto es un fallo de la rama, no una ausencia de datos. Pero antes
+  // de darlo por perdido se prueban dos reparaciones, las dos que de verdad
+  // ocurren: prosa alrededor del objeto, y saltos de línea crudos dentro de un
+  // texto. Lo segundo lo hace `gemini-2.5-flash` (medido el 14/10/2026) y basta
+  // para tirar una tanda de siete activos que por lo demás vino perfecta.
+  const primero = limpio.indexOf('{');
+  const ultimo = limpio.lastIndexOf('}');
+  if (primero === -1 || ultimo <= primero) return null;
+
+  const acotado = limpio.slice(primero, ultimo + 1);
+  return intentar(acotado) || intentar(escaparControlesEnCadenas(acotado));
+}
+
+/**
+ * Escapa los caracteres de control que el modelo dejó crudos **dentro** de una
+ * cadena JSON.
+ *
+ * `JSON.parse` rechaza un salto de línea literal entre comillas, y el modelo lo
+ * escribe cuando el texto de un hallazgo es largo. Se recorre el texto sabiendo
+ * si se está dentro o fuera de una cadena —respetando lo ya escapado— para no
+ * tocar el formato del propio JSON.
+ *
+ * @param {string} json
+ * @returns {string}
+ */
+function escaparControlesEnCadenas(json) {
+  const ESCAPES = { '\n': '\\n', '\r': '\\r', '\t': '\\t' };
+  let salida = '';
+  let dentro = false;
+  let escapado = false;
+
+  for (const c of json) {
+    if (escapado) { salida += c; escapado = false; continue; }
+    if (c === '\\') { salida += c; escapado = dentro; continue; }
+    if (c === '"') { dentro = !dentro; salida += c; continue; }
+
+    if (dentro && c < ' ') {
+      salida += ESCAPES[c] || '';
+      continue;
+    }
+    salida += c;
   }
+
+  return salida;
 }
 
 /**
@@ -322,6 +364,7 @@ module.exports = {
   parsearRespuesta,
   filtrarHallazgos,
   filtrarConflictos,
+  escaparControlesEnCadenas,
   normalizarDatos,
   normalizarInvestigacion,
   normalizarInvestigacionLote,
