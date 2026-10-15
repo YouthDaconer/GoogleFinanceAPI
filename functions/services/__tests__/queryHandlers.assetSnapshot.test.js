@@ -246,7 +246,7 @@ describe('PERF-SNAP-024: getHistoricalReturns — per-asset snapshot path', () =
     expect(mockGenerateAssetSnapshot).not.toHaveBeenCalled();
   });
 
-  it('should fallback to legacy when only ticker provided (no assetType)', async () => {
+  it('should reject when only ticker provided (no assetType)', async () => {
     mockDocGet.mockResolvedValue({ exists: false });
     const { getHistoricalReturnsV2 } = require('../consolidatedReturnsService');
     getHistoricalReturnsV2.mockResolvedValue({
@@ -258,10 +258,12 @@ describe('PERF-SNAP-024: getHistoricalReturns — per-asset snapshot path', () =
       monthlyCompoundData: {},
     });
 
-    await getHistoricalReturns(
+    // Sin tipo el legacy devolvía el portafolio entero etiquetado como AAPL
+    await expect(getHistoricalReturns(
       createContext('user1'),
       { currency: 'USD', accountId: 'overall', ticker: 'AAPL', assetType: null }
-    );
+    )).rejects.toMatchObject({ code: 'invalid-argument' });
+    expect(getHistoricalReturnsV2).not.toHaveBeenCalled();
 
     // Should NOT try to build per-asset snapshot docId
     expect(mockBuildSnapshotDocId).not.toHaveBeenCalledWith(

@@ -281,17 +281,17 @@ describe('PERF-SNAP-007: getHistoricalReturns with snapshots', () => {
   // ==========================================================================
 
   describe('getHistoricalReturns — ticker/assetType redirect (AC4)', () => {
-    it('should use legacy path when ticker is provided', async () => {
+    it('should reject a ticker without assetType instead of returning the whole portfolio', async () => {
       mockSnapshotGet.mockResolvedValue({ exists: false });
       mockGetHistoricalReturnsV2.mockResolvedValue(mockV2Result);
 
-      const result = await getHistoricalReturns(
+      await expect(getHistoricalReturns(
         createContext('user1'),
         { currency: 'USD', ticker: 'AAPL' }
-      );
+      )).rejects.toMatchObject({ code: 'invalid-argument' });
 
       expect(mockBuildSnapshotDocId).not.toHaveBeenCalled();
-      expect(mockGetHistoricalReturnsV2).toHaveBeenCalled();
+      expect(mockGetHistoricalReturnsV2).not.toHaveBeenCalled();
     });
 
     it('should use legacy path when assetType is provided', async () => {

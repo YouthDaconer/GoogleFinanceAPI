@@ -437,6 +437,8 @@ async function getHistoricalReturns(context, payload) {
 
   console.log(`[queryHandlers][getHistoricalReturns] userId: ${userId}, currency: ${currency}, accountId: ${accountId}`);
 
+  rejectTickerWithoutAssetType(payload, 'getHistoricalReturns');
+
   try {
     // FEAT-EXCLUDE-001: los snapshots son agregados y no permiten quitar
     // activos; la exclusión se calcula aparte, desde los docs diarios.
@@ -648,6 +650,19 @@ function rejectExcludeTickers(payload, endpoint) {
 }
 
 /**
+ * Un ticker sin su assetType no identifica al activo (la llave de
+ * assetPerformance es `${ticker}_${assetType}`) y el cálculo caía a la rama
+ * top-level: devolvía el rendimiento de todo el portafolio como si fuera el
+ * del ticker. Mismo criterio que rejectExcludeTickers: rechazar, no adivinar.
+ */
+function rejectTickerWithoutAssetType(payload, endpoint) {
+  if (payload?.ticker && !payload?.assetType) {
+    throw new HttpsError('invalid-argument',
+      `${endpoint} necesita assetType cuando se pide un ticker`);
+  }
+}
+
+/**
  * Ruta legacy de rendimientos históricos (V2 consolidados + cache Firestore).
  * Usada como fallback cuando no hay snapshot, para ticker/assetType, o forceRefresh.
  */
@@ -746,6 +761,7 @@ async function getMultiAccountHistoricalReturns(context, payload) {
   console.log(`[queryHandlers][getMultiAccountHistoricalReturns] userId: ${userId}, accounts: ${accountIds.length}`);
 
   rejectExcludeTickers(payload, 'getMultiAccountHistoricalReturns');
+  rejectTickerWithoutAssetType(payload, 'getMultiAccountHistoricalReturns');
 
   try {
     // Validación de parámetros

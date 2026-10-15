@@ -356,20 +356,15 @@ describe('PERF-SNAP-008: getMultiAccountHistoricalReturns — snapshot path', ()
     expect(result.returns.hasYtdData).toBe(false);
   });
 
-  it('should skip snapshot and use legacy when ticker is provided', async () => {
-    mockCollectionGet.mockResolvedValueOnce({
-      empty: false,
-      docs: [{ id: 'acc1' }, { id: 'acc2' }, { id: 'acc3' }, { id: 'acc4' }],
-    });
-    mockCollectionGet.mockResolvedValue({ size: 0, docs: [] });
-
-    await getMultiAccountHistoricalReturns(
+  it('should reject a ticker without assetType instead of returning the whole portfolio', async () => {
+    // Sin mocks de Firestore: el rechazo ocurre antes de cualquier lectura
+    await expect(getMultiAccountHistoricalReturns(
       createContext('user1'),
       { accountIds: ['acc1', 'acc2', 'acc3'], currency: 'USD', ticker: 'AAPL' }
-    );
+    )).rejects.toMatchObject({ code: 'invalid-argument' });
 
-    // Snapshot path should NOT be attempted
     expect(mockBuildSnapshotDocId).not.toHaveBeenCalled();
+    expect(mockCollectionGet).not.toHaveBeenCalled();
   });
 
   it('should skip snapshot and use legacy when assetType is provided', async () => {
