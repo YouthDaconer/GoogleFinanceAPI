@@ -21,6 +21,15 @@ const { invalidatePerformanceCache, invalidateDistributionCache } = require('../
 // LATE-REG-002: Detección y marcado de transacciones retroactivas
 const { checkAndMarkStaleIfRetroactive } = require('../../utils/performanceStaleMarker');
 
+/**
+ * La fecha más antigua entre transacciones (o activos) que se acaban de
+ * editar o borrar: desde ahí hay que recalcular el rendimiento, porque los
+ * docs diarios posteriores se calcularon con ellas.
+ */
+const earliestDate = (dates) => dates
+  .filter((d) => typeof d === 'string' && d.length >= 10)
+  .sort()[0] || null;
+
 // Importar getQuotes para crear currentPrices de nuevos tickers
 const { getQuotes } = require('../financeQuery');
 
@@ -867,6 +876,23 @@ async function updateAsset(context, payload) {
     // 9. Invalidar caches
     await invalidatePerformanceCache(auth.uid);
     invalidateDistributionCache(auth.uid);
+
+    // 10. Editar unidades, precio, fecha, moneda o cuenta de una compra cambia
+    // los días ya calculados desde su fecha (la más antigua de la vieja y la
+    // nueva). Sin marcarlo, el EOD siguiente vería unidades distintas sin
+    // ninguna transacción del día y lo contaría como rendimiento.
+    const HISTORY_FIELDS = ['units', 'unitValue', 'acquisitionDate', 'currency',
+      'acquisitionDollarValue', 'portfolioAccount', 'name', 'assetType'];
+    if (HISTORY_FIELDS.some((field) => updateData[field] !== undefined)) {
+      const since = earliestDate([oldAsset.acquisitionDate, updateData.acquisitionDate]);
+      if (since) {
+        checkAndMarkStaleIfRetroactive(auth.uid, since, {
+          reason: 'asset_edit',
+          transactionType: 'edit',
+          portfolioAccount: updateData.portfolioAccount || oldAsset.portfolioAccount,
+        });
+      }
+    }
 
     console.log(`[assetHandlers][updateAsset] Éxito - assetId: ${data.assetId}`);
 
@@ -1984,6 +2010,20 @@ async function deleteAsset(context, payload) {
     await invalidatePerformanceCache(auth.uid);
     invalidateDistributionCache(auth.uid);
 
+    // 7. Los días ya calculados desde la primera transacción borrada incluyen
+    // este activo: hay que recalcularlos sin él.
+    const deleteSince = earliestDate([
+      assetData.acquisitionDate,
+      ...deletedTransactions.map((t) => t.date),
+    ]);
+    if (deleteSince) {
+      checkAndMarkStaleIfRetroactive(auth.uid, deleteSince, {
+        reason: 'asset_delete',
+        transactionType: 'delete',
+        portfolioAccount: assetData.portfolioAccount,
+      });
+    }
+
     console.log(`[assetHandlers][deleteAsset] Éxito - assetId: ${data.assetId}`);
 
     return {
@@ -2131,6 +2171,19 @@ async function deleteAssets(context, payload) {
     }
 
     await batch.commit();
+
+    // Mismo motivo que en deleteAsset
+    const deleteSince = earliestDate([
+      ...assetsSnapshot.docs.map((d) => d.data().acquisitionDate),
+      ...deletedTransactions.map((t) => t.date),
+    ]);
+    if (deleteSince) {
+      checkAndMarkStaleIfRetroactive(auth.uid, deleteSince, {
+        reason: 'asset_delete',
+        transactionType: 'delete',
+        portfolioAccount: data.accountId,
+      });
+    }
 
     console.log(`[assetHandlers][deleteAssets] Éxito - deletedCount: ${deletedCount}`);
 

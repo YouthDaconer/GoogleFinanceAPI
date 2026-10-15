@@ -2,7 +2,8 @@ const { onSchedule } = require("firebase-functions/v2/scheduler");
 const { defineSecret } = require("firebase-functions/params");
 const admin = require('firebase-admin');
 const axios = require('axios');
-const { calculateAccountPerformance, convertCurrency } = require('../utils/portfolioCalculations');
+const { calculateAccountPerformance, convertCurrency, detectUnexplainedUnitChanges } = require('../utils/portfolioCalculations');
+const { markPerformanceAsStale } = require('../utils/performanceStaleMarker');
 const { calculatePortfolioRisk } = require('./calculatePortfolioRisk');
 const { invalidatePerformanceCacheBatch } = require('./cacheInvalidationService');
 const { DateTime } = require('luxon');
@@ -476,6 +477,11 @@ class PerformanceDataCache {
     };
   }
 
+  /** Fecha (YYYY-MM-DD) del doc del día anterior del usuario, o null. */
+  getUserLastPerformanceDate(userId) {
+    return this.userLastPerformance.get(userId)?.date || null;
+  }
+
   getUserLastPerformance(userId, currencies) {
     const data = this.userLastPerformance.get(userId);
     if (!data) {
@@ -575,6 +581,35 @@ async function processUserPerformance({
       lastOverallTotalValue,
       userTransactions
     );
+
+    // LATE-REG: red de seguridad. Si hay unidades que cambiaron sin ninguna
+    // transacción del día, algo se registró, editó o borró tarde y este día
+    // lo contaría como rendimiento. Los handlers ya marcan esos casos, pero
+    // cualquier camino que se les escape termina aquí; se marca al usuario y
+    // la reconciliación de las 02:00 lo recalcula desde las transacciones esa
+    // misma noche. Sin lecturas extra: usa lo que el EOD ya tiene en memoria.
+    const unexplainedUnits = detectUnexplainedUnitChanges(allUserAssets, lastOverallTotalValue, userTransactions);
+    if (unexplainedUnits.length > 0) {
+      const lastDate = cache.getUserLastPerformanceDate(userId) || formattedDate;
+      // Si entraron unidades, la compra más reciente del grupo es la tardía y
+      // su fecha es desde donde falta; si salieron, no hay pista mejor que el
+      // último día calculado.
+      const since = unexplainedUnits
+        .filter((u) => u.unitsNow > u.unitsBefore + u.unitsFromTransactions && u.latestAcquisitionDate)
+        .map((u) => u.latestAcquisitionDate)
+        .filter((d) => d < lastDate)
+        .reduce((min, d) => (d < min ? d : min), lastDate);
+      logWarn(`[LATE-REG] ${userId} ${formattedDate}: unidades sin transacción en ` +
+        `${unexplainedUnits.map((u) => `${u.groupKey} ${u.unitsBefore}->${u.unitsNow}`).join(', ')}; stale desde ${since}`);
+      try {
+        await markPerformanceAsStale(userId, since, {
+          reason: 'unexplained_units_change',
+          transactionType: 'unknown',
+        });
+      } catch (staleError) {
+        logWarn(`[LATE-REG] No se pudo marcar stale a ${userId}: ${staleError.message}`);
+      }
+    }
 
     // Calcular doneProfitAndLoss para cada moneda
     const userDoneProfitAndLossByCurrency = {};

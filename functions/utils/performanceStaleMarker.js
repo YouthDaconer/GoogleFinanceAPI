@@ -26,36 +26,25 @@ const MAX_TRADING_DAYS = 30;
  */
 async function getLatestPerformanceDate(userId) {
   try {
-    const perfDoc = await db.collection('portfolioPerformance').doc(userId).get();
-    
-    if (!perfDoc.exists) {
-      return null;
-    }
-    
-    const data = perfDoc.data();
-    
-    // El campo 'date' contiene la fecha del último cálculo
-    // Formato: "2026-02-13" o ISO string "2026-02-13T00:00:00.000Z"
-    if (data.date) {
-      return data.date.split('T')[0];
-    }
-    
-    // Si no hay campo 'date' en el documento principal, buscar en la subcollection 'dates'
-    // Esto cubre el caso donde el documento solo tiene userId y los datos están en dates/
+    // La fuente es el último doc diario y no el campo `date` del doc principal:
+    // ese campo solo lo escribía el backfill y el EOD nunca lo actualiza, así
+    // que se quedaba congelado en el último backfill (visto: 2026-06-30 con
+    // docs diarios hasta octubre) y toda transacción tardía posterior parecía
+    // a tiempo.
     const datesSnap = await db.collection('portfolioPerformance')
       .doc(userId)
       .collection('dates')
       .orderBy('date', 'desc')
       .limit(1)
       .get();
-    
+
     if (datesSnap.empty) {
       return null;
     }
-    
+
     // El ID del documento es la fecha (YYYY-MM-DD)
     return datesSnap.docs[0].id;
-    
+
   } catch (error) {
     console.error(`[performanceStaleMarker] Error getting latest date for user ${userId}:`, error.message);
     return null;
@@ -77,8 +66,10 @@ function getDatePart(dateString) {
 
 /**
  * Determina si una transacción es retroactiva
- * Una transacción es retroactiva si su fecha es ANTERIOR a la fecha
- * del último documento de portfolioPerformance calculado
+ * Una transacción es retroactiva si su fecha es ANTERIOR O IGUAL a la fecha
+ * del último documento de portfolioPerformance calculado: ese día ya lo cerró
+ * el EOD sin ella, y el EOD siguiente solo cuenta transacciones de su propio
+ * día, así que nadie más la va a contabilizar.
  * 
  * @param {string} transactionDate - Fecha de la transacción (YYYY-MM-DD o ISO)
  * @param {string} userId - ID del usuario
@@ -94,9 +85,11 @@ async function isRetroactiveTransaction(transactionDate, userId) {
   
   const txDate = getDatePart(transactionDate);
   
-  // Es retroactivo si la fecha de la transacción es ESTRICTAMENTE anterior
-  // al último día de performance calculado
-  return txDate < latestDate;
+  // `<=` y no `<`: el caso más común es "compré ayer y lo registro hoy", con
+  // fecha igual al último día calculado. Con `<` no se marcaba, el EOD de hoy
+  // veía las unidades nuevas sin flujo de caja y contaba la compra como
+  // rendimiento (MA_stock 2026-05-07: +47,9 % con el mercado en +1,8 %).
+  return txDate <= latestDate;
 }
 
 /**

@@ -505,6 +505,76 @@ const calculateDailyChangePercentage = (currentValue, previousValue) => {
   return ((currentValue - previousValue) / previousValue) * 100;
 };
 
+/**
+ * Grupos (TICKER_tipo) cuyas unidades cambiaron respecto al día anterior sin
+ * una transacción del día que lo explique: un registro tardío, una edición o
+ * un borrado. calculateAccountPerformance solo cuenta como flujo de caja las
+ * transacciones con fecha del día, así que ese cambio de valor lo contaría
+ * como rendimiento. No intenta corregirlo —inferir el flujo con el precio del
+ * día ya se probó y se quitó (FIX-LATE-REG-002), y una edición por split lo
+ * haría peor—: solo lo señala para que se reconcilie desde las transacciones.
+ *
+ * Es pura y no lee nada: usa los mismos datos que ya recibe el EOD.
+ *
+ * @param {Asset[]} assets - Activos que entran al cálculo del día
+ * @param {Object} totalValueYesterday - Mismo objeto que recibe calculateAccountPerformance
+ * @param {Transaction[]} todaysTransactions - Transacciones con fecha del día
+ * @returns {Array<{groupKey: string, unitsBefore: number, unitsNow: number, unitsFromTransactions: number, latestAcquisitionDate: string|null}>}
+ */
+const detectUnexplainedUnitChanges = (assets, totalValueYesterday, todaysTransactions) => {
+  // Las unidades son las mismas en todas las monedas; USD siempre está.
+  const yesterday = totalValueYesterday?.USD;
+  // Sin día anterior no hay contra qué comparar (primer cálculo del usuario).
+  if (!yesterday || !(yesterday.totalValue > 0)) return [];
+
+  const unitsNow = {};
+  const latestAcquisition = {};
+  const groupByAssetId = {};
+  for (const asset of assets) {
+    const key = `${asset.name}_${asset.assetType}`;
+    unitsNow[key] = (unitsNow[key] || 0) + (parseFloat(asset.units) || 0);
+    groupByAssetId[asset.id] = key;
+    const acquired = typeof asset.acquisitionDate === 'string' ? asset.acquisitionDate.substring(0, 10) : null;
+    if (acquired && (!latestAcquisition[key] || acquired > latestAcquisition[key])) {
+      latestAcquisition[key] = acquired;
+    }
+  }
+
+  const unitsFromTransactions = {};
+  for (const t of todaysTransactions) {
+    const key = groupByAssetId[t.assetId];
+    if (!key) continue;
+    const units = parseFloat(t.amount) || 0;
+    if (t.type === 'buy') unitsFromTransactions[key] = (unitsFromTransactions[key] || 0) + units;
+    if (t.type === 'sell') unitsFromTransactions[key] = (unitsFromTransactions[key] || 0) - units;
+  }
+
+  const keys = new Set([
+    ...Object.keys(unitsNow),
+    // El objeto de ayer mezcla `totalValue` con los grupos; los grupos son objetos.
+    ...Object.keys(yesterday).filter((k) => yesterday[k] && typeof yesterday[k] === 'object'),
+  ]);
+
+  const unexplained = [];
+  for (const groupKey of keys) {
+    const before = yesterday[groupKey]?.units || 0;
+    const now = unitsNow[groupKey] || 0;
+    const fromTransactions = unitsFromTransactions[groupKey] || 0;
+    const gap = now - (before + fromTransactions);
+    // Tolerancia relativa: hay fracciones de cripto con 8 decimales.
+    if (Math.abs(gap) > 1e-6 * Math.max(1, Math.abs(now), Math.abs(before))) {
+      unexplained.push({
+        groupKey,
+        unitsBefore: before,
+        unitsNow: now,
+        unitsFromTransactions: fromTransactions,
+        latestAcquisitionDate: latestAcquisition[groupKey] || null,
+      });
+    }
+  }
+  return unexplained;
+};
+
 const calculatePureReturnWithoutCashflows = (startValue, endValue, cashFlows, dividends = [], isNewInvestment = false) => {
   // Si es una nueva inversión después de haber vendido todas las posiciones anteriores,
   // el rendimiento debe ser 0% en el primer día
@@ -603,5 +673,6 @@ module.exports = {
   calculateAccountPerformance,
   calculateDailyChangePercentage,
   calculatePureReturnWithoutCashflows,
-  calculateRawDailyChange
+  calculateRawDailyChange,
+  detectUnexplainedUnitChanges
 };

@@ -88,7 +88,12 @@ jest.mock("../../utils/portfolioCalculations", () => ({
       }
     }
   })),
-  convertCurrency: jest.fn((value) => value)
+  convertCurrency: jest.fn((value) => value),
+  detectUnexplainedUnitChanges: jest.fn(() => [])
+}));
+
+jest.mock("../../utils/performanceStaleMarker", () => ({
+  markPerformanceAsStale: jest.fn().mockResolvedValue(undefined)
 }));
 
 jest.mock("../calculatePortfolioRisk", () => ({
@@ -176,6 +181,7 @@ function buildCache() {
     getUserLastPerformance: jest.fn(() => ({
       USD: { totalValue: 9800 }
     })),
+    getUserLastPerformanceDate: jest.fn(() => "2026-05-06"),
     getAccountLastPerformance: jest.fn(() => ({
       USD: { totalValue: 4900 }
     })),
@@ -967,5 +973,46 @@ describe("PERF-SNAP-026: Smart Currency filtering in processUserPerformance", ()
 
     expect(mockFetchLatestAssetPerformance).toHaveBeenCalledTimes(1);
     expect(mockFetchLatestAssetPerformance).toHaveBeenCalledWith(mockDb, "user-1", "overall", "USD");
+  });
+});
+
+// LATE-REG: si el EOD ve unidades que cambiaron sin transacción del día,
+// marca al usuario para que la reconciliación lo recalcule esa misma noche.
+describe("LATE-REG: red de seguridad en processUserPerformance", () => {
+  const { detectUnexplainedUnitChanges } = require("../../utils/portfolioCalculations");
+  const { markPerformanceAsStale } = require("../../utils/performanceStaleMarker");
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockBatchCommit.mockResolvedValue(undefined);
+  });
+
+  it("marca stale desde la fecha de la compra tardía cuando entraron unidades", async () => {
+    detectUnexplainedUnitChanges.mockReturnValueOnce([{
+      groupKey: "MA_stock", unitsBefore: 0.2609, unitsNow: 0.3789,
+      unitsFromTransactions: 0, latestAcquisitionDate: "2026-05-05",
+    }]);
+
+    const result = await processUserPerformance(buildBaseParams());
+
+    expect(result.success).toBe(true);
+    expect(markPerformanceAsStale).toHaveBeenCalledWith("user-1", "2026-05-05",
+      expect.objectContaining({ reason: "unexplained_units_change" }));
+  });
+
+  it("si salieron unidades marca desde el último día calculado", async () => {
+    detectUnexplainedUnitChanges.mockReturnValueOnce([{
+      groupKey: "MA_stock", unitsBefore: 0.3789, unitsNow: 0.2609,
+      unitsFromTransactions: 0, latestAcquisitionDate: "2026-01-28",
+    }]);
+
+    await processUserPerformance(buildBaseParams());
+
+    expect(markPerformanceAsStale).toHaveBeenCalledWith("user-1", "2026-05-06", expect.anything());
+  });
+
+  it("no marca nada en un día normal", async () => {
+    await processUserPerformance(buildBaseParams());
+    expect(markPerformanceAsStale).not.toHaveBeenCalled();
   });
 });
