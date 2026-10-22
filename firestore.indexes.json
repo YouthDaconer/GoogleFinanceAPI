@@ -505,6 +505,20 @@
           "order": "ASCENDING"
         }
       ]
+    },
+    {
+      "collectionGroup": "contradictions",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "against",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "at",
+          "order": "ASCENDING"
+        }
+      ]
     }
   ],
   "fieldOverrides": [
@@ -526,6 +540,11 @@
           "queryScope": "COLLECTION"
         }
       ]
+    },
+    {
+      "collectionGroup": "dates",
+      "fieldPath": "*",
+      "indexes": []
     },
     {
       "collectionGroup": "dates",
