@@ -49,6 +49,61 @@ const { StructuredLogger } = require('../utils/logger');
 // OPT-DEMAND-CLEANUP: Importar helper para obtener precios y currencies del API Lambda
 const { getPricesFromApi, getCurrencyRatesFromApi } = require('./marketDataHelper');
 
+// HU 6.3: el reparto del cierre nocturno — una tarea por inversor
+const { getFunctions } = require('firebase-admin/functions');
+const { guardarSnapshotDelDia } = require('./eodMarketSnapshot');
+const eodProgress = require('./eodProgressService');
+
+/**
+ * HU 6.3 (D4) — El interruptor del reparto, **apagado por defecto**.
+ *
+ * RN-6-H pide poder volver al cierre actual sin romper nada, y esto toca el
+ * corazón del cierre nocturno de producción. El orquestador conserva los dos
+ * caminos —el `p-limit(5)` de siempre y el reparto en cola— y elige por esta
+ * bandera: volver atrás es cambiar un valor, no revertir un despliegue.
+ *
+ * @see platform-docs/stories/6.3-cierre-nocturno-termina-siempre/refinamiento.md (T4, D4)
+ */
+const EOD_FANOUT_ENABLED = process.env.EOD_FANOUT_ENABLED === 'true';
+
+/** Nombre de la función de cola a la que se encolan las tareas por inversor. */
+const EOD_TASK_QUEUE = 'eodUserPerformanceTask';
+
+/**
+ * HU 6.3 (T4) — Encola una tarea por inversor.
+ *
+ * El cuerpo de la tarea es `{ userId, date }` y nada más (D2): Cloud Tasks
+ * acota el tamaño del cuerpo, los precios son ~100 KB que se duplicarían por
+ * cada inversor, y un dato serializado en la tarea sería un dato rancio en el
+ * reintento. Los precios ya quedaron materializados en el documento del día.
+ *
+ * Un encolado que falla no tumba la corrida: el inversor queda sin tarea y el
+ * cierre póstumo lo detecta como «sin rastro» y lo nombra en el aviso
+ * (RN-6-E, RN-6.3-N).
+ *
+ * @param {string[]} userIds
+ * @param {string} formattedDate - `YYYY-MM-DD`
+ * @returns {Promise<{encoladas: number, fallidas: string[]}>}
+ */
+async function encolarTareasPorInversor(userIds, formattedDate) {
+  const queue = getFunctions().taskQueue(EOD_TASK_QUEUE);
+  const fallidas = [];
+  let encoladas = 0;
+
+  const limit = pLimit(20);
+  await Promise.all(userIds.map((userId) => limit(async () => {
+    try {
+      await queue.enqueue({ userId, date: formattedDate }, { dispatchDeadlineSeconds: 180 });
+      encoladas++;
+    } catch (error) {
+      console.error(`[unifiedMarketDataUpdate] No se pudo encolar a ${userId} para ${formattedDate}: ${error.message}`);
+      fallidas.push(userId);
+    }
+  })));
+
+  return { encoladas, fallidas };
+}
+
 /**
  * End-of-Day Portfolio Update
  * 
@@ -1073,17 +1128,25 @@ async function markInconsistentUsersAsStale(db, inconsistentUsers) {
  * @param {Array} currencies - Tasas de cambio del API Lambda
  * @param {Object} [options] - Opciones adicionales
  * @param {FirebaseFirestore.QuerySnapshot} [options.activeAssetsSnapshot] - FIX-READS-002: Pre-fetched active assets to avoid redundant global scan
+ * @param {string} [options.formattedDate] - HU 6.3 (T2): día que se cierra, `YYYY-MM-DD`
  */
 async function calculateDailyPortfolioPerformance(db, currentPrices, currencies, options = {}) {
   logInfo('🔄 Calculando rendimiento diario del portafolio (API Lambda)...');
-  
+
+  // HU 6.3 (T2): el día que se cierra llega como parámetro. Antes se deducía
+  // aquí de la hora de ejecución, y eso impedía relanzar un día concreto —que
+  // es justo lo que piden los disparadores de la historia— y hacía que un
+  // reintento al día siguiente recalculara ayer con los precios de hoy.
+  // Sin el parámetro se conserva el comportamiento de siempre.
+  // @see platform-docs/stories/6.3-cierre-nocturno-termina-siempre/refinamiento.md (T2)
+  //
   // OPT-DEMAND-400-FIX: Usar fecha del DÍA ANTERIOR para el cálculo
   // Esta función se ejecuta a las 00:05 ET del día siguiente,
   // por lo que los precios corresponden al día de trading anterior
   const now = DateTime.now().setZone('America/New_York');
   const yesterday = now.minus({ days: 1 });
-  const formattedDate = yesterday.toISODate();
-  
+  const formattedDate = options.formattedDate || yesterday.toISODate();
+
   // FIX-TIMESTAMP-002: Rango de fechas para soportar campo date con timestamp completo
   const dateRangeStart = `${formattedDate}T00:00:00.000Z`;
   const dateRangeEnd = `${formattedDate}T23:59:59.999Z`;
@@ -1359,10 +1422,75 @@ exports.unifiedMarketDataUpdate = onSchedule({
     // aplicó vive en el propio movimiento desde la épica #2 (RN-3-B).
     // @see platform-docs/stories/3-tasa-vigente-canal-mercado/refinamiento.md (T6)
 
+    // =========================================================================
+    // HU 6.3 (T4) — El reparto: una tarea por inversor.
+    //
+    // Cuando el interruptor está encendido, el orquestador deja de calcular: su
+    // trabajo es dejar los precios del día materializados (para que todos usen
+    // los mismos, RN-6.3-M), abrir la cuenta del día y encolar. Los pasos
+    // globales —riesgo, índices, caché, benchmarks, systemStatus— se mueven al
+    // cierre póstumo, que es el único punto que sabe cuándo terminaron todos.
+    //
+    // Apagado por defecto (D4, RN-6-H): sin la bandera, abajo sigue corriendo
+    // exactamente el cierre de siempre.
+    // =========================================================================
+    if (EOD_FANOUT_ENABLED) {
+      const fechaCierre = yesterday.toISODate();
+      const runId = (event && event.jobName) || `unifiedMarketDataUpdate-${startTime}`;
+      const fanoutOp = logger.startOperation('eodFanout');
+
+      const snapshotResult = await guardarSnapshotDelDia(db, fechaCierre, {
+        prices: currentPrices,
+        currencies,
+        sourceRunId: runId,
+      });
+
+      const cuentasSnapshot = await db.collection('portfolioAccounts').where('isActive', '==', true).get();
+      const userIds = [...new Set(cuentasSnapshot.docs.map((d) => d.data().userId).filter(Boolean))];
+
+      await eodProgress.iniciarProgreso(db, fechaCierre, {
+        totalUsers: userIds.length,
+        userIds,
+        runId,
+      });
+
+      const { encoladas, fallidas } = await encolarTareasPorInversor(userIds, fechaCierre);
+
+      fanoutOp.success({
+        date: fechaCierre,
+        users: userIds.length,
+        enqueued: encoladas,
+        enqueueFailed: fallidas.length,
+        snapshotCreated: snapshotResult.creado,
+      });
+
+      logger.info('📬 Cierre repartido: una tarea por inversor', {
+        date: fechaCierre,
+        users: userIds.length,
+        enqueued: encoladas,
+        enqueueFailed: fallidas.length,
+      });
+
+      if (fallidas.length > 0) {
+        // No pasa en silencio: el cierre póstumo lo verá como «sin rastro», y
+        // además queda dicho aquí con el prefijo que engancha la alerta.
+        console.error(`[EOD-INCOMPLETO] ${fechaCierre}: ${fallidas.length} inversores no se pudieron encolar`);
+      }
+
+      mainOp.success({
+        mode: 'fanout',
+        date: fechaCierre,
+        usersEnqueued: encoladas,
+        executionTimeSec: (Date.now() - startTime) / 1000,
+      });
+
+      return null;
+    }
+
     // Paso 3: Calcular performance del portafolio
     // FIX-READS-002: Pass pre-fetched assetsSnapshot to avoid redundant global scan inside
     const perfOp = logger.startOperation('calculateDailyPortfolioPerformance');
-    const portfolioResult = await calculateDailyPortfolioPerformance(db, currentPrices, currencies, { activeAssetsSnapshot: assetsSnapshot });
+    const portfolioResult = await calculateDailyPortfolioPerformance(db, currentPrices, currencies, { activeAssetsSnapshot: assetsSnapshot, formattedDate: yesterday.toISODate() });
     perfOp.success({ portfoliosCalculated: portfolioResult.count, failed: portfolioResult.failedCount || 0 });
     
     logger.info('📈 Portfolio performance calculated', {
@@ -1483,6 +1611,31 @@ exports.unifiedMarketDataUpdate = onSchedule({
     throw error;
   }
 });
+
+/**
+ * HU 6.3 (T3) — Inyecta el logger del módulo desde fuera.
+ *
+ * `logger` es global del módulo y hasta ahora sólo lo poblaba el job programado.
+ * Cuando el cálculo de un inversor lo invoca la tarea de cola, `logger` queda en
+ * `null` y `logDebug`/`logInfo`/`logWarn` se vuelven silenciosos: se perderían,
+ * entre otros, los avisos de LATE-REG. La tarea le pasa aquí un adaptador sobre
+ * `console.*`, que es el patrón vigente de los estándares (§7), sin migrar el
+ * `StructuredLogger` que ya usa el resto de este archivo.
+ *
+ * @param {{debug: Function, info: Function, warn: Function, error: Function}|null} nuevoLogger
+ * @see platform-docs/stories/6.3-cierre-nocturno-termina-siempre/refinamiento.md (T3)
+ */
+function setModuleLogger(nuevoLogger) {
+  logger = nuevoLogger;
+}
+
+// HU 6.3 (T3): la tarea por inversor reutiliza el cálculo tal cual, sin tocarlo.
+// Lo único que cambia es quién lo llama y de dónde saca los precios.
+exports.processUserPerformance = processUserPerformance;
+exports.PerformanceDataCache = PerformanceDataCache;
+exports.markInconsistentUsersAsStale = markInconsistentUsersAsStale;
+exports.calculateDailyPortfolioPerformance = calculateDailyPortfolioPerformance;
+exports.setModuleLogger = setModuleLogger;
 
 // SCALE-001: Exportar para testing
 if (process.env.NODE_ENV === "test" || process.env.FUNCTIONS_EMULATOR) {

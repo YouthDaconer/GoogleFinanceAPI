@@ -112,3 +112,88 @@ conditions:
       duration: "0s"
 combiner: OR
 enabled: true
+
+---
+# Política 5: El cierre nocturno dejó inversores fuera (HU 6.3, RN-6.3-N)
+# Archivo: policy-eod-incompleto.json
+#
+# Es el aviso del Escenario 4. El cierre póstomo escribe `[EOD-INCOMPLETO]` en
+# el log cuando uno o más inversores no quedaron con su rendimiento del día ni
+# siquiera tras los reintentos. El detalle —cuántos, cuáles y por qué— queda en
+# la colección `eodFailures/{fecha}` de Firestore.
+#
+# IMPORTANTE: el prefijo del log es el contrato. Si se cambia en
+# services/eodFinalizationScheduled.js (PREFIJO_ALERTA), hay que cambiarlo aquí.
+
+displayName: "EOD - Inversores sin rendimiento del día"
+documentation:
+  content: |
+    El cierre nocturno terminó con inversores sin su rendimiento del día.
+    Detalle en Firestore: `eodFailures/{YYYY-MM-DD}` (cuántos, cuáles y por qué).
+    La reconciliación de las 02:00 ET reintenta a los marcados `_stale`.
+  mimeType: "text/markdown"
+conditions:
+  - displayName: "Log con [EOD-INCOMPLETO]"
+    conditionMatchedLog:
+      filter: >
+        resource.type="cloud_run_revision"
+        AND severity="ERROR"
+        AND textPayload:"[EOD-INCOMPLETO]"
+alertStrategy:
+  notificationRateLimit:
+    period: "3600s"
+combiner: OR
+enabled: true
+
+---
+# Política 6: Scheduled Job Failed — cierre póstumo (HU 6.3, T6)
+# Archivo: policy-eod-finalization-failed.json
+#
+# Si el cierre póstumo no corre, los pasos globales del día no se ejecutan y
+# —peor— nadie comprueba si alguien quedó fuera: el fallo volvería a ser
+# silencioso, que es justo lo que la HU 6.3 viene a quitar.
+
+displayName: "Scheduled Job - scheduledEodFinalization Failed"
+documentation:
+  content: "El cierre póstumo del EOD ha fallado. Sin él, nadie comprueba si algún inversor quedó fuera."
+  mimeType: "text/markdown"
+conditions:
+  - displayName: "Function execution failed"
+    conditionThreshold:
+      filter: >
+        resource.type="cloud_function"
+        AND resource.labels.function_name="scheduledEodFinalization"
+        AND severity="ERROR"
+      comparison: COMPARISON_GT
+      thresholdValue: 0
+      duration: "0s"
+combiner: OR
+enabled: true
+
+---
+# Política 7: Tasa de fallo alta en las tareas por inversor (HU 6.3, T3)
+# Archivo: policy-eod-task-errors.json
+#
+# Una tarea que falla y se reintenta es normal. Muchas a la vez no lo es: suele
+# significar que el documento del día no se materializó o que Firestore está
+# rechazando escrituras, y en ese caso conviene saberlo antes de las 00:20.
+
+displayName: "EOD - Tareas por inversor con muchos fallos"
+documentation:
+  content: "Más de 10 errores/min en eodUserPerformanceTask. Revisar que marketData/eod/dates/{fecha} exista y el throughput de Firestore."
+  mimeType: "text/markdown"
+conditions:
+  - displayName: "Error rate > 10/min"
+    conditionThreshold:
+      filter: >
+        resource.type="cloud_function"
+        AND resource.labels.function_name="eodUserPerformanceTask"
+        AND severity="ERROR"
+      comparison: COMPARISON_GT
+      thresholdValue: 10
+      duration: "300s"
+      aggregations:
+        - alignmentPeriod: "60s"
+          perSeriesAligner: ALIGN_RATE
+combiner: OR
+enabled: true

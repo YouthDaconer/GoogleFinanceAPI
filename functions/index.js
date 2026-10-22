@@ -180,6 +180,27 @@ exports.syncHolidaysHttpV2 = marketStatusService.syncHolidaysHttp;
 exports.reconcileStalePerformance = reconcileStalePerformance;
 
 // ============================================================================
+// HU 6.3: El cierre nocturno termina siempre y avisa si alguien queda fuera
+// ============================================================================
+/**
+ * El cierre nocturno repartido: una tarea por inversor, con su propio tiempo,
+ * su propio reintento y su propio resultado.
+ *
+ * - `eodUserPerformanceTask`: calcula el rendimiento del día de UN inversor.
+ *   Se encola desde `unifiedMarketDataUpdateV2` cuando `EOD_FANOUT_ENABLED`
+ *   está encendido (apagado por defecto, D4/RN-6-H).
+ * - `scheduledEodFinalization`: a las 00:20 ET Ma-Sa, ejecuta los pasos
+ *   globales y avisa a operación si alguien quedó fuera (RN-6.3-N).
+ *
+ * @see platform-docs/stories/6.3-cierre-nocturno-termina-siempre/refinamiento.md (T3, T6)
+ */
+const { eodUserPerformanceTask } = require('./services/eodUserPerformanceTask');
+const { scheduledEodFinalization } = require('./services/eodFinalizationScheduled');
+
+exports.eodUserPerformanceTask = eodUserPerformanceTask;
+exports.scheduledEodFinalization = scheduledEodFinalization;
+
+// ============================================================================
 // PERF-SNAP-028: Snapshot Lifecycle Cleanup & Archival
 // ============================================================================
 /**

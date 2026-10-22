@@ -100,4 +100,29 @@ class StructuredLogger {
   }
 }
 
-module.exports = { StructuredLogger };
+/**
+ * HU 6.3 — Adaptador de `console.*` con la forma que espera un `StructuredLogger`.
+ *
+ * Hay módulos antiguos que reciben un logger y lo usan sin comprobar que exista
+ * (`updateBenchmarkSnapshots`) o que lo guardan en una global que sólo poblaba
+ * el job programado (`unifiedMarketDataUpdate`). Al llamarlos desde código
+ * nuevo —que por estándar (§7) registra con `console.*` y prefijo `[unidad]`—
+ * hace falta un puente. Este es ese puente, en un solo sitio: lo usan la tarea
+ * por inversor y el cierre póstumo.
+ *
+ * @param {string} prefijo - La unidad, sin corchetes. Ej.: `eodFinalization`
+ * @returns {{debug: Function, info: Function, warn: Function, error: Function}}
+ * @see platform-docs/stories/6.3-cierre-nocturno-termina-siempre/refinamiento.md (T3, T6)
+ */
+function crearLoggerDeConsola(prefijo) {
+  return {
+    // `debug` se descarta a propósito: en producción es ruido, y el detalle que
+    // importa de estos caminos ya sale por `info`.
+    debug: () => {},
+    info: (mensaje) => console.log(`[${prefijo}] ${mensaje}`),
+    warn: (mensaje) => console.warn(`[${prefijo}] ${mensaje}`),
+    error: (mensaje, error) => console.error(`[${prefijo}] ${mensaje}`, error || ''),
+  };
+}
+
+module.exports = { StructuredLogger, crearLoggerDeConsola };
