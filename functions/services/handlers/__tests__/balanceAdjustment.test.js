@@ -25,7 +25,14 @@ const store = {
 const directUpdates = [];
 
 const mockBatch = {
-  set: jest.fn(),
+  // Un documento que el batch escribe entra al almacén: lo que se relee
+  // después de confirmar —el veredicto de conciliación, sin ir más lejos— tiene
+  // que ver el movimiento recién escrito, igual que en Firestore.
+  set: jest.fn((ref, data) => {
+    if (ref?.collectionName && store[ref.collectionName]) {
+      store[ref.collectionName][ref.id] = data;
+    }
+  }),
   update: jest.fn(),
   delete: jest.fn(),
   commit: jest.fn().mockResolvedValue(undefined),
@@ -35,6 +42,7 @@ let generatedDocId = 0;
 
 const makeDocRef = (collectionName, docId) => ({
   id: docId,
+  collectionName,
   get: jest.fn(async () => {
     const data = store[collectionName]?.[docId];
     return { exists: data !== undefined, id: docId, data: () => data, ref: makeDocRef(collectionName, docId) };
@@ -137,6 +145,29 @@ const writtenTransactions = () => mockBatch.set.mock.calls.map(([, data]) => dat
 /** Actualizaciones de cuenta que el batch preparó */
 const batchAccountUpdates = () => mockBatch.update.mock.calls.map(([, payload]) => payload);
 
+/**
+ * Movimiento de apertura de un saldo. Es lo que hace que el saldo guardado
+ * coincida con su historial, que es el estado en el que HU 2.6 deja a toda
+ * cuenta: sin él, cada divisa arrastraría una deriva del tamaño de su saldo.
+ *
+ * @param {string} currency - Divisa del saldo
+ * @param {number} amount - Monto de la apertura
+ * @param {string} [accountId='account-123'] - Cuenta a la que pertenece
+ * @returns {Object} Documento de `transactions`
+ */
+const opening = (currency, amount, accountId = 'account-123') => ({
+  userId: 'user-123',
+  portfolioAccountId: accountId,
+  type: 'cash_adjustment',
+  adjustmentReason: 'opening',
+  assetType: 'cash',
+  currency,
+  adjustmentDelta: amount,
+  amount: Math.abs(amount),
+  price: 1,
+  date: '2026-01-01T00:00:00.000Z',
+});
+
 beforeEach(() => {
   jest.clearAllMocks();
   directUpdates.length = 0;
@@ -155,7 +186,10 @@ beforeEach(() => {
     },
   };
   store.userData = { 'user-123': { defaultCurrency: 'COP' } };
-  store.transactions = {};
+  store.transactions = {
+    'opening-usd': opening('USD', 1000),
+    'opening-eur': opening('EUR', 400),
+  };
   store.assets = {};
 
   historicalRateService.getCrossRate.mockResolvedValue({
@@ -266,6 +300,7 @@ describe('registerBalanceAdjustment — corregir a mano deja rastro (AC-4)', () 
 
   it('sin exposición cambiaria el documento no lleva ni un campo de divisa (RN-14)', async () => {
     store.portfolioAccounts['account-123'].balances.COP = 1000000;
+    store.transactions['opening-cop'] = opening('COP', 1000000);
 
     await assetHandlers.registerBalanceAdjustment(context, {
       portfolioAccountId: 'account-123',
@@ -295,6 +330,85 @@ describe('registerBalanceAdjustment — corregir a mano deja rastro (AC-4)', () 
       newBalance: -10,
       date: '2026-08-20',
     })).rejects.toThrow(/negativo/i);
+  });
+
+  // ==========================================================================
+  // Una deriva se cierra en UN intento (RN-06)
+  //
+  // El movimiento que falta se despeja contra el saldo del historial. Cuando se
+  // despejaba contra el guardado, el ajuste movía los dos saldos la misma
+  // cantidad: la diferencia sobrevivía intacta, el aviso de "no conciliado"
+  // volvía a salir con la misma cifra y cada intento dejaba un movimiento falso.
+  // ==========================================================================
+
+  describe('un saldo con deriva', () => {
+    beforeEach(() => {
+      // El historial llega a 1.000 y el saldo guardado dice 996,28: faltan
+      // 3,72 que ningún movimiento explica.
+      store.portfolioAccounts['account-123'].balances.USD = 996.28;
+    });
+
+    it('el movimiento se despeja contra el historial, no contra el saldo guardado', async () => {
+      const result = await assetHandlers.registerBalanceAdjustment(context, {
+        portfolioAccountId: 'account-123',
+        currency: 'USD',
+        newBalance: 1050,
+        date: '2026-08-20',
+      });
+
+      // Al historial le faltan 50 para llegar a 1.050, no 53,72.
+      expect(result.delta).toBe(50);
+      expect(writtenTransactions()[0].adjustmentDelta).toBe(50);
+    });
+
+    it('deja el saldo guardado exactamente en la cifra escrita, cerrando la deriva', async () => {
+      const result = await assetHandlers.registerBalanceAdjustment(context, {
+        portfolioAccountId: 'account-123',
+        currency: 'USD',
+        newBalance: 1050,
+        date: '2026-08-20',
+      });
+
+      expect(result.newBalance).toBe(1050);
+      expect(batchAccountUpdates()[0]['balances.USD']).toBe(1050);
+      // Historial 1.000 + 50 = 1.050 = saldo guardado: conciliado.
+      expect(result.reconciliation).toMatchObject({ difference: 0, status: 'reconciled' });
+    });
+
+    it('aceptar la cifra del historial corrige el número guardado sin inventar un movimiento', async () => {
+      const result = await assetHandlers.registerBalanceAdjustment(context, {
+        portfolioAccountId: 'account-123',
+        currency: 'USD',
+        newBalance: 1000,
+        date: '2026-08-20',
+      });
+
+      expect(result.transactionId).toBeNull();
+      expect(writtenTransactions()).toHaveLength(0);
+      expect(result.newBalance).toBe(1000);
+      expect(batchAccountUpdates()[0]['balances.USD']).toBe(1000);
+      expect(result.reconciliation).toMatchObject({ status: 'reconciled' });
+    });
+
+    it('la deriva no sobrevive al ajuste: el segundo intento ya no tiene nada que corregir', async () => {
+      await assetHandlers.registerBalanceAdjustment(context, {
+        portfolioAccountId: 'account-123',
+        currency: 'USD',
+        newBalance: 1050,
+        date: '2026-08-20',
+      });
+
+      // El movimiento ya está en el historial —lo escribió el batch—; lo que
+      // falta por reflejar en el doble es el saldo que el ajuste dejó.
+      store.portfolioAccounts['account-123'].balances.USD = 1050;
+
+      await expect(assetHandlers.registerBalanceAdjustment(context, {
+        portfolioAccountId: 'account-123',
+        currency: 'USD',
+        newBalance: 1050,
+        date: '2026-08-20',
+      })).rejects.toThrow(/no cambia el saldo/i);
+    });
   });
 
   it('deja el veredicto de conciliación recalculado con el asiento ya escrito (D4)', async () => {

@@ -706,42 +706,22 @@ async function updateAsset(context, payload) {
     const oldUnits = cleanDecimal(Number(oldAsset.units));
     const oldUnitValue = cleanDecimal(Number(oldAsset.unitValue));
     const oldCommission = cleanDecimal(Number(oldAsset.commission) || 0);
-    const oldTotalValue = cleanDecimal(oldUnits * oldUnitValue + oldCommission);
 
-    const newUnits = data.updates.units !== undefined 
-      ? cleanDecimal(Number(data.updates.units)) 
+    const newUnits = data.updates.units !== undefined
+      ? cleanDecimal(Number(data.updates.units))
       : oldUnits;
-    const newUnitValue = data.updates.unitValue !== undefined 
-      ? cleanDecimal(Number(data.updates.unitValue)) 
+    const newUnitValue = data.updates.unitValue !== undefined
+      ? cleanDecimal(Number(data.updates.unitValue))
       : oldUnitValue;
-    const newCommission = data.updates.commission !== undefined 
-      ? cleanDecimal(Number(data.updates.commission)) 
+    const newCommission = data.updates.commission !== undefined
+      ? cleanDecimal(Number(data.updates.commission))
       : oldCommission;
-    const newTotalValue = cleanDecimal(newUnits * newUnitValue + newCommission);
 
-    // 5. Calcular diferencia de valor
-    const valueDifference = cleanDecimal(newTotalValue - oldTotalValue);
     const currency = data.updates.currency || oldAsset.currency;
 
-    // 6. Verificar saldo suficiente si el nuevo valor es mayor
-    // FIX-DECIMAL-001: Aplicar tolerancia para evitar falsos positivos por punto flotante
-    if (valueDifference > 0) {
-      const currentBalance = account.balances?.[currency] || 0;
-      const roundedBalance = Math.round(currentBalance * 100) / 100;
-      const roundedDifference = Math.round(valueDifference * 100) / 100;
-      const EPSILON = 0.01;
-      
-      if (roundedBalance + EPSILON < roundedDifference) {
-        throw new HttpsError(
-          'failed-precondition',
-          `Saldo insuficiente. Disponible: ${roundedBalance.toFixed(2)} ${currency}, Requerido adicional: ${roundedDifference.toFixed(2)} ${currency}`
-        );
-      }
-    }
-
-    // 7. Preparar los datos de actualización
+    // 5. Preparar los datos de actualización del activo
     const updateData = { ...data.updates };
-    
+
     if (updateData.units !== undefined) {
       updateData.units = cleanDecimal(Number(updateData.units));
     }
@@ -759,82 +739,60 @@ async function updateAsset(context, payload) {
       updateData.acquisitionDate = combineDateWithCurrentTime(updateData.acquisitionDate);
     }
 
-    // 8. Ejecutar transacción atómica
-    const batch = db.batch();
-
-    batch.update(assetRef, updateData);
-
-    // 8.0. Ajuste de balances
-    // HU 2.1: todo movimiento de saldo pasa por buildBalanceUpdate para que la
-    // base de costo no quede atada a un saldo que ya cambió.
-    const referenceCurrency = await getUserReferenceCurrency(auth.uid);
-
-    if (isChangingAccount) {
-      // Si cambia de cuenta: devolver valor a cuenta original, cobrar de cuenta nueva
-      const oldAccountRef = db.collection('portfolioAccounts').doc(oldAsset.portfolioAccount);
-      const newAccountRef = db.collection('portfolioAccounts').doc(data.updates.portfolioAccount);
-
-      // Devolver el valor total a la cuenta original. El costo de ese efectivo
-      // no se conoce (venía de un activo, no de un ingreso), así que el saldo
-      // pasa a indeterminado en lugar de heredar un costo inventado.
-      batch.update(oldAccountRef, buildBalanceUpdate({
-        account,
-        currency,
-        amountDelta: oldTotalValue,
-        referenceCurrency,
-      }));
-
-      // Validar saldo suficiente en la nueva cuenta
-      // FIX-DECIMAL-001: Aplicar tolerancia para evitar falsos positivos por punto flotante
-      const newAccountBalance = newAccount.balances?.[currency] || 0;
-      const roundedNewBalance = Math.round(newAccountBalance * 100) / 100;
-      const roundedNewTotal = Math.round(newTotalValue * 100) / 100;
-      const EPSILON = 0.01;
-      
-      if (roundedNewBalance + EPSILON < roundedNewTotal) {
-        throw new HttpsError(
-          'failed-precondition',
-          `Saldo insuficiente en la nueva cuenta. Disponible: ${roundedNewBalance.toFixed(2)} ${currency}, Requerido: ${roundedNewTotal.toFixed(2)} ${currency}`
-        );
-      }
-      
-      // Cobrar el valor total de la nueva cuenta
-      batch.update(newAccountRef, buildBalanceUpdate({
-        account: newAccount,
-        currency,
-        amountDelta: -newTotalValue,
-        referenceCurrency,
-      }));
-
-      console.log(`[assetHandlers][updateAsset] Balance ajustado: cuenta original +${oldTotalValue}, cuenta nueva -${newTotalValue}`);
-    } else if (valueDifference !== 0) {
-      // Si no cambia de cuenta, solo ajustar la diferencia
-      const accountRef = db.collection('portfolioAccounts').doc(oldAsset.portfolioAccount);
-      batch.update(accountRef, buildBalanceUpdate({
-        account,
-        currency,
-        amountDelta: -valueDifference,
-        referenceCurrency,
-      }));
-    }
-
-    // 8.1. Actualizar la transacción de compra asociada (si existe)
-    const transactionQuery = await db.collection('transactions')
+    // 6. HU 2.6 (RN-06) — La compra asociada **es** el movimiento de este saldo.
+    //
+    // Editar un activo corrige su compra, y el efectivo que se cobra o se
+    // devuelve tiene que ser EXACTAMENTE el que cambia en esa compra. Antes el
+    // cobro se calculaba por un lado (el valor del activo) y la transacción se
+    // parcheaba por otro: cuando los dos números no coincidían, el saldo
+    // guardado se separaba de su historial sin que nada lo registrara, y el
+    // aviso de "no conciliado" que salía después no había forma de cerrarlo.
+    //
+    // La distinción que lo provocaba: `asset.units` es la **tenencia de hoy** y
+    // `amount` de la compra son las **unidades que se compraron**. Una venta
+    // parcial las separa para siempre. Por eso aquí se traslada la *corrección*
+    // de unidades (`nuevas − viejas`), no el número de unidades: sin ventas de
+    // por medio las dos cosas coinciden, y con ventas de por medio sólo la
+    // primera dice la verdad.
+    const purchaseSnapshot = await db.collection('transactions')
       .where('assetId', '==', data.assetId)
       .where('type', '==', 'buy')
-      .limit(1)
       .get();
-    
-    if (!transactionQuery.empty) {
-      const transactionRef = transactionQuery.docs[0].ref;
-      const transactionUpdate = {};
-      
+
+    // Cada compra crea su propio activo, así que lo normal es que haya una. Si
+    // hubiera varias se corrige la más antigua — y no "la que devuelva primero
+    // el índice", que haría que dos ediciones iguales tocaran documentos
+    // distintos.
+    const purchaseDoc = purchaseSnapshot.docs
+      .slice()
+      .sort((a, b) => (String(a.data().date || '') < String(b.data().date || '') ? -1 : 1))[0] || null;
+
+    const purchase = purchaseDoc
+      ? { id: purchaseDoc.id, ...purchaseDoc.data() }
+      : null;
+
+    const transactionUpdate = {};
+
+    if (purchase) {
       // Solo actualizar los campos que cambiaron
       if (updateData.name !== undefined) {
         transactionUpdate.assetName = updateData.name;
       }
       if (updateData.units !== undefined) {
-        transactionUpdate.amount = updateData.units;
+        const purchasedUnits = cleanDecimal(Number(purchase.amount));
+        const unitsCorrection = cleanDecimal(newUnits - oldUnits);
+        const correctedUnits = Number.isFinite(purchasedUnits)
+          ? cleanDecimal(purchasedUnits + unitsCorrection)
+          : newUnits;
+
+        if (!(correctedUnits > 0)) {
+          throw new HttpsError(
+            'failed-precondition',
+            'Esa corrección dejaría la compra de este activo en cero unidades o menos. Si quieres deshacer la compra, elimina el activo.'
+          );
+        }
+
+        transactionUpdate.amount = correctedUnits;
       }
       if (updateData.unitValue !== undefined) {
         transactionUpdate.price = updateData.unitValue;
@@ -864,11 +822,125 @@ async function updateAsset(context, payload) {
       if (updateData.portfolioAccount !== undefined) {
         transactionUpdate.portfolioAccountId = updateData.portfolioAccount;
       }
-      
-      if (Object.keys(transactionUpdate).length > 0) {
-        batch.update(transactionRef, transactionUpdate);
-        console.log(`[assetHandlers][updateAsset] Actualizando transacción asociada: ${transactionRef.id}`);
+    }
+
+    /**
+     * Qué mueve en caja un documento de compra, leído con la MISMA aritmética
+     * con la que el libro mayor lo va a leer después (`resolveCashImpact`). Si
+     * algún día cambia la regla, cambia en un sitio y este cobro la sigue.
+     *
+     * @param {Object|null} transaction - Documento de compra, o `null`
+     * @returns {{amount: number, currency: string, accountId: string}}
+     */
+    const cashImpactOf = (transaction) => {
+      if (!transaction) {
+        return { amount: 0, currency, accountId: oldAsset.portfolioAccount };
       }
+
+      const txCurrency = transaction.currency || oldAsset.currency;
+      const impact = resolveCashImpact({ ...transaction, currency: txCurrency }, txCurrency);
+
+      return {
+        amount: impact ? cleanDecimal(impact.amount) : 0,
+        currency: txCurrency,
+        accountId: transaction.portfolioAccountId || oldAsset.portfolioAccount,
+      };
+    };
+
+    const cashBefore = cashImpactOf(purchase);
+    const cashAfter = cashImpactOf(purchase ? { ...purchase, ...transactionUpdate } : null);
+
+    /** Documento de cuenta ya validado, por id */
+    const accountsById = {
+      [oldAsset.portfolioAccount]: account,
+      ...(newAccount ? { [newAccount.id]: newAccount } : {}),
+    };
+
+    // Es la compra la que dice de qué saldo salió el dinero. Si apuntara a una
+    // cuenta distinta de la del activo —dato inconsistente, pero posible— hay
+    // que comprobar que también es del usuario antes de tocarle el saldo.
+    for (const accountId of [cashBefore.accountId, cashAfter.accountId]) {
+      if (!accountsById[accountId]) {
+        accountsById[accountId] = await validateAccountOwnership(accountId, auth.uid);
+      }
+    }
+
+    // 7. Ejecutar transacción atómica
+    const batch = db.batch();
+
+    batch.update(assetRef, updateData);
+
+    if (purchase && Object.keys(transactionUpdate).length > 0) {
+      batch.update(purchaseDoc.ref, transactionUpdate);
+      console.log(`[assetHandlers][updateAsset] Actualizando transacción asociada: ${purchase.id}`);
+    }
+
+    // 7.1. Ajuste de saldos
+    // HU 2.1: todo movimiento de saldo pasa por buildBalanceUpdate para que la
+    // base de costo no quede atada a un saldo que ya cambió.
+    //
+    // Sin compra asociada no hay movimiento que corregir, así que tampoco se
+    // mueve el saldo: cobrarlo igual sería crear un cargo que su historial no
+    // puede explicar, que es justo lo que RN-06 prohíbe.
+    const referenceCurrency = await getUserReferenceCurrency(auth.uid);
+
+    /** Fragmentos de actualización acumulados por cuenta */
+    const balanceUpdates = {};
+
+    const applyBalanceDelta = (accountId, balanceCurrency, amountDelta) => {
+      if (!amountDelta) return;
+
+      balanceUpdates[accountId] = {
+        ...(balanceUpdates[accountId] || {}),
+        ...buildBalanceUpdate({
+          account: accountsById[accountId],
+          currency: balanceCurrency,
+          amountDelta,
+          referenceCurrency,
+        }),
+      };
+    };
+
+    const movesToAnotherBalance = cashBefore.accountId !== cashAfter.accountId
+      || cashBefore.currency !== cashAfter.currency;
+
+    if (movesToAnotherBalance) {
+      // El dinero vuelve entero al saldo del que salió y se cobra entero del
+      // nuevo. El costo del efectivo que vuelve no se conoce (venía de un
+      // activo, no de un ingreso), así que ese saldo pasa a indeterminado en
+      // lugar de heredar un costo inventado.
+      applyBalanceDelta(cashBefore.accountId, cashBefore.currency, -cashBefore.amount);
+
+      const targetAccount = accountsById[cashAfter.accountId];
+      validateSufficientFunds(targetAccount, cashAfter.currency, -cashAfter.amount);
+
+      applyBalanceDelta(cashAfter.accountId, cashAfter.currency, cashAfter.amount);
+
+      console.log(`[assetHandlers][updateAsset] Saldo ajustado: ${cashBefore.accountId}/${cashBefore.currency} ${-cashBefore.amount}, ${cashAfter.accountId}/${cashAfter.currency} ${cashAfter.amount}`);
+    } else {
+      const cashDelta = cleanDecimal(cashAfter.amount - cashBefore.amount);
+
+      if (cashDelta !== 0) {
+        // FIX-DECIMAL-001: tolerancia de un centavo para no rechazar por punto flotante
+        if (cashDelta < 0) {
+          const available = accountsById[cashAfter.accountId]?.balances?.[cashAfter.currency] || 0;
+          const roundedBalance = Math.round(available * 100) / 100;
+          const roundedRequired = Math.round(-cashDelta * 100) / 100;
+
+          if (roundedBalance + 0.01 < roundedRequired) {
+            throw new HttpsError(
+              'failed-precondition',
+              `Saldo insuficiente. Disponible: ${roundedBalance.toFixed(2)} ${cashAfter.currency}, Requerido adicional: ${roundedRequired.toFixed(2)} ${cashAfter.currency}`
+            );
+          }
+        }
+
+        applyBalanceDelta(cashAfter.accountId, cashAfter.currency, cashDelta);
+      }
+    }
+
+    for (const [accountId, balanceUpdate] of Object.entries(balanceUpdates)) {
+      batch.update(db.collection('portfolioAccounts').doc(accountId), balanceUpdate);
     }
 
     await batch.commit();
@@ -899,7 +971,10 @@ async function updateAsset(context, payload) {
     return {
       success: true,
       assetId: data.assetId,
-      balanceAdjustment: valueDifference,
+      // Lo que el saldo se movió de verdad, con el signo del saldo: negativo si
+      // la corrección costó dinero. Es el mismo número que el libro mayor va a
+      // leer de la compra corregida, no una cifra calculada aparte.
+      balanceAdjustment: cleanDecimal(cashAfter.amount - cashBefore.amount),
     };
 
   } catch (error) {
@@ -2358,6 +2433,18 @@ async function backfillRealizedFxDecomposition(context, payload) {
  * solución no es prohibir la corrección sino registrarla, con su fecha y su
  * motivo, como un movimiento más del historial (RN-06).
  *
+ * **El movimiento se despeja contra el saldo del historial, no contra el
+ * guardado** (RN-06, la misma regla que RN-2.7-B). Cuando los dos no coinciden,
+ * lo que falta no es la diferencia con el número guardado —ése es justamente el
+ * número que no se puede creer— sino lo que le falta al historial para llegar a
+ * la cifra del bróker. Despejarlo contra el guardado movía los dos saldos la
+ * misma cantidad: la deriva sobrevivía intacta a cada intento y la conciliación
+ * volvía a ofrecerse indefinidamente, dejando un movimiento falso por intento.
+ *
+ * Y si el historial ya llega a la cifra correcta, el ajuste no inventa ningún
+ * movimiento: corrige el número guardado y ya. Lo contrario sería registrar un
+ * hecho que no ocurrió para explicar un error de anotación.
+ *
  * Un ajuste que **aumenta** un saldo en divisa extranjera necesita tipo de
  * cambio, igual que un ingreso, porque introduce dinero cuyo costo hay que
  * conocer (RN-2.6-B). Uno que lo **disminuye** consume base al promedio vigente
@@ -2365,7 +2452,7 @@ async function backfillRealizedFxDecomposition(context, payload) {
  *
  * @param {Object} context - Contexto de ejecución
  * @param {Object} payload - { portfolioAccountId, currency, newBalance, date, reason, exchangeRate }
- * @returns {Promise<{success: boolean, transactionId: string, previousBalance: number,
+ * @returns {Promise<{success: boolean, transactionId: string|null, previousBalance: number,
  *   newBalance: number, delta: number, exchangeRate: number|null, reconciliation: Object}>}
  */
 async function registerBalanceAdjustment(context, payload) {
@@ -2382,28 +2469,55 @@ async function registerBalanceAdjustment(context, payload) {
     const account = await validateAccountOwnership(data.portfolioAccountId, auth.uid);
 
     const currentBalance = account.balances?.[data.currency] || 0;
+    const referenceCurrency = await getUserReferenceCurrency(auth.uid);
+
+    // RN-06: un saldo es la proyección de sus movimientos, así que el movimiento
+    // que falta se despeja contra el saldo del HISTORIAL, no contra el guardado
+    // — la misma regla que ya aplica la corrección de apertura (RN-2.7-B).
+    //
+    // Despejarlo contra el guardado era lo que hacía que la conciliación no se
+    // cerrara nunca: el ajuste movía los dos saldos la misma cantidad, así que
+    // la diferencia entre ellos sobrevivía intacta y el aviso volvía a salir
+    // una y otra vez, con un movimiento falso de más en cada intento.
+    const ledgerSnapshot = await db.collection('transactions')
+      .where('portfolioAccountId', '==', data.portfolioAccountId)
+      .get();
+
+    const projection = projectBalanceLedger({
+      transactions: ledgerSnapshot.docs.map((doc) => ({ id: doc.id, ...doc.data() })),
+      currency: data.currency,
+      referenceCurrency,
+      balance: currentBalance,
+    });
+
+    const ledgerBalance = projection.reconciliation.ledgerBalance;
 
     // Se acepta el saldo correcto (lo que el usuario lee en su bróker) o la
     // diferencia directa. Lo primero es lo que pide el diálogo; lo segundo, lo
-    // que resulta cómodo cuando ya se conoce la deriva detectada.
+    // que resulta cómodo cuando ya se conoce el movimiento que falta.
     const targetBalance = Number(data.newBalance);
     const declaredDelta = Number(data.delta);
 
-    let delta;
+    let target;
     if (Number.isFinite(targetBalance)) {
-      delta = cleanDecimal(targetBalance - currentBalance);
+      target = cleanDecimal(targetBalance);
     } else if (Number.isFinite(declaredDelta)) {
-      delta = cleanDecimal(declaredDelta);
+      target = cleanDecimal(ledgerBalance + declaredDelta);
     } else {
       throw new HttpsError('invalid-argument', 'Indica el saldo correcto o la diferencia a ajustar');
     }
 
-    if (Math.abs(delta) < MIN_ADJUSTMENT_DELTA) {
-      throw new HttpsError('failed-precondition', 'El ajuste no cambia el saldo');
+    if (target < 0) {
+      throw new HttpsError('failed-precondition', 'El ajuste dejaría el saldo en negativo');
     }
 
-    if (cleanDecimal(currentBalance + delta) < 0) {
-      throw new HttpsError('failed-precondition', 'El ajuste dejaría el saldo en negativo');
+    const delta = cleanDecimal(target - ledgerBalance);
+    const needsMovement = Math.abs(delta) >= MIN_ADJUSTMENT_DELTA;
+    const repairsStoredBalance = Math.abs(cleanDecimal(target - currentBalance)) >= MIN_ADJUSTMENT_DELTA;
+
+    // Ni movimiento que registrar ni número que corregir: no hay ajuste.
+    if (!needsMovement && !repairsStoredBalance) {
+      throw new HttpsError('failed-precondition', 'El ajuste no cambia el saldo');
     }
 
     const rateDate = data.date
@@ -2413,51 +2527,75 @@ async function registerBalanceAdjustment(context, payload) {
       ? combineDateWithCurrentTime(String(data.date).substring(0, 10))
       : new Date().toISOString();
 
-    const referenceCurrency = await getUserReferenceCurrency(auth.uid);
-
-    const resolved = await resolveAdjustmentRate({
-      currency: data.currency,
-      referenceCurrency,
-      date: rateDate,
-      declaredRate: data.exchangeRate,
-    });
-
-    // RN-2.6-B: sin tasa no se puede saber cuánto costó el dinero que entra. A
-    // diferencia de crear una cuenta (D9), aquí el usuario está delante y puede
-    // escribirla, así que se le pide en lugar de registrar una base ausente.
-    if (requiresExchangeRate({ delta, currency: data.currency, referenceCurrency })
-      && resolved.acquisitionRate === null) {
-      throw new HttpsError(
-        'failed-precondition',
-        `No se pudo obtener el tipo de cambio de ${data.currency} a ${referenceCurrency} para el ${rateDate}. Indícalo manualmente para registrar el ajuste.`
-      );
-    }
-
-    const { transactionData, balanceUpdate, newBalance } = buildAdjustment({
-      account,
-      accountId: data.portfolioAccountId,
-      userId: auth.uid,
-      currency: data.currency,
-      delta,
-      date: transactionDate,
-      referenceCurrency,
-      adjustmentReason: ADJUSTMENT_REASONS.MANUAL,
-      description: data.reason || '',
-      acquisitionRate: resolved.acquisitionRate,
-      acquisitionRateSource: resolved.acquisitionRateSource,
-      dollarPriceToDate: resolved.dollarPriceToDate,
-    });
-
     const batch = db.batch();
-
-    const transactionRef = db.collection('transactions').doc();
-    batch.set(transactionRef, transactionData);
-
     const accountRef = db.collection('portfolioAccounts').doc(data.portfolioAccountId);
-    batch.update(accountRef, {
-      ...balanceUpdate,
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
+
+    let transactionId = null;
+    let exchangeRate = null;
+    let newBalance = target;
+
+    if (needsMovement) {
+      const resolved = await resolveAdjustmentRate({
+        currency: data.currency,
+        referenceCurrency,
+        date: rateDate,
+        declaredRate: data.exchangeRate,
+      });
+
+      // RN-2.6-B: sin tasa no se puede saber cuánto costó el dinero que entra. A
+      // diferencia de crear una cuenta (D9), aquí el usuario está delante y puede
+      // escribirla, así que se le pide en lugar de registrar una base ausente.
+      if (requiresExchangeRate({ delta, currency: data.currency, referenceCurrency })
+        && resolved.acquisitionRate === null) {
+        throw new HttpsError(
+          'failed-precondition',
+          `No se pudo obtener el tipo de cambio de ${data.currency} a ${referenceCurrency} para el ${rateDate}. Indícalo manualmente para registrar el ajuste.`
+        );
+      }
+
+      const adjustment = buildAdjustment({
+        // El asiento describe lo que le falta al HISTORIAL, así que el saldo
+        // sobre el que se construye es el del historial: el fragmento que sale
+        // de aquí deja `balances` exactamente en la cifra que escribió el
+        // usuario, cerrando la deriva en la misma operación (igual que hace la
+        // migración al escribir una apertura).
+        account: { ...account, balances: { ...account.balances, [data.currency]: ledgerBalance } },
+        accountId: data.portfolioAccountId,
+        userId: auth.uid,
+        currency: data.currency,
+        delta,
+        date: transactionDate,
+        referenceCurrency,
+        adjustmentReason: ADJUSTMENT_REASONS.MANUAL,
+        description: data.reason || '',
+        acquisitionRate: resolved.acquisitionRate,
+        acquisitionRateSource: resolved.acquisitionRateSource,
+        dollarPriceToDate: resolved.dollarPriceToDate,
+      });
+
+      const transactionRef = db.collection('transactions').doc();
+      batch.set(transactionRef, adjustment.transactionData);
+
+      batch.update(accountRef, {
+        ...adjustment.balanceUpdate,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+
+      transactionId = transactionRef.id;
+      exchangeRate = resolved.acquisitionRate;
+      newBalance = adjustment.newBalance;
+    } else {
+      // El historial ya llega a la cifra correcta: lo que estaba mal era el
+      // número guardado. No se inventa un movimiento para explicar algo que no
+      // pasó — se corrige el número y se deja constancia de cuándo.
+      //
+      // La base de costo no se toca: el dinero y lo que costó son los mismos;
+      // lo único que estaba mal era la cantidad anotada (RN-13).
+      batch.update(accountRef, {
+        [`balances.${data.currency}`]: target,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    }
 
     await batch.commit();
 
@@ -2470,23 +2608,28 @@ async function registerBalanceAdjustment(context, payload) {
       balance: newBalance,
     });
 
-    checkAndMarkStaleIfRetroactive(auth.uid, transactionDate, {
-      reason: 'retroactive_transaction',
-      transactionType: 'cash_adjustment',
-      portfolioAccount: data.portfolioAccountId,
-    });
+    // Sólo un movimiento nuevo cambia la historia. Corregir el número guardado
+    // no añade nada al pasado, así que no hay días que recalcular.
+    if (needsMovement) {
+      checkAndMarkStaleIfRetroactive(auth.uid, transactionDate, {
+        reason: 'retroactive_transaction',
+        transactionType: 'cash_adjustment',
+        portfolioAccount: data.portfolioAccountId,
+      });
+    }
 
     invalidateDistributionCache(auth.uid);
 
-    console.log(`[assetHandlers][registerBalanceAdjustment] Éxito - ${data.currency}: ${currentBalance} -> ${newBalance}`);
+    console.log(`[assetHandlers][registerBalanceAdjustment] Éxito - ${data.currency}: ${currentBalance} -> ${newBalance} (${needsMovement ? `movimiento ${delta}` : 'sin movimiento: sólo se corrigió el saldo guardado'})`);
 
     return {
       success: true,
-      transactionId: transactionRef.id,
+      /** `null` cuando no hizo falta registrar ningún movimiento */
+      transactionId,
       previousBalance: currentBalance,
       newBalance,
       delta,
-      exchangeRate: resolved.acquisitionRate,
+      exchangeRate,
       referenceCurrency,
       reconciliation,
     };
