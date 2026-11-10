@@ -222,6 +222,10 @@ async function getCarveOutHistoricalReturns(
 module.exports = {
   getCarveOutHistoricalReturns,
   chooseHistoryRange,
+  // FIX-ATTR-HOLDINGS-001: la atribución reutiliza la misma cache de cierres
+  fetchSeries,
+  mapLimit,
+  FETCH_CONCURRENCY,
   // Exportados para test
   _historyCache: historyCache,
 };

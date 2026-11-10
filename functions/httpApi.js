@@ -1249,16 +1249,18 @@ app.get("/attribution", async (req, res) => {
     benchmarkReturn = '0',
     maxBars = '8',
     portfolioReturn,
-    includeIntraday = 'true'
+    includeIntraday = 'true',
+    // FIX-ATTR-HOLDINGS-001: contribución intradía por activo sin tocar el TWR
+    intradayContributions = 'false'
   } = req.query;
-  
+
   try {
     if (!userId) {
       return res.status(400).json({
         error: "Por favor, proporcione el parámetro userId"
       });
     }
-    
+
     // FEAT-UX-001: Construir dateRange si se proporcionan fechas explícitas
     let dateRange = undefined;
     if (startDateParam) {
@@ -1282,16 +1284,17 @@ app.get("/attribution", async (req, res) => {
         maxWaterfallBars: parseInt(maxBars) || 8,
         includeMetadata: true,
         portfolioReturn: portfolioReturn ? parseFloat(portfolioReturn) : undefined,
-        includeIntraday: includeIntraday !== 'false' // INTRADAY-001: true por defecto
+        includeIntraday: includeIntraday !== 'false', // INTRADAY-001: true por defecto
+        includeIntradayContributions: intradayContributions === 'true'
       }
     });
-    
+
     if (!result.success) {
       return res.status(404).json({
         error: result.error || 'No attribution data found'
       });
     }
-    
+
     res.status(200).json(result);
     
   } catch (error) {

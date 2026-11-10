@@ -79,6 +79,17 @@ async function getLatestPerformanceData(userId, accountId = 'overall') {
 }
 
 /**
+ * Fecha 'YYYY-MM-DD' de una transacción (string ISO o Timestamp de Firestore).
+ * @param {string|{toDate: Function}|undefined} value
+ * @returns {string|null}
+ */
+function transactionDateStr(value) {
+  if (typeof value === 'string') return value.slice(0, 10);
+  if (value && typeof value.toDate === 'function') return value.toDate().toISOString().slice(0, 10);
+  return null;
+}
+
+/**
  * Obtiene las transacciones de venta realizadas en un período
  * 
  * FIX-ATTR-CURRENCY-001: Ahora convierte valuePnL y totalSold a la moneda
@@ -120,11 +131,15 @@ async function getSellTransactionsInPeriod(userId, startDate, endDate, accountId
   const snapshots = await Promise.all(accountQueries);
   
   // Filtrar por fecha en memoria (evita necesitar índice compuesto)
+  // FIX-ATTR-HOLDINGS-001: las fechas de las transacciones son ISO con hora
+  // ('2026-11-10T15:20:41.053Z'); compararlas enteras contra 'YYYY-MM-DD'
+  // dejaba fuera las ventas del último día del período (las de hoy).
   const userSellTransactions = [];
   for (const snapshot of snapshots) {
     for (const doc of snapshot.docs) {
       const data = doc.data();
-      if (data.date >= startDateStr && data.date <= endDateStr) {
+      const txDate = transactionDateStr(data.date);
+      if (txDate && txDate >= startDateStr && txDate <= endDateStr) {
         userSellTransactions.push({ id: doc.id, ...data });
       }
     }
@@ -976,5 +991,6 @@ module.exports = {
   findNearestPerformanceData,
   getPerformanceDataForDate,
   getSellTransactionsInPeriod,
-  mapSnapshotAssetPerformance
+  mapSnapshotAssetPerformance,
+  transactionDateStr
 };

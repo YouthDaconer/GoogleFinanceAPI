@@ -23,6 +23,9 @@ const { getPeriodLabel, getPeriodStartDate } = require('./types');
 const { calculateIntradayPerformance, calculateIntradayContributions, combineHistoricalWithIntraday } = require('./intradayCalculator');
 const { getQuotes } = require('../financeQuery');
 const { buildSnapshotDocId, generatePerformanceSnapshot } = require('../snapshotGenerator');
+// FIX-ATTR-HOLDINGS-001: contribuciones por tenencias diarias
+const { calculateHoldingsContributions } = require('./holdingsContributions');
+const { tickerFromAssetKey } = require('../../utils/carveOutReturns');
 
 const admin = require('../firebaseAdmin');
 const db = admin.firestore();
@@ -347,7 +350,10 @@ async function getPortfolioAttribution(params) {
     maxWaterfallBars = 8,
     includeMetadata = true,
     portfolioReturn: frontendTWR, // TWR pasado desde el frontend
-    includeIntraday = true // INTRADAY-001: Incluir rendimiento intraday por defecto
+    includeIntraday = true, // INTRADAY-001: Incluir rendimiento intraday por defecto
+    // FIX-ATTR-HOLDINGS-001: sólo la contribución intradía por activo, sin el
+    // ajuste intradía del TWR legacy (el frontend ya trae su TWR con intradía)
+    includeIntradayContributions = false
   } = options;
   
   const startTime = Date.now();
@@ -523,15 +529,32 @@ async function getPortfolioAttribution(params) {
     
     // =========================================================================
     // 3. CALCULAR CONTRIBUCIONES
+    //
+    // FIX-ATTR-HOLDINGS-001: el método principal es por tenencias diarias
+    // (peso del día anterior × retorno del día, encadenado). Sus contribuciones
+    // suman el TWR por tenencias por construcción, así que NO se reparte ningún
+    // residuo: la diferencia contra el TWR oficial se informa como
+    // "no atribuido". El cálculo legacy (ganancia / valor al inicio del período
+    // + reparto del residuo) queda sólo como respaldo sin serie diaria.
     // =========================================================================
-    const contributionResult = await calculateContributions(
-      userId,
-      period,
-      currency,
-      accountIds,
-      dateRange,
-      { snapshot }
-    );
+    let contributionResult = null;
+    try {
+      contributionResult = await calculateHoldingsContributions({ userId, period, currency, accountIds, dateRange });
+    } catch (holdingsErr) {
+      console.warn(`[Attribution] Metodo por tenencias fallo, se usa legacy: ${holdingsErr.message}`);
+    }
+    if (!contributionResult) {
+      contributionResult = await calculateContributions(
+        userId,
+        period,
+        currency,
+        accountIds,
+        dateRange,
+        { snapshot }
+      );
+      contributionResult.method = 'legacy';
+    }
+    const isHoldingsMethod = contributionResult.method === 'holdings';
     
     if (contributionResult.error) {
       return {
@@ -546,108 +569,174 @@ async function getPortfolioAttribution(params) {
     // Guardar el ROI original para diagnóstico
     contributionResult.originalPortfolioReturn = contributionResult.portfolioReturn;
     
-    // =========================================================================
-    // 3.1 INTRADAY-002: Aplicar contribuciones intraday a cada activo
-    // 
-    // Cuando includeIntraday está habilitado, calculamos cuánto contribuye
-    // cada activo al cambio intraday y lo sumamos a su contribución del período.
-    // Esto permite que la suma de contribuciones coincida con el TWR ajustado.
-    // =========================================================================
     let intradayContributionsApplied = false;
     let totalIntradayContribution = 0;
     
-    if (intradayApplied && intradayPerformance?.success) {
-      // FIX-PERF-002: Para multi-cuenta, obtener datos del último día de 'overall'
-      // en lugar de solo la primera cuenta (que solo tendría un subset de los activos).
-      const intradayAccountId = accountIds.includes('overall') || accountIds.length === 1
-        ? (accountIds[0] || 'overall')
-        : 'overall';
-      const latestData = await getLatestPerformanceData(userId, intradayAccountId);
-      
-      if (latestData) {
+    if (isHoldingsMethod) {
+      // -----------------------------------------------------------------------
+      // Intradía por tenencias: lo que se movió cada activo desde el último
+      // cierre, encadenado con el crecimiento del período (G), para que
+      // Σ contribuciones = (1 + TWR histórico) × (1 + intradía) − 1 exacto.
+      // Sólo en USD: calculateIntradayContributions convierte las cotizaciones
+      // a USD y los valores de cierre están en la moneda del reporte.
+      // -----------------------------------------------------------------------
+      const wantsIntraday = (includeIntraday || includeIntradayContributions)
+        && !isDateRangeInPast
+        && currency === 'USD';
+      if (wantsIntraday) {
         const intradayContribResult = await calculateIntradayContributions({
           userId,
           currency,
           accountIds,
-          latestPerformanceData: latestData
+          latestPerformanceData: contributionResult.latestPerformanceData
         });
-        
         if (intradayContribResult.success) {
-          console.log(`[Attribution] Aplicando contribuciones intraday a ${Object.keys(intradayContribResult.contributions).length} activos`);
-          
-          // Aplicar contribución intraday a cada activo
+          const rawByTicker = new Map();
+          for (const [key, value] of Object.entries(intradayContribResult.contributions || {})) {
+            if (!value || !Number.isFinite(value)) continue;
+            const ticker = tickerFromAssetKey(key);
+            rawByTicker.set(ticker, (rawByTicker.get(ticker) || 0) + value);
+          }
+          const growth = contributionResult.growthFactor || 1;
+          let rawIntraday = 0;
           for (const attr of contributionResult.attributions) {
-            const intradayContrib = intradayContribResult.contributions[attr.assetKey] || 0;
-            
-            if (intradayContrib !== 0) {
-              // Guardar contribución histórica para diagnóstico
-              attr.historicalContribution = attr.contribution;
-              attr.intradayContribution = intradayContrib;
-              
-              // Sumar contribución intraday
-              attr.contribution += intradayContrib;
-              totalIntradayContribution += intradayContrib;
+            if (attr.status !== 'active') continue;
+            const raw = rawByTicker.get(tickerFromAssetKey(attr.assetKey)) || 0;
+            if (!raw) continue;
+            attr.historicalContribution = attr.contribution;
+            attr.intradayContribution = raw * growth;
+            attr.contribution += raw * growth;
+            rawIntraday += raw;
+            totalIntradayContribution += raw * growth;
+          }
+          if (rawIntraday !== 0) {
+            intradayContributionsApplied = true;
+            const intradayFactor = 1 + rawIntraday / 100;
+            contributionResult.portfolioReturn = combineHistoricalWithIntraday(contributionResult.holdingsTWR, intradayFactor);
+            // El TWR oficial también debe incluir hoy, salvo que ya lo incluya (INTRADAY-001)
+            if (hasTWRData && !intradayApplied) {
+              periodTWR = combineHistoricalWithIntraday(periodTWR, intradayFactor);
             }
           }
-          
-          intradayContributionsApplied = true;
-          console.log(`[Attribution] Total contribución intraday aplicada: ${totalIntradayContribution.toFixed(4)}pp`);
+          console.log(`[Attribution] Intradia por tenencias: ${rawIntraday.toFixed(4)}pp (x G=${growth.toFixed(4)} -> ${totalIntradayContribution.toFixed(4)}pp)`);
         } else {
-          console.log(`[Attribution] No se pudieron calcular contribuciones intraday: ${intradayContribResult.error}`);
+          console.log(`[Attribution] Sin intradia por tenencias: ${intradayContribResult.error}`);
         }
       }
-    }
-    
-    // IMPORTANTE: Sobrescribir portfolioReturn con el TWR del período (ya incluye intraday)
-    // El totalROI de assetPerformance es el ROI total desde compra, NO del período
-    if (hasTWRData && periodTWR !== 0) {
-      console.log(`[Attribution] Reemplazando portfolioReturn: ${contributionResult.portfolioReturn.toFixed(2)}% → ${periodTWR.toFixed(2)}%`);
-      contributionResult.portfolioReturn = periodTWR;
       
-      // =========================================================================
-      // FIX-ATTR-CONSISTENCY: NORMALIZACIÓN OBLIGATORIA
-      // 
-      // La suma de contribuciones DEBE ser igual al TWR para mostrar datos consistentes
-      // al usuario (el TWR del PortfolioSummary debe coincidir con la suma de atribuciones).
-      // 
-      // Método: Distribuir el residuo (diferencia) proporcionalmente entre los activos.
-      // Esto preserva la dirección (signo) de cada contribución individual mientras
-      // garantiza que la suma sea exactamente igual al TWR.
-      // =========================================================================
-      const sumOfContributions = contributionResult.attributions.reduce((sum, a) => sum + a.contribution, 0);
-      const residual = periodTWR - sumOfContributions;
+      // El retorno que se muestra sigue siendo el TWR oficial (el mismo del
+      // resto de la app). Las contribuciones no se fuerzan a sumarlo.
+      if (hasTWRData && periodTWR !== 0) {
+        contributionResult.portfolioReturn = periodTWR;
+      }
+      const attributed = contributionResult.attributions.reduce((sum, a) => sum + a.contribution, 0);
+      contributionResult.sumOfContributions = attributed;
+      contributionResult.unattributedReturn = contributionResult.portfolioReturn - attributed;
+      contributionResult.normalized = false;
+      console.log(`[Attribution] Tenencias: suma contribuciones=${attributed.toFixed(4)}pp, retorno=${contributionResult.portfolioReturn.toFixed(4)}%, no atribuido=${contributionResult.unattributedReturn.toFixed(4)}pp`);
+    } else {
+      // =======================================================================
+      // LEGACY (respaldo sin serie diaria)
+      // 3.1 INTRADAY-002: Aplicar contribuciones intraday a cada activo
+      //
+      // Cuando includeIntraday está habilitado, calculamos cuánto contribuye
+      // cada activo al cambio intraday y lo sumamos a su contribución del período.
+      // Esto permite que la suma de contribuciones coincida con el TWR ajustado.
+      // =======================================================================
+      if (intradayApplied && intradayPerformance?.success) {
+        // FIX-PERF-002: Para multi-cuenta, obtener datos del último día de 'overall'
+        // en lugar de solo la primera cuenta (que solo tendría un subset de los activos).
+        const intradayAccountId = accountIds.includes('overall') || accountIds.length === 1
+          ? (accountIds[0] || 'overall')
+          : 'overall';
+        const latestData = await getLatestPerformanceData(userId, intradayAccountId);
       
-      console.log(`[Attribution] Suma contribuciones: ${sumOfContributions.toFixed(4)}%, TWR: ${periodTWR.toFixed(4)}%, Residuo: ${residual.toFixed(4)}pp`);
-      
-      if (Math.abs(residual) > 0.001) {
-        // Distribuir el residuo proporcionalmente al peso de cada activo
-        // Usamos el valor absoluto de la contribución como peso para la distribución
-        const totalAbsContribution = contributionResult.attributions.reduce((sum, a) => sum + Math.abs(a.contribution), 0);
+        if (latestData) {
+          const intradayContribResult = await calculateIntradayContributions({
+            userId,
+            currency,
+            accountIds,
+            latestPerformanceData: latestData
+          });
         
-        if (totalAbsContribution > 0) {
-          for (const attr of contributionResult.attributions) {
-            // Guardar contribución original para diagnóstico
-            attr.originalContribution = attr.contribution;
-            
-            // Distribuir residuo proporcionalmente al peso del activo
-            const weight = Math.abs(attr.contribution) / totalAbsContribution;
-            const adjustment = residual * weight;
-            attr.contribution += adjustment;
-            attr.normalizationAdjustment = adjustment;
-          }
+          if (intradayContribResult.success) {
+            console.log(`[Attribution] Aplicando contribuciones intraday a ${Object.keys(intradayContribResult.contributions).length} activos`);
           
-          console.log(`[Attribution] Residuo distribuido entre ${contributionResult.attributions.length} activos`);
+            // Aplicar contribución intraday a cada activo
+            for (const attr of contributionResult.attributions) {
+              const intradayContrib = intradayContribResult.contributions[attr.assetKey] || 0;
+            
+              if (intradayContrib !== 0) {
+                // Guardar contribución histórica para diagnóstico
+                attr.historicalContribution = attr.contribution;
+                attr.intradayContribution = intradayContrib;
+              
+                // Sumar contribución intraday
+                attr.contribution += intradayContrib;
+                totalIntradayContribution += intradayContrib;
+              }
+            }
+          
+            intradayContributionsApplied = true;
+            console.log(`[Attribution] Total contribución intraday aplicada: ${totalIntradayContribution.toFixed(4)}pp`);
+          } else {
+            console.log(`[Attribution] No se pudieron calcular contribuciones intraday: ${intradayContribResult.error}`);
+          }
         }
-        
-        contributionResult.normalized = true;
-        contributionResult.sumOfContributions = periodTWR;
-        contributionResult.residualDistributed = residual;
-      } else {
-        // Residuo insignificante, no es necesario ajustar
-        console.log(`[Attribution] Residuo insignificante (${residual.toFixed(4)}pp), sin ajuste necesario`);
-        contributionResult.normalized = true;
-        contributionResult.sumOfContributions = sumOfContributions;
       }
+    
+      // IMPORTANTE: Sobrescribir portfolioReturn con el TWR del período (ya incluye intraday)
+      // El totalROI de assetPerformance es el ROI total desde compra, NO del período
+      if (hasTWRData && periodTWR !== 0) {
+        console.log(`[Attribution] Reemplazando portfolioReturn: ${contributionResult.portfolioReturn.toFixed(2)}% → ${periodTWR.toFixed(2)}%`);
+        contributionResult.portfolioReturn = periodTWR;
+      
+        // =========================================================================
+        // FIX-ATTR-CONSISTENCY: NORMALIZACIÓN OBLIGATORIA
+        // 
+        // La suma de contribuciones DEBE ser igual al TWR para mostrar datos consistentes
+        // al usuario (el TWR del PortfolioSummary debe coincidir con la suma de atribuciones).
+        // 
+        // Método: Distribuir el residuo (diferencia) proporcionalmente entre los activos.
+        // Esto preserva la dirección (signo) de cada contribución individual mientras
+        // garantiza que la suma sea exactamente igual al TWR.
+        // =========================================================================
+        const sumOfContributions = contributionResult.attributions.reduce((sum, a) => sum + a.contribution, 0);
+        const residual = periodTWR - sumOfContributions;
+      
+        console.log(`[Attribution] Suma contribuciones: ${sumOfContributions.toFixed(4)}%, TWR: ${periodTWR.toFixed(4)}%, Residuo: ${residual.toFixed(4)}pp`);
+      
+        if (Math.abs(residual) > 0.001) {
+          // Distribuir el residuo proporcionalmente al peso de cada activo
+          // Usamos el valor absoluto de la contribución como peso para la distribución
+          const totalAbsContribution = contributionResult.attributions.reduce((sum, a) => sum + Math.abs(a.contribution), 0);
+        
+          if (totalAbsContribution > 0) {
+            for (const attr of contributionResult.attributions) {
+              // Guardar contribución original para diagnóstico
+              attr.originalContribution = attr.contribution;
+            
+              // Distribuir residuo proporcionalmente al peso del activo
+              const weight = Math.abs(attr.contribution) / totalAbsContribution;
+              const adjustment = residual * weight;
+              attr.contribution += adjustment;
+              attr.normalizationAdjustment = adjustment;
+            }
+          
+            console.log(`[Attribution] Residuo distribuido entre ${contributionResult.attributions.length} activos`);
+          }
+        
+          contributionResult.normalized = true;
+          contributionResult.sumOfContributions = periodTWR;
+          contributionResult.residualDistributed = residual;
+        } else {
+          // Residuo insignificante, no es necesario ajustar
+          console.log(`[Attribution] Residuo insignificante (${residual.toFixed(4)}pp), sin ajuste necesario`);
+          contributionResult.normalized = true;
+          contributionResult.sumOfContributions = sumOfContributions;
+        }
+      }
+    
     }
     
     // Guardar info de contribuciones intraday en el resultado
@@ -685,6 +774,16 @@ async function getPortfolioAttribution(params) {
       period,
       { benchmarkReturn }
     );
+    // FIX-ATTR-HOLDINGS-001: lo que suman las contribuciones y lo que queda sin
+    // atribuir a un activo (flujos mal registrados, días sin datos, operaciones
+    // a precio distinto del cierre). En legacy el residuo ya se repartió.
+    if (summary) {
+      summary.attributionMethod = contributionResult.method;
+      summary.attributedReturn = contributionResult.sumOfContributions;
+      summary.unattributedReturn = isHoldingsMethod ? contributionResult.unattributedReturn : 0;
+      // El frontend no debe volver a aplicar el factor de hoy (rangos con fechas)
+      summary.includesIntraday = intradayApplied || intradayContributionsApplied;
+    }
     
     // =========================================================================
     // 7. PREPARAR RESPUESTA
@@ -701,7 +800,10 @@ async function getPortfolioAttribution(params) {
       response.metadata = {
         calculatedAt: new Date().toISOString(),
         processingTimeMs: Date.now() - startTime,
-        dataSource: intradayPerformance ? 'assetPerformance + TWR + intraday' : 'assetPerformance + TWR',
+        dataSource: isHoldingsMethod
+          ? `holdings-daily${intradayContributionsApplied ? ' + intraday' : ''}`
+          : (intradayPerformance ? 'assetPerformance + TWR + intraday' : 'assetPerformance + TWR'),
+        attributionMethod: contributionResult.method,
         portfolioDate: contributionResult.latestDate,
         periodStartDate: dateRange ? effectiveStartStr : contributionResult.periodStartDate,
         periodEndDate: dateRange ? effectiveEndStr : undefined,
@@ -718,7 +820,12 @@ async function getPortfolioAttribution(params) {
           originalTotalROI: contributionResult.originalPortfolioReturn,
           portfolioReturn: contributionResult.portfolioReturn,
           discrepancy: contributionResult.discrepancy,
-          normalized: contributionResult.normalized
+          normalized: contributionResult.normalized,
+          // FIX-ATTR-HOLDINGS-001
+          holdingsTWR: contributionResult.holdingsTWR,
+          unattributedReturn: contributionResult.unattributedReturn,
+          baseDate: contributionResult.baseDate,
+          coverage: contributionResult.coverage
         },
         // INTRADAY-001: Información de rendimiento intraday
         intraday: {
