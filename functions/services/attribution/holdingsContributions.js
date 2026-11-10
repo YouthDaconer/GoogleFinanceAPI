@@ -200,50 +200,89 @@ async function loadDividendTransactions(db, accountIds, afterDate) {
 }
 
 /**
+ * Moneda de cotización por ticker (casi nunca cambia): evita volver a pedir
+ * cotizaciones en cada consulta sólo para saber en qué moneda cotiza.
+ */
+const QUOTE_CURRENCY_TTL_MS = 24 * 60 * 60 * 1000;
+const quoteCurrencyCache = new Map();
+
+/**
+ * Rango de históricos a pedir. Siempre al menos '5y': así todos los períodos
+ * (y el carve-out, que pide desde el primer doc) comparten la misma entrada
+ * de cache por símbolo en vez de bajar '1y', '2y' y '5y' por separado.
+ */
+function historyRangeFor(firstDate, deps) {
+  const range = deps.chooseHistoryRange(firstDate);
+  return range === '1y' || range === '2y' ? '5y' : range;
+}
+
+/**
  * Moneda de cotización, cierres y tasas de cambio de los tickers tenidos.
- * Si se agota el presupuesto devuelve lo vacío y el cálculo usa el precio
- * implícito de los docs (las series que ya llegaron quedan en cache).
+ * Si se agota el presupuesto devuelve LO QUE YA LLEGÓ: esos tickers usan
+ * precio de mercado y el resto el precio implícito de los docs. Lo que siga
+ * llegando queda en cache para la próxima consulta.
  */
 async function loadMarketData({ tickers, currency, dividendTxs, firstDate, deps }) {
-  const empty = { prices: new Map(), quoteCurrency: new Map(), fxSeriesByCurrency: {}, fxNeeded: [], timedOut: false };
-  if (tickers.length === 0) return empty;
+  const state = { prices: new Map(), quoteCurrency: new Map(), fxSeriesByCurrency: {}, fxNeeded: [], timedOut: false };
+  if (tickers.length === 0) return state;
+
+  const now = Date.now();
+  const unknown = [];
+  for (const ticker of tickers) {
+    const hit = quoteCurrencyCache.get(ticker);
+    if (hit && now - hit.at < QUOTE_CURRENCY_TTL_MS) state.quoteCurrency.set(ticker, hit.currency);
+    else unknown.push(ticker);
+  }
 
   const work = (async () => {
-    const quotes = await deps.getPricesFromApi(tickers);
-    const quoteCurrency = new Map();
-    for (const quote of quotes || []) {
-      if (quote?.symbol) {
-        quoteCurrency.set(carve.normalizeTicker(quote.symbol), carve.normalizeCurrency(quote.currency));
+    if (unknown.length > 0) {
+      const quotes = await deps.getPricesFromApi(unknown);
+      for (const quote of quotes || []) {
+        if (!quote?.symbol) continue;
+        const ticker = carve.normalizeTicker(quote.symbol);
+        const quoteCurrency = carve.normalizeCurrency(quote.currency);
+        state.quoteCurrency.set(ticker, quoteCurrency);
+        quoteCurrencyCache.set(ticker, { currency: quoteCurrency, at: Date.now() });
       }
     }
     const currencies = new Set([carve.normalizeCurrency(currency)]);
-    quoteCurrency.forEach((c) => currencies.add(c));
+    state.quoteCurrency.forEach((c) => currencies.add(c));
     dividendTxs.forEach((tx) => currencies.add(carve.normalizeCurrency(tx.currency)));
     currencies.delete('USD');
+    state.fxNeeded = [...currencies];
 
-    const range = deps.chooseHistoryRange(firstDate);
-    const priced = tickers.filter((t) => quoteCurrency.has(t));
-    const fxList = [...currencies];
-    const [priceSeries, fxSeries] = await Promise.all([
-      deps.mapLimit(priced, deps.fetchConcurrency, (t) => deps.fetchSeries(t, range, deps)),
-      deps.mapLimit(fxList, deps.fetchConcurrency, (c) => deps.fetchSeries(carve.fxSymbol(c), range, deps)),
+    const range = historyRangeFor(firstDate, deps);
+    const priced = tickers.filter((t) => state.quoteCurrency.has(t));
+    await Promise.all([
+      deps.mapLimit(priced, deps.fetchConcurrency, async (t) => {
+        const series = await deps.fetchSeries(t, range, deps);
+        if (series) state.prices.set(t, series);
+      }),
+      deps.mapLimit(state.fxNeeded, deps.fetchConcurrency, async (c) => {
+        const series = await deps.fetchSeries(carve.fxSymbol(c), range, deps);
+        if (series) state.fxSeriesByCurrency[c] = series;
+      }),
     ]);
-    const prices = new Map();
-    priced.forEach((t, i) => { if (priceSeries[i]) prices.set(t, priceSeries[i]); });
-    const fxSeriesByCurrency = {};
-    fxList.forEach((c, i) => { if (fxSeries[i]) fxSeriesByCurrency[c] = fxSeries[i]; });
-    return { prices, quoteCurrency, fxSeriesByCurrency, fxNeeded: fxList, timedOut: false, range };
-  })();
-
-  const result = await withTimeout(work.catch((error) => {
+    return true;
+  })().catch((error) => {
     console.warn(`[AttributionHoldings] Sin precios de mercado: ${error.message}`);
-    return empty;
-  }), deps.priceBudgetMs);
-  if (!result) {
-    console.warn(`[AttributionHoldings] Presupuesto de precios agotado (${deps.priceBudgetMs} ms): se usa el precio implicito`);
-    return { ...empty, timedOut: true };
+    return true;
+  });
+
+  const finished = await withTimeout(work, deps.priceBudgetMs);
+  if (!finished) {
+    state.timedOut = true;
+    console.warn(`[AttributionHoldings] Presupuesto de precios agotado (${deps.priceBudgetMs} ms): `
+      + `${state.prices.size}/${tickers.length} tickers con precio de mercado, el resto con precio implicito`);
   }
-  return result;
+  // Copia: lo que llegue después no debe cambiar el cálculo en curso
+  return {
+    prices: new Map(state.prices),
+    quoteCurrency: new Map(state.quoteCurrency),
+    fxSeriesByCurrency: { ...state.fxSeriesByCurrency },
+    fxNeeded: [...state.fxNeeded],
+    timedOut: state.timedOut,
+  };
 }
 
 function defaultDeps() {
@@ -414,6 +453,7 @@ async function calculateHoldingsContributions(params, deps = null) {
       seriesIds: accounts.seriesIds,
       tickers: tickers.length,
       tickersWithoutQuote,
+      tickersWithMarketPrice: market.prices.size,
       currenciesWithoutFx: market.fxNeeded.filter((c) => !market.fxSeriesByCurrency[c]),
       priceBudgetExhausted: market.timedOut,
       dividendsUnconverted: dividends.unconverted,
@@ -435,4 +475,5 @@ module.exports = {
   _withTimeout: withTimeout,
   _getSeriesDays: getSeriesDays,
   _seriesCache: seriesCache,
+  _quoteCurrencyCache: quoteCurrencyCache,
 };
