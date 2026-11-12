@@ -14,6 +14,7 @@ const fetch = nodeFetch.default || nodeFetch;
 
 const admin = require('./firebaseAdmin');
 const { FieldValue } = require('firebase-admin/firestore');
+const { deleteInSmallBatches } = require('../utils/firestoreDeletes');
 const db = admin.firestore();
 
 // HU #3: las tasas llegan por el canal de datos de mercado, por rango y sin persistirse
@@ -34,17 +35,33 @@ const {
 const CONFIG = {
   // API de precios históricos
   HISTORICAL_API_BASE: 'https://api.portastock.net/v1',
-  
-  // Headers de autenticación para API (sin fallback por seguridad)
-  API_HEADERS: {
-    'x-service-token': process.env.PORTASTOCK_API_TOKEN,
-    'origin': 'https://portastock.net',
-    'referer': 'https://portastock.net'
-  },
-  
+
   // Rate limiting
   API_DELAY_MS: 200,
 };
+
+/**
+ * Headers del API de precios, leídos en cada llamada.
+ *
+ * Antes eran una constante del módulo con `PORTASTOCK_API_TOKEN`: en Cloud
+ * Functions v2 los secretos se inyectan después de cargar los módulos
+ * (FIX-SECRET-001) y el secreto enlazado se llama `CF_SERVICE_TOKEN`, así que
+ * la reconciliación salía con el token vacío y todo respondía 401.
+ */
+function apiHeaders() {
+  let token = '';
+  try {
+    const { getServiceTokenSecret } = require('./config');
+    if (typeof getServiceTokenSecret === 'function') token = getServiceTokenSecret();
+  } catch (_) {
+    // Sin config (scripts sueltos): queda la variable de siempre
+  }
+  return {
+    'x-service-token': token || (process.env.PORTASTOCK_API_TOKEN || '').trim(),
+    'origin': 'https://portastock.net',
+    'referer': 'https://portastock.net',
+  };
+}
 
 // Cache para datos dinámicos de Firestore
 let _cachedCurrencies = null;
@@ -198,11 +215,11 @@ function isDateEqual(txDate, targetDate) {
  * sólo se calculan días hábiles, y una compra de cripto en sábado o domingo
  * entra en las unidades del lunes; si su flujo no entra también, el lunes la
  * cuenta como rendimiento (BTC-USD 2026-07-27: +19,9 % con el precio en -0,6 %).
+ *
+ * FLOW-WINDOW: es la misma función que usa el cierre nocturno, para que un día
+ * del EOD y uno recalculado cuenten exactamente los mismos flujos.
  */
-function isFlowOfDay(txDate, targetDate, fromExclusive = null) {
-  const day = getDatePart(txDate);
-  return fromExclusive ? day > fromExclusive && day <= targetDate : day === targetDate;
-}
+const { isFlowOfDay } = require('../utils/flowWindow');
 
 /**
  * Calculate daily cash flow for TWR adjustment
@@ -365,46 +382,74 @@ function clearHistoricalPriceCache() {
  * el rango cubre `startDate`; sólo espera API_DELAY_MS cuando va a la red.
  */
 async function fetchHistoricalPricesCached(symbol, startDate = null) {
+  return (await fetchHistoricalPricesCachedDetailed(symbol, startDate)).prices;
+}
+
+/** Igual que fetchHistoricalPricesCached, con el estado de la respuesta. */
+async function fetchHistoricalPricesCachedDetailed(symbol, startDate = null) {
   const range = historicalRangeFor(startDate);
   const cached = _historicalPriceCache.get(symbol);
   if (cached
       && Date.now() - cached.fetchedAt < HISTORICAL_PRICE_CACHE_TTL_MS
       && (range === 'ytd' || RANGE_ORDER.indexOf(cached.range) >= RANGE_ORDER.indexOf(range))) {
-    return cached.prices;
+    return { prices: cached.prices, status: 'ok' };
   }
-  const prices = await fetchHistoricalPrices(symbol, startDate);
+  const result = await fetchHistoricalPricesDetailed(symbol, startDate);
   // Una respuesta vacía (error de red) no se cachea: el siguiente usuario reintenta
-  if (Object.keys(prices).length > 0) {
-    _historicalPriceCache.set(symbol, { range, prices, fetchedAt: Date.now() });
+  if (Object.keys(result.prices).length > 0) {
+    _historicalPriceCache.set(symbol, { range, prices: result.prices, fetchedAt: Date.now() });
   }
   await sleep(CONFIG.API_DELAY_MS);
-  return prices;
+  return result;
 }
 
 async function fetchHistoricalPrices(symbol, startDate = null) {
-  try {
-    const range = historicalRangeFor(startDate);
-    
-    const url = `${CONFIG.HISTORICAL_API_BASE}/historical?symbol=${encodeURIComponent(symbol)}&range=${range}&interval=1d`;
-    const response = await fetch(url, { headers: CONFIG.API_HEADERS });
-    
-    if (!response.ok) {
-      console.warn(`[backfillCore] No prices for ${symbol}: ${response.status}`);
-      return {};
+  return (await fetchHistoricalPricesDetailed(symbol, startDate)).prices;
+}
+
+/** Códigos con los que el API dice "no conozco ese símbolo": no es una caída. */
+const NOT_FOUND_STATUSES = new Set([400, 404, 422]);
+/** Códigos que merecen un segundo intento: límite de tasa y errores del servidor. */
+const RETRY_STATUSES = new Set([429, 500, 502, 503, 504]);
+
+/**
+ * Precios de cierre por día y el estado de la consulta:
+ * - `ok`: hay precios;
+ * - `not-found`: el API no conoce el símbolo (o no tiene historia); el EOD
+ *   tampoco lo valora, así que recalcular sin él es coherente con el EOD;
+ * - `error`: caída, 401, límite de tasa o red. Recalcular así deja el símbolo
+ *   en 0 en todo el rango y el EOD siguiente lo valora: es un salto, no un dato.
+ *
+ * @returns {Promise<{prices: Object<string, number>, status: 'ok'|'not-found'|'error', httpStatus?: number}>}
+ */
+async function fetchHistoricalPricesDetailed(symbol, startDate = null) {
+  const range = historicalRangeFor(startDate);
+  const url = `${CONFIG.HISTORICAL_API_BASE}/historical?symbol=${encodeURIComponent(symbol)}&range=${range}&interval=1d`;
+
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const response = await fetch(url, { headers: apiHeaders() });
+
+      if (!response.ok) {
+        console.warn(`[backfillCore] No prices for ${symbol}: ${response.status}`);
+        if (NOT_FOUND_STATUSES.has(response.status)) return { prices: {}, status: 'not-found', httpStatus: response.status };
+        if (attempt === 1 && RETRY_STATUSES.has(response.status)) { await sleep(1000); continue; }
+        return { prices: {}, status: 'error', httpStatus: response.status };
+      }
+
+      const data = await response.json();
+      const priceMap = {};
+      Object.entries(data || {}).forEach(([date, ohlcv]) => {
+        if (ohlcv && ohlcv.close > 0) priceMap[date] = ohlcv.close;
+      });
+      return { prices: priceMap, status: Object.keys(priceMap).length > 0 ? 'ok' : 'not-found' };
+    } catch (error) {
+      console.error(`[backfillCore] Error fetching prices for ${symbol}:`, error.message);
+      if (attempt === 1) { await sleep(1000); continue; }
+      return { prices: {}, status: 'error' };
     }
-    
-    const data = await response.json();
-    const priceMap = {};
-    
-    Object.entries(data).forEach(([date, ohlcv]) => {
-      priceMap[date] = ohlcv.close;
-    });
-    
-    return priceMap;
-  } catch (error) {
-    console.error(`[backfillCore] Error fetching prices for ${symbol}:`, error.message);
-    return {};
   }
+  return { prices: {}, status: 'error' };
 }
 
 /**
@@ -632,6 +677,149 @@ function reconstructAssetStateForDate(transactions, targetDate, exchangeRates = 
 }
 
 // ============================================================================
+// PRECIOS IMPLÍCITOS: LA VALORACIÓN QUE YA REGISTRÓ EL EOD
+// ============================================================================
+
+/**
+ * Precio USD implícito (valor / unidades) de cada activo, por día, en los docs
+ * ya guardados.
+ *
+ * Recalcular un rango corrige unidades y flujos; la valoración del día ya la
+ * registró el EOD y no hay por qué cambiarla. Además el histórico del API no
+ * es comparable con ella en tres casos:
+ * - **splits**: el histórico viene ajustado y las unidades de antes del split
+ *   no (BKNG 25:1: 0,0557 acciones valoradas a ~160 USD en vez de ~4.000;
+ *   −5,1 % el día de la compra y +5,0 % el de la venta en XTB);
+ * - **cripto**: el EOD valora a las 00:05 ET y el cierre diario es a las 00:00 UTC;
+ * - **bolsas fuera de EE. UU.** con festivos y horarios propios.
+ * Sólo cuando el doc no tiene el activo (un día que falta, una compra tardía)
+ * se usa el histórico.
+ *
+ * @param {{accounts: Object, overall: Object}} existing - Salida de readExistingDocs
+ * @returns {Object<string, Object<string, number>>} fecha -> { TICKER_tipo: precio USD }
+ */
+function impliedPricesByDate(existing) {
+  const byDate = {};
+  const collect = (docsByDate) => {
+    for (const [date, doc] of Object.entries(docsByDate || {})) {
+      const assets = doc?.USD?.assetPerformance;
+      if (!assets || typeof assets !== 'object') continue;
+      for (const [key, a] of Object.entries(assets)) {
+        const units = Number(a?.units);
+        const value = Number(a?.totalValue);
+        if (!(units > 1e-9) || !(value > 0)) continue;
+        byDate[date] = byDate[date] || {};
+        if (!(key in byDate[date])) byDate[date][key] = value / units;
+      }
+    }
+  };
+  // El portafolio primero; las cuentas completan lo que falte
+  collect(existing?.overall);
+  for (const docsByDate of Object.values(existing?.accounts || {})) collect(docsByDate);
+  return byDate;
+}
+
+// ============================================================================
+// LEDGER-LOTS: UNA SOLA FUENTE DE UNIDADES
+// ============================================================================
+
+/**
+ * Alinea el libro de transacciones de una cuenta con sus lotes (`assets`).
+ *
+ * El EOD toma las unidades de los lotes; este módulo las reconstruye sumando
+ * compras y ventas. Cuando las dos fuentes no cuadran, cada frontera entre un
+ * día del EOD y uno recalculado es un salto de unidades sin transacción, y el
+ * rendimiento lo cuenta como ganancia o pérdida. Medido en DDeR8P (YTD 2026):
+ * 2026-01-02 −2,1 pp y 2026-04-07 −0,9 pp al entrar en tramos reconstruidos,
+ * y la subida de vuelta al salir. Las causas eran datos de lote, no ventas:
+ * - un lote sin su compra (SPYG 0,33: sólo tiene las ventas);
+ * - un lote con más unidades que su compra (DPZ: lote 0,05, compra 0,03);
+ * - una venta de un lote que ya no existe (NVDA 0,3).
+ *
+ * La regla es la del EOD, para que las dos fuentes no puedan divergir:
+ * - **las unidades de cada lote mandan**. Si su libro (compras − ventas con su
+ *   `assetId`) no da sus unidades, se añade una corrección sintética por la
+ *   diferencia, fechada en su adquisición y valorada a su costo unitario. Es
+ *   la lectura menos inventiva: el lote dice que esas unidades existen desde
+ *   entonces, y su costo es el que el propio lote declara;
+ * - **las transacciones de un lote que no existe no cuentan**, ni como
+ *   unidades ni como flujo: el EOD tampoco las ve;
+ * - nombre y tipo salen del lote, que es como agrupa el EOD (`name_assetType`).
+ *
+ * Las transacciones sin `assetId` (datos antiguos) y las de efectivo pasan
+ * tal cual.
+ *
+ * @param {Array} transactions - Transacciones de la cuenta
+ * @param {Map<string, Object>} lotsById - Lotes del usuario (activos o no) por id
+ * @param {string} accountId - Cuenta de `transactions`
+ * @returns {{transactions: Array, corrections: Array, orphans: Array}}
+ */
+function alignLedgerWithLots(transactions, lotsById, accountId) {
+  const ledger = new Map(); // lotId -> { units, firstBuyDate }
+  const aligned = [];
+  const orphans = [];
+
+  for (const tx of transactions) {
+    const isAssetTx = tx.type === 'buy' || tx.type === 'sell';
+    if (!isAssetTx || !tx.assetId) {
+      aligned.push(tx);
+      continue;
+    }
+    const lot = lotsById.get(tx.assetId);
+    if (!lot) {
+      orphans.push(tx);
+      continue;
+    }
+    aligned.push({ ...tx, assetName: lot.name || tx.assetName, assetType: lot.assetType || tx.assetType });
+
+    const entry = ledger.get(lot.id) || { units: 0, firstBuyDate: null };
+    const amount = parseFloat(tx.amount) || 0;
+    entry.units += tx.type === 'buy' ? amount : -amount;
+    const day = getDatePart(tx.date);
+    if (tx.type === 'buy' && day && (!entry.firstBuyDate || day < entry.firstBuyDate)) entry.firstBuyDate = day;
+    ledger.set(lot.id, entry);
+  }
+
+  const corrections = [];
+  for (const lot of lotsById.values()) {
+    if (lot.portfolioAccount !== accountId) continue;
+    // Un lote inactivo no entra en el EOD aunque conserve unidades (NKE 0,5 y
+    // META 0,25 en XTB): para el EOD vale 0, y aquí también.
+    const lotUnits = lot.isActive === false ? 0 : (parseFloat(lot.units) || 0);
+    const entry = ledger.get(lot.id) || { units: 0, firstBuyDate: null };
+    const gap = lotUnits - entry.units;
+    // Tolerancia relativa: hay fracciones de cripto con 8 decimales.
+    if (Math.abs(gap) <= 1e-6 * Math.max(1, Math.abs(lotUnits), Math.abs(entry.units))) continue;
+
+    const acquired = getDatePart(lot.acquisitionDate) || getDatePart(lot.createdAt) || entry.firstBuyDate;
+    if (!acquired) {
+      corrections.push({ accountId, assetId: lot.id, name: lot.name, lotUnits, ledgerUnits: entry.units, gap, date: null, applied: false });
+      continue;
+    }
+    // Una corrección a la baja va el día de la primera compra si es posterior:
+    // antes de comprar no hay unidades que quitar.
+    const date = gap < 0 && entry.firstBuyDate && entry.firstBuyDate > acquired ? entry.firstBuyDate : acquired;
+    aligned.push({
+      id: `ledger-lots:${lot.id}`,
+      type: gap > 0 ? 'buy' : 'sell',
+      amount: Math.abs(gap),
+      price: parseFloat(lot.unitValue) || 0,
+      currency: lot.currency || 'USD',
+      date,
+      assetId: lot.id,
+      assetName: lot.name,
+      assetType: lot.assetType || 'stock',
+      portfolioAccountId: accountId,
+      synthetic: 'ledger-lots',
+    });
+    corrections.push({ accountId, assetId: lot.id, name: lot.name, lotUnits, ledgerUnits: entry.units, gap, date, applied: true });
+  }
+
+  aligned.sort((a, b) => getDatePart(a.date).localeCompare(getDatePart(b.date)));
+  return { transactions: aligned, corrections, orphans };
+}
+
+// ============================================================================
 // MAIN BACKFILL FUNCTION
 // ============================================================================
 
@@ -725,9 +913,15 @@ function usdCostFields(totalValue, totalInvestment, unrealizedProfitAndLoss = to
  * @param {Object} pricesBySymbol - Historical prices by symbol
  * @param {Object|null} previousDayData - Resultado de esta misma función para
  *   el día anterior ({ USD: {...}, COP: {...} }), o null
+ * @param {Array|null} [issues] - Si se pasa, recibe lo que no se pudo valorar:
+ *   `{type: 'no-rate', currency, symbol}` (el día quedaría sin ese activo: es un
+ *   salto, no un dato) o `{type: 'no-price', symbol}` (sin historia de precios)
+ * @param {Object<string, number>|null} [impliedUSD] - Precio USD por llave
+ *   TICKER_tipo que ya registró el EOD ese día (valor / unidades). Si está, manda
+ *   sobre el histórico: ver `impliedPricesByDate`.
  * @returns {Object|null} Performance data for this day
  */
-function calculateAccountDayPerformance(transactions, date, exchangeRates, pricesBySymbol, previousDayData) {
+function calculateAccountDayPerformance(transactions, date, exchangeRates, pricesBySymbol, previousDayData, issues = null, impliedUSD = null) {
   // Reconstruct asset state for this date
   const assets = reconstructAssetStateForDate(transactions, date, exchangeRates);
 
@@ -749,8 +943,20 @@ function calculateAccountDayPerformance(transactions, date, exchangeRates, price
   const valuedUSD = {};
 
   for (const asset of assets) {
+    const key = `${asset.name}_${asset.assetType}`;
+    const implied = impliedUSD?.[key];
+    if (implied > 0) {
+      const valueInUSD = asset.units * implied;
+      totalValueUSD += valueInUSD;
+      totalInvestmentUSD += asset.totalCostUSD;
+      valuedAssets++;
+      valuedUSD[key] = { units: asset.units, valueUSD: valueInUSD, costUSD: asset.totalCostUSD };
+      continue;
+    }
+
     const symbolPrices = pricesBySymbol[asset.name];
     const price = getPriceForDate(symbolPrices, date);
+    if (!(price > 0) && issues) issues.push({ type: 'no-price', symbol: asset.name, date });
 
     if (price > 0) {
       const valueInLocalCurrency = asset.units * price;
@@ -763,6 +969,7 @@ function calculateAccountDayPerformance(transactions, date, exchangeRates, price
           // CRITICAL: Skip assets without exchange rate to avoid inflated values
           // A COP value treated as USD would be ~4000x inflated
           console.warn(`[backfillCore] Skipping asset ${asset.name} (${asset.currency}): no exchange rate available`);
+          if (issues) issues.push({ type: 'no-rate', currency: asset.currency, symbol: asset.name, date });
           continue;
         }
       }
@@ -972,6 +1179,22 @@ function aggregateOverallPerformance(accountsPerformance, date, previousOverall 
  * SCALE-003: Capture existing performance documents before overwriting
  */
 async function capturePreBackfillSnapshot(userId, accounts, tradingDays) {
+  const existing = await readExistingDocs(userId, accounts, tradingDays);
+  return buildRollbackSnapshot(userId, accounts, tradingDays, existing);
+}
+
+/**
+ * Docs ya guardados en el rango, completos: cuentas y portafolio. Sirven para
+ * borrar las llaves de activo que ya no existen y como respaldo.
+ *
+ * Antes sólo vivían dentro del respaldo, y el respaldo se recorta al
+ * portafolio cuando pasa de ~800 KB: con un usuario grande las cuentas se
+ * quedaban sin borrar sus llaves viejas y el merge las dejaba vivas con
+ * unidades de otro día (MC.PA en XTB, sin lote desde enero).
+ *
+ * @returns {Promise<{accounts: Object, overall: Object, totalDocs: number}>}
+ */
+async function readExistingDocs(userId, accounts, tradingDays) {
   const firstDay = tradingDays[0];
   const lastDay = tradingDays[tradingDays.length - 1];
   let totalDocs = 0;
@@ -1011,6 +1234,12 @@ async function capturePreBackfillSnapshot(userId, accounts, tradingDays) {
     });
   }
 
+  return { accounts: accountsData, overall: overallData, totalDocs };
+}
+
+/** El respaldo `_backfillSnapshots` de `existing`, recortado si es grande; null si no hay nada. */
+function buildRollbackSnapshot(userId, accounts, tradingDays, existing) {
+  const { accounts: accountsData, overall: overallData, totalDocs } = existing;
   if (totalDocs === 0) return null;
 
   const AVG_DOC_SIZE_BYTES = 12 * 1024;
@@ -1184,20 +1413,41 @@ function heldAssetKeys(transactions, date, exchangeRates) {
  *   `portfolioPerformance/{userId}`: su campo `date` se quedaba congelado en
  *   el último día recalculado y el detector de retroactivas lo usaba.
  *
+ * LEDGER-LOTS: las transacciones se alinean con los lotes antes de
+ * reconstruir (`alignLedgerWithLots`), para que las unidades recalculadas sean
+ * las mismas que verá el EOD siguiente y no haya salto en la frontera.
+ *
+ * Todo o nada, en dos pasadas: la primera calcula todos los días sin escribir
+ * y la segunda sólo escribe si ninguno falló. Antes, sin precios (token vacío,
+ * 401) cada día se saltaba en silencio y la corrida "salía bien" con 0 días;
+ * y un día sin tasa se escribía sin los activos en esa moneda. Un hueco en
+ * medio del rango deja un doc viejo entre dos nuevos, que es otra frontera.
+ *
  * @param {string} userId
  * @param {string[]} tradingDays - Días hábiles ordenados (YYYY-MM-DD)
- * @returns {Promise<{success: boolean, daysProcessed: number, errors: string[]}>}
+ * @param {Object} [options]
+ * @param {boolean} [options.dryRun=false] - Calcula sin escribir nada y
+ *   devuelve `plan` (docs por día) y `existing` (los docs guardados)
+ * Dentro del rango, lo guardado queda exactamente igual a lo recalculado: los
+ * docs que el recálculo no produce se borran. Son días que el calendario no
+ * calcula (fines de semana y festivos con doc de procesos viejos: 36 en IBKR)
+ * y ámbitos sin tenencias ese día. Si se quedaran, su variación vieja se
+ * encadenaría junto a la del día siguiente, que ya la cubre.
+ *
+ * @returns {Promise<{success: boolean, daysProcessed: number, errors: string[],
+ *   corrections: Array, orphans: number, staleDocs: Array, plan?: Array, existing?: Object}>}
  */
-async function backfillUserPerformance(userId, tradingDays) {
-  const errors = [];
-  let daysProcessed = 0;
+async function backfillUserPerformance(userId, tradingDays, options = {}) {
+  const { dryRun = false } = options;
+  const corrections = [];
+  let orphans = 0;
+  let staleDocs = [];
+  const done = (extra) => ({ success: true, daysProcessed: 0, errors: [], corrections, orphans, staleDocs, ...extra });
 
-  if (!tradingDays || tradingDays.length === 0) {
-    return { success: true, daysProcessed: 0, errors: [] };
-  }
+  if (!tradingDays || tradingDays.length === 0) return done();
 
   const startDate = tradingDays[0];
-  console.log(`[backfillCore] Starting backfill for user ${userId}: ${tradingDays.length} days from ${startDate}`);
+  console.log(`[backfillCore] Starting backfill for user ${userId}: ${tradingDays.length} days from ${startDate}${dryRun ? ' (dry run)' : ''}`);
 
   try {
     // 1. Get all accounts for the user
@@ -1205,33 +1455,62 @@ async function backfillUserPerformance(userId, tradingDays) {
 
     if (accounts.length === 0) {
       console.log(`[backfillCore] User ${userId} has no active accounts. Skipping.`);
-      return { success: true, daysProcessed: 0, errors: [] };
+      return done();
     }
 
-    // 2. Get transactions for each account
+    // 2. Transacciones de cada cuenta, alineadas con sus lotes (LEDGER-LOTS)
+    const lots = await getAssetsForUser(userId);
+    const lotsById = new Map(lots.map((lot) => [lot.id, lot]));
     const transactionsByAccount = new Map();
     const allSymbols = new Set();
 
     for (const account of accounts) {
-      const transactions = await getTransactionsByAccount(account.id);
-      transactionsByAccount.set(account.id, transactions);
-      transactions.forEach(tx => {
-        if (tx.assetName) allSymbols.add(tx.assetName);
+      const aligned = alignLedgerWithLots(await getTransactionsByAccount(account.id), lotsById, account.id);
+      transactionsByAccount.set(account.id, aligned.transactions);
+      corrections.push(...aligned.corrections);
+      orphans += aligned.orphans.length;
+      aligned.transactions.forEach((tx) => {
+        // Sólo lo que se puede tener: el efectivo no tiene precio
+        if ((tx.type === 'buy' || tx.type === 'sell') && tx.assetName) allSymbols.add(tx.assetName);
       });
+    }
+
+    if (corrections.length > 0 || orphans > 0) {
+      const detail = corrections
+        .map((c) => `${c.name} ${c.gap > 0 ? '+' : ''}${c.gap.toFixed(4)}${c.applied ? ` desde ${c.date}` : ' (sin fecha, no aplicada)'}`)
+        .join(', ');
+      console.warn(`[backfillCore] LEDGER-LOTS ${userId}: ${corrections.length} lote(s) no cuadran con su libro` +
+        `${detail ? ` (${detail})` : ''}; ${orphans} transacción(es) de lotes que ya no existen, ignoradas`);
     }
 
     if (allSymbols.size === 0) {
       console.log(`[backfillCore] User ${userId} has no valid symbols. Skipping.`);
-      return { success: true, daysProcessed: 0, errors: [] };
+      return done();
     }
 
     // 3. Línea base: el día hábil anterior al primero, reconstruido
     const baselineDate = await getPreviousTradingDay(startDate);
 
-    // 4. Precios desde la línea base (caché compartida entre usuarios de la corrida)
+    // 4. Precios desde la línea base (caché compartida entre usuarios de la
+    //    corrida). Un símbolo caído no se puede dejar en 0: el EOD siguiente
+    //    lo valoraría y ese salto contaría como rendimiento.
     const pricesBySymbol = {};
+    const failedSymbols = [];
+    const unknownSymbols = [];
     for (const symbol of allSymbols) {
-      pricesBySymbol[symbol] = await fetchHistoricalPricesCached(symbol, baselineDate || startDate);
+      const { prices, status, httpStatus } = await fetchHistoricalPricesCachedDetailed(symbol, baselineDate || startDate);
+      pricesBySymbol[symbol] = prices;
+      if (status === 'error') failedSymbols.push(httpStatus ? `${symbol} (HTTP ${httpStatus})` : symbol);
+      if (status === 'not-found') unknownSymbols.push(symbol);
+    }
+    if (failedSymbols.length > 0) {
+      const message = `Sin precios por fallo del API en ${failedSymbols.length}/${allSymbols.size} símbolos: ` +
+        `${failedSymbols.slice(0, 8).join(', ')}${failedSymbols.length > 8 ? ', …' : ''}`;
+      console.error(`[backfillCore] ${userId}: ${message}. No se escribe nada.`);
+      return { ...done(), success: false, errors: [message] };
+    }
+    if (unknownSymbols.length > 0) {
+      console.warn(`[backfillCore] ${userId}: el API no conoce ${unknownSymbols.join(', ')}; se valoran en 0, igual que en el EOD`);
     }
 
     // 5. SCALE-005: tasas de la línea base y de todos los días, por rango
@@ -1239,11 +1518,16 @@ async function backfillUserPerformance(userId, tradingDays) {
       baselineDate ? [baselineDate, ...tradingDays] : tradingDays,
     );
 
-    const previousDayByAccount = new Map();
-    let previousOverall = null;
+    // Docs guardados, completos y con la línea base: deciden qué llaves de
+    // activo se borran (sin ellos el merge dejaría vivas llaves con unidades
+    // de otro día) y dan la valoración que ya registró el EOD.
+    const existingDocs = await readExistingDocs(userId, accounts, baselineDate ? [baselineDate, ...tradingDays] : tradingDays);
+    const impliedByDate = impliedPricesByDate(existingDocs);
+
+    const baselineAccounts = new Map();
+    let baselineOverall = null;
 
     if (baselineDate) {
-      const baselineAccounts = new Map();
       for (const account of accounts) {
         const baseline = calculateAccountDayPerformance(
           transactionsByAccount.get(account.id) || [],
@@ -1251,114 +1535,169 @@ async function backfillUserPerformance(userId, tradingDays) {
           ratesByDate[baselineDate] || { USD: 1 },
           pricesBySymbol,
           null,
+          null,
+          impliedByDate[baselineDate] || null,
         );
-        if (baseline) {
-          previousDayByAccount.set(account.id, baseline);
-          baselineAccounts.set(account.id, baseline);
-        }
+        if (baseline) baselineAccounts.set(account.id, baseline);
       }
       // Sólo valores y unidades importan en la base: la suma basta.
-      previousOverall = baselineAccounts.size > 0
+      baselineOverall = baselineAccounts.size > 0
         ? aggregateOverallPerformance(baselineAccounts, baselineDate)
         : null;
       console.log(`[backfillCore] Baseline ${baselineDate} reconstruida para ${baselineAccounts.size} cuentas`);
     }
 
-    // SCALE-003: Capture snapshot before overwriting (también sirve para
-    // saber qué llaves de activo ya no existen)
-    let existingDocs = null;
+    /**
+     * Recorre los días encadenando cada uno con el anterior calculado, y
+     * entrega a `visit` los docs del día. Se llama dos veces (validar y
+     * escribir) con el mismo resultado: todo es puro sobre lo ya cargado.
+     */
+    const runDays = async (visit) => {
+      const previousDayByAccount = new Map(baselineAccounts);
+      let previousOverall = baselineOverall;
+      const dayErrors = [];
+
+      for (const date of tradingDays) {
+        try {
+          const exchangeRates = ratesByDate[date] || { USD: 1 };
+          const issues = [];
+          const accountDocs = new Map();
+          const accountsPerformanceForDay = new Map();
+          const overallHeldKeys = new Set();
+
+          for (const account of accounts) {
+            const transactions = transactionsByAccount.get(account.id);
+            if (!transactions || transactions.length === 0) continue;
+
+            const accountPerformance = calculateAccountDayPerformance(
+              transactions,
+              date,
+              exchangeRates,
+              pricesBySymbol,
+              previousDayByAccount.get(account.id) || null,
+              issues,
+              impliedByDate[date] || null,
+            );
+
+            if (!accountPerformance) {
+              // Sin tenencias ese día: la próxima compra empieza de cero
+              previousDayByAccount.delete(account.id);
+              continue;
+            }
+
+            const held = heldAssetKeys(transactions, date, exchangeRates);
+            held.forEach((k) => overallHeldKeys.add(k));
+            const deletes = staleAssetKeyDeletes(existingDocs.accounts[account.id]?.[date], accountPerformance, held);
+
+            accountsPerformanceForDay.set(account.id, accountPerformance);
+            accountDocs.set(account.id, withDeletes(accountPerformance, deletes));
+            previousDayByAccount.set(account.id, accountPerformance);
+          }
+
+          // Un activo sin tasa quedaría fuera del valor del día: es un salto.
+          const noRate = issues.filter((i) => i.type === 'no-rate');
+          if (noRate.length > 0) {
+            const currencies = [...new Set(noRate.map((i) => i.currency))].join(', ');
+            dayErrors.push(`Day ${date}: sin tasa de ${currencies} para ${[...new Set(noRate.map((i) => i.symbol))].join(', ')}`);
+            continue;
+          }
+
+          let overallDoc = null;
+          if (accountsPerformanceForDay.size > 0) {
+            const overallPerformance = aggregateOverallPerformance(accountsPerformanceForDay, date, previousOverall);
+            const deletes = staleAssetKeyDeletes(existingDocs.overall[date], overallPerformance, overallHeldKeys);
+            overallDoc = withDeletes(overallPerformance, deletes);
+            previousOverall = overallPerformance;
+          }
+
+          if (overallDoc) await visit({ date, accountDocs, overallDoc });
+        } catch (dayError) {
+          dayErrors.push(`Day ${date}: ${dayError.message}`);
+        }
+      }
+      return dayErrors;
+    };
+
+    // Pasada 1: calcular y validar todo, sin escribir
+    const plan = [];
+    let validDays = 0;
+    const produced = new Set(); // `${scope}|${date}`
+    const validationErrors = await runDays(async ({ date, accountDocs, overallDoc }) => {
+      validDays++;
+      produced.add(`overall|${date}`);
+      for (const accountId of accountDocs.keys()) produced.add(`${accountId}|${date}`);
+      if (dryRun) plan.push({ date, accounts: Object.fromEntries(accountDocs), overall: overallDoc });
+    });
+
+    // Docs del rango que el recálculo no produce (ver arriba)
+    const firstDay = tradingDays[0];
+    const lastDay = tradingDays[tradingDays.length - 1];
+    const inRange = (date) => date >= firstDay && date <= lastDay;
+    staleDocs = [
+      ...Object.keys(existingDocs.overall).filter(inRange)
+        .filter((date) => !produced.has(`overall|${date}`))
+        .map((date) => ({ scope: 'overall', date })),
+      ...Object.entries(existingDocs.accounts).flatMap(([accountId, docs]) => Object.keys(docs).filter(inRange)
+        .filter((date) => !produced.has(`${accountId}|${date}`))
+        .map((date) => ({ scope: accountId, date }))),
+    ];
+
+    if (validationErrors.length > 0) {
+      validationErrors.forEach((e) => console.error(`[backfillCore] User ${userId}: ${e}`));
+      console.error(`[backfillCore] User ${userId}: ${validationErrors.length} día(s) no se pudieron calcular. No se escribe nada.`);
+      return { ...done(dryRun ? { plan, existing: existingDocs } : {}), success: false, errors: validationErrors };
+    }
+
+    if (dryRun) {
+      console.log(`[backfillCore] Dry run ${userId}: ${validDays}/${tradingDays.length} días calculados, nada escrito`);
+      return done({ daysProcessed: validDays, plan, existing: existingDocs });
+    }
+
+    // SCALE-003: respaldo antes de sobrescribir (recortado si es grande)
     try {
-      existingDocs = await capturePreBackfillSnapshot(userId, accounts, tradingDays);
-      if (existingDocs) {
+      const rollback = buildRollbackSnapshot(userId, accounts, tradingDays, existingDocs);
+      if (rollback) {
         const snapshotId = `${userId}_${tradingDays[0]}`;
         const ttlExpiry = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
-        await db.collection('_backfillSnapshots').doc(snapshotId).set({
-          ...existingDocs,
-          ttlExpiry
-        });
-        console.log(`[backfillCore] Snapshot saved: _backfillSnapshots/${snapshotId} (${existingDocs.totalDocs} docs)`);
+        await db.collection('_backfillSnapshots').doc(snapshotId).set({ ...rollback, ttlExpiry });
+        console.log(`[backfillCore] Snapshot saved: _backfillSnapshots/${snapshotId} (${rollback.totalDocs} docs)`);
       }
     } catch (snapshotError) {
       console.warn(`[backfillCore] Could not save pre-backfill snapshot: ${snapshotError.message}`);
     }
 
+    // Pasada 2: escribir, un batch por día (cuentas + overall)
     const userRef = db.collection('portfolioPerformance').doc(userId);
+    let daysProcessed = 0;
+    const writeErrors = await runDays(async ({ date, accountDocs, overallDoc }) => {
+      const batch = db.batch();
+      for (const [accountId, doc] of accountDocs) {
+        batch.set(userRef.collection('accounts').doc(accountId).collection('dates').doc(date), doc, { merge: true });
+      }
+      batch.set(userRef.collection('dates').doc(date), overallDoc, { merge: true });
+      await batch.commit();
+      daysProcessed++;
+    });
 
-    for (const date of tradingDays) {
+    if (writeErrors.length === 0 && staleDocs.length > 0) {
       try {
-        const exchangeRates = ratesByDate[date] || { USD: 1 };
-        const accountsPerformanceForDay = new Map();
-        const overallHeldKeys = new Set();
-        const batch = db.batch();
-
-        for (const account of accounts) {
-          const transactions = transactionsByAccount.get(account.id);
-          if (!transactions || transactions.length === 0) continue;
-
-          const accountPerformance = calculateAccountDayPerformance(
-            transactions,
-            date,
-            exchangeRates,
-            pricesBySymbol,
-            previousDayByAccount.get(account.id) || null,
-          );
-
-          if (!accountPerformance) {
-            // Sin tenencias ese día: la próxima compra empieza de cero
-            previousDayByAccount.delete(account.id);
-            continue;
-          }
-
-          const held = heldAssetKeys(transactions, date, exchangeRates);
-          held.forEach((k) => overallHeldKeys.add(k));
-          const deletes = staleAssetKeyDeletes(
-            existingDocs?.accounts?.[account.id]?.[date], accountPerformance, held,
-          );
-
-          accountsPerformanceForDay.set(account.id, accountPerformance);
-          batch.set(
-            userRef.collection('accounts').doc(account.id).collection('dates').doc(date),
-            withDeletes(accountPerformance, deletes),
-            { merge: true },
-          );
-          previousDayByAccount.set(account.id, accountPerformance);
-        }
-
-        if (accountsPerformanceForDay.size > 0) {
-          const overallPerformance = aggregateOverallPerformance(accountsPerformanceForDay, date, previousOverall);
-          const deletes = staleAssetKeyDeletes(existingDocs?.overall?.[date], overallPerformance, overallHeldKeys);
-          batch.set(
-            userRef.collection('dates').doc(date),
-            withDeletes(overallPerformance, deletes),
-            { merge: true },
-          );
-          previousOverall = overallPerformance;
-
-          await batch.commit();
-          daysProcessed++;
-        }
-      } catch (dayError) {
-        const errMsg = `Day ${date}: ${dayError.message}`;
-        errors.push(errMsg);
-        console.error(`[backfillCore] User ${userId}:`, errMsg);
+        await deleteInSmallBatches(db, staleDocs.map(({ scope, date }) => (scope === 'overall'
+          ? userRef.collection('dates').doc(date)
+          : userRef.collection('accounts').doc(scope).collection('dates').doc(date))));
+        console.log(`[backfillCore] User ${userId}: ${staleDocs.length} doc(s) del rango que el recálculo no produce, borrados`);
+      } catch (deleteError) {
+        writeErrors.push(`Borrando docs sobrantes: ${deleteError.message}`);
       }
     }
 
+    writeErrors.forEach((e) => console.error(`[backfillCore] User ${userId}:`, e));
     console.log(`[backfillCore] Completed backfill for user ${userId}: ${daysProcessed}/${tradingDays.length} days, ${accounts.length} accounts`);
 
-    return {
-      success: errors.length === 0,
-      daysProcessed,
-      errors
-    };
+    return { ...done(), success: writeErrors.length === 0, daysProcessed, errors: writeErrors };
 
   } catch (error) {
     console.error(`[backfillCore] Fatal error for user ${userId}:`, error);
-    return {
-      success: false,
-      daysProcessed,
-      errors: [...errors, `Fatal: ${error.message}`]
-    };
+    return { ...done(), success: false, errors: [`Fatal: ${error.message}`] };
   }
 }
 
@@ -1384,6 +1723,8 @@ module.exports = {
   // Data fetching
   fetchHistoricalPrices,
   fetchHistoricalPricesCached,
+  fetchHistoricalPricesDetailed,
+  fetchHistoricalPricesCachedDetailed,
   clearHistoricalPriceCache,
   historicalRangeFor,
   getPriceForDate,
@@ -1397,15 +1738,19 @@ module.exports = {
   
   // State reconstruction
   reconstructAssetStateForDate,
+  alignLedgerWithLots,
   
   // Performance calculation helpers
   calculateAccountDayPerformance,
+  impliedPricesByDate,
   calculateDailyCashFlowByAsset,
   aggregateOverallPerformance,
   staleAssetKeyDeletes,
   
   // Snapshot (SCALE-003)
   capturePreBackfillSnapshot,
+  readExistingDocs,
+  buildRollbackSnapshot,
   
   // Exchange rates (HU #3: por rango, sin archivo)
   getExchangeRatesForDates,

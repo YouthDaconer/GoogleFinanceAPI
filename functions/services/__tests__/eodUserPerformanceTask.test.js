@@ -42,6 +42,9 @@ jest.mock('../unifiedMarketDataUpdate', () => ({
   processUserPerformance: jest.fn().mockResolvedValue({ userId: 'u1', success: true, durationMs: 42 }),
   PerformanceDataCache: jest.fn().mockImplementation(() => ({
     preloadHistoricalData: jest.fn().mockResolvedValue(undefined),
+    preloadLastPerformance: jest.fn().mockResolvedValue(undefined),
+    preloadBuyTransactions: jest.fn().mockResolvedValue(undefined),
+    getLastPerformanceDates: jest.fn(() => []),
     validateDataConsistency: jest.fn(() => ({ isConsistent: true, gap: 0 })),
   })),
   markInconsistentUsersAsStale: jest.fn().mockResolvedValue(0),

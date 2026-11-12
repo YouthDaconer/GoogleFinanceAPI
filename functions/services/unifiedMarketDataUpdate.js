@@ -4,6 +4,9 @@ const admin = require('firebase-admin');
 const axios = require('axios');
 const { calculateAccountPerformance, convertCurrency, detectUnexplainedUnitChanges } = require('../utils/portfolioCalculations');
 const { markPerformanceAsStale } = require('../utils/performanceStaleMarker');
+const {
+  MAX_FLOW_WINDOW_DAYS, flowWindowFor, isFlowOfDay, queryWindowStart, queryBounds,
+} = require('../utils/flowWindow');
 const { calculatePortfolioRisk } = require('./calculatePortfolioRisk');
 const { invalidatePerformanceCacheBatch } = require('./cacheInvalidationService');
 const { DateTime } = require('luxon');
@@ -411,15 +414,25 @@ class PerformanceDataCache {
     this.buyTransactionsByAsset = new Map();
   }
 
+  /**
+   * Precarga en dos pasos porque el segundo depende del primero: la ventana de
+   * transacciones del día empieza en el último doc de cada ámbito
+   * (FLOW-WINDOW), así que hay que leer esos docs antes de consultar las
+   * transacciones, y las compras de los activos vendidos después.
+   */
   async preloadHistoricalData(db, formattedDate, userPortfolios, sellTransactions) {
-    logDebug('📁 Precargando datos históricos (OPTIMIZACIÓN)...');
-    
+    await this.preloadLastPerformance(db, formattedDate, userPortfolios);
+    await this.preloadBuyTransactions(db, sellTransactions);
+  }
+
+  /** Último doc (< formattedDate) del portafolio de cada usuario y de cada cuenta. */
+  async preloadLastPerformance(db, formattedDate, userPortfolios) {
+    logDebug('📁 Precargando últimos docs diarios...');
+
     const allUserIds = Object.keys(userPortfolios);
     const allAccountIds = Object.values(userPortfolios).flat().map(acc => acc.id);
-    const assetIdsWithSells = [...new Set(sellTransactions.map(t => t.assetId).filter(id => id))];
 
-    // ✨ OPTIMIZACIÓN: Consultas paralelas masivas
-    const [userPerformanceResults, accountPerformanceResults, buyTransactionsResults] = await Promise.all([
+    const [userPerformanceResults, accountPerformanceResults] = await Promise.all([
       Promise.all(allUserIds.map(async (userId) => {
         const userRef = db.collection('portfolioPerformance').doc(userId);
         const query = await userRef.collection('dates')
@@ -445,16 +458,8 @@ class PerformanceDataCache {
           .get();
         return { accountId, data: query.empty ? null : query.docs[0].data() };
       })),
-      
-      assetIdsWithSells.length > 0 ? 
-        db.collection('transactions')
-          .where('type', '==', 'buy')
-          .where('assetId', 'in', assetIdsWithSells)
-          .get() : 
-        { docs: [] }
     ]);
 
-    // Procesar resultados
     userPerformanceResults.forEach(({ userId, data }) => {
       if (data) this.userLastPerformance.set(userId, data);
     });
@@ -462,6 +467,24 @@ class PerformanceDataCache {
     accountPerformanceResults.forEach(({ accountId, data }) => {
       if (data) this.accountLastPerformance.set(accountId, data);
     });
+
+    logInfo(`✅ Caché precargado: ${this.userLastPerformance.size} usuarios, ${this.accountLastPerformance.size} cuentas`);
+  }
+
+  /** Compras de los activos con ventas en la ventana (P&L realizado sin `valuePnL`). */
+  async preloadBuyTransactions(db, sellTransactions) {
+    const assetIdsWithSells = [...new Set(sellTransactions.map(t => t.assetId).filter(id => id))];
+    if (assetIdsWithSells.length === 0) return;
+
+    // El operador `in` admite 30 valores; una ventana de varios días puede pasarse.
+    const buyTransactionsResults = { docs: [] };
+    for (let i = 0; i < assetIdsWithSells.length; i += 30) {
+      const snapshot = await db.collection('transactions')
+        .where('type', '==', 'buy')
+        .where('assetId', 'in', assetIdsWithSells.slice(i, i + 30))
+        .get();
+      buyTransactionsResults.docs.push(...(snapshot.docs || []));
+    }
 
     if (buyTransactionsResults.docs) {
       const buyTransactions = buyTransactionsResults.docs.map(doc => ({ id: doc.id, ...doc.data() }));
@@ -472,8 +495,6 @@ class PerformanceDataCache {
         this.buyTransactionsByAsset.get(tx.assetId).push(tx);
       });
     }
-
-    logInfo(`✅ Caché precargado: ${this.userLastPerformance.size} usuarios, ${this.accountLastPerformance.size} cuentas`);
   }
 
   /**
@@ -535,6 +556,21 @@ class PerformanceDataCache {
   /** Fecha (YYYY-MM-DD) del doc del día anterior del usuario, o null. */
   getUserLastPerformanceDate(userId) {
     return this.userLastPerformance.get(userId)?.date || null;
+  }
+
+  /** Fecha (YYYY-MM-DD) del doc del día anterior de la cuenta, o null. */
+  getAccountLastPerformanceDate(accountId) {
+    return this.accountLastPerformance.get(accountId)?.date || null;
+  }
+
+  /** Fechas del último doc de cada ámbito (portafolio y cuentas) de los usuarios dados. */
+  getLastPerformanceDates(userPortfolios) {
+    const dates = [];
+    for (const [userId, accounts] of Object.entries(userPortfolios)) {
+      dates.push(this.getUserLastPerformanceDate(userId));
+      for (const account of accounts) dates.push(this.getAccountLastPerformanceDate(account.id));
+    }
+    return dates;
   }
 
   getUserLastPerformance(userId, currencies) {
@@ -620,14 +656,43 @@ async function processUserPerformance({
   try {
     logDebug(`👤 Procesando usuario ${userId} con ${accounts.length} cuentas`);
     const lastOverallTotalValue = cache.getUserLastPerformance(userId, currencies);
+    const accountIds = new Set(accounts.map((account) => account.id));
 
-    const allUserAssets = assetsToInclude.filter(asset =>
-      accounts.some(account => account.id === asset.portfolioAccount)
+    // FLOW-WINDOW: el flujo del día es todo lo movido desde el último doc del
+    // ámbito, no sólo lo fechado hoy. Si falta el doc de ayer, la base es el de
+    // anteayer y las ventas de ayer tienen que entrar como flujo; si no, su
+    // dinero sale del portafolio como pérdida. `todaysTransactions` ya trae la
+    // ventana más amplia de todos los ámbitos; cada uno se queda con la suya.
+    const userWindow = flowWindowFor(formattedDate, cache.getUserLastPerformanceDate(userId));
+    const userTransactions = todaysTransactions.filter((t) =>
+      accountIds.has(t.portfolioAccountId) && isFlowOfDay(t.date, formattedDate, userWindow.fromExclusive)
     );
 
-    const userTransactions = todaysTransactions.filter(t =>
-      accounts.some(account => account.id === t.portfolioAccountId)
+    // Los inactivos sólo entran si se vendieron dentro de la ventana: su venta
+    // es flujo de este cálculo. Vendidos antes ya salieron en un doc anterior.
+    const inactiveIds = new Set(inactiveAssets.map((asset) => asset.id));
+    const userSoldAssetIds = new Set(userTransactions.filter((t) => t.type === 'sell').map((t) => t.assetId));
+    const allUserAssets = assetsToInclude.filter((asset) =>
+      accountIds.has(asset.portfolioAccount) && (!inactiveIds.has(asset.id) || userSoldAssetIds.has(asset.id))
     );
+
+    // Un hueco mayor que el tope no es un día perdido: los flujos más viejos
+    // quedan fuera de la ventana y sólo la reconciliación puede rehacerlo.
+    const cappedScopes = [
+      userWindow.capped ? 'overall' : null,
+      ...accounts.map((account) =>
+        flowWindowFor(formattedDate, cache.getAccountLastPerformanceDate(account.id)).capped ? account.id : null),
+    ].filter(Boolean);
+    if (cappedScopes.length > 0) {
+      const since = cache.getUserLastPerformanceDate(userId) || formattedDate;
+      logWarn(`[FLOW-WINDOW] ${userId} ${formattedDate}: el último doc de ${cappedScopes.join(', ')} ` +
+        `supera ${MAX_FLOW_WINDOW_DAYS} días; stale desde ${since}`);
+      try {
+        await markPerformanceAsStale(userId, since, { reason: 'flow_window_capped', transactionType: 'unknown' });
+      } catch (staleError) {
+        logWarn(`[FLOW-WINDOW] No se pudo marcar stale a ${userId}: ${staleError.message}`);
+      }
+    }
 
     const overallPerformance = calculateAccountPerformance(
       allUserAssets,
@@ -668,9 +733,7 @@ async function processUserPerformance({
 
     // Calcular doneProfitAndLoss para cada moneda
     const userDoneProfitAndLossByCurrency = {};
-    const userSellTransactions = sellTransactions.filter(t =>
-      accounts.some(account => account.id === t.portfolioAccountId)
-    );
+    const userSellTransactions = userTransactions.filter((t) => t.type === 'sell');
 
     for (const currency of currencies) {
       let totalDoneProfitAndLoss = 0;
@@ -788,7 +851,12 @@ async function processUserPerformance({
 
     // Procesar cada cuenta del usuario
     for (const account of accounts) {
-      const accountSellTransactions = sellTransactionsByAccount[account.id] || [];
+      // FLOW-WINDOW: la cuenta, desde su propio último doc.
+      const accountWindow = flowWindowFor(formattedDate, cache.getAccountLastPerformanceDate(account.id));
+      const accountTransactions = todaysTransactions.filter((t) =>
+        t.portfolioAccountId === account.id && isFlowOfDay(t.date, formattedDate, accountWindow.fromExclusive)
+      );
+      const accountSellTransactions = accountTransactions.filter((t) => t.type === 'sell');
       const inactiveAccountAssetsWithSells = inactiveAssets.filter(asset =>
         asset.portfolioAccount === account.id &&
         accountSellTransactions.some(t => t.assetId === asset.id)
@@ -801,7 +869,6 @@ async function processUserPerformance({
 
       const lastAccountTotalValue = cache.getAccountLastPerformance(account.id, currencies);
 
-      const accountTransactions = userTransactions.filter(t => t.portfolioAccountId === account.id);
       const accountPerformance = calculateAccountPerformance(
         accountAssets,
         currentPrices,
@@ -1147,31 +1214,45 @@ async function calculateDailyPortfolioPerformance(db, currentPrices, currencies,
   const yesterday = now.minus({ days: 1 });
   const formattedDate = options.formattedDate || yesterday.toISODate();
 
-  // FIX-TIMESTAMP-002: Rango de fechas para soportar campo date con timestamp completo
-  const dateRangeStart = `${formattedDate}T00:00:00.000Z`;
-  const dateRangeEnd = `${formattedDate}T23:59:59.999Z`;
-  
   logDebug(`📅 Fecha de cálculo (día anterior): ${formattedDate}`);
   logDebug(`📅 Hora actual de ejecución (NY): ${now.toISO()}`);
-  
+
   // OPT-DEMAND-CLEANUP: Solo consultar datos que NO vienen del API
-  // FIX-TIMESTAMP-002: Usar rango de fechas para soportar timestamps completos
   // FIX-READS-002: Use injected assets if available to avoid redundant global scan
   const [
-    transactionsSnapshot,
     activeAssetsSnapshot,
     portfolioAccountsSnapshot
   ] = await Promise.all([
-    db.collection('transactions')
-      .where('date', '>=', dateRangeStart)
-      .where('date', '<=', dateRangeEnd)
-      .get(),
     options.activeAssetsSnapshot
       ? Promise.resolve(options.activeAssetsSnapshot)
       : db.collection('assets').where('isActive', '==', true).get(),
     db.collection('portfolioAccounts').where('isActive', '==', true).get()
   ]);
-  
+
+  const activeAssets = activeAssetsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+  const portfolioAccounts = portfolioAccountsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+
+  const userPortfolios = portfolioAccounts.reduce((acc, account) => {
+    if (!acc[account.userId]) acc[account.userId] = [];
+    acc[account.userId].push(account);
+    return acc;
+  }, {});
+
+  // ✨ OPTIMIZACIÓN: Sistema de caché para datos históricos
+  const cache = new PerformanceDataCache();
+  await cache.preloadLastPerformance(db, formattedDate, userPortfolios);
+
+  // FLOW-WINDOW: las transacciones desde el último doc más antiguo de todos
+  // los ámbitos (con tope); cada ámbito filtra luego la suya. Con todos los
+  // docs de ayer presentes es exactamente el día, como antes.
+  // FIX-TIMESTAMP-002: rango sobre el string `date`, que puede traer hora.
+  const windowStart = queryWindowStart(formattedDate, cache.getLastPerformanceDates(userPortfolios));
+  const { after, until } = queryBounds(windowStart, formattedDate);
+  const transactionsSnapshot = await db.collection('transactions')
+    .where('date', '>', after)
+    .where('date', '<=', until)
+    .get();
+
   const todaysTransactions = transactionsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
   const sellTransactions = todaysTransactions.filter(t => t.type === 'sell');
   const assetIdsInSellTransactions = [...new Set(sellTransactions.map(t => t.assetId).filter(id => id))];
@@ -1179,9 +1260,6 @@ async function calculateDailyPortfolioPerformance(db, currentPrices, currencies,
   // 🚀 OPTIMIZACIÓN: Log consolidado de transacciones
   logInfo(`📊 Transacciones para ${formattedDate}: ${todaysTransactions.length} total (${sellTransactions.length} ventas)`);
   logInfo(`📊 Datos de mercado: ${currentPrices.length} precios, ${currencies.length} currencies (fuente: API Lambda)`);
-  
-  const activeAssets = activeAssetsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-  const portfolioAccounts = portfolioAccountsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
   
   // Obtener activos inactivos involucrados en ventas
   let inactiveAssets = [];
@@ -1222,15 +1300,8 @@ async function calculateDailyPortfolioPerformance(db, currentPrices, currencies,
     ...inactiveAssets.filter(asset => inactiveAssetsWithSellTransactions.has(asset.id))
   ];
 
-  const userPortfolios = portfolioAccounts.reduce((acc, account) => {
-    if (!acc[account.userId]) acc[account.userId] = [];
-    acc[account.userId].push(account);
-    return acc;
-  }, {});
-
-  // ✨ OPTIMIZACIÓN: Sistema de caché para datos históricos
-  const cache = new PerformanceDataCache();
-  await cache.preloadHistoricalData(db, formattedDate, userPortfolios, sellTransactions);
+  // Las compras de lo vendido en la ventana (P&L sin `valuePnL`)
+  await cache.preloadBuyTransactions(db, sellTransactions);
 
   // OPT-DEMAND-500: Validar consistencia de datos antes de calcular
   // Esto previene corrupciones cuando overall y cuentas tienen fechas diferentes

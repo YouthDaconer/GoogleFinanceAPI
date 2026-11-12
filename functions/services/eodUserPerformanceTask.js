@@ -44,6 +44,8 @@ const {
   setModuleLogger,
 } = require('./unifiedMarketDataUpdate');
 const { chunkArray } = require('./backfillCoreModule');
+const { queryWindowStart, queryBounds } = require('../utils/flowWindow');
+const { deleteInSmallBatches } = require('../utils/firestoreDeletes');
 const { crearLoggerDeConsola } = require('../utils/logger');
 
 /** SEC-TOKEN-001: el cálculo no llama al API, pero sí los módulos que arrastra. */
@@ -126,11 +128,8 @@ async function borrarSnapshotsDelInversor(db, userId) {
     .where(FieldPath.documentId(), '<', snapshots.doc(`${prefijo}`))
     .get();
 
-  for (let i = 0; i < docs.docs.length; i += 400) {
-    const batch = db.batch();
-    docs.docs.slice(i, i + 400).forEach((d) => batch.delete(d.ref));
-    await batch.commit();
-  }
+  // En lotes pequeños: 400 snapshots grandes no caben en una escritura.
+  await deleteInSmallBatches(db, docs.docs.map((d) => d.ref));
 
   if (docs.size > 0) {
     console.log(`[eodUserPerformanceTask] ${userId}: ${docs.size} snapshots borrados antes de rehacer`);
@@ -167,17 +166,24 @@ async function cargarDatosDelInversor(db, userId, formattedDate) {
   const accountIds = accounts.map((a) => a.id);
   const lotes = chunkArray(accountIds, TAMANO_LOTE_IN);
 
+  // El caché precarga sólo a este inversor: es el mismo componente, acotado a
+  // un portafolio en vez de a todos. Va antes que las transacciones porque la
+  // ventana de flujos empieza en su último doc (FLOW-WINDOW).
+  const cache = new PerformanceDataCache();
+  await cache.preloadLastPerformance(db, formattedDate, { [userId]: accounts });
+
   // FIX-TIMESTAMP-002: el campo `date` puede traer timestamp completo, así que
-  // el día se consulta por rango, igual que en el proceso único.
-  const dateRangeStart = `${formattedDate}T00:00:00.000Z`;
-  const dateRangeEnd = `${formattedDate}T23:59:59.999Z`;
+  // se consulta por rango, igual que en el proceso único. FLOW-WINDOW: desde
+  // el último doc más antiguo de sus ámbitos, no sólo el día.
+  const windowStart = queryWindowStart(formattedDate, cache.getLastPerformanceDates({ [userId]: accounts }));
+  const { after, until } = queryBounds(windowStart, formattedDate);
 
   const todaysTransactions = [];
   for (const lote of lotes) {
     const snapshot = await db.collection('transactions')
       .where('portfolioAccountId', 'in', lote)
-      .where('date', '>=', dateRangeStart)
-      .where('date', '<=', dateRangeEnd)
+      .where('date', '>', after)
+      .where('date', '<=', until)
       .get();
     snapshot.docs.forEach((d) => todaysTransactions.push({ id: d.id, ...d.data() }));
   }
@@ -227,10 +233,7 @@ async function cargarDatosDelInversor(db, userId, formattedDate) {
     ...inactiveAssets.filter((asset) => inactiveAssetsWithSellTransactions.has(asset.id)),
   ];
 
-  // El caché precarga sólo a este inversor: es el mismo componente, acotado a
-  // un portafolio en vez de a todos.
-  const cache = new PerformanceDataCache();
-  await cache.preloadHistoricalData(db, formattedDate, { [userId]: accounts }, sellTransactions);
+  await cache.preloadBuyTransactions(db, sellTransactions);
 
   return {
     accounts,

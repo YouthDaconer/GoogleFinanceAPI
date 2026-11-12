@@ -11,6 +11,7 @@
  */
 
 const { onSchedule } = require('firebase-functions/v2/scheduler');
+const { defineSecret } = require('firebase-functions/params');
 const { getFirestore, FieldValue, FieldPath } = require('firebase-admin/firestore');
 const { DateTime } = require('luxon');
 const {
@@ -20,8 +21,17 @@ const {
 } = require('./backfillCoreModule');
 const { consolidateMonth, consolidateYear } = require('./periodConsolidationScheduled');
 const { invalidatePerformanceCache } = require('./cacheInvalidationService');
+const { deleteInSmallBatches } = require('../utils/firestoreDeletes');
 
 const db = getFirestore();
+
+/**
+ * SEC-TOKEN-001: precios y tasas vienen del API de mercado, que exige
+ * `x-service-token`. Sin el binding la función corría con el token vacío:
+ * todo respondía 401, ningún día se podía valorar y la reconciliación "salía
+ * bien" con 0 días escritos (DDeR8P, 2026-11-06 y 2026-11-10).
+ */
+const cfServiceToken = defineSecret('CF_SERVICE_TOKEN');
 
 // ============================================================================
 // LIMITS AND CONFIGURATION
@@ -109,11 +119,9 @@ async function propagateReconciledRange(userId, firstDay, accountIds) {
     .where(FieldPath.documentId(), '>=', snapshots.doc(prefix))
     .where(FieldPath.documentId(), '<', snapshots.doc(`${prefix}`))
     .get();
-  for (let i = 0; i < snapshotDocs.docs.length; i += 400) {
-    const batch = db.batch();
-    snapshotDocs.docs.slice(i, i + 400).forEach((d) => batch.delete(d.ref));
-    await batch.commit();
-  }
+  // En lotes pequeños: un batch de 400 snapshots grandes falla con
+  // "Transaction too big" (DDeR8P, 261 snapshots, 2026-11-05 en adelante).
+  await deleteInSmallBatches(db, snapshotDocs.docs.map((d) => d.ref));
 
   await invalidatePerformanceCache(userId);
 
@@ -289,6 +297,7 @@ const reconcileStalePerformance = onSchedule({
   memory: '512MiB',
   timeoutSeconds: 540,        // 9 minutes; TIME_BUDGET_MS deja margen
   maxInstances: 1,            // una corrida a la vez: comparten la cola
+  secrets: [cfServiceToken],
   labels: {
     component: 'late-reg',
     purpose: 'reconcile-stale',

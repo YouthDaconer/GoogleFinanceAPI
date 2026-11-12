@@ -182,6 +182,7 @@ function buildCache() {
       USD: { totalValue: 9800 }
     })),
     getUserLastPerformanceDate: jest.fn(() => "2026-05-06"),
+    getAccountLastPerformanceDate: jest.fn(() => null),
     getAccountLastPerformance: jest.fn(() => ({
       USD: { totalValue: 4900 }
     })),
