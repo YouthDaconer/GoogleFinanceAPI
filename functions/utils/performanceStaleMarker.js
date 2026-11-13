@@ -13,12 +13,6 @@ const { getFirestore, FieldValue } = require('firebase-admin/firestore');
 const db = getFirestore();
 
 /**
- * Máximo de trading days que se recalcularán automáticamente
- * Rangos mayores se truncan y se marcan como truncated
- */
-const MAX_TRADING_DAYS = 30;
-
-/**
  * Obtiene la fecha del último documento de portfolioPerformance del usuario
  * 
  * @param {string} userId - ID del usuario
@@ -93,32 +87,16 @@ async function isRetroactiveTransaction(transactionDate, userId) {
 }
 
 /**
- * Calcula el número aproximado de trading days entre dos fechas
- * Usa la aproximación de 5/7 (5 trading days por semana)
- * 
- * @param {string} startDate - Fecha inicio YYYY-MM-DD
- * @param {string} endDate - Fecha fin YYYY-MM-DD
- * @returns {number} Número aproximado de trading days
- */
-function estimateTradingDays(startDate, endDate) {
-  const start = new Date(startDate + 'T12:00:00Z');
-  const end = new Date(endDate + 'T12:00:00Z');
-  
-  if (end <= start) {
-    return 0;
-  }
-  
-  const calendarDays = Math.ceil((end - start) / (1000 * 60 * 60 * 24));
-  
-  // Aproximación conservadora: ~5/7 de los días calendario son trading days
-  return Math.ceil(calendarDays * 5 / 7);
-}
-
-/**
  * Marca el documento de performance como stale
  * 
  * Si ya existe un campo _stale, solo actualiza 'since' si la nueva fecha es más antigua.
  * Esto asegura que múltiples transacciones retroactivas se agrupen correctamente.
+ *
+ * HU 6.8.1 (RN-6.8.1-O): la corrección nocturna avanza `since` tramo a tramo,
+ * así que `since` es el primer día aún sin corregir. Una operación anterior lo
+ * mueve hacia atrás y se rehace desde ella; una posterior no lo mueve y entra
+ * cuando la corrección llegue a su fecha. Ya no hay recorte: sin `truncated`.
+ * @see platform-docs/stories/6.8.1-historial-corregido-por-tramos/historia.md
  * 
  * @param {string} userId - ID del usuario
  * @param {string} transactionDate - Fecha de la transacción retroactiva (YYYY-MM-DD o ISO)
@@ -133,10 +111,6 @@ async function markPerformanceAsStale(userId, transactionDate, metadata = {}) {
   const txDate = getDatePart(transactionDate);
   
   try {
-    // Obtener la última fecha de performance ANTES de la transacción
-    // para calcular correctamente el rango de días a reconciliar
-    const latestDate = await getLatestPerformanceDate(userId);
-    
     await db.runTransaction(async (transaction) => {
       const perfDoc = await transaction.get(perfRef);
       
@@ -148,17 +122,6 @@ async function markPerformanceAsStale(userId, transactionDate, metadata = {}) {
       
       const currentData = perfDoc.data();
       const currentStale = currentData._stale;
-      
-      // latestDate ya fue obtenido antes de la transacción usando getLatestPerformanceDate
-      // que busca en la subcollection dates si no hay campo date en el documento principal
-      
-      // Calcular si el rango es muy grande (> MAX_TRADING_DAYS)
-      const tradingDays = latestDate ? estimateTradingDays(txDate, latestDate) : 0;
-      const truncated = tradingDays > MAX_TRADING_DAYS;
-      
-      if (truncated) {
-        console.warn(`[performanceStaleMarker] User ${userId}: Range of ${tradingDays} trading days exceeds max (${MAX_TRADING_DAYS}). Will be truncated.`);
-      }
       
       // Determinar la fecha "since" más antigua
       // Si ya hay un _stale con fecha más antigua, mantenerla
@@ -173,8 +136,6 @@ async function markPerformanceAsStale(userId, transactionDate, metadata = {}) {
         transactionType: metadata.transactionType || 'unknown',
         portfolioAccount: metadata.portfolioAccount || null,
         registeredAt: new Date().toISOString(),
-        // Mantener truncated si ya estaba true, o marcar true si el nuevo rango es muy grande
-        truncated: truncated || (currentStale?.truncated === true),
         // Resetear retryCount si estamos actualizando con nueva info
         retryCount: currentStale?.retryCount || 0
       };
@@ -238,9 +199,7 @@ async function clearStaleMarker(userId) {
 module.exports = {
   getLatestPerformanceDate,
   isRetroactiveTransaction,
-  estimateTradingDays,
   markPerformanceAsStale,
   checkAndMarkStaleIfRetroactive,
   clearStaleMarker,
-  MAX_TRADING_DAYS,
 };

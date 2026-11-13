@@ -242,14 +242,16 @@ describe('getRateLimitConfig', () => {
       'createCheckoutSession', 'createPortalSession',
       // HU 5.2: lanzar un analisis del Copilot y consultar su estado
       'startAnalysis', 'getAnalysisState',
+      // HU 6.8.1: estado de la corrección del historial para el aviso
+      'getHistoryCorrectionStatus',
     ];
-    
+
     expectedFunctions.forEach(fn => {
       expect(RATE_LIMITS[fn]).toBeDefined();
       expect(RATE_LIMITS[fn].limit).toBeGreaterThan(0);
       expect(RATE_LIMITS[fn].windowMs).toBe(60000);
     });
-    
-    expect(Object.keys(RATE_LIMITS).length).toBe(37);
+
+    expect(Object.keys(RATE_LIMITS).length).toBe(38);
   });
 });

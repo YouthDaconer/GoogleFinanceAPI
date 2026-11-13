@@ -1675,6 +1675,45 @@ async function getOpeningCorrectionPlan(context, payload) {
 }
 
 /**
+ * HU 6.8.1: estado de la corrección del historial del inversor, para el aviso
+ * del Dashboard e Inteligencia (RN-6.8.1-N).
+ *
+ * Sale de las mismas dos fuentes que usa la corrección nocturna, sin campos
+ * espejo:
+ * - `review`: la corrección agotó sus intentos y está en `reconcileFailures`
+ *   sin `resolvedAt` (operación la resuelve borrándolo o poniéndole fecha);
+ * - `pending`: `portfolioPerformance/{uid}` tiene la marca `_stale`;
+ * - `none`: nada que avisar.
+ *
+ * Solo lee lo del `auth.uid`: el navegador no puede leer esos documentos.
+ * @see platform-docs/stories/6.8.1-historial-corregido-por-tramos/historia.md
+ *
+ * @param {Object} context - Contexto de ejecución
+ * @returns {Promise<{status: 'none'|'pending'|'review'}>}
+ */
+async function getHistoryCorrectionStatus(context) {
+  const userId = context.auth.uid;
+
+  try {
+    const [failureDoc, [performanceDoc]] = await Promise.all([
+      db.collection('reconcileFailures').doc(userId).get(),
+      // Solo la marca: el doc principal no hace falta entero
+      db.getAll(db.collection('portfolioPerformance').doc(userId), { fieldMask: ['_stale'] }),
+    ]);
+
+    let status = 'none';
+    if (failureDoc.exists && !failureDoc.data()?.resolvedAt) status = 'review';
+    else if (performanceDoc?.exists && performanceDoc.data()?._stale) status = 'pending';
+
+    console.log(`[queryHandlers][getHistoryCorrectionStatus] userId: ${userId}, estado: ${status}`);
+    return { status };
+  } catch (error) {
+    console.error('[queryHandlers][getHistoryCorrectionStatus] Error:', error);
+    throw new HttpsError('internal', 'Error consultando el estado de la corrección del historial');
+  }
+}
+
+/**
  * Obtiene rendimientos históricos usando períodos consolidados (V2)
  *
  * COST-OPT-001: Versión optimizada que reduce lecturas de Firestore
@@ -1814,6 +1853,8 @@ module.exports = {
   getBalanceLedger,
   // HU 2.7: plan de la correccion del saldo inicial
   getOpeningCorrectionPlan,
+  // HU 6.8.1: estado de la corrección del historial para el aviso
+  getHistoryCorrectionStatus,
   // COST-OPT-001: Nuevos handlers para rendimientos optimizados
   getHistoricalReturnsOptimized,
   getConsolidatedDataStatus,

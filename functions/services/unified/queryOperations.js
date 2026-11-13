@@ -21,6 +21,7 @@
  * - getAvailableSectors
  * - getConsolidatedDataStatus (COST-OPT-001: Diagnóstico de datos)
  * - getPerformanceOnDemand (OPT-DEMAND-102: Rendimiento con precios live)
+ * - getHistoryCorrectionStatus (HU 6.8.1: aviso de corrección del historial)
  *
  * @module unified/queryOperations
  * @see docs/stories/56.story.md
@@ -84,6 +85,8 @@ const ACTION_HANDLERS = {
   getBalanceLedger: queryHandlers.getBalanceLedger,
   // HU 2.7: plan de la correccion del saldo inicial
   getOpeningCorrectionPlan: queryHandlers.getOpeningCorrectionPlan,
+  // HU 6.8.1: estado de la corrección del historial para el aviso
+  getHistoryCorrectionStatus: queryHandlers.getHistoryCorrectionStatus,
   // COST-OPT-001: Nuevas acciones para rendimientos optimizados (V2)
   getHistoricalReturnsOptimized: queryHandlers.getHistoricalReturnsOptimized,
   getConsolidatedDataStatus: queryHandlers.getConsolidatedDataStatus,

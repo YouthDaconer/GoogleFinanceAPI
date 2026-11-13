@@ -55,6 +55,9 @@ const RATE_LIMITS = {
   getBalanceLedger: { limit: 30, windowMs: 60000 },
   // HU 2.7: el plan de la correccion se pide al abrir el dialogo de correccion
   getOpeningCorrectionPlan: { limit: 30, windowMs: 60000 },
+  // HU 6.8.1: el aviso de corrección del historial se pide al abrir el
+  // Dashboard o Inteligencia
+  getHistoryCorrectionStatus: { limit: 30, windowMs: 60000 },
 
   // ═══════════════════════════════════════════════════════════════
   // 🟡 Operaciones de Escritura Normales

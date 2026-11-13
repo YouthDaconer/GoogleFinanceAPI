@@ -1389,6 +1389,37 @@ function withDeletes(doc, deletes) {
   return out;
 }
 
+/**
+ * Devuelve `entries` ({scope, date}) a como estaban en `existing`: el doc
+ * completo, sin merge, o borrado si antes no existía. Un batch por día, como
+ * se escribieron. RN-6-H, HU 6.8.1.
+ *
+ * @returns {Promise<string[]>} Días que no se pudieron devolver
+ */
+async function restoreAsBefore(entries, existing, refFor) {
+  const scopesByDate = new Map();
+  for (const { scope, date } of entries) {
+    if (!scopesByDate.has(date)) scopesByDate.set(date, new Set());
+    scopesByDate.get(date).add(scope);
+  }
+
+  const failures = [];
+  for (const [date, scopes] of scopesByDate) {
+    try {
+      const batch = db.batch();
+      for (const scope of scopes) {
+        const before = scope === 'overall' ? existing.overall[date] : existing.accounts[scope]?.[date];
+        if (before) batch.set(refFor(scope, date), before);
+        else batch.delete(refFor(scope, date));
+      }
+      await batch.commit();
+    } catch (error) {
+      failures.push(`${date}: ${error.message}`);
+    }
+  }
+  return failures;
+}
+
 /** Llaves TICKER_tipo con unidades ese día, se hayan podido valorar o no. */
 function heldAssetKeys(transactions, date, exchangeRates) {
   return new Set(
@@ -1428,17 +1459,31 @@ function heldAssetKeys(transactions, date, exchangeRates) {
  * @param {Object} [options]
  * @param {boolean} [options.dryRun=false] - Calcula sin escribir nada y
  *   devuelve `plan` (docs por día) y `existing` (los docs guardados)
+ * @param {string} [options.rangeStart] - Inicio de calendario del rango
+ *   (YYYY-MM-DD, anterior o igual al primer día hábil). Por defecto, el primer
+ *   día hábil
  * Dentro del rango, lo guardado queda exactamente igual a lo recalculado: los
  * docs que el recálculo no produce se borran. Son días que el calendario no
  * calcula (fines de semana y festivos con doc de procesos viejos: 36 en IBKR)
  * y ámbitos sin tenencias ese día. Si se quedaran, su variación vieja se
  * encadenaría junto a la del día siguiente, que ya la cubre.
  *
+ * HU 6.8.1: la corrección nocturna llama una vez por tramo. Con `rangeStart`
+ * el fin de semana que cae entre dos tramos entra en el siguiente, que empieza
+ * el día de calendario después del anterior; sin él no estaría en ninguno.
+ *
+ * RN-6-H (Escenario 7): si una escritura falla, se deja de escribir y lo ya
+ * escrito vuelve a como estaba antes del tramo, desde `existingDocs`. Ante la
+ * muerte del proceso (tiempo, memoria) no hay quien deshaga: lo escrito es el
+ * mismo recálculo que hará el reintento.
+ * @see platform-docs/stories/6.8.1-historial-corregido-por-tramos/historia.md
+ *
  * @returns {Promise<{success: boolean, daysProcessed: number, errors: string[],
- *   corrections: Array, orphans: number, staleDocs: Array, plan?: Array, existing?: Object}>}
+ *   corrections: Array, orphans: number, staleDocs: Array, rolledBack?: boolean,
+ *   plan?: Array, existing?: Object}>}
  */
 async function backfillUserPerformance(userId, tradingDays, options = {}) {
-  const { dryRun = false } = options;
+  const { dryRun = false, rangeStart = null } = options;
   const corrections = [];
   let orphans = 0;
   let staleDocs = [];
@@ -1551,13 +1596,15 @@ async function backfillUserPerformance(userId, tradingDays, options = {}) {
      * Recorre los días encadenando cada uno con el anterior calculado, y
      * entrega a `visit` los docs del día. Se llama dos veces (validar y
      * escribir) con el mismo resultado: todo es puro sobre lo ya cargado.
+     * `shouldStop(errores)` corta el recorrido antes del día siguiente.
      */
-    const runDays = async (visit) => {
+    const runDays = async (visit, shouldStop = null) => {
       const previousDayByAccount = new Map(baselineAccounts);
       let previousOverall = baselineOverall;
       const dayErrors = [];
 
       for (const date of tradingDays) {
+        if (shouldStop && shouldStop(dayErrors)) break;
         try {
           const exchangeRates = ratesByDate[date] || { USD: 1 };
           const issues = [];
@@ -1629,10 +1676,14 @@ async function backfillUserPerformance(userId, tradingDays, options = {}) {
       if (dryRun) plan.push({ date, accounts: Object.fromEntries(accountDocs), overall: overallDoc });
     });
 
-    // Docs del rango que el recálculo no produce (ver arriba)
+    // Docs del rango que el recálculo no produce (ver arriba). El rango de
+    // calendario nunca incluye la línea base: es del tramo anterior.
     const firstDay = tradingDays[0];
     const lastDay = tradingDays[tradingDays.length - 1];
-    const inRange = (date) => date >= firstDay && date <= lastDay;
+    const rangeFrom = rangeStart && rangeStart < firstDay && (!baselineDate || rangeStart > baselineDate)
+      ? rangeStart
+      : firstDay;
+    const inRange = (date) => date >= rangeFrom && date <= lastDay;
     staleDocs = [
       ...Object.keys(existingDocs.overall).filter(inRange)
         .filter((date) => !produced.has(`overall|${date}`))
@@ -1666,34 +1717,62 @@ async function backfillUserPerformance(userId, tradingDays, options = {}) {
       console.warn(`[backfillCore] Could not save pre-backfill snapshot: ${snapshotError.message}`);
     }
 
-    // Pasada 2: escribir, un batch por día (cuentas + overall)
+    // Pasada 2: escribir, un batch por día (cuentas + overall). Al primer
+    // error se deja de escribir (RN-6-H).
     const userRef = db.collection('portfolioPerformance').doc(userId);
+    const refFor = (scope, date) => (scope === 'overall'
+      ? userRef.collection('dates').doc(date)
+      : userRef.collection('accounts').doc(scope).collection('dates').doc(date));
+    const touched = []; // {scope, date} de cada escritura intentada, también la que falla
     let daysProcessed = 0;
     const writeErrors = await runDays(async ({ date, accountDocs, overallDoc }) => {
       const batch = db.batch();
       for (const [accountId, doc] of accountDocs) {
-        batch.set(userRef.collection('accounts').doc(accountId).collection('dates').doc(date), doc, { merge: true });
+        batch.set(refFor(accountId, date), doc, { merge: true });
+        touched.push({ scope: accountId, date });
       }
-      batch.set(userRef.collection('dates').doc(date), overallDoc, { merge: true });
+      batch.set(refFor('overall', date), overallDoc, { merge: true });
+      touched.push({ scope: 'overall', date });
       await batch.commit();
       daysProcessed++;
-    });
+    }, (errors) => errors.length > 0);
 
+    let staleDeleteAttempted = false;
     if (writeErrors.length === 0 && staleDocs.length > 0) {
+      staleDeleteAttempted = true;
       try {
-        await deleteInSmallBatches(db, staleDocs.map(({ scope, date }) => (scope === 'overall'
-          ? userRef.collection('dates').doc(date)
-          : userRef.collection('accounts').doc(scope).collection('dates').doc(date))));
+        await deleteInSmallBatches(db, staleDocs.map(({ scope, date }) => refFor(scope, date)));
         console.log(`[backfillCore] User ${userId}: ${staleDocs.length} doc(s) del rango que el recálculo no produce, borrados`);
       } catch (deleteError) {
         writeErrors.push(`Borrando docs sobrantes: ${deleteError.message}`);
       }
     }
 
-    writeErrors.forEach((e) => console.error(`[backfillCore] User ${userId}:`, e));
+    if (writeErrors.length > 0) {
+      writeErrors.forEach((e) => console.error(`[backfillCore] User ${userId}:`, e));
+      // Escenario 7: el rango queda como estaba antes, no a medias
+      const restoreErrors = await restoreAsBefore(
+        [...touched, ...(staleDeleteAttempted ? staleDocs : [])],
+        existingDocs,
+        refFor,
+      );
+      if (restoreErrors.length === 0) {
+        console.warn(`[backfillCore] User ${userId}: escritura fallida; ${daysProcessed} día(s) escritos devueltos a como estaban antes`);
+      } else {
+        restoreErrors.forEach((e) => console.error(`[backfillCore] User ${userId}: no se pudo deshacer ${e}`));
+      }
+      return {
+        ...done(),
+        success: false,
+        daysProcessed: 0,
+        rolledBack: restoreErrors.length === 0,
+        errors: [...writeErrors, ...restoreErrors.map((e) => `Deshaciendo ${e}`)],
+      };
+    }
+
     console.log(`[backfillCore] Completed backfill for user ${userId}: ${daysProcessed}/${tradingDays.length} days, ${accounts.length} accounts`);
 
-    return { ...done(), success: writeErrors.length === 0, daysProcessed, errors: writeErrors };
+    return { ...done(), success: true, daysProcessed, errors: [] };
 
   } catch (error) {
     console.error(`[backfillCore] Fatal error for user ${userId}:`, error);
