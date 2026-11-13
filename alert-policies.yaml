@@ -197,3 +197,76 @@ conditions:
           perSeriesAligner: ALIGN_RATE
 combiner: OR
 enabled: true
+
+---
+# Política 8: La corrección nocturna terminó con atraso (HU 6.8.2, Escenario 4)
+# Archivo: (se aplica con el script, ver abajo)
+#
+# IMPORTANTE — cómo se aplican las políticas 5, 6, 8 y 9: con
+#   cd functions && node scripts/aplicarAvisosCorreccionNocturna.js [--aplicar]
+# que elige el canal de operación por su buzón (info@portastock.net) y las
+# reconoce por `userLabels` para no duplicarlas. Hasta el 2026-11-13 las de la
+# HU 6.3 solo existían en este archivo: nunca llegaron a producción y su aviso
+# no le llegaba a nadie. La definición vigente (filtros, textos) es
+# functions/scripts/correccionNocturnaAlerts.js; lo de aquí es su registro.
+#
+# El prefijo del log es el contrato: services/reconcileNightReport.js
+# (PREFIJO_ALERTA). Un test comprueba que el filtro y el código coinciden.
+
+displayName: "Corrección nocturna — inversores atrasados o en revisión"
+documentation:
+  content: |
+    La corrección nocturna del historial terminó con inversores atrasados, o
+    alguno pasó a revisión. Detalle en Firestore: `reconcileNights/{noche}_{hora}`.
+    La corrección no se amplía sola (RN-6.8.2-L).
+  mimeType: "text/markdown"
+conditions:
+  - displayName: "Log con [CORRECCION-ATRASO]"
+    conditionMatchedLog:
+      filter: >
+        resource.type="cloud_run_revision"
+        AND resource.labels.service_name="reconcilestaleperformance"
+        AND severity>=ERROR
+        AND textPayload:"[CORRECCION-ATRASO]"
+alertStrategy:
+  notificationRateLimit:
+    period: "3600s"
+  autoClose: "86400s"
+combiner: OR
+enabled: true
+userLabels:
+  hu: hu-6-8-2
+  aviso: atraso
+
+---
+# Política 9: La plataforma cortó la corrección nocturna (HU 6.8.2, RN-6-E)
+#
+# Es la red del único caso que el código no puede avisar: el proceso entero
+# muere. Las noches del 07, 11 y 12-nov-2026 murió por memoria con este log:
+# "Memory limit of 512 MiB exceeded with 549 MiB used" (varlog/system), más
+# un 500 en el log de la petición.
+
+displayName: "Corrección nocturna — la plataforma cortó la ejecución"
+conditions:
+  - displayName: "Sin memoria o petición fallida en reconcileStalePerformance"
+    conditionMatchedLog:
+      filter: >
+        resource.type="cloud_run_revision"
+        AND resource.labels.service_name="reconcilestaleperformance"
+        AND (textPayload:"Memory limit" OR httpRequest.status>=500)
+alertStrategy:
+  notificationRateLimit:
+    period: "3600s"
+  autoClose: "86400s"
+combiner: OR
+enabled: true
+userLabels:
+  hu: hu-6-8-2
+  aviso: cortada
+
+# Nota sobre las políticas 5 y 6 (HU 6.3): el script las aplica como políticas
+# basadas en logs sobre `cloud_run_revision` (son funciones v2). La 6 de arriba
+# filtra `resource.type="cloud_function"` con un umbral, que no casa con una
+# función v2; la que se aplica vigila el log de memoria y el 500 de
+# `scheduledeodfinalization`. La 7 (tasa de errores de las tareas) no se aplica:
+# es un diagnóstico y necesita una métrica basada en logs.

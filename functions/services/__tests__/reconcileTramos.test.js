@@ -19,185 +19,16 @@ const { DateTime } = require('luxon');
 
 jest.setTimeout(180000);
 
-// --- Reloj y Firestore en memoria -------------------------------------------
-const mockClock = { ms: 0, commitMs: 1000 };
-const mockStore = { docs: new Map(), failCommit: null, afterCommit: null, writes: [] };
+// --- Reloj y Firestore en memoria (compartidos con los tests de la HU 6.8.2) --
+const {
+  clock: mockClock,
+  store: mockStore,
+  db: mockDb,
+  clone: mockClone,
+  isMap: mockIsMap,
+} = require('./support/firestoreEnMemoria');
 
-function mockIsOp(v, op) {
-  return v !== null && typeof v === 'object' && v.__op === op;
-}
-function mockIsMap(v) {
-  return v !== null && typeof v === 'object' && !Array.isArray(v) && !(v instanceof Date) && !v.__op && !v.__ref;
-}
-function mockClone(v) {
-  if (v === undefined || v === null || typeof v !== 'object') return v;
-  if (v instanceof Date) return new Date(v.getTime());
-  if (Array.isArray(v)) return v.map(mockClone);
-  return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, mockClone(x)]));
-}
-function mockField(data, field) {
-  return field.split('.').reduce((node, k) => (node == null ? undefined : node[k]), data);
-}
-
-/** `set` con merge: los mapas se mezclan campo a campo; los centinelas se aplican. */
-function mockMerge(target, patch) {
-  for (const [k, v] of Object.entries(patch)) {
-    if (mockIsOp(v, 'delete')) delete target[k];
-    else if (mockIsOp(v, 'increment')) target[k] = (typeof target[k] === 'number' ? target[k] : 0) + v.n;
-    else if (mockIsOp(v, 'serverTimestamp')) target[k] = new Date(mockClock.ms);
-    else if (mockIsMap(v)) {
-      if (!mockIsMap(target[k])) target[k] = {};
-      mockMerge(target[k], v);
-    } else target[k] = mockClone(v);
-  }
-  return target;
-}
-
-/** `update`: rutas con punto; un mapa reemplaza el campo entero. */
-function mockUpdate(target, patch) {
-  for (const [key, v] of Object.entries(patch)) {
-    const parts = key.split('.');
-    const leaf = parts.pop();
-    let node = target;
-    for (const p of parts) {
-      if (!mockIsMap(node[p])) node[p] = {};
-      node = node[p];
-    }
-    if (mockIsMap(v)) node[leaf] = mockMerge({}, v);
-    else mockMerge(node, { [leaf]: v });
-  }
-}
-
-/** Aplica `ops` de forma atómica: o todas o ninguna. Cada commit cuesta `commitMs`. */
-async function mockCommit(ops) {
-  mockClock.ms += mockClock.commitMs;
-  if (mockStore.failCommit && mockStore.failCommit(ops)) throw new Error('commit forzado a fallar (prueba)');
-  const staged = new Map();
-  const current = (path) => (staged.has(path) ? staged.get(path) : mockClone(mockStore.docs.get(path)));
-  for (const op of ops) {
-    if (op.type === 'delete') staged.set(op.path, undefined);
-    else if (op.type === 'set') {
-      staged.set(op.path, op.opts && op.opts.merge ? mockMerge(current(op.path) || {}, op.data) : mockMerge({}, op.data));
-    } else {
-      const base = current(op.path);
-      if (base === undefined) throw new Error(`5 NOT_FOUND: ${op.path}`);
-      mockUpdate(base, op.data);
-      staged.set(op.path, base);
-    }
-  }
-  for (const [path, data] of staged) {
-    if (data === undefined) mockStore.docs.delete(path);
-    else mockStore.docs.set(path, data);
-    mockStore.writes.push(path);
-  }
-  if (mockStore.afterCommit) await mockStore.afterCommit(ops);
-}
-
-function mockSnap(path) {
-  const data = mockStore.docs.get(path);
-  return {
-    id: path.slice(path.lastIndexOf('/') + 1),
-    ref: mockDocRef(path),
-    exists: data !== undefined,
-    data: () => mockClone(data),
-    get: (f) => mockClone(mockField(data, f)),
-  };
-}
-
-function mockDocRef(path) {
-  return {
-    __ref: true,
-    path,
-    id: path.slice(path.lastIndexOf('/') + 1),
-    collection: (name) => mockQuery(`${path}/${name}`),
-    get: async () => mockSnap(path),
-    set: (data, opts) => mockCommit([{ type: 'set', path, data, opts }]),
-    update: (data) => mockCommit([{ type: 'update', path, data }]),
-    delete: () => mockCommit([{ type: 'delete', path }]),
-  };
-}
-
-function mockMatches(path, data, [field, op, value]) {
-  const a = field === '__name__' ? path.slice(path.lastIndexOf('/') + 1) : mockField(data, field);
-  const b = value && value.__ref ? value.id : value;
-  switch (op) {
-    case '==': return a === b;
-    case '!=': return a !== undefined && a !== b;
-    case '<': return a !== undefined && a < b;
-    case '<=': return a !== undefined && a <= b;
-    case '>': return a !== undefined && a > b;
-    case '>=': return a !== undefined && a >= b;
-    case 'in': return b.includes(a);
-    default: throw new Error(`op ${op}`);
-  }
-}
-
-function mockQuery(path, filters = [], order = null, max = null) {
-  const query = {
-    where: (f, op, v) => mockQuery(path, [...filters, [f, op, v]], order, max),
-    orderBy: (f, dir = 'asc') => mockQuery(path, filters, [f, dir], max),
-    limit: (n) => mockQuery(path, filters, order, n),
-    select: () => query,
-    doc: (id) => mockDocRef(`${path}/${id}`),
-    get: async () => {
-      let entries = [...mockStore.docs.entries()]
-        .filter(([p]) => p.slice(0, p.lastIndexOf('/')) === path)
-        .filter(([p, d]) => filters.every((f) => mockMatches(p, d, f)));
-      if (order) {
-        const [f, dir] = order;
-        entries = entries
-          .filter(([, d]) => mockField(d, f) !== undefined)
-          .sort(([, x], [, y]) => {
-            const a = mockField(x, f);
-            const b = mockField(y, f);
-            return a < b ? -1 : a > b ? 1 : 0;
-          });
-        if (dir === 'desc') entries.reverse();
-      }
-      if (max !== null) entries = entries.slice(0, max);
-      const docs = entries.map(([p]) => mockSnap(p));
-      return { docs, size: docs.length, empty: docs.length === 0, forEach: (fn) => docs.forEach(fn) };
-    },
-  };
-  return query;
-}
-
-const mockDb = {
-  collection: (name) => mockQuery(name),
-  batch: () => {
-    const ops = [];
-    const batch = {
-      set: (ref, data, opts) => { ops.push({ type: 'set', path: ref.path, data, opts }); return batch; },
-      update: (ref, data) => { ops.push({ type: 'update', path: ref.path, data }); return batch; },
-      delete: (ref) => { ops.push({ type: 'delete', path: ref.path }); return batch; },
-      commit: () => mockCommit(ops),
-    };
-    return batch;
-  },
-  runTransaction: async (fn) => {
-    const ops = [];
-    const tx = {
-      get: async (ref) => mockSnap(ref.path),
-      set: (ref, data, opts) => ops.push({ type: 'set', path: ref.path, data, opts }),
-      update: (ref, data) => ops.push({ type: 'update', path: ref.path, data }),
-      delete: (ref) => ops.push({ type: 'delete', path: ref.path }),
-    };
-    const result = await fn(tx);
-    if (ops.length > 0) await mockCommit(ops);
-    return result;
-  },
-  getAll: async (...args) => args.filter((a) => a && a.__ref).map((r) => mockSnap(r.path)),
-};
-
-jest.mock('firebase-admin/firestore', () => ({
-  getFirestore: () => mockDb,
-  FieldValue: {
-    delete: () => ({ __op: 'delete' }),
-    increment: (n) => ({ __op: 'increment', n }),
-    serverTimestamp: () => ({ __op: 'serverTimestamp' }),
-  },
-  FieldPath: { documentId: () => '__name__' },
-}));
+jest.mock('firebase-admin/firestore', () => require('./support/firestoreEnMemoria').firestoreModule);
 jest.mock('../firebaseAdmin', () => ({ firestore: () => mockDb }));
 jest.mock('firebase-functions/v2/scheduler', () => ({ onSchedule: (_opts, fn) => fn }));
 jest.mock('../periodConsolidationScheduled', () => ({
@@ -643,6 +474,8 @@ describe('HU 6.8.1 — un rango largo avanza por tramos, desde donde quedó (Esc
     moveHistoricalPrices();
     await markPerformanceAsStale('inv-a', tradingOffset(FROM['inv-a'], 0), { reason: 'asset_edit' });
     await registerLate('inv-b', 'late', { type: 'buy', asset: 'ko', name: 'KO', assetType: 'stock', amount: 5, date: '2026-11-11' });
+    // HU 6.8.2: va primero el que más espera; B espera desde antes que A
+    mockStore.docs.get('portfolioPerformance/inv-b')._stale.pendienteDesde = '2026-11-01T12:00:00.000Z';
     // B (un par de días) y el primer tramo de A
     const n1 = await run({ n: 1, timeBudgetMs: 10000 });
     expect(n1.tramos.map((t) => [t.uid, t.status])).toEqual([['inv-b', 'reconciled'], ['inv-a', 'advanced']]);
@@ -660,7 +493,7 @@ describe('HU 6.8.1 — un rango largo avanza por tramos, desde donde quedó (Esc
     expect(historyOf('inv-c')).toEqual(before.c);
   });
 
-  test('QA-04 sin la 6.8.2: con más pendientes de los que caben, el orden es el de siempre y los que no alcanzan siguen marcados sin sumar intento', async () => {
+  test('QA-04 con la 6.8.2: con más pendientes de los que caben, va primero el que más espera y los que no alcanzan siguen marcados sin sumar intento', async () => {
     const sats = Array.from({ length: 12 }, (_, i) => `sat-${String(i + 1).padStart(2, '0')}`);
     restore(...sats.map((u) => BASES[u]), BASES['inv-b']);
     moveHistoricalPrices();
@@ -668,8 +501,12 @@ describe('HU 6.8.1 — un rango largo avanza por tramos, desde donde quedó (Esc
       await registerLate(uid, 'late', { type: 'buy', asset: 'ko', name: 'KO', assetType: 'stock', amount: 1, date: tradingOffset('2026-10-01', i) });
     }
     await registerLate('inv-b', 'late', { type: 'buy', asset: 'ko', name: 'KO', assetType: 'stock', amount: 5, date: '2026-08-12' });
+    // Esperas explícitas: sat-01 el más antiguo, inv-b el más reciente (aunque su rango sea el más largo)
+    [...sats, 'inv-b'].forEach((uid, i) => {
+      mockStore.docs.get(`portfolioPerformance/${uid}`)._stale.pendienteDesde = `2026-11-${String(i + 1).padStart(2, '0')}T12:00:00.000Z`;
+    });
     const queue = [...sats, 'inv-b'].map((uid) => ({ uid, since: staleOf(uid).since }));
-    const expectedOrder = queue.slice().sort((x, y) => (x.since < y.since ? 1 : -1)).map((q) => q.uid);
+    const expectedOrder = [...sats, 'inv-b'];
 
     const { tramos } = await run({ n: 1, timeBudgetMs: 150000 });
 

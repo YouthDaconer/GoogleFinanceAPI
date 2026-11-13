@@ -16,7 +16,7 @@
  * @see platform-docs/stories/7-solo-consulta-sus-propias-cifras/refinamiento.md (T6)
  */
 
-const { execSync } = require('child_process');
+const { tokenDeAcceso, llamar, esperar } = require('./gcpMonitoringApi');
 const {
   PROYECTO,
   NOMBRE_METRICA,
@@ -60,35 +60,6 @@ function parseArgs(argv) {
   }
   return args;
 }
-
-// ============================================================================
-// API
-// ============================================================================
-
-function tokenDeAcceso() {
-  return execSync('gcloud auth print-access-token', { encoding: 'utf8' }).trim();
-}
-
-async function llamar(token, metodo, url, cuerpo) {
-  const respuesta = await fetch(url, {
-    method: metodo,
-    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-    body: cuerpo ? JSON.stringify(cuerpo) : undefined,
-  });
-  const texto = await respuesta.text();
-  const json = texto ? JSON.parse(texto) : {};
-  // Un 404 solo es una respuesta válida en una lectura («no existe todavía»). En
-  // una escritura es un fallo: así se perdió en silencio la alerta por origen el
-  // 2026-11-12 (Monitoring aún no veía la métrica recién creada y respondió 404).
-  const ausenciaEsperada = metodo === 'GET' && respuesta.status === 404;
-  if (!respuesta.ok && !ausenciaEsperada) {
-    const mensaje = json.error ? json.error.message : texto;
-    throw new Error(`${metodo} ${url} → ${respuesta.status}: ${mensaje}`);
-  }
-  return { status: respuesta.status, json };
-}
-
-const esperar = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // ============================================================================
 // MAIN

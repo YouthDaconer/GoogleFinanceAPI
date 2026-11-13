@@ -97,6 +97,10 @@ async function isRetroactiveTransaction(transactionDate, userId) {
  * mueve hacia atrás y se rehace desde ella; una posterior no lo mueve y entra
  * cuando la corrección llegue a su fecha. Ya no hay recorte: sin `truncated`.
  * @see platform-docs/stories/6.8.1-historial-corregido-por-tramos/historia.md
+ *
+ * HU 6.8.2: conserva `pendienteDesde` (la primera marca), `retryCount`,
+ * `intentos` y el tramo en curso (`enCurso`).
+ * @see platform-docs/stories/6.8.2-nadie-bloquea-correccion-nocturna/refinamiento.md (T5)
  * 
  * @param {string} userId - ID del usuario
  * @param {string} transactionDate - Fecha de la transacción retroactiva (YYYY-MM-DD o ISO)
@@ -130,15 +134,25 @@ async function markPerformanceAsStale(userId, transactionDate, metadata = {}) {
         newSince = currentStale.since;
       }
       
+      const registeredAt = new Date().toISOString();
       const staleData = {
         since: newSince,
         reason: metadata.reason || 'retroactive_transaction',
         transactionType: metadata.transactionType || 'unknown',
         portfolioAccount: metadata.portfolioAccount || null,
-        registeredAt: new Date().toISOString(),
-        // Resetear retryCount si estamos actualizando con nueva info
-        retryCount: currentStale?.retryCount || 0
+        registeredAt,
+        // HU 6.8.2 (RN-6.8-P): desde cuándo espera es la PRIMERA marca; una
+        // operación nueva no lo manda al final de la cola. Las marcas
+        // anteriores a esta HU no lo tienen: su espera es su `registeredAt`.
+        pendienteDesde: currentStale?.pendienteDesde || currentStale?.registeredAt || registeredAt,
+        // RN-6.8.2-J: solo una noche con avance reinicia la cuenta; una
+        // operación nueva no borra los intentos sin avance ni su motivo
+        retryCount: currentStale?.retryCount || 0,
+        intentos: Array.isArray(currentStale?.intentos) ? currentStale.intentos : [],
       };
+      // Un tramo en curso en este momento lo verá como marca movida y deshará
+      // su intento (reconcileStalePerformance.corregirTramo)
+      if (currentStale?.enCurso) staleData.enCurso = currentStale.enCurso;
       
       transaction.update(perfRef, { _stale: staleData });
     });
