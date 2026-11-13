@@ -46,7 +46,11 @@ app.use((req, res, next) => {
 // Configurar CORS
 const corsOptions = {
   origin: ["https://portastock.net", "https://www.portastock.net", "https://portafolio-inversiones.web.app", "https://portafolio-inversiones.firebaseapp.com", "http://localhost:3000", "http://localhost:3001"],
-  optionsSuccessStatus: 200
+  optionsSuccessStatus: 200,
+  // HU 7 (RN-7-E): las consultas con datos de un inversor llevan ahora
+  // `Authorization`, que obliga al navegador a una petición previa (preflight).
+  // Cachearla 2 h (el tope de Chrome) evita sumar un viaje en cada consulta.
+  maxAge: 7200
 };
 
 // SEC-AUDIT-002: C-MED-03 - Helper para sanitizar errores sin exponer detalles internos
@@ -96,6 +100,35 @@ app.use((req, res, next) => {
     next();
   } else {
     demoApiLimiter(req, res, next);
+  }
+});
+
+// =============================================================================
+// HU 7 — Toda ruta exige sesión salvo las abiertas por decisión (RN-7-F)
+// =============================================================================
+// Va DESPUÉS del limitador y ANTES de todas las rutas: una ruta registrada antes
+// de esta línea quedaría fuera del guardia (la auditoría lo detecta). Las abiertas
+// están en config/publicHttpRoutes.js, cada una con su decisión; el resto sólo
+// responde al dueño de la sesión o al sistema con su token de servicio (RN-7-I).
+// La X-API-Key de arriba sólo exime del limitador: no da acceso a cifras (RN-7-B).
+// @see platform-docs/stories/7-solo-consulta-sus-propias-cifras/refinamiento.md (T4)
+const { crearGuardiaInversor, DEPENDENCIAS_PRODUCCION, RESPUESTA_RECHAZO } = require('./utils/investorSession');
+const { buscarRutaAbierta, tieneDecision, rutaRegistradaEn } = require('./config/publicHttpRoutes');
+
+const guardiaInversor = crearGuardiaInversor({
+  ...DEPENDENCIAS_PRODUCCION,
+  esRutaRegistrada: (req) => rutaRegistradaEn(app, req.method, req.path),
+});
+
+app.use(async function guardiaConsultasInversor(req, res, next) {
+  const abierta = buscarRutaAbierta(req.method, req.path);
+  if (abierta && tieneDecision(abierta)) return next();
+  // Express 4 no captura promesas rechazadas: un fallo inesperado del guardia va
+  // al manejador de errores (500, sin datos) en lugar de dejar la petición colgada.
+  try {
+    return await guardiaInversor(req, res, next);
+  } catch (error) {
+    return next(error);
   }
 });
 
@@ -1226,8 +1259,11 @@ const {
  * INTRADAY-001: Ahora incluye rendimiento intraday en tiempo real por defecto.
  * FEAT-UX-001: Ahora acepta startDate/endDate opcionales para rangos exactos.
  * 
+ * HU 7: el inversor lo fija el guardia (`req.investorUid`): el dueño de la
+ * sesión, o el que indique el sistema con su token de servicio.
+ *
  * Query params:
- * - userId: (required) ID del usuario
+ * - userId: (opcional) Solo puede ser el del dueño de la sesión; obligatorio para el sistema
  * - period: Período de análisis ('YTD', '1M', '3M', '6M', '1Y', '2Y', 'ALL')
  * - startDate: (optional) Fecha inicio explícita (YYYY-MM-DD). Sobreescribe period.
  * - endDate: (optional) Fecha fin explícita (YYYY-MM-DD). Default: hoy.
@@ -1239,9 +1275,9 @@ const {
  * - includeIntraday: (optional) Incluir rendimiento intraday (default: 'true')
  */
 app.get("/attribution", async (req, res) => {
-  const { 
-    userId, 
-    period = 'YTD', 
+  const userId = req.investorUid;
+  const {
+    period = 'YTD',
     startDate: startDateParam,
     endDate: endDateParam,
     currency = 'USD',
@@ -1255,11 +1291,8 @@ app.get("/attribution", async (req, res) => {
   } = req.query;
 
   try {
-    if (!userId) {
-      return res.status(400).json({
-        error: "Por favor, proporcione el parámetro userId"
-      });
-    }
+    // HU 7: sin inversor fijado por el guardia no se lee nada (RN-7-C).
+    if (!userId) return res.status(401).json(RESPUESTA_RECHAZO);
 
     // FEAT-UX-001: Construir dateRange si se proporcionan fechas explícitas
     let dateRange = undefined;
@@ -1318,20 +1351,17 @@ app.get("/attribution", async (req, res) => {
  * - topN: Número de contributors a retornar (default: 5)
  */
 app.get("/attribution/top", async (req, res) => {
-  const { 
-    userId, 
-    period = 'YTD', 
+  const userId = req.investorUid;
+  const {
+    period = 'YTD',
     currency = 'USD',
     topN = '5'
   } = req.query;
-  
+
   try {
-    if (!userId) {
-      return res.status(400).json({
-        error: "Por favor, proporcione el parámetro userId"
-      });
-    }
-    
+    // HU 7: sin inversor fijado por el guardia no se lee nada (RN-7-C).
+    if (!userId) return res.status(401).json(RESPUESTA_RECHAZO);
+
     const result = await getTopContributors({
       userId,
       period,
@@ -1364,15 +1394,12 @@ app.get("/attribution/top", async (req, res) => {
  * - userId: (required) ID del usuario
  */
 app.get("/attribution/check", async (req, res) => {
-  const { userId } = req.query;
-  
+  const userId = req.investorUid;
+
   try {
-    if (!userId) {
-      return res.status(400).json({
-        error: "Por favor, proporcione el parámetro userId"
-      });
-    }
-    
+    // HU 7: sin inversor fijado por el guardia no se lee nada (RN-7-C).
+    if (!userId) return res.status(401).json(RESPUESTA_RECHAZO);
+
     const result = await checkAttributionAvailability(userId);
     res.status(200).json(result);
     
@@ -1403,8 +1430,8 @@ const { buildRiskCacheKey, getCachedRiskMetrics, setCachedRiskMetrics } = requir
  *     parameters:
  *       - name: userId
  *         in: query
- *         required: true
- *         description: ID del usuario
+ *         required: false
+ *         description: HU 7 — solo el del dueño de la sesión (Bearer); obligatorio para el sistema (x-service-token)
  *         schema:
  *           type: string
  *       - name: period
@@ -1442,9 +1469,9 @@ const { buildRiskCacheKey, getCachedRiskMetrics, setCachedRiskMetrics } = requir
  *         description: Error interno
  */
 app.get("/risk-metrics", async (req, res) => {
-  const { 
-    userId, 
-    period = 'YTD', 
+  const userId = req.investorUid;
+  const {
+    period = 'YTD',
     currency = 'USD', 
     accountIds = '',
     requestId = `req_${Date.now()}`
@@ -1458,14 +1485,9 @@ app.get("/risk-metrics", async (req, res) => {
   });
   
   try {
-    if (!userId) {
-      return res.status(400).json({
-        success: false,
-        error: "MISSING_PARAM",
-        message: "Por favor, proporcione el parámetro userId"
-      });
-    }
-    
+    // HU 7: sin inversor fijado por el guardia no se lee nada (RN-7-C).
+    if (!userId) return res.status(401).json(RESPUESTA_RECHAZO);
+
     const validPeriods = ['1M', '3M', '6M', 'YTD', '1Y', '2Y', 'ALL'];
     if (!validPeriods.includes(period)) {
       return res.status(400).json({
@@ -1539,8 +1561,8 @@ const { getClosedPositions } = require('./services/closedPositions');
  *     parameters:
  *       - name: userId
  *         in: query
- *         required: true
- *         description: ID del usuario
+ *         required: false
+ *         description: HU 7 — solo el del dueño de la sesión (Bearer); obligatorio para el sistema (x-service-token)
  *       - name: accountIds
  *         in: query
  *         required: false
@@ -1590,8 +1612,8 @@ const { getClosedPositions } = require('./services/closedPositions');
  *         description: Error interno
  */
 app.get("/closed-positions", async (req, res) => {
-  const { 
-    userId, 
+  const userId = req.investorUid;
+  const {
     accountIds = '',
     startDate,
     endDate,
@@ -1612,18 +1634,13 @@ app.get("/closed-positions", async (req, res) => {
   });
   
   try {
-    if (!userId) {
-      return res.status(400).json({
-        success: false,
-        error: "MISSING_PARAM",
-        message: "Por favor, proporcione el parámetro userId"
-      });
-    }
-    
+    // HU 7: sin inversor fijado por el guardia no se lee nada (RN-7-C).
+    if (!userId) return res.status(401).json(RESPUESTA_RECHAZO);
+
     const parsedAccountIds = accountIds
       ? accountIds.split(',').map(id => id.trim()).filter(Boolean)
       : [];
-    
+
     const parsedTickers = tickers
       ? tickers.split(',').map(t => t.trim()).filter(Boolean)
       : [];

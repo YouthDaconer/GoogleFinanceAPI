@@ -3,17 +3,23 @@
  * 
  * Ejecutar con: node tests/testRiskMetricsEndpoint.js
  * Requiere: Usuario válido en Firebase
+ *
+ * HU 7: la ruta ya no responde sin credenciales. Este script se identifica como
+ * el sistema (RN-7-I) con el token de servicio: CF_SERVICE_TOKEN=<secreto>.
  */
 
 const BASE_URL = process.env.API_URL || 'http://localhost:5001/portafolio-inversiones/us-central1/app';
+const SERVICE_HEADERS = process.env.CF_SERVICE_TOKEN
+  ? { 'x-service-token': process.env.CF_SERVICE_TOKEN.trim() }
+  : {};
 
 async function testEndpoint(name, url, expectedStatus = 200) {
   try {
     console.log(`\n🧪 Test: ${name}`);
     console.log(`   URL: ${url}`);
-    
+
     const start = Date.now();
-    const response = await fetch(url);
+    const response = await fetch(url, { headers: SERVICE_HEADERS });
     const duration = Date.now() - start;
     
     const data = await response.json();
