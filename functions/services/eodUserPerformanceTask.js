@@ -44,6 +44,7 @@ const {
   setModuleLogger,
 } = require('./unifiedMarketDataUpdate');
 const { chunkArray } = require('./backfillCoreModule');
+const { cargarLotesVendidos } = require('./eod/soldLotsService');
 const { queryWindowStart, queryBounds } = require('../utils/flowWindow');
 const { deleteInSmallBatches } = require('../utils/firestoreDeletes');
 const { crearLoggerDeConsola } = require('../utils/logger');
@@ -200,19 +201,14 @@ async function cargarDatosDelInversor(db, userId, formattedDate) {
     snapshot.docs.forEach((d) => activeAssets.push({ id: d.id, ...d.data() }));
   }
 
-  const inactiveAssets = [];
-  if (assetIdsInSellTransactions.length > 0) {
-    for (const lote of lotes) {
-      const snapshot = await db.collection('assets')
-        .where('portfolioAccount', 'in', lote)
-        .where('isActive', '==', false)
-        .get();
-      snapshot.docs
-        .map((d) => ({ id: d.id, ...d.data() }))
-        .filter((asset) => assetIdsInSellTransactions.includes(asset.id))
-        .forEach((asset) => inactiveAssets.push(asset));
-    }
-  }
+  // HU 6.9.3: sólo los lotes de sus ventas de la ventana, no todos los que el
+  // inversor vendió alguna vez (RN-6.9.3-J); sin ventas, ninguno.
+  const { activos: inactiveAssets } = await cargarLotesVendidos({
+    db,
+    assetIds: assetIdsInSellTransactions,
+    lotesDeCuentas: lotes,
+    etiqueta: `${userId} ${formattedDate}`,
+  });
 
   const allAssets = [...activeAssets, ...inactiveAssets];
 

@@ -14,6 +14,8 @@
  * - **Escenario 1**: queda constancia de cuántos se procesaron.
  * - **Escenario 3**: un inversor que falla no arrastra a los demás.
  * - **T2**: el día que se cierra llega como parámetro y se puede relanzar.
+ * - **HU 6.9.3 (RN-6.9.3-J)**: con una venta, el cierre lee por identificador sólo
+ *   el lote de esa venta y escribe lo mismo que con la lectura de siempre.
  *
  * @see platform-docs/stories/6.3-cierre-nocturno-termina-siempre/refinamiento.md (T2, T9, D8)
  */
@@ -149,6 +151,9 @@ const divisa = (code, exchangeRate) => ({ id: code, code, exchangeRate, isActive
  */
 const crearDb = ({ cuentas = [], activos = [], inactivos = [], movimientos = [] } = {}) => {
   const escrito = new Map();
+  // HU 6.9.3: qué consultas y qué lecturas por identificador hizo el cierre
+  const consultas = [];
+  const pedidosPorId = [];
 
   const resultado = (items) => ({
     docs: items.map((d) => ({
@@ -165,6 +170,7 @@ const crearDb = ({ cuentas = [], activos = [], inactivos = [], movimientos = [] 
     orderBy: () => consulta(coleccion, filtros),
     limit: () => consulta(coleccion, filtros),
     get: async () => {
+      consultas.push({ coleccion, filtros });
       if (coleccion === 'portfolioAccounts') {
         const porUsuario = filtros.find(([c]) => c === 'userId');
         return resultado(porUsuario ? cuentas.filter((c) => c.userId === porUsuario[1]) : cuentas);
@@ -201,6 +207,13 @@ const crearDb = ({ cuentas = [], activos = [], inactivos = [], movimientos = [] 
 
   return {
     collection: (nombre) => ({ ...consulta(nombre, []), doc: (id) => crearDoc(`${nombre}/${id}`) }),
+    getAll: async (...refs) => {
+      pedidosPorId.push(refs.map((ref) => ref.id));
+      return refs.map((ref) => {
+        const activo = [...activos, ...inactivos].find((a) => a.id === ref.id);
+        return { id: ref.id, exists: !!activo, data: () => activo };
+      });
+    },
     batch: () => {
       const pendientes = [];
       return {
@@ -214,6 +227,8 @@ const crearDb = ({ cuentas = [], activos = [], inactivos = [], movimientos = [] 
       };
     },
     _escrito: escrito,
+    _consultas: consultas,
+    _pedidosPorId: pedidosPorId,
   };
 };
 
@@ -349,5 +364,66 @@ describe('Las cifras del cierre repartido son idénticas al céntimo (HU 6.3, RN
       const ruta = `portfolioPerformance/u1/accounts/${accountId}/dates/${FECHA}`;
       expect(dbRepartido._escrito.get(ruta)).toEqual(dbActual._escrito.get(ruta));
     }
+  });
+});
+
+describe('HU 6.9.3 — el cierre busca sólo los lotes de las ventas del día (RN-6.9.3-J, RN-6-A)', () => {
+  /** Una venta del día que cierra un lote de u1, y la historia de lotes vendidos de la plataforma. */
+  const escenarioConVenta = () => ({
+    cuentas: [cuenta('acc-1', 'u1'), cuenta('acc-2', 'u2')],
+    activos: [activo('asset-1', 'acc-1', { units: 13, unitValue: 97.33 }), activo('asset-2', 'acc-2', { name: 'MSFT' })],
+    inactivos: [
+      activo('lote-vendido-hoy', 'acc-1', { isActive: false, units: 4, unitValue: 150.25 }),
+      ...Array.from({ length: 60 }, (_, i) => activo(`lote-historia-${i}`, i % 2 ? 'acc-1' : 'acc-2', { isActive: false, units: 0 })),
+    ],
+    movimientos: [{
+      id: 'tx-venta', type: 'sell', assetId: 'lote-vendido-hoy', portfolioAccountId: 'acc-1',
+      amount: 4, price: 231.47, currency: 'USD', date: `${FECHA}T15:30:00.000Z`,
+    }],
+  });
+
+  const consultasDeVendidos = (db) => db._consultas
+    .filter((c) => c.coleccion === 'assets' && c.filtros.some(([campo, valor]) => campo === 'isActive' && valor === false));
+
+  afterEach(() => { delete process.env.SCOPED_READS_ENABLED; });
+
+  it('con una venta lee por identificador sólo su lote, no todos los vendidos de la plataforma', async () => {
+    const db = crearDb(escenarioConVenta());
+
+    await calculateDailyPortfolioPerformance(db, PRECIOS, DIVISAS, { formattedDate: FECHA });
+
+    expect(consultasDeVendidos(db)).toEqual([]);
+    expect(db._pedidosPorId).toEqual([['lote-vendido-hoy']]);
+    // El lote vendido llega al cálculo de su cuenta, como antes
+    const lotesCalculados = calculateAccountPerformance.mock.calls.flatMap(([assets]) => assets.map((a) => a.id));
+    expect(lotesCalculados).toContain('lote-vendido-hoy');
+  });
+
+  it('escribe exactamente los mismos documentos que con la lectura de siempre', async () => {
+    process.env.SCOPED_READS_ENABLED = 'false';
+    const dbDeSiempre = crearDb(escenarioConVenta());
+    await calculateDailyPortfolioPerformance(dbDeSiempre, PRECIOS, DIVISAS, { formattedDate: FECHA });
+    expect(consultasDeVendidos(dbDeSiempre)).toHaveLength(1); // la de siempre: todos los vendidos
+
+    delete process.env.SCOPED_READS_ENABLED;
+    const dbAcotada = crearDb(escenarioConVenta());
+    await calculateDailyPortfolioPerformance(dbAcotada, PRECIOS, DIVISAS, { formattedDate: FECHA });
+
+    expect(docsDeRendimiento(dbAcotada)).toEqual(docsDeRendimiento(dbDeSiempre));
+    expect(docsDeRendimiento(dbAcotada).length).toBeGreaterThan(0);
+  });
+
+  it('una noche sólo con compras no busca ningún lote vendido (Escenario 5, QA-02)', async () => {
+    const escenario = escenarioConVenta();
+    escenario.movimientos = [{
+      id: 'tx-compra', type: 'buy', assetId: 'asset-1', portfolioAccountId: 'acc-1',
+      amount: 5, price: 70.15, currency: 'USD', date: `${FECHA}T15:30:00.000Z`,
+    }];
+    const db = crearDb(escenario);
+
+    await calculateDailyPortfolioPerformance(db, PRECIOS, DIVISAS, { formattedDate: FECHA });
+
+    expect(consultasDeVendidos(db)).toEqual([]);
+    expect(db._pedidosPorId).toEqual([]);
   });
 });

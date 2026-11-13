@@ -141,6 +141,24 @@
       "queryScope": "COLLECTION",
       "fields": [
         {
+          "fieldPath": "portfolioAccountId",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "type",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "date",
+          "order": "ASCENDING"
+        }
+      ]
+    },
+    {
+      "collectionGroup": "transactions",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
           "fieldPath": "assetId",
           "order": "ASCENDING"
         },

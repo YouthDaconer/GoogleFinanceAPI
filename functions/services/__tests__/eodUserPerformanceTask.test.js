@@ -85,6 +85,9 @@ const cotizacion = (symbol, price) => ({ symbol, price, regularMarketPrice: pric
 /** Firestore de mentira: devuelve por colección lo que el test le pone. */
 const crearDb = ({ cuentas = [], activos = [], inactivos = [], movimientos = [], snapshots = [] } = {}) => {
   const borrados = [];
+  // HU 6.9.3: qué consultas y qué lecturas por identificador hizo la tarea
+  const consultas = [];
+  const pedidosPorId = [];
 
   const resultado = (docs) => ({
     docs: docs.map((d) => ({ id: d.id, data: () => d, ref: { id: d.id } })),
@@ -95,6 +98,7 @@ const crearDb = ({ cuentas = [], activos = [], inactivos = [], movimientos = [],
   const query = (coleccion, filtros) => ({
     where: (campo, _op, valor) => query(coleccion, [...filtros, [campo, valor]]),
     get: async () => {
+      consultas.push({ coleccion, filtros });
       if (coleccion === 'portfolioAccounts') return resultado(cuentas);
       if (coleccion === 'transactions') return resultado(movimientos);
       if (coleccion === 'performanceSnapshots') return resultado(snapshots);
@@ -111,11 +115,20 @@ const crearDb = ({ cuentas = [], activos = [], inactivos = [], movimientos = [],
       ...query(nombre, []),
       doc: (id) => ({ id, set: jest.fn().mockResolvedValue(undefined) }),
     }),
+    getAll: async (...refs) => {
+      pedidosPorId.push(refs.map((ref) => ref.id));
+      return refs.map((ref) => {
+        const activo = [...activos, ...inactivos].find((a) => a.id === ref.id);
+        return { id: ref.id, exists: !!activo, data: () => activo };
+      });
+    },
     batch: () => ({
       delete: (ref) => borrados.push(ref.id),
       commit: async () => undefined,
     }),
     _borrados: borrados,
+    _consultas: consultas,
+    _pedidosPorId: pedidosPorId,
   };
 };
 
@@ -273,6 +286,56 @@ describe('eodUserPerformanceTask — la carga es sólo de su inversor (HU 6.3, T
     expect(datos.todaysTransactions).toHaveLength(2); // las 2 cuentas caben en un solo lote de 30
     expect(datos.sellTransactions.every((t) => t.type === 'sell')).toBe(true);
     expect(datos.sellTransactionsByAccount['acc-1']).toBeDefined();
+  });
+
+  it('HU 6.9.3 — con una venta lee sólo el lote de esa venta, no todos los que el inversor vendió (RN-6.9.3-J)', async () => {
+    const escenario = () => ({
+      cuentas: [cuenta('acc-1'), cuenta('acc-2')],
+      activos: [activo('asset-1', 'acc-1'), activo('asset-2', 'acc-2')],
+      inactivos: [
+        activo('lote-vendido-hoy', 'acc-1', { isActive: false, units: 0 }),
+        activo('lote-de-2021', 'acc-1', { isActive: false, units: 0 }),
+        activo('lote-de-2023', 'acc-2', { isActive: false, units: 0 }),
+      ],
+      movimientos: [movimiento('tx-1'), movimiento('tx-2', { type: 'sell', assetId: 'lote-vendido-hoy' })],
+    });
+    const consultasDeVendidos = (db) => db._consultas
+      .filter((c) => c.coleccion === 'assets' && c.filtros.some(([campo, valor]) => campo === 'isActive' && valor === false));
+
+    const db = crearDb(escenario());
+    const datos = await cargarDatosDelInversor(db, 'u1', '2026-10-20');
+
+    expect(consultasDeVendidos(db)).toEqual([]);
+    expect(db._pedidosPorId).toEqual([['lote-vendido-hoy']]);
+    expect(datos.inactiveAssets.map((a) => a.id)).toEqual(['lote-vendido-hoy']);
+    expect(datos.assetsToInclude.map((a) => a.id)).toEqual(['asset-1', 'asset-2', 'lote-vendido-hoy']);
+
+    // Lo mismo que con la lectura de siempre (RN-6-A)
+    process.env.SCOPED_READS_ENABLED = 'false';
+    try {
+      const dbDeSiempre = crearDb(escenario());
+      const deSiempre = await cargarDatosDelInversor(dbDeSiempre, 'u1', '2026-10-20');
+      expect(consultasDeVendidos(dbDeSiempre)).toHaveLength(1);
+      expect(datos.inactiveAssets).toEqual(deSiempre.inactiveAssets);
+      expect(datos.assetsToInclude).toEqual(deSiempre.assetsToInclude);
+    } finally {
+      delete process.env.SCOPED_READS_ENABLED;
+    }
+  });
+
+  it('HU 6.9.3 — sin ventas no busca ningún lote vendido (Escenario 5)', async () => {
+    const db = crearDb({
+      cuentas: [cuenta('acc-1')],
+      activos: [activo('asset-1', 'acc-1')],
+      inactivos: [activo('lote-de-2021', 'acc-1', { isActive: false })],
+      movimientos: [movimiento('tx-1')],
+    });
+
+    const datos = await cargarDatosDelInversor(db, 'u1', '2026-10-20');
+
+    expect(datos.inactiveAssets).toEqual([]);
+    expect(db._pedidosPorId).toEqual([]);
+    expect(db._consultas.filter((c) => c.coleccion === 'assets' && c.filtros.some(([campo, valor]) => campo === 'isActive' && valor === false))).toEqual([]);
   });
 
   it('un inversor sin cuentas activas no provoca ninguna lectura más', async () => {

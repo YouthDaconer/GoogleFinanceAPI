@@ -341,8 +341,18 @@ describe('Escenario 1 — la configuración canónica de este repositorio', () =
 
   const canonica = JSON.parse(fs.readFileSync(RUTA_CANONICO, 'utf8'));
 
-  it('declara las 34 entradas activas en producción (RN-6.1-J)', () => {
-    expect(canonica.indexes).toHaveLength(34);
+  it('declara las 34 entradas de la HU 6.1 (RN-6.1-J) más la de los dividendos del periodo (HU 6.9.3)', () => {
+    expect(canonica.indexes).toHaveLength(35);
+  });
+
+  it('declara el índice de los dividendos del periodo de la atribución (HU 6.9.3, RN-6.9.3-K)', () => {
+    // Sin él, la consulta acotada de dividendos responde FAILED_PRECONDITION y
+    // la atribución vuelve a leer todos los dividendos de cada cuenta.
+    const claves = canonica.indexes.map(normalizarIndice);
+
+    expect(claves).toContain(normalizarIndice(indice({
+      fields: [campo('portfolioAccountId'), campo('type'), campo('date')],
+    })));
   });
 
   it('declara el índice del que depende la reconciliación nocturna (Escenario 4)', () => {

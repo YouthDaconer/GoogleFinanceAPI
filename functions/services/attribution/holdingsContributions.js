@@ -31,6 +31,8 @@
 
 const carve = require('../../utils/carveOutReturns');
 const holdings = require('../../utils/holdingsAttribution');
+const { queryBounds } = require('../../utils/flowWindow');
+const { AREAS, leerAcotado, ordenarPorId, describirMedicion } = require('../../utils/scopedReads');
 const { getPeriodStartDate } = require('./types');
 
 /** Tiempo máximo para traer cierres y tasas; si se agota, se usa el precio implícito. */
@@ -181,22 +183,105 @@ async function loadActiveTickers(db, accountIds) {
   return tickers;
 }
 
-/** dividendPay de las cuentas con fecha posterior a la base. */
-async function loadDividendTransactions(db, accountIds, afterDate) {
+/**
+ * La lectura de siempre: TODOS los dividendPay de cada cuenta y, en memoria,
+ * los posteriores a la base.
+ */
+async function readAllDividends(db, accountIds, isAfterBase) {
   const snapshots = await Promise.all(accountIds.map((accId) =>
     db.collection('transactions')
       .where('portfolioAccountId', '==', accId)
       .where('type', '==', 'dividendPay')
       .get()
   ));
-  const txs = [];
+  const docs = [];
+  let lecturas = 0;
   for (const snapshot of snapshots) {
+    lecturas += snapshot.docs.length;
     for (const doc of snapshot.docs) {
       const tx = doc.data() || {};
-      if (typeof tx.date === 'string' && tx.date.slice(0, 10) > afterDate) txs.push(tx);
+      if (isAfterBase(tx)) docs.push({ id: doc.id, valor: tx });
     }
   }
-  return txs;
+  return { docs, lecturas };
+}
+
+/**
+ * HU 6.9.3 — La lectura acotada: sólo los dividendPay del periodo, por rango
+ * sobre el `date` de texto (índice portfolioAccountId + type + date).
+ *
+ * Los límites son los de `queryBounds`, los mismos del cierre nocturno
+ * (FIX-TIMESTAMP-002). El inferior, `base + 'T23:59:59.999Z'`, deja pasar todo
+ * lo que el filtro de siempre acepta (`date.slice(0, 10) > base`), sea fecha
+ * sola o ISO con hora. Después se aplica en memoria el mismo filtro y se ordena
+ * por identificador, como devolvía la consulta de siempre.
+ */
+async function readPeriodDividends(db, accountIds, afterDate, untilDate, isInPeriod) {
+  const { after, until } = queryBounds(afterDate, untilDate || afterDate);
+  const snapshots = await Promise.all(accountIds.map((accId) => {
+    let query = db.collection('transactions')
+      .where('portfolioAccountId', '==', accId)
+      .where('type', '==', 'dividendPay')
+      .where('date', '>', after);
+    if (untilDate) query = query.where('date', '<=', until);
+    return query.get();
+  }));
+  const docs = [];
+  let lecturas = 0;
+  for (const snapshot of snapshots) {
+    lecturas += snapshot.docs.length;
+    const ofAccount = [];
+    for (const doc of snapshot.docs) {
+      const tx = doc.data() || {};
+      if (isInPeriod(tx)) ofAccount.push({ id: doc.id, valor: tx });
+    }
+    docs.push(...ordenarPorId(ofAccount));
+  }
+  return { docs, lecturas };
+}
+
+/**
+ * dividendPay de las cuentas con fecha en (afterDate, untilDate].
+ *
+ * HU 6.9.3 (RN-6.9.3-K, RN-6.9-N): se leen sólo los del periodo consultado.
+ * Antes se leían todos los de cada cuenta, fuera cual fuera el periodo. Los
+ * importes no cambian: sólo cuentan los dividendos entre dos cierres del
+ * periodo (`dividendsBetween`), y esos son exactamente los que se leen. Con un
+ * rango sin fin (los periodos hasta hoy) el conjunto es idéntico al de antes.
+ * Con un fin, se dejan de leer los posteriores, que nunca movían una cifra.
+ *
+ * @param {FirebaseFirestore.Firestore} db
+ * @param {string[]} accountIds
+ * @param {string} afterDate - Fecha de la base (exclusiva), `YYYY-MM-DD`
+ * @param {string|null} [untilDate] - Fin del rango (inclusivo); null = sin fin
+ * @returns {Promise<{txs: Object[], lecturas: number, modo: string, medicion: string,
+ *   lecturasCompleta?: number, lecturasAcotada?: number, diferencias?: Object}>} Los
+ *   tres últimos campos sólo llegan en verificación
+ * @see platform-docs/stories/6.9.3-solo-periodo-y-ventas-del-dia/refinamiento.md (T4)
+ */
+async function loadDividendTransactions(db, accountIds, afterDate, untilDate = null) {
+  const isAfterBase = (tx) => typeof tx.date === 'string' && tx.date.slice(0, 10) > afterDate;
+  const isInPeriod = (tx) => isAfterBase(tx) && (!untilDate || tx.date.slice(0, 10) <= untilDate);
+
+  const resultado = await leerAcotado({
+    area: AREAS.DIVIDENDOS,
+    acotada: () => readPeriodDividends(db, accountIds, afterDate, untilDate, isInPeriod),
+    completa: () => readAllDividends(db, accountIds, isAfterBase),
+    // La de siempre traía también los posteriores al fin del rango: se comparan
+    // sólo los que el cálculo puede usar.
+    comparable: (docs) => docs.filter((d) => isInPeriod(d.valor)),
+  });
+
+  return {
+    txs: resultado.docs.map((d) => d.valor),
+    lecturas: resultado.lecturas,
+    modo: resultado.modo,
+    medicion: describirMedicion(resultado),
+    // Sólo en verificación (RN-6-I)
+    lecturasCompleta: resultado.lecturasCompleta,
+    lecturasAcotada: resultado.lecturasAcotada,
+    diferencias: resultado.diferencias,
+  };
 }
 
 /**
@@ -343,11 +428,13 @@ async function calculateHoldingsContributions(params, deps = null) {
   const baseDate = days[0].date;
   const tickers = carve.collectHeldTickers(days, new Set());
 
-  const [activeTickers, dividendTxs, sellsByAsset] = await Promise.all([
+  // HU 6.9.3: dividendos sólo del periodo (base, fin] (RN-6.9.3-K)
+  const [activeTickers, dividendRead, sellsByAsset] = await Promise.all([
     loadActiveTickers(d.db, accounts.accountIds),
-    loadDividendTransactions(d.db, accounts.accountIds, baseDate),
+    loadDividendTransactions(d.db, accounts.accountIds, baseDate, endStr),
     d.getSellTransactionsInPeriod(userId, periodStartDate, periodEndDate, accounts.accountIds, currency),
   ]);
+  const dividendTxs = dividendRead.txs;
   t = lap('transactions', t);
 
   const market = await loadMarketData({ tickers, currency, dividendTxs, firstDate: baseDate, deps: d });
@@ -429,6 +516,7 @@ async function calculateHoldingsContributions(params, deps = null) {
   console.log(`[AttributionHoldings] user=${userId} series=${accounts.seriesIds.join(',')} ${currency} ${startStr}..${endStr || 'hoy'} `
     + `dias=${days.length} pasos=${result.coverage.steps} TWR=${result.twr.toFixed(2)}% activos=${attributions.length} `
     + `precios mercado/implicito/sin=${result.coverage.marketReturns}/${result.coverage.impliedReturns}/${result.coverage.missingReturns} `
+    + `dividendos=${dividendTxs.length}, ${dividendRead.medicion} `
     + `${market.timedOut ? 'PRESUPUESTO-AGOTADO ' : ''}${Date.now() - startedAt}ms ${JSON.stringify(timings)}`);
 
   return {
@@ -457,6 +545,9 @@ async function calculateHoldingsContributions(params, deps = null) {
       currenciesWithoutFx: market.fxNeeded.filter((c) => !market.fxSeriesByCurrency[c]),
       priceBudgetExhausted: market.timedOut,
       dividendsUnconverted: dividends.unconverted,
+      // HU 6.9.3 (RN-6-I): cuántos dividendos se leyeron y por qué camino
+      dividendDocsRead: dividendRead.lecturas,
+      dividendReadMode: dividendRead.modo,
       timingsMs: timings,
     },
     realizedPnL: {
@@ -472,6 +563,7 @@ module.exports = {
   PRICE_BUDGET_MS,
   // Exportados para test
   _resolveAccounts: resolveAccounts,
+  _loadDividendTransactions: loadDividendTransactions,
   _withTimeout: withTimeout,
   _getSeriesDays: getSeriesDays,
   _seriesCache: seriesCache,

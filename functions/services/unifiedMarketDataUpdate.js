@@ -57,6 +57,9 @@ const { getFunctions } = require('firebase-admin/functions');
 const { guardarSnapshotDelDia } = require('./eodMarketSnapshot');
 const eodProgress = require('./eodProgressService');
 
+// HU 6.9.3: los lotes vendidos se buscan sólo para las ventas del día
+const { cargarLotesVendidos } = require('./eod/soldLotsService');
+
 /**
  * HU 6.3 (D4) — El interruptor del reparto, **apagado por defecto**.
  *
@@ -1261,19 +1264,16 @@ async function calculateDailyPortfolioPerformance(db, currentPrices, currencies,
   logInfo(`📊 Transacciones para ${formattedDate}: ${todaysTransactions.length} total (${sellTransactions.length} ventas)`);
   logInfo(`📊 Datos de mercado: ${currentPrices.length} precios, ${currencies.length} currencies (fuente: API Lambda)`);
   
-  // Obtener activos inactivos involucrados en ventas
-  let inactiveAssets = [];
-  if (assetIdsInSellTransactions.length > 0) {
-    const inactiveAssetsSnapshot = await db.collection('assets')
-      .where('isActive', '==', false)
-      .get();
-    
-    inactiveAssets = inactiveAssetsSnapshot.docs
-      .map(doc => ({ id: doc.id, ...doc.data() }))
-      .filter(asset => assetIdsInSellTransactions.includes(asset.id));
-    
-    logDebug(`Obtenidos ${inactiveAssets.length} activos inactivos involucrados en ventas`);
-  }
+  // HU 6.9.3: sólo los lotes de las ventas de la ventana, por identificador.
+  // Antes se leían todos los lotes vendidos de la plataforma en cuanto había
+  // una venta (RN-6.9.3-J); sin ventas no se lee ninguno (Escenario 5).
+  // @see platform-docs/stories/6.9.3-solo-periodo-y-ventas-del-dia/refinamiento.md (T3)
+  const { activos: inactiveAssets } = await cargarLotesVendidos({
+    db,
+    assetIds: assetIdsInSellTransactions,
+    etiqueta: `proceso único ${formattedDate}`,
+  });
+  logDebug(`Obtenidos ${inactiveAssets.length} activos inactivos involucrados en ventas`);
   
   const allAssets = [...activeAssets, ...inactiveAssets];
   
