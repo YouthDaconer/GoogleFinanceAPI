@@ -705,6 +705,20 @@ exports.copilotAnalysisWorker = copilotAnalysisWorker;
 exports.scheduledCopilotWatchdog = scheduledCopilotWatchdog;
 
 /**
+ * HU 6.9.1: Las posiciones cerradas solo se recalculan si algo cambió.
+ *
+ * - transactionVersionOnWrite: sube `transactionVersions/{userId}.version` con
+ *   cada compra o venta que se crea, edita o borra, venga de donde venga. El
+ *   navegador reutiliza su copia de las transacciones mientras esa marca no
+ *   cambie (RN-6.9-J, RN-6.9.1-J, RN-6.9.1-K).
+ *
+ * @see platform-docs/stories/6.9.1-posiciones-cerradas-sin-recalculo/refinamiento.md
+ */
+const { transactionVersionOnWrite } = require('./services/closedPositions/transactionVersionTrigger');
+
+exports.transactionVersionOnWrite = transactionVersionOnWrite;
+
+/**
  * COST-OPT-002: Scheduled Functions para consolidación de períodos
  * 
  * - consolidateMonthlyPerformance: Día 1 de cada mes, 00:30 ET
