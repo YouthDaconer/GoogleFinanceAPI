@@ -66,6 +66,8 @@ const { buildExcludeSet } = require('../../utils/carveOutReturns');
 // PERF-SNAP-009: Importar generatePerformanceSnapshot para on-demand generation
 // PERF-SNAP-024: Importar generateAssetSnapshot para on-demand per-asset
 const { buildSnapshotDocId, generatePerformanceSnapshot, generateAssetSnapshot } = require('../snapshotGenerator');
+// HU 6.4: los resúmenes por activo se ponen al día al abrirlos, no cada noche.
+const { resumenesPorActivoBajoDemanda, ponerAlDiaResumenDeActivo } = require('../snapshots/assetSnapshotOnDemandService');
 
 // PERF-SNAP-021: Importar funciones de mercado para TTL inteligente
 const { isNYSEMarketOpen, calculateTTLUntilNextEOD, MARKET_CACHE_TTL_MS } = require('../riskMetrics/riskMetricsCache');
@@ -152,7 +154,9 @@ async function getSnapshotWithCache(snapshotId, userId, preloadedSignal) {
   if (lastSnapshotUpdate && data.lastUpdated &&
       new Date(lastSnapshotUpdate).getTime() > new Date(data.lastUpdated).getTime()) {
     console.log(`[SNAPSHOT-MISS] ${JSON.stringify({ snapshotId, userId, reason: 'stale', snapshotLastUpdated: data.lastUpdated, signalLastUpdate: lastSnapshotUpdate })}`);
-    return { data: null, lastSnapshotUpdate };
+    // HU 6.4: el resumen viejo se entrega aparte para ponerlo al día sin
+    // volver a leerlo. `data` sigue en null: nadie más cambia de comportamiento.
+    return { data: null, staleData: data, lastSnapshotUpdate };
   }
 
   snapshotMemCache.set(snapshotId, { data, cachedAt: Date.now() });
@@ -451,13 +455,15 @@ async function getHistoricalReturns(context, payload) {
 
     // PERF-SNAP-024: Per-asset snapshot read path (antes del bypass legacy)
     if (ticker && assetType && !forceRefresh) {
+      const inicioActivo = Date.now();
       const assetSnapshotId = buildSnapshotDocId(userId, accountId, currency, ticker, assetType);
       const assetSnapshotResult = await getSnapshotWithCache(assetSnapshotId, userId, signal);
       const assetSnapshot = assetSnapshotResult.data;
 
       if (assetSnapshot) {
         const result = transformSnapshotToResponse(assetSnapshot);
-        console.log(`[PERF] Asset snapshot hit - ${assetSnapshotId}`);
+        // HU 6.4 (RN-6.4-J): la duración de la segunda apertura en adelante.
+        console.log(`[PERF] Asset snapshot hit - ${assetSnapshotId} (${Date.now() - inicioActivo} ms)`);
 
         const now = new Date();
         return {
@@ -471,14 +477,28 @@ async function getHistoricalReturns(context, payload) {
 
       // OPT-FIRESTORE-002 P2-A: Await snapshot generation to avoid double-read with legacy.
       // Previously fire-and-forget + legacy read the same daily docs twice (~27K reads/mes).
-      console.log(`[PERF] Asset snapshot miss - ${assetSnapshotId}, generating on-demand`);
+      // HU 6.4: si el resumen existe pero está viejo, se pone al día con los días
+      // que le faltan (RN-6.4-K); si no existe, se prepara entero (Escenario 1).
+      const ponerAlDia = !!assetSnapshotResult.staleData && resumenesPorActivoBajoDemanda();
+      console.log(`[PERF] Asset snapshot miss - ${assetSnapshotId}, ${ponerAlDia ? 'catching up' : 'generating'} on-demand`);
       try {
-        const generatedSnapshot = await generateAssetSnapshot(db, userId, accountId, currency, ticker, assetType);
+        const generatedSnapshot = ponerAlDia
+          ? (await ponerAlDiaResumenDeActivo(db, {
+            userId,
+            accountId,
+            currency,
+            ticker,
+            assetType,
+            snapshot: assetSnapshotResult.staleData,
+            senal: assetSnapshotResult.lastSnapshotUpdate || null,
+          })).snapshot
+          : await generateAssetSnapshot(db, userId, accountId, currency, ticker, assetType);
         if (generatedSnapshot) {
           snapshotMemCache.set(assetSnapshotId, { data: generatedSnapshot, cachedAt: Date.now() });
           const result = transformSnapshotToResponse(generatedSnapshot);
           const now = new Date();
-          console.log(`[PERF] Asset snapshot generated on-demand - ${assetSnapshotId}`);
+          // HU 6.4 (RN-6.4-J): la duración de la primera apertura del día.
+          console.log(`[PERF] Asset snapshot generated on-demand - ${assetSnapshotId} (${Date.now() - inicioActivo} ms)`);
           return {
             ...result,
             cacheHit: false,

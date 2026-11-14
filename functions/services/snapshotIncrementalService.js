@@ -286,21 +286,49 @@ async function updateSnapshotIncremental(db, snapshotDocId, newDailyData, option
  */
 async function updateAssetSnapshotIncremental(db, snapshotDocId, newAssetData, date, options = {}) {
   const existingDoc = await db.doc(`performanceSnapshots/${snapshotDocId}`).get();
+  const snapshot = existingDoc.exists ? existingDoc.data() : null;
 
-  if (!existingDoc.exists || (existingDoc.data().schemaVersion || 0) < SCHEMA_VERSION_INCREMENTAL) {
-    return { updated: false, method: 'full-rebuild', reason: 'missing-or-old-schema' };
+  const result = aplicarDiaAResumenDeActivo(snapshot, newAssetData, date, { now: options.now });
+  if (result.method !== 'incremental') {
+    return { updated: result.method === 'skipped', method: result.method, reason: result.reason };
   }
 
-  const snapshot = existingDoc.data();
+  await db.doc(`performanceSnapshots/${snapshotDocId}`).set(result.snapshot);
+
+  return { updated: true, method: 'incremental' };
+}
+
+/**
+ * HU 6.4 — Un día del incremental de un resumen por activo, sin leer ni escribir.
+ *
+ * Es el cálculo que hacía `updateAssetSnapshotIncremental` cada noche, sacado a
+ * una función pura para que la noche y la apertura del activo usen **la misma**
+ * (RN-6.4-N: las cifras son las mismas se prepare de noche o al abrirlo).
+ *
+ * @param {Object|null} snapshot - Resumen actual (`null` si no existe)
+ * @param {Object|null} newAssetData - Datos del activo ese día (`null` = vendido)
+ * @param {string} date - Fecha ISO YYYY-MM-DD
+ * @param {Object} [options]
+ * @param {DateTime} [options.now] - "Ahora" con el que se recalculan los periodos
+ * @param {boolean} [options.sinTopeDeHueco] - Solo la apertura: añade el día
+ *   aunque el hueco supere `MAX_GAP_CALENDAR_DAYS`, porque lee todos los días
+ *   que faltan (refinamiento 6.4, decisión 5). La noche conserva el tope.
+ * @returns {{method: 'incremental'|'full-rebuild'|'skipped', reason?: string, snapshot?: Object}}
+ * @see platform-docs/stories/6.4-resumenes-activo-bajo-demanda/refinamiento.md (T1)
+ */
+function aplicarDiaAResumenDeActivo(snapshot, newAssetData, date, options = {}) {
+  if (!snapshot || (snapshot.schemaVersion || 0) < SCHEMA_VERSION_INCREMENTAL) {
+    return { method: 'full-rebuild', reason: 'missing-or-old-schema' };
+  }
 
   if (snapshot.lastDateInTimeline === date) {
-    return { updated: true, method: 'skipped', reason: 'already-current' };
+    return { method: 'skipped', reason: 'already-current' };
   }
 
-  if (snapshot.lastDateInTimeline) {
+  if (snapshot.lastDateInTimeline && !options.sinTopeDeHueco) {
     const gap = DateTime.fromISO(date).diff(DateTime.fromISO(snapshot.lastDateInTimeline), 'days').days;
     if (gap > MAX_GAP_CALENDAR_DAYS) {
-      return { updated: false, method: 'full-rebuild', reason: `gap-${Math.round(gap)}-days` };
+      return { method: 'full-rebuild', reason: `gap-${Math.round(gap)}-days` };
     }
   }
 
@@ -345,9 +373,7 @@ async function updateAssetSnapshotIncremental(db, snapshotDocId, newAssetData, d
     schemaVersion: SCHEMA_VERSION_INCREMENTAL,
   };
 
-  await db.doc(`performanceSnapshots/${snapshotDocId}`).set(updatedSnapshot);
-
-  return { updated: true, method: 'incremental' };
+  return { method: 'incremental', snapshot: updatedSnapshot };
 }
 
 // ============================================================================
@@ -503,6 +529,7 @@ module.exports = {
   // Core
   updateSnapshotIncremental,
   updateAssetSnapshotIncremental,
+  aplicarDiaAResumenDeActivo,
   computeReturnsFromTimeline,
 
   // Helpers (exported for testing)

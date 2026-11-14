@@ -1017,3 +1017,51 @@ describe("LATE-REG: red de seguridad en processUserPerformance", () => {
     expect(markPerformanceAsStale).not.toHaveBeenCalled();
   });
 });
+
+/**
+ * HU 6.4 — El cierre deja de rehacer los resúmenes por activo cada noche.
+ *
+ * @see platform-docs/stories/6.4-resumenes-activo-bajo-demanda/refinamiento.md (T5, T8e)
+ */
+describe('HU 6.4: el cierre no toca los resúmenes por activo (Escenario 3, RN-6-H)', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    delete process.env.ASSET_SNAPSHOTS_ON_DEMAND;
+    mockBatchCommit.mockResolvedValue(undefined);
+    mockDocGet.mockResolvedValue({ exists: true, data: () => ({}) });
+    mockUpdateSnapshotIncremental.mockResolvedValue({ updated: true, method: 'incremental' });
+    mockUpdateAssetSnapshotIncremental.mockResolvedValue({ updated: true, method: 'incremental' });
+  });
+
+  afterEach(() => {
+    delete process.env.ASSET_SNAPSHOTS_ON_DEMAND;
+  });
+
+  it('encendido por defecto: ni lee ni escribe ningún resumen por activo, y sí los de portafolio y cuentas', async () => {
+    const result = await processUserPerformance(buildBaseParams());
+
+    expect(result.success).toBe(true);
+    expect(mockUpdateAssetSnapshotIncremental).not.toHaveBeenCalled();
+    expect(mockGenerateAssetSnapshot).not.toHaveBeenCalled();
+    // overall + 2 cuentas, en USD
+    expect(mockUpdateSnapshotIncremental.mock.calls.map((c) => c[1])).toEqual([
+      'user-1_USD', 'user-1_account-1_USD', 'user-1_account-2_USD',
+    ]);
+  });
+
+  it('la señal del cierre se sigue escribiendo: es la que da por viejos los resúmenes al abrirlos', async () => {
+    await processUserPerformance(buildBaseParams());
+
+    expect(mockDocSet).toHaveBeenCalledWith({ lastSnapshotUpdate: expect.any(String) }, { merge: true });
+  });
+
+  it('con ASSET_SNAPSHOTS_ON_DEMAND=false vuelve el comportamiento de siempre (RN-6-H)', async () => {
+    process.env.ASSET_SNAPSHOTS_ON_DEMAND = 'false';
+
+    await processUserPerformance(buildBaseParams());
+
+    expect(mockUpdateAssetSnapshotIncremental.mock.calls.map((c) => c[1])).toEqual([
+      'user-1_AAPL_stock_USD', 'user-1_GOOGL_stock_USD',
+    ]);
+  });
+});

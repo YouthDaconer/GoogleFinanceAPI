@@ -11,6 +11,7 @@
  */
 
 const { DateTime } = require('luxon');
+const { FieldPath } = require('firebase-admin/firestore');
 const {
   calculatePeriodBoundaries,
   initializePeriodFactors,
@@ -53,6 +54,62 @@ async function fetchAllDailyDocs(db, userId, accountId) {
     : `portfolioPerformance/${userId}/accounts/${accountId}/dates`;
 
   const snapshot = await db.collection(basePath)
+    .orderBy('date', 'asc')
+    .get();
+
+  return snapshot.docs;
+}
+
+/**
+ * HU 6.4 — Los documentos diarios con **solo** la fecha y los campos de un activo.
+ *
+ * Cada documento diario guarda todos los activos en todas las monedas (~75 KB):
+ * rehacer el resumen de un activo del inversor más grande leía 559 documentos y
+ * ~42 MB, entre 5 y 8 s (medido el 2026-11-14). Pidiendo solo `date` y
+ * `<moneda>.assetPerformance.<activo>` son las mismas lecturas y ~100 KB.
+ *
+ * Devuelve también los días sin el activo (solo con `date`): así
+ * `buildAssetDailyTimeline` sigue viendo la venta y la recompra. El resumen sale
+ * idéntico al de los documentos completos porque todo el cálculo de un activo
+ * solo lee `date` y `data[currency].assetPerformance[assetKey]`.
+ *
+ * El activo va como `FieldPath` por segmentos: hay claves con punto
+ * (`ECOPETROL.CL_stock`) que una ruta de texto partiría.
+ *
+ * Se piden además `totalValue` y `totalInvestment` de la moneda: sin ellos, un
+ * día **sin** el activo llegaría sin el mapa de la moneda y
+ * `buildAssetDailyTimeline` lo saltaría en vez de marcar la venta (`u: 0`), como
+ * hace con el documento completo. El cierre y la corrección siempre escriben
+ * esos dos campos en cada moneda.
+ *
+ * @param {FirebaseFirestore.Firestore} db
+ * @param {string} userId
+ * @param {string} accountId - `'overall'` o el id de la cuenta
+ * @param {string} currency
+ * @param {string} ticker
+ * @param {string} assetType
+ * @param {Object} [options]
+ * @param {string} [options.despuesDe] - Solo los días posteriores a esta fecha (YYYY-MM-DD)
+ * @returns {Promise<FirebaseFirestore.QueryDocumentSnapshot[]>} En orden de fecha ascendente
+ * @see platform-docs/stories/6.4-resumenes-activo-bajo-demanda/refinamiento.md (T3b)
+ */
+async function fetchAssetDailyDocs(db, userId, accountId, currency, ticker, assetType, options = {}) {
+  const basePath = accountId === 'overall'
+    ? `portfolioPerformance/${userId}/dates`
+    : `portfolioPerformance/${userId}/accounts/${accountId}/dates`;
+
+  let query = db.collection(basePath);
+  if (options.despuesDe) {
+    query = query.where('date', '>', options.despuesDe);
+  }
+
+  const snapshot = await query
+    .select(
+      'date',
+      new FieldPath(currency, 'totalValue'),
+      new FieldPath(currency, 'totalInvestment'),
+      new FieldPath(currency, 'assetPerformance', `${ticker}_${assetType}`),
+    )
     .orderBy('date', 'asc')
     .get();
 
@@ -460,7 +517,9 @@ function computePortfolioReturnsFromDailyDocs(docs, currency, now) {
 
 async function generateAssetSnapshot(db, userId, accountId, currency, ticker, assetType, options = {}) {
   // PERF-SNAP-025: Usar daily docs en vez de V2
-  const dailyDocs = options.dailyDocs || await fetchAllDailyDocs(db, userId, accountId);
+  // HU 6.4 (T3b): sin docs ya leídos, solo los campos de este activo.
+  const dailyDocs = options.dailyDocs
+    || await fetchAssetDailyDocs(db, userId, accountId, currency, ticker, assetType);
 
   // Hallazgo 6: Pre-filtrar docs para este activo
   const assetDocs = filterDocsForAsset(dailyDocs, currency, ticker, assetType);
@@ -586,6 +645,7 @@ module.exports = {
   extractAssetPerformanceFields,
   fetchLatestAssetPerformance,
   fetchAllDailyDocs,
+  fetchAssetDailyDocs,
   buildDailyTimeline,
   extractLatestAssetPerformanceFromDocs,
   // PERF-SNAP-025

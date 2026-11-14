@@ -21,6 +21,8 @@ const { fetchAllDailyDocs, generatePerformanceSnapshot, generateAssetSnapshot, b
 
 // OPT-SNAP-INCR: Importar servicio de actualización incremental de snapshots
 const { updateSnapshotIncremental, updateAssetSnapshotIncremental } = require('./snapshotIncrementalService');
+// HU 6.4: resúmenes por activo bajo demanda
+const { resumenesPorActivoBajoDemanda, monedasDelCierre } = require('./snapshots/assetSnapshotOnDemandService');
 
 // VS-009: Importar servicio de benchmark snapshots
 const { updateBenchmarkSnapshots } = require('./benchmarkSnapshotService');
@@ -1006,13 +1008,12 @@ async function processUserPerformance({
     // Feature flag allows instant rollback to legacy full-rebuild path
     try {
       // PERF-SNAP-026: Smart Currency — solo USD + defaultCurrency del usuario
+      // HU 6.4: misma regla de monedas que usa la apertura para decidir qué pone al día.
       let snapshotCurrencies = ['USD'];
       try {
         const userDataDoc = await db.collection('userData').doc(userId).get();
         const defaultCurrency = userDataDoc.exists ? userDataDoc.data()?.defaultCurrency : null;
-        if (defaultCurrency && defaultCurrency !== 'USD') {
-          snapshotCurrencies.push(defaultCurrency);
-        }
+        snapshotCurrencies = monedasDelCierre(defaultCurrency);
       } catch (currencyReadError) {
         logWarn(`[EOD][Snapshot] Could not read defaultCurrency for ${userId}, using USD only: ${currencyReadError.message}`);
       }
@@ -1075,7 +1076,13 @@ async function processUserPerformance({
       // H2-FIX: Cache dailyDocs to avoid re-fetching for each asset on first deploy
       let cachedOverallDailyDocs = null;
 
-      for (const currency of snapshotCurrencies) {
+      // HU 6.4: los resúmenes por activo ya no se rehacen cada noche; se ponen al
+      // día al abrir el activo (snapshots/assetSnapshotOnDemandService). Con
+      // ASSET_SNAPSHOTS_ON_DEMAND=false vuelve el bucle de siempre (RN-6-H).
+      const assetSnapshotsBajoDemanda = resumenesPorActivoBajoDemanda();
+      const monedasDeActivos = assetSnapshotsBajoDemanda ? [] : snapshotCurrencies;
+
+      for (const currency of monedasDeActivos) {
         const overallCurrencyData = overallPerformance[currency] || {};
         const assetPerf = overallCurrencyData.assetPerformance || {};
 
@@ -1106,7 +1113,9 @@ async function processUserPerformance({
         }
       }
 
-      logInfo(`[OPT-SNAP-INCR] User ${userId}: success=${snapshotSuccess}, failed=${snapshotFailed}, methods=${JSON.stringify(methods)}`);
+      // RN-6-I: `assetSnapshots` distingue en los registros el antes y el después.
+      logInfo(`[OPT-SNAP-INCR] User ${userId}: success=${snapshotSuccess}, failed=${snapshotFailed}, methods=${JSON.stringify(methods)}, ` +
+        `assetSnapshots=${assetSnapshotsBajoDemanda ? 'bajo-demanda' : 'nocturno'}`);
     } catch (snapshotError) {
       logWarn(`[EOD][Snapshot] Error en snapshot para ${userId}: ${snapshotError.message}`);
     }

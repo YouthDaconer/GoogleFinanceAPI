@@ -1011,3 +1011,80 @@ describe('OPT-SNAP-INCR: snapshotIncrementalService', () => {
     });
   });
 });
+
+// ============================================================================
+// HU 6.4 — El paso del incremental de activo, como función pura
+// @see platform-docs/stories/6.4-resumenes-activo-bajo-demanda/refinamiento.md (T1, T8a)
+// ============================================================================
+
+describe('HU 6.4: aplicarDiaAResumenDeActivo (RN-6.4-N)', () => {
+  const { aplicarDiaAResumenDeActivo } = require('../snapshotIncrementalService');
+
+  const resumenDeActivo = (overrides = {}) => ({
+    userId: 'user-1',
+    currency: 'USD',
+    accountId: 'overall',
+    ticker: 'AAPL',
+    assetType: 'stock',
+    type: 'asset',
+    timelineGranularity: 'daily',
+    schemaVersion: SCHEMA_VERSION_INCREMENTAL,
+    lastDateInTimeline: '2026-04-28',
+    timeline: [
+      { d: '2026-04-27', v: 5000, c: 0, u: 10 },
+      { d: '2026-04-28', v: 5050, c: 1.0, u: 10 },
+    ],
+    returns: { ytdReturn: 1.0, hasYtdData: true },
+    performanceByYear: {},
+    monthlyCompound: { 2026: { 4: { returnPct: 1 } } },
+    validDocsCountByPeriod: { ytd: 2 },
+    availableYears: ['2026'],
+    startDate: '2026-04-27',
+    lastUpdated: '2026-04-28T05:00:00.000Z',
+    ...overrides,
+  });
+
+  const sinHora = ({ lastUpdated, ...resto }) => resto;
+  const dia = { totalValue: 5100, adjustedDailyChangePercentage: 0.99, units: 10 };
+
+  it('da exactamente lo que escribía la noche con updateAssetSnapshotIncremental', async () => {
+    const db = createMockDb(resumenDeActivo());
+
+    await updateAssetSnapshotIncremental(db, 'user-1_AAPL_stock_USD', dia, '2026-04-29', { now: NOW });
+    const puro = aplicarDiaAResumenDeActivo(resumenDeActivo(), dia, '2026-04-29', { now: NOW });
+
+    expect(puro.method).toBe('incremental');
+    expect(sinHora(puro.snapshot)).toEqual(sinHora(db._mockSet.mock.calls[0][0]));
+    expect(puro.snapshot.timeline[2]).toEqual({ d: '2026-04-29', v: 5100, c: 0.99, u: 10 });
+    expect(puro.snapshot.lastDateInTimeline).toBe('2026-04-29');
+  });
+
+  it('no lee ni escribe: el resumen de entrada queda intacto', () => {
+    const original = resumenDeActivo();
+    aplicarDiaAResumenDeActivo(original, dia, '2026-04-29', { now: NOW });
+
+    expect(original.timeline).toHaveLength(2);
+    expect(original.lastDateInTimeline).toBe('2026-04-28');
+  });
+
+  it('la noche conserva el tope de 7 días: con 10 días de hueco pide rehacer', () => {
+    const r = aplicarDiaAResumenDeActivo(resumenDeActivo(), dia, '2026-05-08', { now: NOW });
+
+    expect(r).toEqual({ method: 'full-rebuild', reason: 'gap-10-days' });
+  });
+
+  it('la apertura (sinTopeDeHueco) añade el día aunque el hueco sea de 60 días', () => {
+    const r = aplicarDiaAResumenDeActivo(resumenDeActivo(), dia, '2026-06-27', { now: NOW, sinTopeDeHueco: true });
+
+    expect(r.method).toBe('incremental');
+    expect(r.snapshot.lastDateInTimeline).toBe('2026-06-27');
+  });
+
+  it('sin resumen o con esquema viejo pide rehacer; con el mismo día, lo salta', () => {
+    expect(aplicarDiaAResumenDeActivo(null, dia, '2026-04-29', { now: NOW }).method).toBe('full-rebuild');
+    expect(aplicarDiaAResumenDeActivo(resumenDeActivo({ schemaVersion: 2 }), dia, '2026-04-29', { now: NOW }).method)
+      .toBe('full-rebuild');
+    expect(aplicarDiaAResumenDeActivo(resumenDeActivo(), dia, '2026-04-28', { now: NOW }))
+      .toEqual({ method: 'skipped', reason: 'already-current' });
+  });
+});

@@ -199,7 +199,12 @@ function createMockDb(dailyDocsArg) {
     }
     return { limit: mockLimit };
   });
-  const mockCollection = jest.fn(() => ({ doc: mockDoc, orderBy: mockOrderBy }));
+  // HU 6.4 (T3b): generateAssetSnapshot sin dailyDocs lee con
+  // collection().select(...).orderBy('date', 'asc').get(). Aquí el doble
+  // devuelve los documentos completos; la proyección real se prueba en
+  // assetSnapshotOnDemandService.test.js.
+  const mockSelect = jest.fn(() => ({ orderBy: mockOrderBy }));
+  const mockCollection = jest.fn(() => ({ doc: mockDoc, orderBy: mockOrderBy, select: mockSelect }));
 
   return {
     collection: mockCollection,
