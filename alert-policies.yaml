@@ -270,3 +270,74 @@ userLabels:
 # función v2; la que se aplica vigila el log de memoria y el 500 de
 # `scheduledeodfinalization`. La 7 (tasa de errores de las tareas) no se aplica:
 # es un diagnóstico y necesita una métrica basada en logs.
+
+---
+# Políticas 10 a 15: el aviso de consumo, antes de que llegue a la factura (HU 6.7)
+# Archivo: (se aplican con el script, ver abajo)
+#
+# IMPORTANTE — cómo se aplican: con
+#   cd functions && node scripts/aplicarAvisosConsumo.js [--aplicar]
+# que lee en vivo quién tiene roles/billing.admin en la cuenta de facturación
+# (el mismo destinatario del aviso de presupuesto, RN-6.7-M), crea un canal de
+# correo para cada uno, añade el canal de operación (info@portastock.net), crea
+# el panel «Consumo de la plataforma (HU 6.7)» y reconoce cada política por
+# `userLabels` (hu: hu-6-7) para no duplicarla. Ninguna dirección personal se
+# escribe aquí. La definición vigente (filtros, textos, panel) es
+# functions/scripts/consumoAlerts.js; lo de aquí es su registro.
+#
+# La línea es el contrato: services/consumption/consumptionAlertService.js
+# (EVENTO_AVISO, CONSUMO) la construye y scheduledConsumptionWatch la escribe
+# cada 15 min cuando un consumo cruza su umbral y no se avisó todavía hoy (día
+# de Colombia). Un test comprueba que cada filtro escucha el tipo que emite el
+# código. Una política por tipo: el límite de notificaciones (5 min) es por
+# política, y con una sola un aviso silenciaría a otro de la misma ejecución.
+#
+#   aviso                  | userLabels.aviso      | cuándo
+#   -----------------------|-----------------------|---------------------------------------------
+#   10 lecturas            | lecturas              | > 200.000 lecturas en el día
+#   11 escrituras          | escrituras            | > 100.000 escrituras en el día
+#   12 almacenamiento      | almacenamiento        | cruza 0,8 GiB (una vez, no cada día arriba)
+#   13 almacenamiento-normal | almacenamiento-normal | vuelve a 0,8 GiB o menos
+#   14 ia                  | ia                    | análisis de IA por encima del cupo
+#   15 prueba              | prueba                | scripts/lanzarAvisoConsumoPrueba.js --enviar
+#
+# Forma común (la de la política 10; las demás cambian `consumo` y el texto):
+
+displayName: "Consumo — lecturas de la base de datos por encima de 200.000 al día"
+conditions:
+  - displayName: "Línea consumption_alert con consumo=lecturas"
+    conditionMatchedLog:
+      filter: >
+        resource.type="cloud_run_revision"
+        AND resource.labels.service_name="scheduledconsumptionwatch"
+        AND jsonPayload.event="consumption_alert"
+        AND jsonPayload.consumo="lecturas"
+      labelExtractors:
+        valor: "EXTRACT(jsonPayload.valor)"
+        umbral: "EXTRACT(jsonPayload.umbral)"
+        desde: "EXTRACT(jsonPayload.desde)"
+        usuarios: "EXTRACT(jsonPayload.usuarios)"
+documentation:
+  subject: "[Portastock] Consumo — lecturas de la base de datos por encima de 200.000 al día"
+  content: |
+    Consumo, cuánto va (${log.extracted_label.valor}), umbral
+    (${log.extracted_label.umbral}), desde qué hora (${log.extracted_label.desde}),
+    enlace al panel de consumo y las cuatro causas conocidas: consultas abiertas,
+    corrección nocturna, recálculos manuales y análisis de IA.
+  mimeType: "text/markdown"
+alertStrategy:
+  notificationRateLimit:
+    period: "300s"
+  autoClose: "1800s"
+combiner: OR
+enabled: true
+userLabels:
+  hu: hu-6-7
+  aviso: lecturas
+# notificationChannels: el canal de cada administrador de la facturación y el
+# de operación (los resuelve el script).
+#
+# La política 15 (prueba) filtra por el registro del aviso de prueba en lugar
+# del servicio:
+#   logName="projects/portafolio-inversiones/logs/consumo-aviso-prueba"
+#   AND jsonPayload.event="consumption_alert" AND jsonPayload.consumo="prueba"

@@ -201,6 +201,19 @@ exports.eodUserPerformanceTask = eodUserPerformanceTask;
 exports.scheduledEodFinalization = scheduledEodFinalization;
 
 // ============================================================================
+// HU 6.7: Un aviso de consumo el mismo día, antes de que llegue a la factura
+// ============================================================================
+/**
+ * Cada 15 min mide lecturas, escrituras, almacenamiento y análisis de IA fuera
+ * de cupo, y escribe `[CONSUMO-AVISO]` cuando uno cruza su umbral; las
+ * políticas de `scripts/consumoAlerts.js` lo convierten en correo.
+ * @see platform-docs/stories/6.7-aviso-consumo-antes-factura/refinamiento.md (T3)
+ */
+const { scheduledConsumptionWatch } = require('./services/consumption/consumptionWatchScheduled');
+
+exports.scheduledConsumptionWatch = scheduledConsumptionWatch;
+
+// ============================================================================
 // PERF-SNAP-028: Snapshot Lifecycle Cleanup & Archival
 // ============================================================================
 /**
