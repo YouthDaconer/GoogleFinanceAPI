@@ -12,6 +12,7 @@ const { reconcileStalePerformance } = require('./services/reconcileStalePerforma
 // PERF-SNAP-028: Snapshot lifecycle cleanup & archival
 const { scheduledSnapshotCleanup, scheduledSnapshotArchival } = require('./services/snapshotCleanup');
 const { scheduledAlertRetention } = require('./services/alertRetention');
+const { scheduledDataRetention } = require('./services/retention/retentionScheduled');
 
 /**
  * SEC-TOKEN-001: Secret para autenticación server-to-server con API finance-query
@@ -237,6 +238,15 @@ exports.scheduledSnapshotArchival = scheduledSnapshotArchival;
  * @see services/alertRetention.js
  */
 exports.scheduledAlertRetention = scheduledAlertRetention;
+
+/**
+ * HU 6.10.1: plazos de conservación de los datos operativos. Retira, por
+ * tandas, lo vencido de cada tipo que operación activó tras su ensayo en seco,
+ * y deja constancia en dataRetentionRuns.
+ * Schedule: diario 06:00 ET (fuera del cierre y la corrección nocturnos)
+ * @see services/retention/retentionScheduled.js
+ */
+exports.scheduledDataRetention = scheduledDataRetention;
 
 exports.weeklyProfitableWeeksCalculation = onSchedule({
   schedule: "every sunday 23:00",
