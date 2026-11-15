@@ -34,6 +34,7 @@ const holdings = require('../../utils/holdingsAttribution');
 const { queryBounds } = require('../../utils/flowWindow');
 const { AREAS, leerAcotado, ordenarPorId, describirMedicion } = require('../../utils/scopedReads');
 const { getPeriodStartDate } = require('./types');
+const { convertirDiaDeTenencias, convertirVentas, fechasDeVentas } = require('./attributionFromUsdService');
 
 /** Tiempo máximo para traer cierres y tasas; si se agota, se usa el precio implícito. */
 const PRICE_BUDGET_MS = 15000;
@@ -307,8 +308,10 @@ function historyRangeFor(firstDate, deps) {
  * precio de mercado y el resto el precio implícito de los docs. Lo que siga
  * llegando queda en cache para la próxima consulta.
  */
-async function loadMarketData({ tickers, currency, dividendTxs, firstDate, deps }) {
-  const state = { prices: new Map(), quoteCurrency: new Map(), fxSeriesByCurrency: {}, fxNeeded: [], timedOut: false };
+async function loadMarketData({ tickers, currency, dividendTxs, firstDate, deps, fxFijas = {} }) {
+  // HU 6.11.4: `fxFijas` son series ya conocidas (la de cierres de una moneda
+  // poco usada); no se piden a Yahoo y ganan sobre lo que llegue.
+  const state = { prices: new Map(), quoteCurrency: new Map(), fxSeriesByCurrency: { ...fxFijas }, fxNeeded: [], timedOut: false };
   if (tickers.length === 0) return state;
 
   const now = Date.now();
@@ -334,7 +337,7 @@ async function loadMarketData({ tickers, currency, dividendTxs, firstDate, deps 
     state.quoteCurrency.forEach((c) => currencies.add(c));
     dividendTxs.forEach((tx) => currencies.add(carve.normalizeCurrency(tx.currency)));
     currencies.delete('USD');
-    state.fxNeeded = [...currencies];
+    state.fxNeeded = [...currencies].filter((c) => !fxFijas[c]);
 
     const range = historyRangeFor(firstDate, deps);
     const priced = tickers.filter((t) => state.quoteCurrency.has(t));
@@ -364,7 +367,7 @@ async function loadMarketData({ tickers, currency, dividendTxs, firstDate, deps 
   return {
     prices: new Map(state.prices),
     quoteCurrency: new Map(state.quoteCurrency),
-    fxSeriesByCurrency: { ...state.fxSeriesByCurrency },
+    fxSeriesByCurrency: { ...state.fxSeriesByCurrency, ...fxFijas },
     fxNeeded: [...state.fxNeeded],
     timedOut: state.timedOut,
   };
@@ -376,7 +379,9 @@ function defaultDeps() {
   const { getPricesFromApi } = require('../marketDataHelper');
   const carveService = require('../carveOutReturnsService');
   const { getSellTransactionsInPeriod } = require('./contributionCalculator');
+  const { conversorDeCierres } = require('./attributionFromUsdService');
   return {
+    conversorDeCierres,
     db: admin.firestore(),
     getHistoricalPrices,
     getPricesFromApi,
@@ -396,13 +401,19 @@ function defaultDeps() {
  * @param {string} [params.currency='USD']
  * @param {string[]} [params.accountIds=['overall']]
  * @param {{startDate: Date, endDate: Date}} [params.dateRange]
+ * @param {boolean} [params.desdeUsd=false] - HU 6.11.4: moneda poco usada, se
+ *   calcula desde USD (ver `attributionFromUsdService`)
  * @param {Object} [deps] - Inyectables para tests
  * @returns {Promise<Object|null>} Forma de calculateContributions + campos del
  *   método; null si no hay datos suficientes
+ * @throws {HttpsError} Con `desdeUsd`, `CURRENCY_UNAVAILABLE` si falta una tasa de cierre
  */
 async function calculateHoldingsContributions(params, deps = null) {
-  const { userId, period, currency = 'USD', accountIds = ['overall'], dateRange } = params;
+  const { userId, period, currency = 'USD', accountIds = ['overall'], dateRange, desdeUsd = false } = params;
   const d = deps || defaultDeps();
+  // HU 6.11.4 (RN-6.11-J): en una moneda poco usada la serie, las ventas y los
+  // dividendos se leen en USD; nunca el bloque guardado en esa moneda.
+  const monedaLeida = desdeUsd ? 'USD' : currency;
   const startedAt = Date.now();
 
   const periodStartDate = dateRange?.startDate || getPeriodStartDate(period);
@@ -418,26 +429,47 @@ async function calculateHoldingsContributions(params, deps = null) {
   if (accounts.seriesIds.length === 0) return null;
   t = lap('accounts', t);
 
-  const seriesList = await Promise.all(
-    accounts.seriesIds.map((id) => getSeriesDays(d.db, userId, id, currency, startStr, endStr))
+  let seriesList = await Promise.all(
+    accounts.seriesIds.map((id) => getSeriesDays(d.db, userId, id, monedaLeida, startStr, endStr))
   );
   t = lap('series', t);
-  const days = holdings.mergeAccountDays(seriesList);
+  let days = holdings.mergeAccountDays(seriesList);
   if (days.length < 2) return null;
 
   const baseDate = days[0].date;
   const tickers = carve.collectHeldTickers(days, new Set());
 
   // HU 6.9.3: dividendos sólo del periodo (base, fin] (RN-6.9.3-K)
-  const [activeTickers, dividendRead, sellsByAsset] = await Promise.all([
+  const [activeTickers, dividendRead, sellsRead] = await Promise.all([
     loadActiveTickers(d.db, accounts.accountIds),
     loadDividendTransactions(d.db, accounts.accountIds, baseDate, endStr),
-    d.getSellTransactionsInPeriod(userId, periodStartDate, periodEndDate, accounts.accountIds, currency),
+    d.getSellTransactionsInPeriod(userId, periodStartDate, periodEndDate, accounts.accountIds, monedaLeida),
   ]);
   const dividendTxs = dividendRead.txs;
+  let sellsByAsset = sellsRead;
   t = lap('transactions', t);
 
-  const market = await loadMarketData({ tickers, currency, dividendTxs, firstDate: baseDate, deps: d });
+  // HU 6.11.4: USD × la tasa de cierre de cada día (decisión del PO, 2026-11-14).
+  // Cada serie se convierte con la tasa de SUS días antes de fusionar las
+  // cuentas: un día arrastrado conserva la tasa del día en que se guardó. La
+  // serie de cierres es también la de la moneda del reporte para cotizaciones y
+  // dividendos. Sin tasa de algún día → aviso (RN-6.11-K, RN-6.11-L).
+  let fxFijas = {};
+  if (desdeUsd) {
+    const fechas = [
+      ...seriesList.flatMap((serie) => serie.map((dia) => dia.date)),
+      ...dividendTxs.map((tx) => (typeof tx.date === 'string' ? tx.date.slice(0, 10) : null)),
+      ...fechasDeVentas(sellsByAsset),
+    ];
+    const conversor = await d.conversorDeCierres(currency, fechas);
+    seriesList = seriesList.map((serie) => serie.map((dia) => convertirDiaDeTenencias(dia, conversor.tasaDe(dia.date))));
+    days = holdings.mergeAccountDays(seriesList);
+    sellsByAsset = convertirVentas(sellsByAsset, conversor.tasaDe);
+    fxFijas = { [carve.normalizeCurrency(currency)]: conversor.serie };
+    t = lap('fx', t);
+  }
+
+  const market = await loadMarketData({ tickers, currency, dividendTxs, firstDate: baseDate, deps: d, fxFijas });
   t = lap('market', t);
   const dividends = carve.groupDividends(dividendTxs, {
     reportCurrency: currency,
@@ -513,7 +545,7 @@ async function calculateHoldingsContributions(params, deps = null) {
   const firstPeriodDay = days.find((day) => day.date >= startStr);
   const tickersWithoutQuote = tickers.filter((t) => !market.quoteCurrency.has(t));
 
-  console.log(`[AttributionHoldings] user=${userId} series=${accounts.seriesIds.join(',')} ${currency} ${startStr}..${endStr || 'hoy'} `
+  console.log(`[AttributionHoldings] user=${userId} series=${accounts.seriesIds.join(',')} ${currency}${desdeUsd ? ' (desde USD)' : ''} ${startStr}..${endStr || 'hoy'} `
     + `dias=${days.length} pasos=${result.coverage.steps} TWR=${result.twr.toFixed(2)}% activos=${attributions.length} `
     + `precios mercado/implicito/sin=${result.coverage.marketReturns}/${result.coverage.impliedReturns}/${result.coverage.missingReturns} `
     + `dividendos=${dividendTxs.length}, ${dividendRead.medicion} `

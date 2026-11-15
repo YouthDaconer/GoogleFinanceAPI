@@ -445,6 +445,8 @@ module.exports = {
   // la misma regla de los 5 días que los resúmenes derivados.
   monedaPrincipalDe,
   tasasDeLaSerie,
+  // HU 6.11.4: la atribución convierte el cambio diario con la misma fórmula.
+  cambioConvertido,
   derivarResumenDeMoneda,
   obtenerResumenDerivado,
   tasasDelPeriodo,
