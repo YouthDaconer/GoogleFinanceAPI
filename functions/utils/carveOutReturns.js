@@ -573,11 +573,14 @@ function buildCarveOutSeries(days, excludeSet, sources) {
  *
  * @param {ReturnType<typeof buildCarveOutSeries>} series
  * @param {string} currency
+ * @param {Object} [opciones]
+ * @param {boolean} [opciones.incluirNoCalculables] - HU 6.11.3 (T4): también los días sin
+ *   cambio calculable, para convertir cada día contra el anterior antes de filtrarlos
  * @returns {Object[]}
  */
-function toPerformanceDocs(series, currency) {
+function toPerformanceDocs(series, currency, opciones = {}) {
   return series.days
-    .filter(({ day }) => day.adjustedDailyChangePercentage !== null)
+    .filter(({ day }) => opciones.incluirNoCalculables || day.adjustedDailyChangePercentage !== null)
     .map(({ date, day }) => ({
       date,
       [currency]: {

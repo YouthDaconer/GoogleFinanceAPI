@@ -1524,8 +1524,11 @@ app.get("/risk-metrics", async (req, res) => {
     // El frontend debe manejar este caso para mostrar un mensaje apropiado al usuario
     // En vez de devolver 404 (que causa error en fetch), devolvemos 200 con success=false
     if (!result.success) {
-      // Solo usar 500 para errores reales de servidor
-      const statusCode = result.error === 'INSUFFICIENT_DATA' ? 200 : 500;
+      // Solo usar 500 para errores reales de servidor.
+      // HU 6.11.3 (T5): CURRENCY_UNAVAILABLE es el aviso de la 6.11.1 (sin con qué
+      // calcular en una moneda poco usada), no un fallo; tampoco se guarda en caché.
+      const respuestasValidas = ['INSUFFICIENT_DATA', 'CURRENCY_UNAVAILABLE'];
+      const statusCode = respuestasValidas.includes(result.error) ? 200 : 500;
       return res.status(statusCode).json(result);
     }
     

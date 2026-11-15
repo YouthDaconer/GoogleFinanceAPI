@@ -59,16 +59,20 @@ const DIVIDENDS = [
 
 function fakeDb({ days = DAYS, accounts = ['acc-1', 'acc-2'], dividends = DIVIDENDS } = {}) {
   const paths = [];
+  const selects = [];
   return {
     paths,
+    selects,
     collection: (path) => {
       paths.push(path);
       if (path.startsWith('portfolioPerformance/')) {
-        return {
-          orderBy: () => ({
-            get: async () => ({ docs: days.map((d) => ({ id: d.date, data: () => d })) }),
-          }),
+        // HU 6.11.3: `loadDays` pide solo la fecha y la moneda del cálculo.
+        const consulta = {
+          select: (...campos) => { selects.push(campos); return consulta; },
+          orderBy: () => consulta,
+          get: async () => ({ docs: days.map((d) => ({ id: d.date, data: () => d })) }),
         };
+        return consulta;
       }
       if (path === 'portfolioAccounts') {
         return { where: () => ({ get: async () => ({ docs: accounts.map((id) => ({ id })) }) }) };
@@ -208,6 +212,54 @@ describe('carveOutReturnsService', () => {
     await getCarveOutHistoricalReturns(params, d);
     await getCarveOutHistoricalReturns(params, d);
     expect(d.getHistoricalPrices).toHaveBeenCalledTimes(3);
+  });
+
+  describe('HU 6.11.3 (T4): en una moneda poco usada se calcula en USD y se convierte', () => {
+    const TASAS = { '2026-01-05': 3900, '2026-01-06': 3910, '2026-01-07': 3920, '2026-01-08': 3930 };
+    const aCop = jest.fn(async (docs) => docs.map((d) => ({
+      date: d.date,
+      COP: { ...d.USD, totalValue: d.USD.totalValue * TASAS[d.date] },
+    })));
+
+    beforeEach(() => aCop.mockClear());
+
+    it('lee solo la fecha y el mapa USD, y convierte todos los días antes de calcular (QA-02)', async () => {
+      const db = fakeDb();
+      const d = deps();
+
+      const result = await getCarveOutHistoricalReturns(
+        { db, userId: 'u1', currency: 'COP', accountId: 'overall', excludeSet: buildExcludeSet(['VUAA.L']) },
+        d,
+        { monedaCalculo: 'USD', convertirDocs: aCop },
+      );
+
+      expect(db.selects).toEqual([['date', 'USD']]);
+      // Precios y dividendos se llevan a USD, como para un inversor en USD: no se pide COP=X.
+      expect(d.getHistoricalPrices.mock.calls.map((c) => c[0]).sort()).toEqual(['EUR=X', 'MC.PA', 'MSFT']);
+      expect(aCop.mock.calls[0][0].map((x) => Object.keys(x))).toEqual(DAYS.map(() => ['date', 'USD']));
+      expect(result.totalValueData.values).toEqual([500 * 3900, 510 * 3910, 509 * 3920, 511 * 3930]);
+    });
+
+    it('los días no calculables también se convierten (el cambio se mide contra el día anterior) y luego se omiten', async () => {
+      const result = await getCarveOutHistoricalReturns(
+        { db: fakeDb(), userId: 'u1', currency: 'COP', accountId: 'overall', excludeSet: buildExcludeSet(['VUAA.L']) },
+        deps({ quotes: [{ symbol: 'MSFT', currency: 'USD' }] }),
+        { monedaCalculo: 'USD', convertirDocs: aCop },
+      );
+
+      expect(aCop.mock.calls[0][0]).toHaveLength(4);
+      expect(result.totalValueData.dates).toEqual(['2026-01-05']);
+    });
+
+    it('si no hay con qué convertir, el error de la conversión sale tal cual (el aviso)', async () => {
+      const aviso = Object.assign(new Error('no disponible'), { details: { code: 'CURRENCY_UNAVAILABLE' } });
+
+      await expect(getCarveOutHistoricalReturns(
+        { db: fakeDb(), userId: 'u1', currency: 'COP', accountId: 'overall', excludeSet: buildExcludeSet(['VUAA.L']) },
+        deps(),
+        { monedaCalculo: 'USD', convertirDocs: async () => { throw aviso; } },
+      )).rejects.toBe(aviso);
+    });
   });
 
   describe('chooseHistoryRange', () => {
