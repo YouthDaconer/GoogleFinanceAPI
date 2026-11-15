@@ -28,11 +28,20 @@
  * (`utils/portfolioCalculations.js#convertCurrency`). Se comprobó con datos
  * reales (p95 de 0,0000 pp donde la historia se recalculó con tasas de cierre).
  *
+ * HU 6.11.1 — Sin con qué calcular, se avisa y se ofrece USD. En una moneda poco
+ * usada, la lectura de rendimientos ya no vuelve a lo guardado en esa moneda
+ * cuando no puede derivar: responde `monedaNoDisponible` (RN-6.11-J, RN-6.11-K).
+ * Una tasa recibida inválida cuenta como "sin con qué calcular", y un resumen en
+ * USD sin sus listas por día se prepara de nuevo antes de derivar. Todo detrás
+ * de `CURRENCY_UNAVAILABLE_NOTICE` (RN-6-H).
+ *
  * @module services/snapshots/derivedCurrencySnapshotService
  * @see platform-docs/stories/6.9.2-resumenes-poco-usados-incrementales/refinamiento.md (T2, T3)
+ * @see platform-docs/stories/6.11.1-sin-tasa-aviso-y-usd/refinamiento.md (T1, T2, T3)
  */
 
 const { DateTime } = require('luxon');
+const { HttpsError } = require('firebase-functions/v2/https');
 const {
   buildSnapshotDocId,
   generatePerformanceSnapshot,
@@ -68,6 +77,41 @@ function resumenesDerivadosDelUsd() {
 }
 
 /**
+ * HU 6.11.1 (T1): con el interruptor encendido, una moneda poco usada sin con qué
+ * calcular responde el aviso en lugar de lo guardado. Se lee en cada llamada;
+ * `CURRENCY_UNAVAILABLE_NOTICE=false` devuelve el comportamiento de la 6.9.2
+ * sin apagar la derivación (RN-6-H).
+ *
+ * @returns {boolean} `true` salvo `CURRENCY_UNAVAILABLE_NOTICE=false`
+ */
+function avisoMonedaNoDisponible() {
+  return process.env.CURRENCY_UNAVAILABLE_NOTICE !== 'false';
+}
+
+/** Código que el navegador reconoce en `details.code` para pintar el aviso. */
+const CODIGO_MONEDA_NO_DISPONIBLE = 'CURRENCY_UNAVAILABLE';
+
+/**
+ * HU 6.11.1 (T1): el error con el que la lectura de rendimientos dice que la
+ * cifra no está disponible en esa moneda por ahora (RN-6.11-K). Es un error y no
+ * una respuesta vacía para que el navegador nunca lo guarde: al recargar o
+ * cambiar de moneda se vuelve a intentar (Escenario 3).
+ *
+ * @param {string} currency
+ * @param {string} motivo - El de `obtenerResumenDerivado` (`sin-tasas`, `sin-tasa-<día>`…)
+ * @param {string} [id] - Id del resumen, solo para el log
+ * @returns {HttpsError}
+ */
+function monedaNoDisponible(currency, motivo, id = currency) {
+  console.log(`[currencyUnavailable] ${id}: ${motivo}`);
+  return new HttpsError(
+    'unavailable',
+    `La cifra no está disponible en ${currency} por ahora`,
+    { code: CODIGO_MONEDA_NO_DISPONIBLE, currency, motivo },
+  );
+}
+
+/**
  * RN-6.9.2-J: poco usada = ni USD ni la moneda principal, las que mantiene la noche.
  *
  * @param {string} currency
@@ -98,15 +142,27 @@ const PERIODOS_CON_DATOS = ['hasYtdData', 'hasOneMonthData', 'hasThreeMonthData'
  * anterior hasta `MAX_LOOKBACK_DAYS` días, como `historicalRateService`; más
  * allá no hay tasa (RN-3-D).
  *
- * @returns {{tasas?: Object<string, number>, faltante?: string}}
+ * HU 6.11.1 (T2): un día **presente** en la respuesta del servicio de tasas con
+ * un valor que no es un número finito positivo (cero, negativo, vacío) no es un
+ * festivo: es una tasa inválida y deja la cifra sin calcular, sin sustituirla
+ * por el cierre anterior (acuerdo del PO, 2026-11-14). Un día **ausente** sigue
+ * siendo un día sin cierre (RN-6.11-L). Con `CURRENCY_UNAVAILABLE_NOTICE=false`
+ * la tasa inválida vuelve a tratarse como ausente, como en la 6.9.2.
+ *
+ * @returns {{tasas?: Object<string, number>, faltante?: string, invalida?: string}}
  */
 function tasasDeLaSerie(timeline, cierres) {
+  const validarInvalidas = avisoMonedaNoDisponible();
+  const presente = (dia) => Object.prototype.hasOwnProperty.call(cierres, dia);
+  const valida = (dia) => typeof cierres[dia] === 'number' && Number.isFinite(cierres[dia]) && cierres[dia] > 0;
+
   const tasas = {};
   for (const { d } of timeline) {
-    let tasa = cierres[d] > 0 ? cierres[d] : undefined;
-    for (let i = 1; tasa === undefined && i <= MAX_LOOKBACK_DAYS; i++) {
-      const anterior = DateTime.fromISO(d).minus({ days: i }).toISODate();
-      if (cierres[anterior] > 0) tasa = cierres[anterior];
+    let tasa;
+    for (let i = 0; tasa === undefined && i <= MAX_LOOKBACK_DAYS; i++) {
+      const dia = i === 0 ? d : DateTime.fromISO(d).minus({ days: i }).toISODate();
+      if (valida(dia)) tasa = cierres[dia];
+      else if (validarInvalidas && presente(dia)) return { invalida: dia };
     }
     if (tasa === undefined) return { faltante: d };
     tasas[d] = tasa;
@@ -141,7 +197,8 @@ function derivarResumenDeMoneda(resumenUsd, cierres, currency, options = {}) {
     return { snapshot: null, motivo: 'usd-sin-listas' };
   }
 
-  const { tasas, faltante } = tasasDeLaSerie(timelineUsd, cierres);
+  const { tasas, faltante, invalida } = tasasDeLaSerie(timelineUsd, cierres);
+  if (invalida) return { snapshot: null, motivo: `tasa-invalida-${invalida}` };
   if (faltante) return { snapshot: null, motivo: `sin-tasa-${faltante}` };
 
   const now = options.now || DateTime.now().setZone(ZONA);
@@ -297,6 +354,11 @@ async function tasasDelPeriodo(currency, desde, hasta) {
  * está viejo, solo se prepara (`generatePerformanceSnapshot`) cuando quien
  * pregunta lo habría preparado igual: la lectura de rendimientos. La atribución
  * y el riesgo nunca preparaban resúmenes, y no empiezan a hacerlo aquí.
+ *
+ * HU 6.11.1 (T3, Escenario 4): un resumen en USD al día pero sin sus listas por
+ * día (`cashFlows`, `realizedPnL`) también se prepara de nuevo, con la misma
+ * función, en lugar de dar la moneda poco usada por no derivable. La
+ * preparación lo guarda con sus listas: la siguiente consulta ya no lo prepara.
  */
 async function resumenUsdAlDia(db, userId, accountId, senal, prepararUsd) {
   const id = buildSnapshotDocId(userId, accountId, 'USD');
@@ -304,7 +366,9 @@ async function resumenUsdAlDia(db, userId, accountId, senal, prepararUsd) {
   const data = doc.exists ? doc.data() : null;
   const viejo = data && senal && data.lastUpdated &&
     new Date(senal).getTime() > new Date(data.lastUpdated).getTime();
-  if (data && !viejo) return data;
+  const sinListas = data && !(Array.isArray(data.cashFlows) && Array.isArray(data.realizedPnL));
+  const prepararSinListas = sinListas && prepararUsd && avisoMonedaNoDisponible();
+  if (data && !viejo && !prepararSinListas) return data;
   if (!prepararUsd) return null;
   return (await generatePerformanceSnapshot(db, userId, accountId, 'USD')) || null;
 }
@@ -370,6 +434,9 @@ function limpiarCachesDerivados() {
 
 module.exports = {
   resumenesDerivadosDelUsd,
+  avisoMonedaNoDisponible,
+  monedaNoDisponible,
+  CODIGO_MONEDA_NO_DISPONIBLE,
   esMonedaPocoUsada,
   derivarResumenDeMoneda,
   obtenerResumenDerivado,

@@ -68,7 +68,12 @@ const { buildExcludeSet } = require('../../utils/carveOutReturns');
 const { buildSnapshotDocId, generatePerformanceSnapshot, generateAssetSnapshot } = require('../snapshotGenerator');
 // HU 6.4: los resúmenes por activo se ponen al día al abrirlos, no cada noche.
 const { resumenesPorActivoBajoDemanda, ponerAlDiaResumenDeActivo } = require('../snapshots/assetSnapshotOnDemandService');
-const { resumenesDerivadosDelUsd, obtenerResumenDerivado } = require('../snapshots/derivedCurrencySnapshotService');
+const {
+  resumenesDerivadosDelUsd,
+  obtenerResumenDerivado,
+  avisoMonedaNoDisponible,
+  monedaNoDisponible,
+} = require('../snapshots/derivedCurrencySnapshotService');
 
 // PERF-SNAP-021: Importar funciones de mercado para TTL inteligente
 const { isNYSEMarketOpen, calculateTTLUntilNextEOD, MARKET_CACHE_TTL_MS } = require('../riskMetrics/riskMetricsCache');
@@ -175,9 +180,17 @@ async function getSnapshotWithCache(snapshotId, userId, preloadedSignal) {
  * del USD, con la misma caché en memoria y la misma regla de la señal que los
  * guardados: un cierre o una corrección posteriores obligan a volver a derivar.
  *
+ * HU 6.11.1 (T1): si la moneda es poco usada pero no hay con qué derivar (el
+ * servicio de tasas no responde, falta o es inválida una tasa, no hay resumen en
+ * USD), lanza `monedaNoDisponible` en lugar de devolver `null`: quien llama ya no
+ * llega a lo guardado en esa moneda (RN-6.11-J, RN-6.11-K). El aviso no se
+ * recuerda en la caché: la siguiente consulta vuelve a intentarlo (Escenario 3).
+ *
  * @returns {Promise<Object|null>} El derivado, o `null` si la moneda no es poco
  *   usada (o el interruptor está apagado) y hay que seguir el camino de siempre
+ * @throws {HttpsError} `unavailable` con `details.code = 'CURRENCY_UNAVAILABLE'`
  * @see platform-docs/stories/6.9.2-resumenes-poco-usados-incrementales/refinamiento.md (T4)
+ * @see platform-docs/stories/6.11.1-sin-tasa-aviso-y-usd/refinamiento.md (T1)
  */
 async function resumenDerivadoConCache(userId, accountId, currency, signal) {
   if (currency === 'USD' || !resumenesDerivadosDelUsd()) return null;
@@ -191,8 +204,13 @@ async function resumenDerivadoConCache(userId, accountId, currency, signal) {
 
   // Sin derivado (no aplica o no derivable) se sigue el camino de siempre.
   // `prepararUsd`: si el de USD falta o está viejo, se prepara, como ya hacía esta lectura.
-  const { snapshot } = await obtenerResumenDerivado(db, { userId, accountId, currency, senal: signal, prepararUsd: true });
-  if (!snapshot) return null;
+  const { snapshot, metodo, motivo } = await obtenerResumenDerivado(db, { userId, accountId, currency, senal: signal, prepararUsd: true });
+  if (!snapshot) {
+    if (metodo === 'no-derivable' && avisoMonedaNoDisponible()) {
+      throw monedaNoDisponible(currency, motivo, buildSnapshotDocId(userId, accountId, currency));
+    }
+    return null;
+  }
 
   snapshotMemCache.set(clave, { data: snapshot, cachedAt: Date.now() });
   if (snapshotMemCache.size > SNAPSHOT_MEM_CACHE_MAX_SIZE) {
@@ -550,6 +568,8 @@ async function getHistoricalReturns(context, payload) {
     }
 
     // HU 6.9.2 (T4): en una moneda poco usada el resumen se deriva del USD.
+    // HU 6.11.1: si no se puede derivar, `resumenDerivadoConCache` lanza el
+    // aviso y nunca se llega al resumen guardado en esa moneda (RN-6.11-J).
     if (!forceRefresh) {
       const inicioDerivado = Date.now();
       const derivado = await resumenDerivadoConCache(userId, accountId, currency, signal);
@@ -891,6 +911,8 @@ async function getMultiAccountHistoricalReturns(context, payload) {
     if (!forceRefresh && !ticker && !assetType) {
       const signal = await readSnapshotSignal(userId);
       // HU 6.9.2 (T4): en una moneda poco usada cada cuenta se deriva del USD.
+      // HU 6.11.1: si una no se puede derivar, el aviso corta la consulta entera,
+      // antes del resumen guardado y de la ruta legacy en esa moneda (RN-6.11-J).
       const snapshotPromises = accountIds.map(async (accountId) => {
         const derivado = await resumenDerivadoConCache(userId, accountId, currency, signal);
         return derivado
