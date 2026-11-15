@@ -68,6 +68,12 @@ jest.mock('../../snapshots/derivedCurrencySnapshotService', () => ({
   obtenerResumenDerivado: (...args) => mockObtenerDerivado(...args),
   esMonedaPocoUsada: (currency, defaultCurrency) => !['USD', defaultCurrency].includes(currency),
   monedaPrincipalDe: async (db, userId) => (userId === 'inv-p' ? 'COP' : 'USD'),
+  // Integración con la 6.11.1: sin con qué calcular, la pantalla recibe el aviso.
+  avisoMonedaNoDisponible: () => process.env.CURRENCY_UNAVAILABLE_NOTICE !== 'false',
+  monedaNoDisponible: (currency, motivo) => Object.assign(new Error(`La cifra no está disponible en ${currency} por ahora`), {
+    code: 'unavailable', details: { code: 'CURRENCY_UNAVAILABLE', currency, motivo },
+  }),
+  CODIGO_MONEDA_NO_DISPONIBLE: 'CURRENCY_UNAVAILABLE',
 }));
 
 // Firestore: cada ruta de documento devuelve lo que diga `mockDocumentos`
@@ -332,6 +338,20 @@ describe('HU 6.11.2: rendimientoDisponibleEn (el Copiloto decide su moneda)', ()
     mockObtenerDerivado.mockResolvedValue({ snapshot: null, metodo: 'no-derivable', motivo: 'sin-tasas' });
 
     expect(await rendimientoDisponibleEn(UID, 'EUR')).toBe(false);
+  });
+
+  it('integración 6.11.1: el aviso CURRENCY_UNAVAILABLE de la pantalla, para el Copiloto, es "no disponible" (analiza en USD)', async () => {
+    process.env.CURRENCY_UNAVAILABLE_NOTICE = 'true';
+    mockObtenerDerivado.mockResolvedValue({ snapshot: null, metodo: 'no-derivable', motivo: 'tasa-invalida-2026-11-13' });
+
+    await expect(rendimientoDisponibleEn(UID, 'EUR')).resolves.toBe(false);
+    delete process.env.CURRENCY_UNAVAILABLE_NOTICE;
+  });
+
+  it('integración 6.11.1: un error que no es el aviso sigue su curso', async () => {
+    mockObtenerDerivado.mockRejectedValue(new Error('Firestore caído'));
+
+    await expect(rendimientoDisponibleEn(UID, 'EUR')).rejects.toThrow('Firestore caído');
   });
 
   it('una moneda poco usada derivable está disponible y el derivado queda para el rendimiento (QA-03)', async () => {

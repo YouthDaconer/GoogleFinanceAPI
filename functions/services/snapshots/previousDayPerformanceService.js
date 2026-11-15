@@ -148,7 +148,13 @@ async function obtenerCabeceraDiaAnterior(db, { userId, currency, hoy = hoyEnNue
   if (!cierres) {
     return terminar({ disponible: false, date, currency, motivo: 'sin-tasas' }, 'no-disponible');
   }
-  const { tasas, faltante } = tasasDeLaSerie([{ d: date }], cierres);
+  const { tasas, faltante, invalida } = tasasDeLaSerie([{ d: date }], cierres);
+  // Integración 6.11.1 + 6.11.5: una tasa inválida (cero, negativa o vacía) también
+  // es "sin con qué calcular" (acuerdo del PO, 2026-11-14); sin esto, `tasas` llega
+  // vacío y la cabecera fallaría.
+  if (invalida) {
+    return terminar({ disponible: false, date, currency, motivo: 'tasa-invalida' }, 'no-disponible');
+  }
   if (faltante) {
     return terminar({ disponible: false, date, currency, motivo: 'sin-tasa-del-dia' }, 'no-disponible');
   }

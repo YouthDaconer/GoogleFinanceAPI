@@ -10,7 +10,11 @@
  * - RN-6.9.2-J: USD y la moneda principal no se derivan (QA-09).
  * - RN-6-H: con DERIVED_CURRENCY_SNAPSHOTS=false, el comportamiento de siempre (QA-13).
  *
+ * HU 6.11.1: tasa inválida (QA-03), 5 frente a 6 días naturales (QA-05), resumen
+ * en USD sin listas preparado de nuevo (QA-07) y el aviso con su interruptor.
+ *
  * @see platform-docs/stories/6.9.2-resumenes-poco-usados-incrementales/refinamiento.md (T6b)
+ * @see platform-docs/stories/6.11.1-sin-tasa-aviso-y-usd/refinamiento.md (T8a)
  */
 
 const { DateTime, Settings } = require('luxon');
@@ -28,6 +32,9 @@ const {
   derivarResumenDeMoneda,
   obtenerResumenDerivado,
   limpiarCachesDerivados,
+  avisoMonedaNoDisponible,
+  monedaNoDisponible,
+  CODIGO_MONEDA_NO_DISPONIBLE,
 } = require('../derivedCurrencySnapshotService');
 
 // "Ahora" fijo: el desde cero usa DateTime.now() por dentro.
@@ -227,7 +234,7 @@ describe('HU 6.9.2 — derivarResumenDeMoneda: USD × tasa del día', () => {
 
     const resultado = derivarResumenDeMoneda(await desdeCero(HISTORIA), tasas, 'COP', { now: AHORA });
 
-    expect(resultado).toEqual({ snapshot: null, motivo: 'sin-tasa-2025-12-31' });
+    expect(resultado).toEqual({ snapshot: null, motivo: 'tasa-invalida-2025-12-31' });
   });
 
   it('HU 6.11.2: un día sin cierre cuyo cierre anterior es inválido tampoco se calcula (QA-15)', async () => {
@@ -237,7 +244,8 @@ describe('HU 6.9.2 — derivarResumenDeMoneda: USD × tasa del día', () => {
     const resultado = derivarResumenDeMoneda(await desdeCero(HISTORIA), tasas, 'COP', { now: AHORA });
 
     // El primer día que topa con la tasa inválida es el 30 (la suya)
-    expect(resultado).toEqual({ snapshot: null, motivo: 'sin-tasa-2025-12-30' });
+    // Con la regla unificada (6.11.1) el motivo dice que la tasa es inválida
+    expect(resultado).toEqual({ snapshot: null, motivo: 'tasa-invalida-2025-12-30' });
   });
 
   it('un resumen en USD sin las listas por día no se deriva', async () => {
@@ -382,5 +390,144 @@ describe('HU 6.9.2 — interruptor (RN-6-H, QA-13)', () => {
     expect(resumenesDerivadosDelUsd()).toBe(true);
     process.env.DERIVED_CURRENCY_SNAPSHOTS = 'false';
     expect(resumenesDerivadosDelUsd()).toBe(false);
+  });
+});
+
+// ============================================================================
+// HU 6.11.1 — Sin con qué calcular, se avisa y se ofrece USD
+// ============================================================================
+
+describe('HU 6.11.1 — una tasa inválida deja la cifra sin calcular (QA-03)', () => {
+  beforeEach(() => { delete process.env.CURRENCY_UNAVAILABLE_NOTICE; });
+  afterAll(() => { delete process.env.CURRENCY_UNAVAILABLE_NOTICE; });
+
+  it.each([
+    ['cero', 0],
+    ['negativa', -3908.4],
+    ['vacía', null],
+    ['no numérica', '3905,60'],
+  ])('una tasa %s en un día de la serie no se cambia por el cierre anterior: no se deriva', async (_caso, valor) => {
+    const tasas = { ...TASAS, '2025-12-31': valor };
+
+    const resultado = derivarResumenDeMoneda(await desdeCero(HISTORIA), tasas, 'COP', { now: AHORA });
+
+    expect(resultado).toEqual({ snapshot: null, motivo: 'tasa-invalida-2025-12-31' });
+  });
+
+  it('una tasa inválida en el día que sustituiría a un festivo también deja la cifra sin calcular', async () => {
+    const tasas = { ...TASAS, '2025-12-30': 0 };
+    delete tasas['2025-12-31'];
+
+    const resultado = derivarResumenDeMoneda(await desdeCero(HISTORIA), tasas, 'COP', { now: AHORA });
+
+    expect(resultado).toEqual({ snapshot: null, motivo: 'tasa-invalida-2025-12-30' });
+  });
+
+  it('con CURRENCY_UNAVAILABLE_NOTICE=false la tasa inválida vuelve a tratarse como ausente, como en la 6.9.2 (RN-6-H)', async () => {
+    process.env.CURRENCY_UNAVAILABLE_NOTICE = 'false';
+    const tasas = { ...TASAS, '2025-12-31': 0 };
+
+    const { snapshot } = derivarResumenDeMoneda(await desdeCero(HISTORIA), tasas, 'COP', { now: AHORA });
+
+    expect(snapshot.timeline.find((p) => p.d === '2025-12-31').v).toBe(1510 * TASAS['2025-12-30']);
+  });
+});
+
+describe('HU 6.11.1 — los 5 días son naturales, hacia atrás desde el día sin cierre (RN-6.11-L, QA-05)', () => {
+  it('a 5 días naturales del último cierre se toma ese cierre y la cifra se calcula', async () => {
+    const tasas = { ...TASAS };
+    ['2025-12-29', '2025-12-30', '2025-12-31'].forEach((d) => delete tasas[d]); // 2025-12-31 queda a 5 días del 2025-12-26
+
+    const { snapshot } = derivarResumenDeMoneda(await desdeCero(HISTORIA), tasas, 'COP', { now: AHORA });
+
+    expect(snapshot.timeline.find((p) => p.d === '2025-12-31').v).toBe(1510 * TASAS['2025-12-26']);
+  });
+
+  it('a 6 días naturales ya no hay tasa, aunque en medio solo haya 3 días hábiles', async () => {
+    const tasas = { ...TASAS };
+    ['2025-12-31', '2026-01-02', '2026-01-05'].forEach((d) => delete tasas[d]); // 2026-01-05 queda a 6 días del 2025-12-30
+
+    const resultado = derivarResumenDeMoneda(await desdeCero(HISTORIA), tasas, 'COP', { now: AHORA });
+
+    expect(resultado).toEqual({ snapshot: null, motivo: 'sin-tasa-2026-01-05' });
+  });
+});
+
+describe('HU 6.11.1 — el resumen en USD sin sus listas se prepara de nuevo (Escenario 4, QA-07)', () => {
+  async function dbSinListas() {
+    const { cashFlows, realizedPnL, ...sinListas } = await desdeCero(HISTORIA);
+    return crearDb({
+      documentos: { 'userData/u1': { defaultCurrency: 'USD' }, 'performanceSnapshots/u1_USD': sinListas },
+      diarios: { 'portfolioPerformance/u1/dates': HISTORIA },
+    });
+  }
+
+  beforeEach(() => {
+    delete process.env.CURRENCY_UNAVAILABLE_NOTICE;
+    mockGetExchangeRates.mockResolvedValue({ rates: { COP: TASAS } });
+  });
+  afterAll(() => { delete process.env.CURRENCY_UNAVAILABLE_NOTICE; });
+
+  it('se prepara con sus listas, se deriva de él y la cifra es la misma que derivar desde cero (RN-6-A)', async () => {
+    const db = await dbSinListas();
+
+    const r = await obtenerResumenDerivado(db, { userId: 'u1', accountId: 'overall', currency: 'COP', prepararUsd: true });
+
+    const preparado = db.escrituras['performanceSnapshots/u1_USD'];
+    expect(Array.isArray(preparado.cashFlows)).toBe(true);
+    expect(Array.isArray(preparado.realizedPnL)).toBe(true);
+    expect(r.metodo).toBe('derivado');
+    const referencia = derivarResumenDeMoneda(await desdeCero(HISTORIA), TASAS, 'COP', { now: AHORA }).snapshot;
+    expect(sinHora(r.snapshot)).toEqual(sinHora(referencia));
+  });
+
+  it('no lee nada guardado en la moneda poco usada, y la segunda consulta ya no lo prepara (RN-6.11-J)', async () => {
+    const db = await dbSinListas();
+    await obtenerResumenDerivado(db, { userId: 'u1', accountId: 'overall', currency: 'COP', prepararUsd: true });
+    expect(db.lecturas.some((ruta) => ruta.includes('COP'))).toBe(false);
+    db.lecturas.length = 0;
+
+    const r = await obtenerResumenDerivado(db, { userId: 'u1', accountId: 'overall', currency: 'COP', prepararUsd: true });
+
+    expect(r.metodo).toBe('derivado');
+    expect(db.lecturas).toEqual(['performanceSnapshots/u1_USD']);
+  });
+
+  it('sin prepararUsd (atribución, riesgo) sigue sin prepararlo: nada cuesta más que antes', async () => {
+    const db = await dbSinListas();
+
+    const r = await obtenerResumenDerivado(db, { userId: 'u1', accountId: 'overall', currency: 'COP' });
+
+    expect(r).toEqual({ snapshot: null, metodo: 'no-derivable', motivo: 'usd-sin-listas' });
+    expect(db.escrituras).toEqual({});
+  });
+
+  it('con CURRENCY_UNAVAILABLE_NOTICE=false no se prepara de nuevo, como en la 6.9.2 (RN-6-H, QA-10)', async () => {
+    process.env.CURRENCY_UNAVAILABLE_NOTICE = 'false';
+    const db = await dbSinListas();
+
+    const r = await obtenerResumenDerivado(db, { userId: 'u1', accountId: 'overall', currency: 'COP', prepararUsd: true });
+
+    expect(r).toEqual({ snapshot: null, metodo: 'no-derivable', motivo: 'usd-sin-listas' });
+    expect(db.escrituras).toEqual({});
+  });
+});
+
+describe('HU 6.11.1 — el aviso y su interruptor (RN-6.11-K, RN-6-H)', () => {
+  afterEach(() => { delete process.env.CURRENCY_UNAVAILABLE_NOTICE; });
+
+  it('encendido salvo CURRENCY_UNAVAILABLE_NOTICE=false', () => {
+    expect(avisoMonedaNoDisponible()).toBe(true);
+    process.env.CURRENCY_UNAVAILABLE_NOTICE = 'false';
+    expect(avisoMonedaNoDisponible()).toBe(false);
+  });
+
+  it('el aviso es un error "unavailable" con la moneda y el motivo, que el navegador reconoce por su código', () => {
+    const error = monedaNoDisponible('COP', 'sin-tasas', 'u1_COP');
+
+    expect(error.code).toBe('unavailable');
+    expect(error.message).toBe('La cifra no está disponible en COP por ahora');
+    expect(error.details).toEqual({ code: CODIGO_MONEDA_NO_DISPONIBLE, currency: 'COP', motivo: 'sin-tasas' });
+    expect(CODIGO_MONEDA_NO_DISPONIBLE).toBe('CURRENCY_UNAVAILABLE');
   });
 });

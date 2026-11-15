@@ -252,8 +252,10 @@ describe('obtenerCabeceraDiaAnterior — sin con qué calcular (QA-10, QA-12, RN
     ['negativa', -0.8615],
     ['vacía', null],
   ])('tasa inválida (%s): no disponible, sin una cifra calculada con ella', async (_nombre, tasa) => {
+    // Integración con la 6.11.1: la regla unificada distingue la tasa inválida
+    // del día sin cierre; la cabecera responde "no disponible" en lugar de fallar.
     const r = await pedirEur({ '2026-11-12': tasa });
-    expect(r).toMatchObject({ disponible: false, motivo: 'sin-tasa-del-dia' });
+    expect(r).toMatchObject({ disponible: false, motivo: 'tasa-invalida' });
     expect(r.data).toBeUndefined();
   });
 
