@@ -244,6 +244,8 @@ describe('getRateLimitConfig', () => {
       'startAnalysis', 'getAnalysisState',
       // HU 6.8.1: estado de la corrección del historial para el aviso
       'getHistoryCorrectionStatus',
+      // HU 6.11.5: la cabecera del día anterior en una moneda
+      'getPreviousDayPerformance',
     ];
 
     expectedFunctions.forEach(fn => {
@@ -252,6 +254,6 @@ describe('getRateLimitConfig', () => {
       expect(RATE_LIMITS[fn].windowMs).toBe(60000);
     });
 
-    expect(Object.keys(RATE_LIMITS).length).toBe(38);
+    expect(Object.keys(RATE_LIMITS).length).toBe(39);
   });
 });

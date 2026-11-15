@@ -371,6 +371,10 @@ function limpiarCachesDerivados() {
 module.exports = {
   resumenesDerivadosDelUsd,
   esMonedaPocoUsada,
+  // HU 6.11.5: la cabecera del día anterior usa la misma moneda principal y
+  // la misma regla de los 5 días que los resúmenes derivados.
+  monedaPrincipalDe,
+  tasasDeLaSerie,
   derivarResumenDeMoneda,
   obtenerResumenDerivado,
   tasasDelPeriodo,

@@ -69,6 +69,8 @@ const { buildSnapshotDocId, generatePerformanceSnapshot, generateAssetSnapshot }
 // HU 6.4: los resúmenes por activo se ponen al día al abrirlos, no cada noche.
 const { resumenesPorActivoBajoDemanda, ponerAlDiaResumenDeActivo } = require('../snapshots/assetSnapshotOnDemandService');
 const { resumenesDerivadosDelUsd, obtenerResumenDerivado } = require('../snapshots/derivedCurrencySnapshotService');
+// HU 6.11.5: la cabecera del día anterior, solo en la moneda que se muestra
+const { obtenerCabeceraDiaAnterior } = require('../snapshots/previousDayPerformanceService');
 
 // PERF-SNAP-021: Importar funciones de mercado para TTL inteligente
 const { isNYSEMarketOpen, calculateTTLUntilNextEOD, MARKET_CACHE_TTL_MS } = require('../riskMetrics/riskMetricsCache');
@@ -1786,6 +1788,37 @@ async function getHistoryCorrectionStatus(context) {
 }
 
 /**
+ * HU 6.11.5: la cabecera del día anterior de /portfolio, solo en la moneda que
+ * se muestra.
+ *
+ * Antes la leía el navegador descargando el documento diario con todas sus
+ * monedas. Ahora se lee aquí solo la fecha y el bloque que hace falta, y en una
+ * moneda poco usada se deriva de USD × la tasa de cierre del día
+ * (`previousDayPerformanceService`). Solo lee lo del `auth.uid`.
+ *
+ * @see platform-docs/stories/6.11.5-recargar-portfolio-sin-lecturas/refinamiento.md (T2)
+ *
+ * @param {Object} context - Contexto de ejecución
+ * @param {Object} payload
+ * @param {string} payload.currency - Código ISO de 3 letras
+ * @returns {Promise<Object>} Ver `obtenerCabeceraDiaAnterior`
+ */
+async function getPreviousDayPerformance(context, payload) {
+  const userId = context.auth.uid;
+  const currency = payload?.currency;
+  if (typeof currency !== 'string' || !/^[A-Z]{3}$/.test(currency)) {
+    throw new HttpsError('invalid-argument', 'Se requiere una moneda válida (código de 3 letras)');
+  }
+
+  try {
+    return await obtenerCabeceraDiaAnterior(db, { userId, currency });
+  } catch (error) {
+    console.error('[queryHandlers][getPreviousDayPerformance] Error:', error);
+    throw new HttpsError('internal', 'Error consultando el día anterior del portafolio');
+  }
+}
+
+/**
  * Obtiene rendimientos históricos usando períodos consolidados (V2)
  *
  * COST-OPT-001: Versión optimizada que reduce lecturas de Firestore
@@ -1913,6 +1946,8 @@ async function getConsolidatedDataStatus(context, payload) {
 
 module.exports = {
   getCurrentPricesForUser,
+  // HU 6.11.5
+  getPreviousDayPerformance,
   getHistoricalReturns,
   getMultiAccountHistoricalReturns,
   getIndexHistory,

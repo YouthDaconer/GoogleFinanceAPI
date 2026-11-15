@@ -58,6 +58,9 @@ const RATE_LIMITS = {
   // HU 6.8.1: el aviso de corrección del historial se pide al abrir el
   // Dashboard o Inteligencia
   getHistoryCorrectionStatus: { limit: 30, windowMs: 60000 },
+  // HU 6.11.5: la cabecera del día anterior se pide al abrir /portfolio o
+  // cambiar de moneda, y solo si el navegador no la tiene guardada
+  getPreviousDayPerformance: { limit: 30, windowMs: 60000 },
 
   // ═══════════════════════════════════════════════════════════════
   // 🟡 Operaciones de Escritura Normales
