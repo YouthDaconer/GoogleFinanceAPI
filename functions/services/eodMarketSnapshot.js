@@ -184,4 +184,9 @@ module.exports = {
   refDelDia,
   COTIZACIONES_POR_TROZO,
   ESTADO_LISTO,
+  // HU 6.10.1: la limpieza de plazos de conservación retira los días vencidos
+  COLECCION_RAIZ,
+  DOC_EOD,
+  SUBCOLECCION_FECHAS,
+  SUBCOLECCION_TROZOS,
 };

@@ -306,4 +306,6 @@ module.exports = {
   ESTADO_DIA,
   ESTADO_INVERSOR,
   COLECCION_PROGRESO,
+  // HU 6.10.1: la limpieza de plazos de conservación retira los días vencidos
+  SUBCOLECCION_USUARIOS,
 };
