@@ -84,11 +84,18 @@ async function mapLimit(items, limit, fn) {
   return results;
 }
 
+/**
+ * Los días del alcance, solo con la fecha y el mapa de la moneda del cálculo.
+ *
+ * HU 6.11.3 (T4): con `select` ya no se descargan las demás monedas; en una
+ * moneda poco usada el cálculo va en USD y nunca llega el mapa de esa moneda
+ * (RN-6.11-J).
+ */
 async function loadDays(db, userId, accountId, currency) {
   const basePath = accountId === 'overall'
     ? `portfolioPerformance/${userId}/dates`
     : `portfolioPerformance/${userId}/accounts/${accountId}/dates`;
-  const snapshot = await db.collection(basePath).orderBy('date', 'asc').get();
+  const snapshot = await db.collection(basePath).select('date', currency).orderBy('date', 'asc').get();
   return snapshot.docs.map((doc) => {
     const data = doc.data() || {};
     return { date: data.date || doc.id, currencyData: data[currency] };
@@ -125,6 +132,12 @@ function stripPersonalReturns(returns) {
 }
 
 /**
+ * HU 6.11.3 (T4) — En una moneda poco usada, el sub-portafolio se calcula en
+ * `monedaCalculo` (USD): días en USD, precios y dividendos llevados a USD, como
+ * para cualquier inversor en USD. Sus días se pasan después por
+ * `convertirDocs` (USD × tasa de cierre del día, regla de la 6.9.2) y los
+ * periodos se calculan en la moneda pedida con la misma función.
+ *
  * @param {Object} params
  * @param {FirebaseFirestore.Firestore} params.db
  * @param {string} params.userId
@@ -132,13 +145,20 @@ function stripPersonalReturns(returns) {
  * @param {string} params.accountId - 'overall' o id de cuenta
  * @param {Set<string>} params.excludeSet - De carve.buildExcludeSet (no vacío)
  * @param {Object} [deps] - Inyectables para tests
+ * @param {Object} [opciones]
+ * @param {string} [opciones.monedaCalculo] - Moneda en que se calcula el sub-portafolio (por defecto, la del reporte)
+ * @param {(docs: Object[]) => Promise<Object[]>} [opciones.convertirDocs] - De `monedaCalculo` a la del reporte;
+ *   recibe todos los días, también los no calculables, y lanza si no hay con qué convertir
  * @returns {Promise<Object>} Forma de getHistoricalReturns + bloque carveOut
+ * @see platform-docs/stories/6.11.3-activo-comparacion-riesgo-usd/refinamiento.md (T4)
  */
 async function getCarveOutHistoricalReturns(
   { db, userId, currency, accountId, excludeSet },
-  deps = { getHistoricalPrices, getPricesFromApi }
+  deps = { getHistoricalPrices, getPricesFromApi },
+  opciones = {}
 ) {
-  const days = await loadDays(db, userId, accountId, currency);
+  const monedaCalculo = opciones.monedaCalculo || currency;
+  const days = await loadDays(db, userId, accountId, monedaCalculo);
   const excludedTickers = [...excludeSet].sort();
 
   const meta = {
@@ -169,7 +189,7 @@ async function getCarveOutHistoricalReturns(
 
   const dividendTxs = await loadDividendTransactions(db, userId, accountId, firstDate);
 
-  const currencies = new Set([carve.normalizeCurrency(currency)]);
+  const currencies = new Set([carve.normalizeCurrency(monedaCalculo)]);
   quoteCurrency.forEach((c) => currencies.add(c));
   dividendTxs.forEach((tx) => currencies.add(carve.normalizeCurrency(tx.currency)));
   currencies.delete('USD');
@@ -186,19 +206,27 @@ async function getCarveOutHistoricalReturns(
   const fxSeriesByCurrency = {};
   fxList.forEach((c, i) => { if (fxSeriesList[i]) fxSeriesByCurrency[c] = fxSeriesList[i]; });
 
-  const dividends = carve.groupDividends(dividendTxs, { reportCurrency: currency, fxSeriesByCurrency });
+  const dividends = carve.groupDividends(dividendTxs, { reportCurrency: monedaCalculo, fxSeriesByCurrency });
 
   const series = carve.buildCarveOutSeries(days, excludeSet, {
     marketReturn: (ticker, d0, d1) => carve.marketReturnPct({
       priceSeries: prices.get(ticker),
       quoteCurrency: quoteCurrency.get(ticker),
-      reportCurrency: currency,
+      reportCurrency: monedaCalculo,
       fxSeriesByCurrency,
     }, d0, d1),
     dividendCash: (ticker, d0, d1) => carve.dividendsBetween(dividends.byTicker, ticker, d0, d1),
   });
 
-  const result = calculateHistoricalReturns(carve.toPerformanceDocs(series, currency), currency, null, null);
+  let docs = carve.toPerformanceDocs(series, monedaCalculo);
+  if (opciones.convertirDocs) {
+    // Se convierten todos los días, también los no calculables: el cambio de un
+    // día se mide contra el anterior, sea cual sea (computeCarveOutDay).
+    const convertidos = await opciones.convertirDocs(carve.toPerformanceDocs(series, monedaCalculo, { incluirNoCalculables: true }));
+    docs = convertidos.filter((d) => d[currency]?.adjustedDailyChangePercentage !== null
+      && d[currency]?.adjustedDailyChangePercentage !== undefined);
+  }
+  const result = calculateHistoricalReturns(docs, currency, null, null);
 
   console.log(`[carveOut] user=${userId} account=${accountId} ${currency} excl=${excludedTickers.join(',')} `
     + `usable=${series.coverage.usableDays}/${series.coverage.totalDays} tickers=${tickers.length} range=${range}`);

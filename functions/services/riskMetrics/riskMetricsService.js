@@ -16,8 +16,15 @@ const {
   calculateBenchmarkMetrics
 } = require('./mathCalculations');
 const { getMarketReturns, getDynamicRiskFreeRate } = require('./benchmarkCache');
-const { aggregateMultiAccountData, determineStrategy } = require('./multiAccountAggregator');
+const { aggregateMultiAccountData, determineStrategy, leerResumen } = require('./multiAccountAggregator');
 const { MIN_DAYS_FOR_METRICS, TRADING_DAYS_PER_YEAR } = require('./types');
+const { DateTime } = require('luxon');
+// HU 6.11.3 (T5): en una moneda poco usada, sin respaldos a lo guardado y con el aviso.
+const { calculaDesdeUsd } = require('../snapshots/rareCurrencyScreensService');
+const { CODIGO_MONEDA_NO_DISPONIBLE } = require('../snapshots/derivedCurrencySnapshotService');
+
+/** Lo que devuelve `fetchProfitableWeeks` cuando no hay semanas que contar. */
+const SEMANAS_RENTABLES_POR_DEFECTO = 50;
 
 /**
  * Calcula la fecha de inicio según el período
@@ -105,6 +112,49 @@ async function fetchProfitableWeeks(db, userId, accountId, currency) {
     console.warn('[riskMetricsService] Error fetching profitable weeks:', error);
     return 50;
   }
+}
+
+/**
+ * HU 6.11.3 (T5, decisión 3 del refinamiento) — El % de semanas rentables de una
+ * serie, con la regla del job semanal (`calculateProfitableWeeks`): las 52 semanas
+ * hasta `hasta`, agrupadas por año y número de semana ISO; cuenta una semana con
+ * al menos 3 días y es rentable si el valor de su último día supera al del primero.
+ * Sin semanas, el mismo 50 que devuelve `fetchProfitableWeeks`.
+ *
+ * @param {Array<{d: string, v: number}>} timeline - Serie diaria en orden de fecha
+ * @param {DateTime} hasta - Fin del periodo (America/New_York)
+ * @returns {number}
+ */
+function semanasRentablesDeLaSerie(timeline, hasta) {
+  const fin = hasta.toISODate();
+  const inicio = hasta.minus({ weeks: 52 }).toISODate();
+  const semanas = new Map();
+  for (const punto of timeline || []) {
+    if (punto.d < inicio || punto.d > fin) continue;
+    const dia = DateTime.fromISO(punto.d);
+    const clave = `${dia.year}-W${dia.weekNumber}`;
+    if (!semanas.has(clave)) semanas.set(clave, []);
+    semanas.get(clave).push(punto);
+  }
+
+  let total = 0;
+  let rentables = 0;
+  for (const puntos of semanas.values()) {
+    if (puntos.length < 3) continue;
+    total++;
+    if ((puntos[puntos.length - 1].v || 0) > (puntos[0].v || 0)) rentables++;
+  }
+  return (total > 0 ? (rentables / total) * 100 : 0) || SEMANAS_RENTABLES_POR_DEFECTO;
+}
+
+/**
+ * HU 6.11.3 (T5) — Las semanas rentables en una moneda poco usada, de la serie
+ * derivada del USD (la misma de las demás métricas), en lugar de `metrics[moneda]`
+ * que guarda el job semanal (RN-6.11-J).
+ */
+async function semanasRentablesDesdeUsd(userId, accountId, currency) {
+  const resumen = await leerResumen(userId, accountId, currency);
+  return semanasRentablesDeLaSerie(resumen?.timeline, DateTime.now().setZone('America/New_York'));
 }
 
 /**
@@ -213,7 +263,9 @@ async function calculateRiskMetrics(userId, options = {}) {
     const primaryAccountId = strategy === 'overall' ? 'overall' : 
       (strategy === 'single' ? accountIds[0] : 'overall');
     
-    const profitableWeeks = await fetchProfitableWeeks(db, userId, primaryAccountId, currency);
+    const profitableWeeks = await calculaDesdeUsd(db, userId, currency)
+      ? await semanasRentablesDesdeUsd(userId, primaryAccountId, currency)
+      : await fetchProfitableWeeks(db, userId, primaryAccountId, currency);
     
     const result = {
       success: true,
@@ -281,6 +333,25 @@ async function calculateRiskMetrics(userId, options = {}) {
     return result;
     
   } catch (error) {
+    // HU 6.11.3 (T5): sin con qué calcular en una moneda poco usada, el aviso de la
+    // 6.11.1 en lugar de un error de cálculo (RN-6.11-K). No es un fallo del servidor.
+    if (error?.details?.code === CODIGO_MONEDA_NO_DISPONIBLE) {
+      return {
+        success: false,
+        error: CODIGO_MONEDA_NO_DISPONIBLE,
+        currency: error.details.currency,
+        motivo: error.details.motivo,
+        message: error.message,
+        metadata: {
+          calculatedAt: new Date().toISOString(),
+          period,
+          currency,
+          requestId,
+          durationMs: Date.now() - startTime
+        }
+      };
+    }
+
     console.error(`[riskMetricsService] Error:`, {
       requestId,
       error: error.message,
@@ -304,6 +375,7 @@ async function calculateRiskMetrics(userId, options = {}) {
 
 module.exports = {
   calculateRiskMetrics,
+  semanasRentablesDeLaSerie,
   getPeriodStartDate,
   formatDateToISO,
   getDataQuality

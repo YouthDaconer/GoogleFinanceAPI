@@ -15,7 +15,13 @@
 const admin = require('../firebaseAdmin');
 const db = admin.firestore();
 const { buildSnapshotDocId } = require('../snapshotGenerator');
-const { resumenesDerivadosDelUsd, obtenerResumenDerivado } = require('../snapshots/derivedCurrencySnapshotService');
+const {
+  resumenesDerivadosDelUsd,
+  obtenerResumenDerivado,
+  monedaNoDisponible,
+} = require('../snapshots/derivedCurrencySnapshotService');
+// HU 6.11.3 (T5): en una moneda poco usada, el riesgo no vuelve a lo guardado.
+const { calculaDesdeUsd } = require('../snapshots/rareCurrencyScreensService');
 
 const SNAPSHOT_LOCAL_CACHE_TTL = 10 * 60 * 1000;
 const SNAPSHOT_LOCAL_CACHE_MAX_SIZE = 200;
@@ -58,8 +64,13 @@ async function leerResumen(userId, accountId, currency) {
   const cached = snapshotLocalCache.get(clave);
   if (cached && Date.now() - cached.timestamp < SNAPSHOT_LOCAL_CACHE_TTL) return cached.data;
 
-  const { snapshot } = await obtenerResumenDerivado(db, { userId, accountId, currency });
-  // Si no aplica o no se puede derivar, se lee el guardado como antes.
+  const { snapshot, metodo, motivo } = await obtenerResumenDerivado(db, { userId, accountId, currency });
+  // HU 6.11.3 (T5): sin con qué derivar, el aviso de la 6.11.1, nunca lo guardado
+  // (RN-6.11-J, RN-6.11-K). Con el interruptor apagado, el guardado como antes.
+  if (!snapshot && metodo === 'no-derivable' && await calculaDesdeUsd(db, userId, currency)) {
+    throw monedaNoDisponible(currency, motivo, snapshotId);
+  }
+  // Si no aplica, se lee el guardado como antes.
   if (!snapshot) return getOrReadSnapshot(snapshotId);
   if (snapshotLocalCache.size >= SNAPSHOT_LOCAL_CACHE_MAX_SIZE) {
     snapshotLocalCache.delete(snapshotLocalCache.keys().next().value);
@@ -106,6 +117,7 @@ function chunkArray(array, size = 10) {
 }
 
 async function fetchAccountPerformanceData(userId, accountId, startDate, endDate, currency) {
+  const desdeUsd = await calculaDesdeUsd(db, userId, currency);
   try {
     const snapshotDocId = buildSnapshotDocId(userId, accountId, currency || 'USD');
     const snapshotData = await leerResumen(userId, accountId, currency || 'USD');
@@ -123,16 +135,29 @@ async function fetchAccountPerformanceData(userId, accountId, startDate, endDate
         };
       }
 
+      if (desdeUsd) return sinDiasEnElRango(snapshotDocId, startDate, endDate);
       console.log(`[RiskMetrics] Account snapshot exists for ${snapshotDocId} but no data in range ${startDate}..${endDate}, falling back to legacy`);
       return fetchAccountPerformanceDataLegacy(userId, accountId, startDate, endDate, currency);
     }
 
+    if (desdeUsd) return sinDiasEnElRango(snapshotDocId, startDate, endDate);
     console.log(`[RiskMetrics] Account snapshot not found for ${snapshotDocId}, falling back to legacy`);
     return fetchAccountPerformanceDataLegacy(userId, accountId, startDate, endDate, currency);
   } catch (error) {
+    // HU 6.11.3 (T5): en una moneda poco usada no hay respaldo a lo guardado.
+    if (desdeUsd) throw error;
     console.error('[multiAccountAggregator] Error fetching account snapshot, falling back to legacy:', error);
     return fetchAccountPerformanceDataLegacy(userId, accountId, startDate, endDate, currency);
   }
+}
+
+/**
+ * HU 6.11.3 (T5, Escenario 4): en una moneda poco usada, una serie sin días en el
+ * rango responde "sin datos suficientes", como en USD, sin ir a lo guardado.
+ */
+function sinDiasEnElRango(snapshotDocId, startDate, endDate) {
+  console.log(`[RiskMetrics] ${snapshotDocId}: sin días en ${startDate}..${endDate}, desde USD; sin datos suficientes`);
+  return null;
 }
 
 async function fetchAccountPerformanceDataLegacy(userId, accountId, startDate, endDate, currency) {
@@ -193,6 +218,7 @@ function extractDailyDataFromSnapshot(snapshot, startDate, endDate) {
 }
 
 async function fetchOverallPerformanceData(userId, startDate, endDate, currency) {
+  const desdeUsd = await calculaDesdeUsd(db, userId, currency);
   try {
     const snapshotDocId = buildSnapshotDocId(userId, 'overall', currency || 'USD');
     const snapshotData = await leerResumen(userId, 'overall', currency || 'USD');
@@ -210,13 +236,17 @@ async function fetchOverallPerformanceData(userId, startDate, endDate, currency)
         };
       }
 
+      if (desdeUsd) return sinDiasEnElRango(snapshotDocId, startDate, endDate);
       console.log(`[RiskMetrics] Snapshot exists for ${snapshotDocId} but no data in range ${startDate}..${endDate}, falling back to legacy`);
       return fetchOverallPerformanceDataLegacy(userId, startDate, endDate, currency);
     }
 
+    if (desdeUsd) return sinDiasEnElRango(snapshotDocId, startDate, endDate);
     console.log(`[RiskMetrics] Snapshot not found for ${snapshotDocId}, falling back to legacy`);
     return fetchOverallPerformanceDataLegacy(userId, startDate, endDate, currency);
   } catch (error) {
+    // HU 6.11.3 (T5): en una moneda poco usada no hay respaldo a lo guardado.
+    if (desdeUsd) throw error;
     console.error('[multiAccountAggregator] Error fetching overall snapshot, falling back to legacy:', error);
     return fetchOverallPerformanceDataLegacy(userId, startDate, endDate, currency);
   }
@@ -386,6 +416,10 @@ async function aggregateMultiAccountData(userId, accountIds, startDate, endDate,
 
   if (allSnapshotsAvailable) {
     allAccountsData = snapshotProbes;
+  } else if (await calculaDesdeUsd(db, userId, effectiveCurrency)) {
+    // HU 6.11.3 (T5): en una moneda poco usada, las cuentas sin días en el rango
+    // se omiten, como hace la ruta legacy en USD, sin leer lo guardado.
+    allAccountsData = snapshotProbes.filter(probe => probe !== null);
   } else {
     console.log('[RiskMetrics] Mixed snapshot availability in multi-account, falling back to legacy for all accounts');
     const batches = chunkArray(accountIds, 10);
@@ -433,6 +467,8 @@ module.exports = {
   consolidateDailyReturns,
   aggregateMultiAccountData,
   getOrReadSnapshot,
+  // HU 6.11.3 (T5): las semanas rentables en una moneda poco usada salen de la misma serie.
+  leerResumen,
   clearSnapshotCache,
   getSnapshotCacheSize,
   SNAPSHOT_LOCAL_CACHE_TTL

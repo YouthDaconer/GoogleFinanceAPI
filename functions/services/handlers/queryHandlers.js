@@ -77,6 +77,13 @@ const {
   monedaNoDisponible,
   CODIGO_MONEDA_NO_DISPONIBLE,
 } = require('../snapshots/derivedCurrencySnapshotService');
+// HU 6.11.3: detalle de activo y Versus en monedas poco usadas, desde los días en USD.
+const { fetchAssetDailyDocs } = require('../snapshotGenerator');
+const {
+  calculaDesdeUsd,
+  resumenDeActivoDesdeUsd,
+  diasEnMonedaDesdeUsd,
+} = require('../snapshots/rareCurrencyScreensService');
 // HU 6.11.2: un resumen viejo se prepara una sola vez aunque lo pidan varios a la vez.
 const { prepararResumenUnaVez } = require('../snapshots/snapshotPreparationService');
 // HU 6.11.5: la cabecera del día anterior, solo en la moneda que se muestra
@@ -227,6 +234,88 @@ async function resumenDerivadoConCache(userId, accountId, currency, signal) {
 }
 
 /**
+ * HU 6.11.3 (T2) — El detalle de un activo (portafolio o una cuenta) en una
+ * moneda poco usada, desde sus días en USD, con la misma caché en memoria y la
+ * misma regla de la señal que el derivado de la 6.9.2.
+ *
+ * Ya no se lee el resumen guardado en esa moneda, ni se rehace con lo guardado,
+ * ni se cae a la ruta legacy (RN-6.11-J). Sin con qué calcular, el aviso de la
+ * 6.11.1 (RN-6.11-K), que no se recuerda: la siguiente apertura lo reintenta.
+ *
+ * @returns {Promise<Object|undefined>} La respuesta, o `undefined` si la consulta
+ *   no se calcula desde USD (USD, moneda principal o interruptor apagado)
+ * @throws {HttpsError} `unavailable` con `details.code = 'CURRENCY_UNAVAILABLE'`
+ * @see platform-docs/stories/6.11.3-activo-comparacion-riesgo-usd/refinamiento.md (T2)
+ */
+async function activoDesdeUsdConCache(userId, params, signal) {
+  const { accountId, currency, ticker, assetType, forceRefresh } = params;
+  if (!(await calculaDesdeUsd(db, userId, currency))) return undefined;
+
+  const id = buildSnapshotDocId(userId, accountId, currency, ticker, assetType);
+  const clave = `derivado:${id}`;
+  const cached = snapshotMemCache.get(clave);
+  const vigente = cached && Date.now() - cached.cachedAt < getSnapshotCacheTTL() &&
+    !(signal && new Date(signal).getTime() > cached.cachedAt);
+
+  let snapshot = vigente && !forceRefresh ? cached.data : null;
+  if (!snapshot) {
+    const resultado = await resumenDeActivoDesdeUsd(db, { userId, accountId, currency, ticker, assetType });
+    if (resultado.metodo === 'no-derivable') throw monedaNoDisponible(currency, resultado.motivo, id);
+    snapshot = resultado.snapshot;
+    if (snapshot) {
+      snapshotMemCache.set(clave, { data: snapshot, cachedAt: Date.now() });
+      if (snapshotMemCache.size > SNAPSHOT_MEM_CACHE_MAX_SIZE) {
+        snapshotMemCache.delete(snapshotMemCache.keys().next().value);
+      }
+    }
+  }
+
+  // Sin datos del activo en ese alcance: la respuesta vacía, sin la ruta legacy.
+  const result = snapshot
+    ? transformSnapshotToResponse(snapshot)
+    : calculateHistoricalReturns([], currency, ticker, assetType);
+  return {
+    ...result,
+    cacheHit: false,
+    lastCalculated: new Date().toISOString(),
+    validUntil: calculateDynamicTTL().toISOString(),
+    lastSnapshotUpdate: signal || null,
+  };
+}
+
+/**
+ * HU 6.11.3 (T3) — El detalle de un activo con dos o más cuentas (no todas) en
+ * una moneda poco usada: los días del activo en USD de cada cuenta, convertidos,
+ * y **la misma agregación** de la ruta legacy, que en USD lee los días completos.
+ * No guarda nada en la caché de Firestore: es una moneda poco usada y casi nadie
+ * la consulta.
+ *
+ * @throws {HttpsError} `unavailable` con `details.code = 'CURRENCY_UNAVAILABLE'`
+ * @see platform-docs/stories/6.11.3-activo-comparacion-riesgo-usd/refinamiento.md (T3)
+ */
+async function activoVariasCuentasDesdeUsd(userId, { accountIds, currency, ticker, assetType }) {
+  const claveActivo = `${ticker}_${assetType}`;
+  const inicio = Date.now();
+  const diasPorCuenta = await Promise.all(accountIds.map(async (accountId) => {
+    const dias = await fetchAssetDailyDocs(db, userId, accountId, 'USD', ticker, assetType);
+    const conversion = await diasEnMonedaDesdeUsd(dias, currency, { claveActivo });
+    if (conversion.motivo) {
+      throw monedaNoDisponible(currency, conversion.motivo, buildSnapshotDocId(userId, accountId, currency, ticker, assetType));
+    }
+    return conversion.dias;
+  }));
+
+  const result = calculateHistoricalReturns(agregarDiasDeCuentas(diasPorCuenta), currency, ticker, assetType);
+  console.log(`[rareCurrencyScreens] activo ${userId}/[${accountIds.join(',')}]/${claveActivo} ${currency}: derivado, ${Date.now() - inicio} ms`);
+  return {
+    ...result,
+    cacheHit: false,
+    lastCalculated: new Date().toISOString(),
+    validUntil: calculateDynamicTTL().toISOString(),
+  };
+}
+
+/**
  * HU 6.11.2 (T3) — ¿Se puede calcular el rendimiento del portafolio en esta
  * moneda? Solo lo pregunta quien no puede mostrar el aviso de la 6.11.1 y tiene
  * que cambiar de moneda por su cuenta: el Copiloto.
@@ -293,6 +382,12 @@ function rendimientoDesdeResumenes() {
 async function rendimientoDeUnAlcance(context, accountId, params) {
   const { currency, ticker, assetType, forceRefresh } = params;
   const userId = context.auth.uid;
+
+  // HU 6.11.3 (T3): el detalle de un activo en una moneda poco usada sale de sus
+  // días en USD (T2), no del camino antiguo, que lee lo guardado en esa moneda.
+  if (ticker && assetType && await calculaDesdeUsd(db, userId, currency)) {
+    return await getHistoricalReturns(context, { currency, accountId, ticker, assetType, forceRefresh });
+  }
 
   if (!rendimientoDesdeResumenes() || ticker || assetType || forceRefresh) {
     return await getHistoricalReturnsInternal(userId, { currency, accountId, ticker, assetType, forceRefresh });
@@ -588,6 +683,13 @@ async function getHistoricalReturns(context, payload) {
     // R-03: Read signal once, reuse across all snapshot lookups in this CF invocation.
     const signal = await readSnapshotSignal(userId);
 
+    // HU 6.11.3 (T2): en una moneda poco usada, el detalle del activo sale de sus
+    // días en USD, antes del resumen guardado y de la ruta legacy en esa moneda.
+    if (ticker && assetType) {
+      const desdeUsd = await activoDesdeUsdConCache(userId, { accountId, currency, ticker, assetType, forceRefresh }, signal);
+      if (desdeUsd) return desdeUsd;
+    }
+
     // PERF-SNAP-024: Per-asset snapshot read path (antes del bypass legacy)
     if (ticker && assetType && !forceRefresh) {
       const inicioActivo = Date.now();
@@ -771,7 +873,10 @@ async function getHistoricalReturnsExcluding(context, payload) {
     .update([...excludeSet].sort().join(','))
     .digest('hex')
     .slice(0, 12);
-  const cacheKey = `${currency}_${accountId}_ex_${exclusionHash}`;
+  // HU 6.11.3 (T4): en una moneda poco usada se calcula desde USD. La clave lleva
+  // `_usd` para no servir lo que se guardó antes, hecho con lo guardado en esa moneda.
+  const desdeUsd = await calculaDesdeUsd(db, userId, currency);
+  const cacheKey = `${currency}_${accountId}_ex_${exclusionHash}${desdeUsd ? '_usd' : ''}`;
   const cacheRef = db.doc(`userData/${userId}/performanceCache/${cacheKey}`);
 
   if (!forceRefresh) {
@@ -789,7 +894,18 @@ async function getHistoricalReturnsExcluding(context, payload) {
     }
   }
 
-  const result = await getCarveOutHistoricalReturns({ db, userId, currency, accountId, excludeSet });
+  // Sin con qué convertir, el aviso de la 6.11.1, que no llega a la caché (RN-6.11-K).
+  const opciones = desdeUsd
+    ? {
+      monedaCalculo: 'USD',
+      convertirDocs: async (docs) => {
+        const conversion = await diasEnMonedaDesdeUsd(docs, currency);
+        if (conversion.motivo) throw monedaNoDisponible(currency, conversion.motivo, cacheKey);
+        return conversion.dias;
+      },
+    }
+    : undefined;
+  const result = await getCarveOutHistoricalReturns({ db, userId, currency, accountId, excludeSet }, undefined, opciones);
 
   const now = new Date();
   const validUntil = calculateDynamicTTL();
@@ -1063,6 +1179,12 @@ async function getMultiAccountHistoricalReturns(context, payload) {
       });
     }
 
+    // HU 6.11.3 (T3): el detalle de un activo con varias cuentas en una moneda
+    // poco usada no recorre lo guardado en esa moneda.
+    if (ticker && assetType && await calculaDesdeUsd(db, userId, currency)) {
+      return await activoVariasCuentasDesdeUsd(userId, { accountIds, currency, ticker, assetType });
+    }
+
     // Fallback a ruta legacy (full collection scan + cache)
     return await getMultiAccountHistoricalReturnsLegacy(context, payload);
 
@@ -1165,11 +1287,31 @@ async function getMultiAccountHistoricalReturnsLegacy(context, payload) {
     };
   }
 
+  const aggregatedDocs = agregarDiasDeCuentas(accountSnapshots.map(snapshot => snapshot.docs));
+
+  console.log(`[queryHandlers][getMultiAccountHistoricalReturnsLegacy] Procesando ${aggregatedDocs.length} fechas agregadas`);
+
+  const result = calculateHistoricalReturns(aggregatedDocs, currency, ticker, assetType);
+  return guardarYResponderMultiLegacy(userId, cacheKey, result);
+}
+
+/**
+ * Agrega los días de varias cuentas por fecha y moneda: suma importes y activos,
+ * y pondera el cambio diario por el valor previo de cada cuenta (TWR multi-cuenta).
+ *
+ * HU 6.11.3 (T3): extraída de `getMultiAccountHistoricalReturnsLegacy` sin cambiar
+ * lo que hace, para que el detalle de un activo con varias cuentas en una moneda
+ * poco usada agregue sus días en USD convertidos con la misma cuenta.
+ *
+ * @param {Array<Array>} diasPorCuenta - Por cuenta, sus días (snapshots o planos) en orden de fecha
+ * @returns {Array<{data: Function}>} Documentos agregados, en orden de fecha
+ */
+function agregarDiasDeCuentas(diasPorCuenta) {
   const aggregatedByDate = new Map();
 
-  accountSnapshots.forEach(snapshot => {
-    snapshot.docs.forEach(doc => {
-      const data = doc.data();
+  diasPorCuenta.forEach(dias => {
+    dias.forEach(doc => {
+      const data = typeof doc.data === 'function' ? doc.data() : doc;
       const date = data.date;
       
       if (!aggregatedByDate.has(date)) {
@@ -1292,7 +1434,7 @@ async function getMultiAccountHistoricalReturnsLegacy(context, payload) {
     });
   });
 
-  const aggregatedDocs = sortedDates.map(date => {
+  return sortedDates.map(date => {
     const dateData = aggregatedByDate.get(date);
     return {
       data: () => ({
@@ -1301,11 +1443,10 @@ async function getMultiAccountHistoricalReturnsLegacy(context, payload) {
       })
     };
   });
+}
 
-  console.log(`[queryHandlers][getMultiAccountHistoricalReturnsLegacy] Procesando ${aggregatedDocs.length} fechas agregadas`);
-
-  const result = calculateHistoricalReturns(aggregatedDocs, currency, ticker, assetType);
-
+/** Guarda en la caché de Firestore la respuesta de la ruta legacy multi-cuenta y la devuelve. */
+async function guardarYResponderMultiLegacy(userId, cacheKey, result) {
   const now = new Date();
   const validUntil = calculateDynamicTTL();
 

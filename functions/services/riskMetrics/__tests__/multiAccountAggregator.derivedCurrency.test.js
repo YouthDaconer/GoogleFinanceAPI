@@ -2,6 +2,9 @@
  * HU 6.9.2 (T4) — Las métricas de riesgo derivan del USD los resúmenes en
  * monedas poco usadas en lugar de leer los guardados, que nadie mantiene.
  *
+ * HU 6.11.3: sin derivado ya no se lee el guardado (aviso); ese caso está en
+ * `multiAccountAggregator.rareCurrency.test.js`. Aquí queda con el interruptor apagado.
+ *
  * @see platform-docs/stories/6.9.2-resumenes-poco-usados-incrementales/refinamiento.md (T6c)
  */
 const mockGet = jest.fn();
@@ -36,6 +39,12 @@ jest.mock('../../snapshots/derivedCurrencySnapshotService', () => ({
   obtenerResumenDerivado: (...args) => mockObtenerDerivado(...args),
 }));
 
+// HU 6.11.3: COP es poco usada para este inversor, salvo con el interruptor apagado.
+jest.mock('../../snapshots/rareCurrencyScreensService', () => ({
+  calculaDesdeUsd: async (db, userId, currency) => process.env.RARE_CURRENCY_SCREENS_FROM_USD !== 'false'
+    && currency !== 'USD',
+}));
+
 const { fetchOverallPerformanceData, clearSnapshotCache } = require('../multiAccountAggregator');
 
 const serie = [{ d: '2026-11-12', v: 4000000, c: 0 }, { d: '2026-11-13', v: 4080400, c: 2.01 }];
@@ -45,6 +54,7 @@ describe('HU 6.9.2: métricas de riesgo en una moneda poco usada', () => {
     jest.clearAllMocks();
     clearSnapshotCache();
     delete process.env.DERIVED_CURRENCY_SNAPSHOTS;
+    delete process.env.RARE_CURRENCY_SCREENS_FROM_USD;
   });
 
   it('usa la serie derivada del USD y la recuerda en la caché local', async () => {
@@ -62,7 +72,11 @@ describe('HU 6.9.2: métricas de riesgo en una moneda poco usada', () => {
     expect(mockDocGet).not.toHaveBeenCalled();
   });
 
-  it.each(['no-aplica', 'no-derivable'])('si el derivado es %s, lee el resumen guardado como antes (QA-09)', async (metodo) => {
+  it.each([
+    ['no-aplica', 'true'],
+    ['no-derivable', 'false'],
+  ])('si el derivado es %s (pantallas desde USD: %s), lee el resumen guardado como antes (QA-09)', async (metodo, desdeUsd) => {
+    process.env.RARE_CURRENCY_SCREENS_FROM_USD = desdeUsd;
     mockObtenerDerivado.mockResolvedValue({ snapshot: null, metodo });
     mockDocGet.mockResolvedValue({ exists: true, data: () => ({ timeline: serie }) });
 

@@ -547,12 +547,19 @@ function computePortfolioReturnsFromDailyDocs(docs, currency, now) {
   });
 }
 
-async function generateAssetSnapshot(db, userId, accountId, currency, ticker, assetType, options = {}) {
-  // PERF-SNAP-025: Usar daily docs en vez de V2
-  // HU 6.4 (T3b): sin docs ya leídos, solo los campos de este activo.
-  const dailyDocs = options.dailyDocs
-    || await fetchAssetDailyDocs(db, userId, accountId, currency, ticker, assetType);
-
+/**
+ * El resumen de un activo a partir de sus documentos diarios, sin escribir nada.
+ *
+ * HU 6.11.3 (T2): es el cálculo de `generateAssetSnapshot`, separado para que el
+ * detalle de activo en una moneda poco usada lo corra sobre los días en USD
+ * convertidos, sin guardar un resumen en esa moneda.
+ *
+ * @param {Array} dailyDocs - Documentos diarios (snapshots o planos) en orden de fecha
+ * @param {Object} alcance - `{ userId, accountId, currency, ticker, assetType }`
+ * @returns {Object|null} El resumen, o `null` si el activo no tiene datos
+ * @see platform-docs/stories/6.11.3-activo-comparacion-riesgo-usd/refinamiento.md (T2)
+ */
+function armarResumenDeActivo(dailyDocs, { userId, accountId, currency, ticker, assetType }) {
   // Hallazgo 6: Pre-filtrar docs para este activo
   const assetDocs = filterDocsForAsset(dailyDocs, currency, ticker, assetType);
 
@@ -562,7 +569,7 @@ async function generateAssetSnapshot(db, userId, accountId, currency, ticker, as
 
   if (!computedResult || !computedResult.returns) {
     console.log(`[snapshotGenerator] No asset data for ${ticker}_${assetType} userId=${userId} — skipping`);
-    return false;
+    return null;
   }
 
   const hasAnyData = computedResult.returns.hasYtdData ||
@@ -571,7 +578,7 @@ async function generateAssetSnapshot(db, userId, accountId, currency, ticker, as
 
   if (!hasAnyData) {
     console.log(`[snapshotGenerator] Empty asset result for ${ticker}_${assetType} userId=${userId} — skipping`);
-    return false;
+    return null;
   }
 
   // Timeline diaria completa (necesita todos los docs para detectar gaps/re-compras)
@@ -602,6 +609,18 @@ async function generateAssetSnapshot(db, userId, accountId, currency, ticker, as
     // OPT-SNAP-INCR: Enable incremental path on next run
     lastDateInTimeline: timeline.length > 0 ? timeline[timeline.length - 1].d : null,
   };
+  return snapshot;
+}
+
+async function generateAssetSnapshot(db, userId, accountId, currency, ticker, assetType, options = {}) {
+  // PERF-SNAP-025: Usar daily docs en vez de V2
+  // HU 6.4 (T3b): sin docs ya leídos, solo los campos de este activo.
+  const dailyDocs = options.dailyDocs
+    || await fetchAssetDailyDocs(db, userId, accountId, currency, ticker, assetType);
+
+  const snapshot = armarResumenDeActivo(dailyDocs, { userId, accountId, currency, ticker, assetType });
+  if (!snapshot) return false;
+  const timeline = snapshot.timeline;
 
   const docId = buildSnapshotDocId(userId, accountId, currency, ticker, assetType);
   console.log(`[snapshotGenerator] Writing asset snapshot ${docId} — timeline: ${timeline.length} points (daily)`);
@@ -671,6 +690,8 @@ module.exports = {
   generatePerformanceSnapshot,
   generateAllSnapshots,
   generateAssetSnapshot,
+  // HU 6.11.3: el mismo cálculo, sin escribir
+  armarResumenDeActivo,
   generateAllAssetSnapshots,
   buildSnapshotDocId,
   transformToCompactTimeline,
