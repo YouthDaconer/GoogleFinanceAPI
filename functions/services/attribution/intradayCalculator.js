@@ -163,9 +163,13 @@ async function getCurrencyRates() {
  * Obtiene los datos del día anterior de portfolioPerformance
  * @param {string} userId - ID del usuario
  * @param {string} accountId - ID de cuenta o 'overall'
+ * @param {string} [currency] - Si se indica, solo viajan `date`, esa moneda y
+ *   `USD` (el respaldo de quien lo usa). Integración 6.11.4: sin esto el documento
+ *   llegaba entero, con todas las monedas, también la poco usada (RN-6.11-J), y
+ *   el `medir` de `scripts/atribucion-desde-usd.js` lo marcaba en "Día en curso".
  * @returns {Promise<Object|null>} Datos del día anterior o null
  */
-async function getPreviousDayPerformance(userId, accountId = 'overall') {
+async function getPreviousDayPerformance(userId, accountId = 'overall', currency) {
   // Obtener la fecha de ayer (o el último día hábil)
   const today = new Date();
   const yesterday = getLastTradingDay(today);
@@ -175,10 +179,11 @@ async function getPreviousDayPerformance(userId, accountId = 'overall') {
     : `portfolioPerformance/${userId}/accounts/${accountId}/dates`;
   
   // Buscar el documento más reciente (que debería ser ayer o antes)
-  const snapshot = await db.collection(path)
+  let query = db.collection(path)
     .orderBy('date', 'desc')
-    .limit(1)
-    .get();
+    .limit(1);
+  if (currency) query = query.select('date', ...new Set([currency, 'USD']));
+  const snapshot = await query.get();
   
   if (snapshot.empty) {
     console.log(`[IntradayCalc] No previous day performance found for ${userId}/${accountId}`);
@@ -204,18 +209,18 @@ async function getPreviousDayPerformance(userId, accountId = 'overall') {
 async function getPreviousDayPerformanceMultiAccount(userId, accountIds, currency) {
   // Si es 'overall' o un solo account, usar la función simple
   if (accountIds.includes('overall') || accountIds.includes('all')) {
-    return getPreviousDayPerformance(userId, 'overall');
+    return getPreviousDayPerformance(userId, 'overall', currency);
   }
   
   if (accountIds.length === 1) {
-    return getPreviousDayPerformance(userId, accountIds[0]);
+    return getPreviousDayPerformance(userId, accountIds[0], currency);
   }
   
   console.log(`[IntradayCalc] Getting previous day for ${accountIds.length} accounts`);
   
   // Obtener datos de todas las cuentas en paralelo
   const promises = accountIds.map(accountId => 
-    getPreviousDayPerformance(userId, accountId)
+    getPreviousDayPerformance(userId, accountId, currency)
   );
   const results = await Promise.all(promises);
   
