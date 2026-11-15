@@ -23,12 +23,31 @@ const { getPeriodLabel, getPeriodStartDate } = require('./types');
 const { calculateIntradayPerformance, calculateIntradayContributions, combineHistoricalWithIntraday } = require('./intradayCalculator');
 const { getQuotes } = require('../financeQuery');
 const { buildSnapshotDocId, generatePerformanceSnapshot } = require('../snapshotGenerator');
+const { resumenesDerivadosDelUsd, obtenerResumenDerivado } = require('../snapshots/derivedCurrencySnapshotService');
 // FIX-ATTR-HOLDINGS-001: contribuciones por tenencias diarias
 const { calculateHoldingsContributions } = require('./holdingsContributions');
 const { tickerFromAssetKey } = require('../../utils/carveOutReturns');
 
 const admin = require('../firebaseAdmin');
 const db = admin.firestore();
+
+/**
+ * HU 6.9.2 (T4) — El resumen de un alcance. En una moneda poco usada se deriva
+ * del USD en lugar de leer el guardado, que nadie mantiene (los que había eran
+ * de abril de 2026).
+ *
+ * @returns {Promise<Object|null>} Los datos del resumen, o `null` si no hay
+ * @see platform-docs/stories/6.9.2-resumenes-poco-usados-incrementales/refinamiento.md (T4)
+ */
+async function leerResumen(userId, accountId, currency) {
+  if (currency !== 'USD' && resumenesDerivadosDelUsd()) {
+    // Si no se puede derivar, se lee el guardado como antes: nunca cuesta más.
+    const { snapshot } = await obtenerResumenDerivado(db, { userId, accountId, currency });
+    if (snapshot) return snapshot;
+  }
+  const doc = await db.doc(`performanceSnapshots/${buildSnapshotDocId(userId, accountId, currency)}`).get();
+  return doc.exists ? doc.data() : null;
+}
 
 // PERF-SNAP-010: Mapeo de períodos estándar a campos del snapshot pre-computado
 const PERIOD_TO_SNAPSHOT_FIELD = {
@@ -192,14 +211,12 @@ async function calculateMultiAccountTWR(userId, period, currency, accountIds, da
     const field = PERIOD_TO_SNAPSHOT_FIELD[period];
     if (field) {
       const filteredAccountIds = accountIds.filter(id => id !== 'overall');
-      const snapshotPromises = filteredAccountIds.map(accId =>
-        db.doc(`performanceSnapshots/${buildSnapshotDocId(userId, accId, currency)}`).get()
-      );
+      // HU 6.9.2 (T4): `leerResumen` deriva del USD las monedas poco usadas.
+      const snapshotPromises = filteredAccountIds.map(accId => leerResumen(userId, accId, currency));
       const snapshotDocs = await Promise.all(snapshotPromises);
 
-      if (snapshotDocs.every(doc => doc.exists)) {
-        const accountsData = snapshotDocs.map((doc, i) => {
-          const snap = doc.data();
+      if (snapshotDocs.every(Boolean)) {
+        const accountsData = snapshotDocs.map((snap, i) => {
           const twr = snap.returns?.[field] ?? null;
           const timeline = snap.timeline || [];
           const lastPoint = timeline.length > 0 ? timeline[timeline.length - 1] : null;
@@ -223,13 +240,13 @@ async function calculateMultiAccountTWR(userId, period, currency, accountIds, da
 
       // All-or-nothing: si algún snapshot falta → fallback completo a legacy
       const missingIds = snapshotDocs
-        .map((doc, i) => doc.exists ? null : buildSnapshotDocId(userId, filteredAccountIds[i], currency))
+        .map((snap, i) => snap ? null : buildSnapshotDocId(userId, filteredAccountIds[i], currency))
         .filter(Boolean);
       console.log(`[PERF] Attribution multi-account snapshot miss for [${missingIds.join(', ')}], falling back to legacy`);
 
       // Generación on-demand fire-and-forget para cuentas sin snapshot
       const missingAccountIds = snapshotDocs
-        .map((doc, i) => doc.exists ? null : filteredAccountIds[i])
+        .map((snap, i) => snap ? null : filteredAccountIds[i])
         .filter(Boolean);
       missingAccountIds.forEach(accId => {
         generatePerformanceSnapshot(db, userId, accId, currency).catch(err =>
@@ -401,8 +418,8 @@ async function getPortfolioAttribution(params) {
         : 'overall';
       const snapshotDocId = buildSnapshotDocId(userId, effectiveAccountId, currency);
       try {
-        const snapshotDoc = await db.doc(`performanceSnapshots/${snapshotDocId}`).get();
-        snapshot = snapshotDoc.exists ? snapshotDoc.data() : null;
+        // HU 6.9.2 (T4): derivado del USD en una moneda poco usada.
+        snapshot = await leerResumen(userId, effectiveAccountId, currency);
         console.log(`[PERF] Attribution snapshot ${snapshot ? 'hit' : 'miss'} for ${snapshotDocId}`);
         if (!snapshot) {
           generatePerformanceSnapshot(db, userId, effectiveAccountId, currency).catch(err =>

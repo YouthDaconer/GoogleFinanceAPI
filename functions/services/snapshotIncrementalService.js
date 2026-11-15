@@ -268,11 +268,35 @@ async function updateSnapshotIncremental(db, snapshotDocId, newDailyData, option
     lastUpdated: new Date().toISOString(),
     lastDateInTimeline: newDailyData.date,
     schemaVersion: SCHEMA_VERSION_INCREMENTAL,
+    // HU 6.9.2 (T1): las listas por día, solo si el resumen ya las tiene.
+    ...extenderListasDiarias(snapshot, newDailyData),
   };
 
   await db.doc(`performanceSnapshots/${snapshotDocId}`).set(updatedSnapshot);
 
   return { updated: true, method: 'incremental' };
+}
+
+/**
+ * HU 6.9.2 (T1) — Añade el día a `cashFlows` y `realizedPnL`, las listas con que
+ * el resumen en USD se deriva a otra moneda.
+ *
+ * Solo si el resumen **ya tiene las dos**: uno anterior a la HU sigue sin ellas
+ * hasta que se rehaga o se completen con la herramienta. Una lista empezada a
+ * mitad de la historia daría un rendimiento personal y un P&G falsos.
+ *
+ * @param {Object} snapshot - Resumen actual
+ * @param {Object} newDailyData - Datos del día
+ * @returns {{cashFlows?: Array, realizedPnL?: Array}} Los campos a escribir, o nada
+ * @see platform-docs/stories/6.9.2-resumenes-poco-usados-incrementales/refinamiento.md (T1)
+ */
+function extenderListasDiarias(snapshot, newDailyData) {
+  if (!Array.isArray(snapshot.cashFlows) || !Array.isArray(snapshot.realizedPnL)) return {};
+  const cashFlows = snapshot.cashFlows.slice();
+  const realizedPnL = snapshot.realizedPnL.slice();
+  if (newDailyData.totalCashFlow) cashFlows.push({ d: newDailyData.date, f: newDailyData.totalCashFlow });
+  if (newDailyData.doneProfitAndLoss) realizedPnL.push({ d: newDailyData.date, p: newDailyData.doneProfitAndLoss });
+  return { cashFlows, realizedPnL };
 }
 
 /**
@@ -530,6 +554,7 @@ module.exports = {
   updateSnapshotIncremental,
   updateAssetSnapshotIncremental,
   aplicarDiaAResumenDeActivo,
+  extenderListasDiarias,
   computeReturnsFromTimeline,
 
   // Helpers (exported for testing)

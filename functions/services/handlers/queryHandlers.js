@@ -68,6 +68,7 @@ const { buildExcludeSet } = require('../../utils/carveOutReturns');
 const { buildSnapshotDocId, generatePerformanceSnapshot, generateAssetSnapshot } = require('../snapshotGenerator');
 // HU 6.4: los resúmenes por activo se ponen al día al abrirlos, no cada noche.
 const { resumenesPorActivoBajoDemanda, ponerAlDiaResumenDeActivo } = require('../snapshots/assetSnapshotOnDemandService');
+const { resumenesDerivadosDelUsd, obtenerResumenDerivado } = require('../snapshots/derivedCurrencySnapshotService');
 
 // PERF-SNAP-021: Importar funciones de mercado para TTL inteligente
 const { isNYSEMarketOpen, calculateTTLUntilNextEOD, MARKET_CACHE_TTL_MS } = require('../riskMetrics/riskMetricsCache');
@@ -167,6 +168,37 @@ async function getSnapshotWithCache(snapshotId, userId, preloadedSignal) {
   }
 
   return { data, lastSnapshotUpdate };
+}
+
+/**
+ * HU 6.9.2 (T4) — El resumen de un alcance en una moneda poco usada, derivado
+ * del USD, con la misma caché en memoria y la misma regla de la señal que los
+ * guardados: un cierre o una corrección posteriores obligan a volver a derivar.
+ *
+ * @returns {Promise<Object|null>} El derivado, o `null` si la moneda no es poco
+ *   usada (o el interruptor está apagado) y hay que seguir el camino de siempre
+ * @see platform-docs/stories/6.9.2-resumenes-poco-usados-incrementales/refinamiento.md (T4)
+ */
+async function resumenDerivadoConCache(userId, accountId, currency, signal) {
+  if (currency === 'USD' || !resumenesDerivadosDelUsd()) return null;
+
+  const clave = `derivado:${buildSnapshotDocId(userId, accountId, currency)}`;
+  const cached = snapshotMemCache.get(clave);
+  if (cached && Date.now() - cached.cachedAt < getSnapshotCacheTTL() &&
+      !(signal && new Date(signal).getTime() > cached.cachedAt)) {
+    return cached.data;
+  }
+
+  // Sin derivado (no aplica o no derivable) se sigue el camino de siempre.
+  // `prepararUsd`: si el de USD falta o está viejo, se prepara, como ya hacía esta lectura.
+  const { snapshot } = await obtenerResumenDerivado(db, { userId, accountId, currency, senal: signal, prepararUsd: true });
+  if (!snapshot) return null;
+
+  snapshotMemCache.set(clave, { data: snapshot, cachedAt: Date.now() });
+  if (snapshotMemCache.size > SNAPSHOT_MEM_CACHE_MAX_SIZE) {
+    snapshotMemCache.delete(snapshotMemCache.keys().next().value);
+  }
+  return snapshot;
 }
 
 function clearSnapshotMemCache() {
@@ -517,6 +549,22 @@ async function getHistoricalReturns(context, payload) {
       return await getHistoricalReturnsLegacy(context, payload);
     }
 
+    // HU 6.9.2 (T4): en una moneda poco usada el resumen se deriva del USD.
+    if (!forceRefresh) {
+      const inicioDerivado = Date.now();
+      const derivado = await resumenDerivadoConCache(userId, accountId, currency, signal);
+      if (derivado) {
+        console.log(`[PERF][getHistoricalReturns] Derived currency snapshot - ${buildSnapshotDocId(userId, accountId, currency)} (${Date.now() - inicioDerivado} ms)`);
+        return {
+          ...transformSnapshotToResponse(derivado),
+          cacheHit: false,
+          lastCalculated: new Date().toISOString(),
+          validUntil: calculateDynamicTTL().toISOString(),
+          lastSnapshotUpdate: signal || null,
+        };
+      }
+    }
+
     // PERF-SNAP-007/021: Intentar leer snapshot (cache in-memory → Firestore)
     if (!forceRefresh) {
       const snapshotDocId = buildSnapshotDocId(userId, accountId, currency);
@@ -842,9 +890,13 @@ async function getMultiAccountHistoricalReturns(context, payload) {
     // ============================================================================
     if (!forceRefresh && !ticker && !assetType) {
       const signal = await readSnapshotSignal(userId);
-      const snapshotPromises = accountIds.map(accountId =>
-        getSnapshotWithCache(buildSnapshotDocId(userId, accountId, currency), userId, signal)
-      );
+      // HU 6.9.2 (T4): en una moneda poco usada cada cuenta se deriva del USD.
+      const snapshotPromises = accountIds.map(async (accountId) => {
+        const derivado = await resumenDerivadoConCache(userId, accountId, currency, signal);
+        return derivado
+          ? { data: derivado, lastSnapshotUpdate: signal }
+          : getSnapshotWithCache(buildSnapshotDocId(userId, accountId, currency), userId, signal);
+      });
       const snapshotResults = await Promise.all(snapshotPromises);
 
       if (snapshotResults.every(r => r.data !== null)) {

@@ -1088,3 +1088,42 @@ describe('HU 6.4: aplicarDiaAResumenDeActivo (RN-6.4-N)', () => {
       .toEqual({ method: 'skipped', reason: 'already-current' });
   });
 });
+
+describe('HU 6.9.2 (T1) — la noche mantiene las listas por día', () => {
+  it('añade el flujo y la venta del día cuando el resumen ya tiene las listas', async () => {
+    const snapshot = buildExistingSnapshot({
+      cashFlows: [{ d: '2026-04-25', f: -1000 }],
+      realizedPnL: [],
+    });
+    const db = createMockDb(snapshot);
+
+    await updateSnapshotIncremental(db, 'user1_USD',
+      buildNewDailyData({ totalCashFlow: 250, doneProfitAndLoss: 12.5 }), { now: NOW });
+
+    const escrito = db._mockSet.mock.calls[0][0];
+    expect(escrito.cashFlows).toEqual([{ d: '2026-04-25', f: -1000 }, { d: '2026-04-29', f: 250 }]);
+    expect(escrito.realizedPnL).toEqual([{ d: '2026-04-29', p: 12.5 }]);
+    expect(snapshot.cashFlows).toHaveLength(1); // no muta el leído
+  });
+
+  it('un día sin flujo ni venta no añade entradas', async () => {
+    const db = createMockDb(buildExistingSnapshot({ cashFlows: [], realizedPnL: [] }));
+
+    await updateSnapshotIncremental(db, 'user1_USD', buildNewDailyData(), { now: NOW });
+
+    const escrito = db._mockSet.mock.calls[0][0];
+    expect(escrito.cashFlows).toEqual([]);
+    expect(escrito.realizedPnL).toEqual([]);
+  });
+
+  it('un resumen anterior a la HU sigue sin listas: una lista a medias daría cifras falsas', async () => {
+    const db = createMockDb(buildExistingSnapshot());
+
+    await updateSnapshotIncremental(db, 'user1_USD',
+      buildNewDailyData({ totalCashFlow: 250 }), { now: NOW });
+
+    const escrito = db._mockSet.mock.calls[0][0];
+    expect(escrito).not.toHaveProperty('cashFlows');
+    expect(escrito).not.toHaveProperty('realizedPnL');
+  });
+});

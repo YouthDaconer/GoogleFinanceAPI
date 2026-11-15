@@ -116,6 +116,32 @@ async function fetchAssetDailyDocs(db, userId, accountId, currency, ticker, asse
   return snapshot.docs;
 }
 
+/**
+ * HU 6.9.2 (T1) — Lo que la serie (`timeline`) no guarda y hace falta para
+ * derivar el resumen a otra moneda: el flujo de caja y el P&G realizado de cada
+ * día. Solo los días con dato, para que el resumen no crezca con días en cero.
+ *
+ * Misma regla que el cálculo desde cero: `totalCashFlow || 0` y
+ * `doneProfitAndLoss ?? 0`, así que un día sin dato equivale a 0.
+ *
+ * @param {Array} docs - Documentos diarios en orden de fecha
+ * @param {string} currency
+ * @returns {{cashFlows: Array<{d: string, f: number}>, realizedPnL: Array<{d: string, p: number}>}}
+ * @see platform-docs/stories/6.9.2-resumenes-poco-usados-incrementales/refinamiento.md (T1)
+ */
+function extraerListasDiarias(docs, currency) {
+  const cashFlows = [];
+  const realizedPnL = [];
+  for (const doc of docs) {
+    const data = doc.data ? doc.data() : doc;
+    const currencyData = data?.[currency];
+    if (!currencyData) continue;
+    if (currencyData.totalCashFlow) cashFlows.push({ d: data.date, f: currencyData.totalCashFlow });
+    if (currencyData.doneProfitAndLoss) realizedPnL.push({ d: data.date, p: currencyData.doneProfitAndLoss });
+  }
+  return { cashFlows, realizedPnL };
+}
+
 function buildDailyTimeline(docs, currency) {
   const timeline = [];
   for (const doc of docs) {
@@ -301,6 +327,8 @@ async function generatePerformanceSnapshot(db, userId, accountId, currency, opti
 
   const timeline = buildDailyTimeline(dailyDocs, currency);
   const latestAssetPerformance = extractLatestAssetPerformanceFromDocs(dailyDocs, currency);
+  // HU 6.9.2 (T1): para derivar este resumen a otra moneda sin releer la historia.
+  const { cashFlows, realizedPnL } = extraerListasDiarias(dailyDocs, currency);
 
   const snapshot = {
     userId,
@@ -323,6 +351,10 @@ async function generatePerformanceSnapshot(db, userId, accountId, currency, opti
 
     // OPT-SNAP-INCR: Enable incremental path on next run
     lastDateInTimeline: timeline.length > 0 ? timeline[timeline.length - 1].d : null,
+
+    // HU 6.9.2 (T1)
+    cashFlows,
+    realizedPnL,
   };
 
   const docId = buildSnapshotDocId(userId, accountId, currency);
@@ -648,6 +680,7 @@ module.exports = {
   fetchAssetDailyDocs,
   buildDailyTimeline,
   extractLatestAssetPerformanceFromDocs,
+  extraerListasDiarias,
   // PERF-SNAP-025
   filterDocsForAsset,
   buildAssetDailyTimeline,

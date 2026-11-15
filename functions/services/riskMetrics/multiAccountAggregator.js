@@ -15,6 +15,7 @@
 const admin = require('../firebaseAdmin');
 const db = admin.firestore();
 const { buildSnapshotDocId } = require('../snapshotGenerator');
+const { resumenesDerivadosDelUsd, obtenerResumenDerivado } = require('../snapshots/derivedCurrencySnapshotService');
 
 const SNAPSHOT_LOCAL_CACHE_TTL = 10 * 60 * 1000;
 const SNAPSHOT_LOCAL_CACHE_MAX_SIZE = 200;
@@ -39,6 +40,32 @@ function getOrReadSnapshot(snapshotId) {
     snapshotLocalCache.set(snapshotId, { data, timestamp: Date.now() });
     return data;
   });
+}
+
+/**
+ * HU 6.9.2 (T4) — El resumen de un alcance, con la misma caché local. En una
+ * moneda poco usada se deriva del USD en lugar de leer el guardado, que nadie
+ * mantiene.
+ *
+ * @returns {Promise<Object|null>}
+ * @see platform-docs/stories/6.9.2-resumenes-poco-usados-incrementales/refinamiento.md (T4)
+ */
+async function leerResumen(userId, accountId, currency) {
+  const snapshotId = buildSnapshotDocId(userId, accountId, currency);
+  if (currency === 'USD' || !resumenesDerivadosDelUsd()) return getOrReadSnapshot(snapshotId);
+
+  const clave = `derivado:${snapshotId}`;
+  const cached = snapshotLocalCache.get(clave);
+  if (cached && Date.now() - cached.timestamp < SNAPSHOT_LOCAL_CACHE_TTL) return cached.data;
+
+  const { snapshot } = await obtenerResumenDerivado(db, { userId, accountId, currency });
+  // Si no aplica o no se puede derivar, se lee el guardado como antes.
+  if (!snapshot) return getOrReadSnapshot(snapshotId);
+  if (snapshotLocalCache.size >= SNAPSHOT_LOCAL_CACHE_MAX_SIZE) {
+    snapshotLocalCache.delete(snapshotLocalCache.keys().next().value);
+  }
+  snapshotLocalCache.set(clave, { data: snapshot, timestamp: Date.now() });
+  return snapshot;
 }
 
 function clearSnapshotCache() {
@@ -81,7 +108,7 @@ function chunkArray(array, size = 10) {
 async function fetchAccountPerformanceData(userId, accountId, startDate, endDate, currency) {
   try {
     const snapshotDocId = buildSnapshotDocId(userId, accountId, currency || 'USD');
-    const snapshotData = await getOrReadSnapshot(snapshotDocId);
+    const snapshotData = await leerResumen(userId, accountId, currency || 'USD');
 
     if (snapshotData) {
       const dailyData = extractDailyDataFromSnapshot(snapshotData, startDate, endDate);
@@ -168,7 +195,7 @@ function extractDailyDataFromSnapshot(snapshot, startDate, endDate) {
 async function fetchOverallPerformanceData(userId, startDate, endDate, currency) {
   try {
     const snapshotDocId = buildSnapshotDocId(userId, 'overall', currency || 'USD');
-    const snapshotData = await getOrReadSnapshot(snapshotDocId);
+    const snapshotData = await leerResumen(userId, 'overall', currency || 'USD');
 
     if (snapshotData) {
       const dailyData = extractDailyDataFromSnapshot(snapshotData, startDate, endDate);
@@ -344,8 +371,7 @@ async function aggregateMultiAccountData(userId, accountIds, startDate, endDate,
   const effectiveCurrency = currency || 'USD';
   const snapshotProbes = await Promise.all(
     accountIds.map(id => {
-      const snapshotDocId = buildSnapshotDocId(userId, id, effectiveCurrency);
-      return getOrReadSnapshot(snapshotDocId).then(data => {
+      return leerResumen(userId, id, effectiveCurrency).then(data => {
         if (!data) return null;
         const dailyData = extractDailyDataFromSnapshot(data, startDate, endDate);
         if (dailyData.length === 0) return null;

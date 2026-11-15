@@ -36,6 +36,8 @@ const {
 } = require('../multiAccountAggregator');
 const { buildSnapshotDocId } = require('../../snapshotGenerator');
 
+afterEach(() => { delete process.env.DERIVED_CURRENCY_SNAPSHOTS; });
+
 beforeEach(() => {
   jest.clearAllMocks();
   clearSnapshotCache();
@@ -183,6 +185,9 @@ describe('fetchOverallPerformanceData', () => {
   });
 
   it('should use buildSnapshotDocId with correct params', async () => {
+    // HU 6.9.2: una moneda poco usada se deriva del USD (multiAccountAggregator.derivedCurrency.test.js);
+    // aquí se comprueba la lectura del resumen guardado, con la derivación apagada.
+    process.env.DERIVED_CURRENCY_SNAPSHOTS = 'false';
     mockDocGet.mockResolvedValue({
       exists: true,
       data: () => ({

@@ -1028,3 +1028,31 @@ describe('PERF-SNAP-003: snapshotGenerator', () => {
     });
   });
 });
+
+describe('HU 6.9.2 (T1) — el resumen guarda flujos y P&G realizado por día', () => {
+  const dia = (date, usd) => ({ data: () => ({ date, USD: { totalValue: 1000, adjustedDailyChangePercentage: 0, ...usd } }) });
+
+  it('escribe solo los días con flujo de caja o con venta, con su importe exacto', async () => {
+    const db = createMockDb([
+      dia('2026-11-10', { totalCashFlow: -500.25 }),
+      dia('2026-11-11', {}),
+      dia('2026-11-12', { totalCashFlow: 300, doneProfitAndLoss: 41.7 }),
+    ]);
+
+    await generatePerformanceSnapshot(db, 'user1', 'overall', 'USD');
+
+    const escrito = db._mockSet.mock.calls[0][0];
+    expect(escrito.cashFlows).toEqual([{ d: '2026-11-10', f: -500.25 }, { d: '2026-11-12', f: 300 }]);
+    expect(escrito.realizedPnL).toEqual([{ d: '2026-11-12', p: 41.7 }]);
+  });
+
+  it('sin flujos ni ventas deja las dos listas vacías, no ausentes', async () => {
+    const db = createMockDb([dia('2026-11-10', {}), dia('2026-11-11', {})]);
+
+    await generatePerformanceSnapshot(db, 'user1', 'overall', 'USD');
+
+    const escrito = db._mockSet.mock.calls[0][0];
+    expect(escrito.cashFlows).toEqual([]);
+    expect(escrito.realizedPnL).toEqual([]);
+  });
+});
