@@ -23,7 +23,14 @@ const { getPeriodLabel, getPeriodStartDate } = require('./types');
 const { calculateIntradayPerformance, calculateIntradayContributions, combineHistoricalWithIntraday } = require('./intradayCalculator');
 const { getQuotes } = require('../financeQuery');
 const { buildSnapshotDocId, generatePerformanceSnapshot } = require('../snapshotGenerator');
-const { resumenesDerivadosDelUsd, obtenerResumenDerivado } = require('../snapshots/derivedCurrencySnapshotService');
+const { resumenesDerivadosDelUsd, obtenerResumenDerivado, monedaNoDisponible } = require('../snapshots/derivedCurrencySnapshotService');
+// HU 6.11.4: en una moneda poco usada, toda la atribución sale de USD
+const {
+  monedaPocoUsadaDeAtribucion,
+  twrDeRangoDesdeUsd,
+  intradiaDesdeUsd,
+  esAvisoMonedaNoDisponible,
+} = require('./attributionFromUsdService');
 // FIX-ATTR-HOLDINGS-001: contribuciones por tenencias diarias
 const { calculateHoldingsContributions } = require('./holdingsContributions');
 const { tickerFromAssetKey } = require('../../utils/carveOutReturns');
@@ -36,10 +43,20 @@ const db = admin.firestore();
  * del USD en lugar de leer el guardado, que nadie mantiene (los que había eran
  * de abril de 2026).
  *
+ * HU 6.11.4 (T3): con `pocoUsada`, solo el derivado. Si no se puede derivar,
+ * `null`: quien llama sigue desde los días en USD, nunca lee el guardado en esa
+ * moneda (RN-6.11-J).
+ *
+ * @param {boolean} [pocoUsada=false] - La atribución se calcula desde USD
  * @returns {Promise<Object|null>} Los datos del resumen, o `null` si no hay
  * @see platform-docs/stories/6.9.2-resumenes-poco-usados-incrementales/refinamiento.md (T4)
+ * @see platform-docs/stories/6.11.4-atribucion-desde-usd/refinamiento.md (T3)
  */
-async function leerResumen(userId, accountId, currency) {
+async function leerResumen(userId, accountId, currency, pocoUsada = false) {
+  if (pocoUsada) {
+    const { snapshot } = await obtenerResumenDerivado(db, { userId, accountId, currency });
+    return snapshot || null;
+  }
   if (currency !== 'USD' && resumenesDerivadosDelUsd()) {
     // Si no se puede derivar, se lee el guardado como antes: nunca cuesta más.
     const { snapshot } = await obtenerResumenDerivado(db, { userId, accountId, currency });
@@ -102,10 +119,11 @@ function calculateCustomRangeTWR(snapshot, startDate, endDate) {
  * @param {Date} [dateRange.endDate] - Fecha fin
  * @param {Object} [options] - PERF-SNAP-010: Opciones adicionales
  * @param {Object} [options.snapshot] - Snapshot pre-computado
+ * @param {boolean} [options.pocoUsada] - HU 6.11.4: el respaldo sale de los días en USD
  * @returns {Promise<{twr: number, hasData: boolean, docsCount: number}>}
  */
 async function calculatePeriodTWR(userId, period, currency, accountId = 'overall', dateRange, options = {}) {
-  const { snapshot } = options;
+  const { snapshot, pocoUsada = false } = options;
 
   // PERF-SNAP-010: Si tenemos snapshot, no hay dateRange, y es período estándar → leer del snapshot
   if (snapshot && !dateRange) {
@@ -130,7 +148,16 @@ async function calculatePeriodTWR(userId, period, currency, accountId = 'overall
   const periodStartDate = dateRange?.startDate || getPeriodStartDate(period);
   const periodStartStr = periodStartDate.toISOString().split('T')[0];
   const periodEndStr = dateRange?.endDate ? dateRange.endDate.toISOString().split('T')[0] : null;
-  
+
+  // HU 6.11.4 (T3, respaldo por periodo): los días en USD × la tasa de cierre,
+  // nunca el bloque guardado en la moneda poco usada (RN-6.11-J).
+  if (pocoUsada) {
+    const { twr, hasData, docsCount } = await twrDeRangoDesdeUsd(db, {
+      userId, accountId, currency, startStr: periodStartStr, endStr: periodEndStr,
+    });
+    return { twr, hasData, docsCount };
+  }
+
   // Obtener todos los documentos desde el inicio del período
   const path = accountId === 'overall'
     ? `portfolioPerformance/${userId}/dates`
@@ -193,9 +220,11 @@ async function calculatePeriodTWR(userId, period, currency, accountId = 'overall
  * @param {Object} [dateRange] - FEAT-UX-001: Rango de fechas explícito opcional
  * @param {Object} [options] - PERF-SNAP-010: Opciones adicionales
  * @param {Object} [options.snapshot] - Snapshot pre-computado (para single/overall)
+ * @param {boolean} [options.pocoUsada] - HU 6.11.4: todo sale de USD
  * @returns {Promise<{twr: number, hasData: boolean}>}
  */
 async function calculateMultiAccountTWR(userId, period, currency, accountIds, dateRange, options = {}) {
+  const { pocoUsada = false } = options;
   // Si es solo 'overall' o una cuenta, usar cálculo simple
   if (accountIds.length === 0 || 
       (accountIds.length === 1 && accountIds[0] === 'overall')) {
@@ -212,7 +241,8 @@ async function calculateMultiAccountTWR(userId, period, currency, accountIds, da
     if (field) {
       const filteredAccountIds = accountIds.filter(id => id !== 'overall');
       // HU 6.9.2 (T4): `leerResumen` deriva del USD las monedas poco usadas.
-      const snapshotPromises = filteredAccountIds.map(accId => leerResumen(userId, accId, currency));
+      // HU 6.11.4 (T3): con `pocoUsada`, sin respaldo a lo guardado.
+      const snapshotPromises = filteredAccountIds.map(accId => leerResumen(userId, accId, currency, pocoUsada));
       const snapshotDocs = await Promise.all(snapshotPromises);
 
       if (snapshotDocs.every(Boolean)) {
@@ -244,8 +274,9 @@ async function calculateMultiAccountTWR(userId, period, currency, accountIds, da
         .filter(Boolean);
       console.log(`[PERF] Attribution multi-account snapshot miss for [${missingIds.join(', ')}], falling back to legacy`);
 
-      // Generación on-demand fire-and-forget para cuentas sin snapshot
-      const missingAccountIds = snapshotDocs
+      // Generación on-demand fire-and-forget para cuentas sin snapshot.
+      // HU 6.11.4: nunca en una moneda poco usada (recorrería lo guardado en ella).
+      const missingAccountIds = pocoUsada ? [] : snapshotDocs
         .map((snap, i) => snap ? null : filteredAccountIds[i])
         .filter(Boolean);
       missingAccountIds.forEach(accId => {
@@ -267,6 +298,14 @@ async function calculateMultiAccountTWR(userId, period, currency, accountIds, da
   const accountPromises = accountIds
     .filter(accountId => accountId !== 'overall')
     .map(async (accountId) => {
+      // HU 6.11.4 (T3, varias cuentas con fechas): los días en USD de la cuenta
+      // × la tasa de cierre (RN-6.11-J).
+      if (pocoUsada) {
+        const r = await twrDeRangoDesdeUsd(db, {
+          userId, accountId, currency, startStr: periodStartStr, endStr: periodEndStr,
+        });
+        return r.docsCount === 0 ? null : { accountId, twr: r.twr, value: r.value };
+      }
       const path = `portfolioPerformance/${userId}/accounts/${accountId}/dates`;
       let queryRef = db.collection(path)
         .where('date', '>=', periodStartStr);
@@ -406,7 +445,20 @@ async function getPortfolioAttribution(params) {
     if (dateRange) {
       console.log(`[Attribution] FEAT-UX-001: Usando rango explícito ${effectiveStartStr} → ${effectiveEndStr}`);
     }
-    
+
+    // =========================================================================
+    // 1.1 HU 6.11.4: ¿MONEDA POCO USADA? Entonces cada camino sale de USD y la
+    // tasa de cierre del día, y ninguno lee lo guardado en esa moneda
+    // (RN-6.11-J). USD y la moneda principal siguen igual (RN-6.11-N).
+    // =========================================================================
+    const pocoUsada = await monedaPocoUsadaDeAtribucion(db, userId, currency);
+    if (pocoUsada) {
+      console.log(`[attributionFromUsd] atribución ${userId} ${currency} [${accountIds.join(',')}] ` +
+        `${dateRange ? `${effectiveStartStr}..${effectiveEndStr}` : period}: desde USD`);
+    }
+    // El aviso "no disponible en esa moneda" no se convierte en un 0 % (RN-6.11-K)
+    let avisoMoneda = null;
+
     // =========================================================================
     // 1.5 PERF-SNAP-010/013: LEER SNAPSHOT UNA VEZ (si aplica)
     // PERF-SNAP-013: También leer snapshot cuando hay dateRange para usar timeline
@@ -419,9 +471,11 @@ async function getPortfolioAttribution(params) {
       const snapshotDocId = buildSnapshotDocId(userId, effectiveAccountId, currency);
       try {
         // HU 6.9.2 (T4): derivado del USD en una moneda poco usada.
-        snapshot = await leerResumen(userId, effectiveAccountId, currency);
+        // HU 6.11.4 (T3): con `pocoUsada`, sin respaldo a lo guardado.
+        snapshot = await leerResumen(userId, effectiveAccountId, currency, pocoUsada);
         console.log(`[PERF] Attribution snapshot ${snapshot ? 'hit' : 'miss'} for ${snapshotDocId}`);
-        if (!snapshot) {
+        // HU 6.11.4: en una moneda poco usada nunca se genera el resumen guardado
+        if (!snapshot && !pocoUsada) {
           generatePerformanceSnapshot(db, userId, effectiveAccountId, currency).catch(err =>
             console.warn(`[PERF] On-demand snapshot generation failed for ${snapshotDocId}: ${err.message}`)
           );
@@ -451,7 +505,7 @@ async function getPortfolioAttribution(params) {
       console.log(`[Attribution] Usando TWR del frontend: ${periodTWR.toFixed(2)}%`);
     } else {
       promises.push(
-        calculateMultiAccountTWR(userId, period, currency, accountIds, dateRange, { snapshot })
+        calculateMultiAccountTWR(userId, period, currency, accountIds, dateRange, { snapshot, pocoUsada })
           .then(twrResult => {
             periodTWR = twrResult.twr || 0;
             historicalTWR = twrResult.twr || 0;
@@ -459,6 +513,10 @@ async function getPortfolioAttribution(params) {
             console.log(`[Attribution] Usando TWR calculado del período ${period}: ${periodTWR.toFixed(2)}%`);
           })
           .catch(err => {
+            if (esAvisoMonedaNoDisponible(err)) {
+              avisoMoneda = err;
+              return;
+            }
             console.error(`[Attribution] Error calculando TWR:`, err);
             periodTWR = 0;
             historicalTWR = 0;
@@ -474,8 +532,11 @@ async function getPortfolioAttribution(params) {
       new Date().getFullYear(), new Date().getMonth(), new Date().getDate()
     );
     if (includeIntraday && !isDateRangeInPast) {
+      // HU 6.11.4 (T4, Escenario 4): en una moneda poco usada, el día en curso
+      // desde USD con la tasa vigente y la de cierre del día anterior.
+      const calcularIntradia = pocoUsada ? intradiaDesdeUsd : calculateIntradayPerformance;
       promises.push(
-        calculateIntradayPerformance({
+        calcularIntradia({
           userId,
           currency,
           accountIds
@@ -490,16 +551,22 @@ async function getPortfolioAttribution(params) {
             }
           })
           .catch(err => {
+            if (esAvisoMonedaNoDisponible(err)) {
+              avisoMoneda = err;
+              return;
+            }
             intradayError = err.message;
             console.error(`[Attribution] Error calculando intraday:`, err);
           })
       );
     }
-    
+
     // Esperar todas las promises en paralelo
     if (promises.length > 0) {
       await Promise.all(promises);
     }
+    // HU 6.11.4: sin con qué calcular en la moneda poco usada, el aviso (RN-6.11-K)
+    if (avisoMoneda) throw avisoMoneda;
     
     // INTRADAY-001: Combinar TWR histórico con factor intraday
     // Fórmula TWR: (1 + histórico) × todayFactor - 1
@@ -556,9 +623,18 @@ async function getPortfolioAttribution(params) {
     // =========================================================================
     let contributionResult = null;
     try {
-      contributionResult = await calculateHoldingsContributions({ userId, period, currency, accountIds, dateRange });
+      // HU 6.11.4 (T2): en una moneda poco usada, desde la serie en USD × la tasa de cierre
+      contributionResult = await calculateHoldingsContributions({
+        userId, period, currency, accountIds, dateRange, desdeUsd: pocoUsada,
+      });
     } catch (holdingsErr) {
+      if (esAvisoMonedaNoDisponible(holdingsErr)) throw holdingsErr;
       console.warn(`[Attribution] Metodo por tenencias fallo, se usa legacy: ${holdingsErr.message}`);
+    }
+    // HU 6.11.4 (T5): el legacy solo sabe leer lo guardado en la moneda; en una
+    // moneda poco usada, sin tenencias diarias no hay con qué calcular (RN-6.11-K).
+    if (!contributionResult && pocoUsada) {
+      throw monedaNoDisponible(currency, 'sin-tenencias-diarias', `${userId}_${currency}`);
     }
     if (!contributionResult) {
       contributionResult = await calculateContributions(
@@ -872,8 +948,20 @@ async function getPortfolioAttribution(params) {
     return response;
     
   } catch (error) {
+    // HU 6.11.4 (T6): el aviso de la 6.11.1 viaja como tal hasta la ruta HTTP,
+    // que responde 503 con `CURRENCY_UNAVAILABLE` (RN-6.11-K)
+    if (esAvisoMonedaNoDisponible(error)) {
+      return {
+        success: false,
+        error: error.message,
+        currencyUnavailable: { currency: error.details.currency, motivo: error.details.motivo },
+        assetAttributions: [],
+        waterfallData: [],
+        summary: null,
+      };
+    }
     console.error('[AttributionService] Error:', error);
-    
+
     return {
       success: false,
       error: error.message,

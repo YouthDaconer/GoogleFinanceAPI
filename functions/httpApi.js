@@ -1244,11 +1244,35 @@ if (process.env.NODE_ENV === 'development') {
 // ATTRIBUTION API - Portfolio Performance Attribution
 // =============================================================================
 
-const { 
-  getPortfolioAttribution, 
-  getTopContributors, 
-  checkAttributionAvailability 
+const {
+  getPortfolioAttribution,
+  getTopContributors,
+  checkAttributionAvailability
 } = require('./services/attribution');
+
+/**
+ * HU 6.11.4 (T6): sin con qué calcular la atribución en una moneda poco usada,
+ * el aviso de la 6.11.1 en lugar de lo guardado (RN-6.11-K). Responde 503 con
+ * `code: 'CURRENCY_UNAVAILABLE'`, que el navegador reconoce. Es un error y no
+ * una respuesta, así que no se guarda: al recargar se vuelve a intentar.
+ *
+ * @param {Object} res - Respuesta de Express
+ * @param {Object} result - Lo que devolvió el servicio de atribución
+ * @returns {boolean} `true` si respondió el aviso
+ * @see platform-docs/stories/6.11.4-atribucion-desde-usd/refinamiento.md (T6)
+ */
+function responderMonedaNoDisponible(res, result) {
+  if (!result?.currencyUnavailable) return false;
+  const { currency, motivo } = result.currencyUnavailable;
+  res.status(503).json({
+    success: false,
+    error: result.error,
+    code: 'CURRENCY_UNAVAILABLE',
+    currency,
+    motivo,
+  });
+  return true;
+}
 
 /**
  * GET /attribution
@@ -1323,6 +1347,7 @@ app.get("/attribution", async (req, res) => {
     });
 
     if (!result.success) {
+      if (responderMonedaNoDisponible(res, result)) return;
       return res.status(404).json({
         error: result.error || 'No attribution data found'
       });
@@ -1368,8 +1393,9 @@ app.get("/attribution/top", async (req, res) => {
       currency,
       topN: parseInt(topN) || 5
     });
-    
+
     if (!result.success) {
+      if (responderMonedaNoDisponible(res, result)) return;
       return res.status(404).json({
         error: result.error || 'No attribution data found'
       });

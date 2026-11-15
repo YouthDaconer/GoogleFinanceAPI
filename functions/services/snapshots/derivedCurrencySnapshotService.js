@@ -445,7 +445,7 @@ module.exports = {
   // la misma regla de los 5 días que los resúmenes derivados.
   monedaPrincipalDe,
   tasasDeLaSerie,
-  // HU 6.11.3: el detalle de activo, Versus y el riesgo convierten sus días con la misma fórmula.
+  // HU 6.11.3 (activo, Versus, riesgo) y 6.11.4 (atribución) convierten el cambio diario con la misma fórmula.
   cambioConvertido,
   derivarResumenDeMoneda,
   obtenerResumenDerivado,
