@@ -218,6 +218,28 @@ describe('HU 6.9.2 — derivarResumenDeMoneda: USD × tasa del día', () => {
     expect(resultado).toEqual({ snapshot: null, motivo: 'sin-tasa-2025-12-26' });
   });
 
+  it.each([
+    ['cero', 0],
+    ['negativa', -3950.5],
+    ['vacía', null],
+  ])('HU 6.11.2: una tasa %s no se tapa con el cierre anterior: no hay con qué calcular (QA-15)', async (_caso, valor) => {
+    const tasas = { ...TASAS, '2025-12-31': valor };
+
+    const resultado = derivarResumenDeMoneda(await desdeCero(HISTORIA), tasas, 'COP', { now: AHORA });
+
+    expect(resultado).toEqual({ snapshot: null, motivo: 'sin-tasa-2025-12-31' });
+  });
+
+  it('HU 6.11.2: un día sin cierre cuyo cierre anterior es inválido tampoco se calcula (QA-15)', async () => {
+    const tasas = { ...TASAS, '2025-12-30': 0 };
+    delete tasas['2025-12-31'];
+
+    const resultado = derivarResumenDeMoneda(await desdeCero(HISTORIA), tasas, 'COP', { now: AHORA });
+
+    // El primer día que topa con la tasa inválida es el 30 (la suya)
+    expect(resultado).toEqual({ snapshot: null, motivo: 'sin-tasa-2025-12-30' });
+  });
+
   it('un resumen en USD sin las listas por día no se deriva', async () => {
     const { cashFlows, realizedPnL, ...sinListas } = await desdeCero(HISTORIA);
 

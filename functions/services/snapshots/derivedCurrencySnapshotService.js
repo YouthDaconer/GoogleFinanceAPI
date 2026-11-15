@@ -35,9 +35,9 @@
 const { DateTime } = require('luxon');
 const {
   buildSnapshotDocId,
-  generatePerformanceSnapshot,
   computePortfolioReturnsFromDailyDocs,
 } = require('../snapshotGenerator');
+const { prepararResumenUnaVez } = require('./snapshotPreparationService');
 const { SCHEMA_VERSION_INCREMENTAL } = require('../snapshotIncrementalService');
 const { monedasDelCierre } = require('./assetSnapshotOnDemandService');
 const { getExchangeRates } = require('../financeQuery');
@@ -98,15 +98,23 @@ const PERIODOS_CON_DATOS = ['hasYtdData', 'hasOneMonthData', 'hasThreeMonthData'
  * anterior hasta `MAX_LOOKBACK_DAYS` días, como `historicalRateService`; más
  * allá no hay tasa (RN-3-D).
  *
+ * HU 6.11.2 (acordada con el PO, 2026-11-14): una tasa **inválida** —el día
+ * viene, pero con cero, negativa o vacía— no es un día sin cierre: cuenta como
+ * sin con qué calcular, y no se tapa con la del día anterior (QA-15).
+ *
  * @returns {{tasas?: Object<string, number>, faltante?: string}}
  */
 function tasasDeLaSerie(timeline, cierres) {
   const tasas = {};
+  const valida = (dia) => cierres[dia] > 0;
+  const invalida = (dia) => Object.prototype.hasOwnProperty.call(cierres, dia) && !valida(dia);
   for (const { d } of timeline) {
-    let tasa = cierres[d] > 0 ? cierres[d] : undefined;
+    if (invalida(d)) return { faltante: d };
+    let tasa = valida(d) ? cierres[d] : undefined;
     for (let i = 1; tasa === undefined && i <= MAX_LOOKBACK_DAYS; i++) {
       const anterior = DateTime.fromISO(d).minus({ days: i }).toISODate();
-      if (cierres[anterior] > 0) tasa = cierres[anterior];
+      if (invalida(anterior)) return { faltante: d };
+      if (valida(anterior)) tasa = cierres[anterior];
     }
     if (tasa === undefined) return { faltante: d };
     tasas[d] = tasa;
@@ -306,7 +314,8 @@ async function resumenUsdAlDia(db, userId, accountId, senal, prepararUsd) {
     new Date(senal).getTime() > new Date(data.lastUpdated).getTime();
   if (data && !viejo) return data;
   if (!prepararUsd) return null;
-  return (await generatePerformanceSnapshot(db, userId, accountId, 'USD')) || null;
+  // HU 6.11.2 (T2): consultas simultáneas del mismo USD viejo lo preparan una vez.
+  return (await prepararResumenUnaVez(db, userId, accountId, 'USD')) || null;
 }
 
 /**
@@ -371,6 +380,8 @@ function limpiarCachesDerivados() {
 module.exports = {
   resumenesDerivadosDelUsd,
   esMonedaPocoUsada,
+  // HU 6.11.2: el Copiloto pregunta si su moneda es poco usada con la misma caché.
+  monedaPrincipalDe,
   derivarResumenDeMoneda,
   obtenerResumenDerivado,
   tasasDelPeriodo,

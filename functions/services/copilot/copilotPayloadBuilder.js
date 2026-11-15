@@ -262,6 +262,36 @@ async function readPortfolioState(userId) {
 }
 
 /**
+ * HU 6.11.2 — La moneda en que se arma el análisis.
+ *
+ * La pedida, salvo que sea una moneda poco usada para el inversor y no haya con
+ * qué calcular su rendimiento (sin tasa de cierre en los 5 días anteriores a
+ * algún día, tasa inválida o servicio de tasas caído). Entonces USD, y se
+ * recuerda cuál no estaba disponible para decirlo en el informe (acordada con
+ * el PO, 2026-11-14). USD y la moneda principal no preguntan nada (QA-05).
+ *
+ * Si la pregunta misma falla, se sigue con la pedida: el rendimiento ya tiene su
+ * propio manejo de errores y ninguna fuente auxiliar tumba un análisis.
+ *
+ * @param {string} userId
+ * @param {string} currency - La moneda pedida
+ * @returns {Promise<{currency: string, unavailableCurrency: string|null}>}
+ * @see platform-docs/stories/6.11.2-una-cuenta-y-copiloto-sin-recorrer/refinamiento.md (T3)
+ */
+async function monedaDelAnalisis(userId, currency) {
+  try {
+    if (await queryHandlers.rendimientoDisponibleEn(userId, currency)) {
+      return { currency, unavailableCurrency: null };
+    }
+  } catch (error) {
+    console.error('[copilotPayloadBuilder] No se pudo comprobar la moneda del análisis:', error);
+    return { currency, unavailableCurrency: null };
+  }
+  console.log(`[copilotPayloadBuilder] ${currency} no está disponible para ${userId}: el análisis va en USD`);
+  return { currency: 'USD', unavailableCurrency: currency };
+}
+
+/**
  * Arma el retrato del portafolio que recibirá el motor.
  *
  * @param {string} userId
@@ -269,7 +299,7 @@ async function readPortfolioState(userId) {
  * @returns {Promise<{ sinPosiciones: boolean, payload: object|null, estado: object|null }>}
  *   `sinPosiciones` corta el análisis antes de gastar nada (Escenario 7).
  */
-async function buildBasePayload(userId, { language, currency }) {
+async function buildBasePayload(userId, { language, currency: monedaPedida }) {
   const estado = await readPortfolioState(userId);
   const rates = buildCurrencyRateMap(estado.currencies);
   const userHoldings = buildUserHoldings(estado.assets, estado.priceMap, rates);
@@ -279,6 +309,11 @@ async function buildBasePayload(userId, { language, currency }) {
   }
 
   const contexto = { auth: { uid: userId } };
+
+  // HU 6.11.2 (Escenario 5): en una moneda poco usada sin con qué calcularla,
+  // el análisis entero se arma en USD y lo dice. Nunca con lo guardado en esa
+  // moneda (RN-6.11-J, RN-6.11-K).
+  const { currency, unavailableCurrency } = await monedaDelAnalisis(userId, monedaPedida);
 
   const [distributionResult, returnsResult, riskResult] = await Promise.allSettled([
     queryHandlers.getPortfolioDistribution(contexto, { currency, includeHoldings: true }),
@@ -324,6 +359,7 @@ async function buildBasePayload(userId, { language, currency }) {
     profitableWeeksPercentage: Math.round(profitableWeeks * 10) / 10,
     concentration: buildConcentration(userHoldings),
     userCurrency: currency,
+    ...(unavailableCurrency ? { unavailableCurrency } : {}),
     userLanguage: language,
     totalPortfolioValue,
     periodReturns: {
@@ -346,5 +382,6 @@ module.exports = {
   extractTopMovers,
   buildConcentration,
   readPortfolioState,
+  monedaDelAnalisis,
   buildBasePayload,
 };

@@ -633,3 +633,53 @@ describe('HU 5.4 — la comparación contra el análisis anterior', () => {
     expect(documentosEscritos[0].datos.comparison.state).toBe('first');
   });
 });
+
+describe('HU 6.11.2 — la moneda pedida no estaba disponible (Escenario 5)', () => {
+  const conMonedaNoDisponible = () => {
+    payloadBuilder.buildBasePayload.mockResolvedValue({
+      sinPosiciones: false,
+      payload: crearPayload({ userCurrency: 'USD', unavailableCurrency: 'EUR' }),
+      estado: {
+        assets: [crearAsset()],
+        priceMap: new Map([['MSFT', { price: 400, currency: 'USD' }]]),
+        rates: new Map([['USD', 1]]),
+        accounts: [],
+      },
+    });
+  };
+
+  it('el informe empieza con la nota fija y el redactor sabe qué moneda faltó (QA-14, QA-15)', async () => {
+    conMonedaNoDisponible();
+
+    await servicio.runAnalysis(crearRun({ currency: 'EUR' }), ENTORNO);
+
+    const markdown = documentosEscritos[0].datos.analysisMarkdown;
+    expect(markdown.startsWith('> Este análisis está en USD porque EUR no está disponible por ahora.\n\n## Resumen ejecutivo')).toBe(true);
+    expect(composer.redactarInforme.mock.calls[0][0].portafolio).toEqual({
+      currency: 'USD', totalAssets: 1, unavailableCurrency: 'EUR',
+    });
+    expect(documentosEscritos[0].datos.payloadSummary.currency).toBe('USD');
+  });
+
+  it('en inglés, la nota va en inglés', async () => {
+    conMonedaNoDisponible();
+
+    await servicio.runAnalysis(crearRun({ currency: 'EUR', language: 'en' }), ENTORNO);
+
+    expect(documentosEscritos[0].datos.analysisMarkdown)
+      .toMatch(/^> This analysis is in USD because EUR isn't available right now\.\n\n/);
+  });
+
+  it('con la moneda disponible el informe no lleva nota ni el contexto la menciona (QA-17)', async () => {
+    await servicio.runAnalysis(crearRun(), ENTORNO);
+
+    expect(documentosEscritos[0].datos.analysisMarkdown).toBe(crearInforme().markdown);
+    expect(composer.redactarInforme.mock.calls[0][0].portafolio).not.toHaveProperty('unavailableCurrency');
+  });
+
+  it('conNotaDeMoneda: sin moneda no disponible devuelve el informe tal cual; con idioma desconocido, en español', () => {
+    expect(servicio.conNotaDeMoneda('# Informe', null, 'es')).toBe('# Informe');
+    expect(servicio.conNotaDeMoneda('# Informe', 'COP', 'fr'))
+      .toBe('> Este análisis está en USD porque COP no está disponible por ahora.\n\n# Informe');
+  });
+});
