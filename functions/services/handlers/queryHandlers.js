@@ -68,7 +68,14 @@ const { buildExcludeSet } = require('../../utils/carveOutReturns');
 const { buildSnapshotDocId, generatePerformanceSnapshot, generateAssetSnapshot } = require('../snapshotGenerator');
 // HU 6.4: los resúmenes por activo se ponen al día al abrirlos, no cada noche.
 const { resumenesPorActivoBajoDemanda, ponerAlDiaResumenDeActivo } = require('../snapshots/assetSnapshotOnDemandService');
-const { resumenesDerivadosDelUsd, obtenerResumenDerivado } = require('../snapshots/derivedCurrencySnapshotService');
+const {
+  resumenesDerivadosDelUsd,
+  obtenerResumenDerivado,
+  esMonedaPocoUsada,
+  monedaPrincipalDe,
+} = require('../snapshots/derivedCurrencySnapshotService');
+// HU 6.11.2: un resumen viejo se prepara una sola vez aunque lo pidan varios a la vez.
+const { prepararResumenUnaVez } = require('../snapshots/snapshotPreparationService');
 
 // PERF-SNAP-021: Importar funciones de mercado para TTL inteligente
 const { isNYSEMarketOpen, calculateTTLUntilNextEOD, MARKET_CACHE_TTL_MS } = require('../riskMetrics/riskMetricsCache');
@@ -199,6 +206,76 @@ async function resumenDerivadoConCache(userId, accountId, currency, signal) {
     snapshotMemCache.delete(snapshotMemCache.keys().next().value);
   }
   return snapshot;
+}
+
+/**
+ * HU 6.11.2 (T3) — ¿Se puede calcular el rendimiento del portafolio en esta
+ * moneda? Solo lo pregunta quien no puede mostrar el aviso de la 6.11.1 y tiene
+ * que cambiar de moneda por su cuenta: el Copiloto.
+ *
+ * En USD y en la moneda principal siempre (salen de sus resúmenes). En una
+ * moneda poco usada, si hay derivado del USD. El derivado queda en la caché en
+ * memoria, así que la consulta de rendimientos que viene después no lo repite.
+ *
+ * @param {string} userId
+ * @param {string} currency
+ * @returns {Promise<boolean>} `false` solo en una moneda poco usada sin con qué calcular
+ * @see platform-docs/stories/6.11.2-una-cuenta-y-copiloto-sin-recorrer/refinamiento.md (T3)
+ */
+async function rendimientoDisponibleEn(userId, currency) {
+  if (currency === 'USD' || !resumenesDerivadosDelUsd()) return true;
+  const defaultCurrency = await monedaPrincipalDe(db, userId);
+  if (!esMonedaPocoUsada(currency, defaultCurrency)) return true;
+
+  const signal = await readSnapshotSignal(userId);
+  const derivado = await resumenDerivadoConCache(userId, 'overall', currency, signal);
+  return derivado !== null;
+}
+
+/**
+ * HU 6.11.2 — Interruptor de "una cuenta, todas y el Copiloto salen de los
+ * resúmenes". Se lee en cada llamada: basta cambiar la variable y desplegar
+ * para volver al camino antiguo sin perder nada (RN-6-H, Escenario 6).
+ *
+ * @returns {boolean} `true` salvo `PERFORMANCE_FROM_SNAPSHOTS=false`
+ */
+function rendimientoDesdeResumenes() {
+  return process.env.PERFORMANCE_FROM_SNAPSHOTS !== 'false';
+}
+
+/**
+ * HU 6.11.2 (T1) — El rendimiento de un alcance (`'overall'` o una cuenta)
+ * cuando `getMultiAccountHistoricalReturns` no tiene que agregar varias cuentas.
+ *
+ * Antes iba siempre a `getHistoricalReturnsInternal`, que lee una caché vieja
+ * (sin mirar si hubo un cierre o una corrección) o **recorre todos los días
+ * guardados** del alcance; en una moneda poco usada, lo guardado en esa moneda.
+ * Ahora va por `getHistoricalReturns`, el camino de los resúmenes que ya usa la
+ * vista de una cuenta y la de todas: el resumen preparado en USD y en la moneda
+ * principal, derivado del USD en una moneda poco usada (HU 6.9.2), y preparado
+ * una sola vez si falta o está viejo (Escenario 3).
+ *
+ * `ticker`/`assetType` y `forceRefresh` siguen por el camino antiguo: no son una
+ * cuenta ni todas, y `forceRefresh` es pedir el cálculo completo.
+ *
+ * @param {Object} context - Contexto con `auth.uid`
+ * @param {string} accountId - `'overall'` o el id de la cuenta
+ * @param {Object} params - `{ currency, ticker, assetType, forceRefresh }`
+ * @returns {Promise<Object>}
+ * @see platform-docs/stories/6.11.2-una-cuenta-y-copiloto-sin-recorrer/refinamiento.md (T1)
+ */
+async function rendimientoDeUnAlcance(context, accountId, params) {
+  const { currency, ticker, assetType, forceRefresh } = params;
+  const userId = context.auth.uid;
+
+  if (!rendimientoDesdeResumenes() || ticker || assetType || forceRefresh) {
+    return await getHistoricalReturnsInternal(userId, { currency, accountId, ticker, assetType, forceRefresh });
+  }
+
+  const inicio = Date.now();
+  const resultado = await getHistoricalReturns(context, { currency, accountId });
+  console.log(`[PERF][getMultiAccountHistoricalReturns] Desde resúmenes - ${accountId} ${currency} (${Date.now() - inicio} ms)`);
+  return resultado;
 }
 
 function clearSnapshotMemCache() {
@@ -593,7 +670,8 @@ async function getHistoricalReturns(context, payload) {
       // Previously fire-and-forget + legacy both read all daily docs (~27K reads/mes).
       // Now: generate snapshot → use directly. Legacy only on failure.
       try {
-        const generatedSnapshot = await generatePerformanceSnapshot(db, userId, accountId, currency);
+        // HU 6.11.2 (T2, Escenario 3): consultas simultáneas lo preparan una vez.
+        const generatedSnapshot = await prepararResumenUnaVez(db, userId, accountId, currency);
         if (generatedSnapshot) {
           snapshotMemCache.set(snapshotDocId, { data: generatedSnapshot, cachedAt: Date.now() });
           const result = transformSnapshotToResponse(generatedSnapshot);
@@ -837,28 +915,19 @@ async function getMultiAccountHistoricalReturns(context, payload) {
       throw new HttpsError('invalid-argument', 'Debes proporcionar al menos una cuenta en accountIds');
     }
 
-    // Si es "overall" o "all", delegar a getHistoricalReturnsInternal
+    // HU 6.11.2 (T1): un solo alcance sale de los resúmenes, no de recorrer la historia.
+    const unAlcance = { currency, ticker, assetType, forceRefresh };
+
+    // "overall" o "all": el portafolio completo (lo pide el Copiloto)
     if (accountIds.includes("overall") || accountIds.includes("all")) {
-      console.log(`[queryHandlers][getMultiAccountHistoricalReturns] Delegando a internal (overall)`);
-      return await getHistoricalReturnsInternal(userId, {
-        currency,
-        accountId: "overall",
-        ticker,
-        assetType,
-        forceRefresh
-      });
+      console.log(`[queryHandlers][getMultiAccountHistoricalReturns] Un solo alcance (overall)`);
+      return await rendimientoDeUnAlcance(context, 'overall', unAlcance);
     }
 
-    // Si es una sola cuenta, delegar
+    // Una sola cuenta
     if (accountIds.length === 1) {
-      console.log(`[queryHandlers][getMultiAccountHistoricalReturns] Delegando a internal (cuenta única)`);
-      return await getHistoricalReturnsInternal(userId, {
-        currency,
-        accountId: accountIds[0],
-        ticker,
-        assetType,
-        forceRefresh
-      });
+      console.log(`[queryHandlers][getMultiAccountHistoricalReturns] Un solo alcance (cuenta única)`);
+      return await rendimientoDeUnAlcance(context, accountIds[0], unAlcance);
     }
 
     // Verificar si se seleccionaron TODAS las cuentas del usuario
@@ -874,13 +943,7 @@ async function getMultiAccountHistoricalReturns(context, payload) {
     if (sortedRequestedIds.length === sortedUserIds.length && 
         sortedRequestedIds.every((id, i) => id === sortedUserIds[i])) {
       console.log(`[queryHandlers][getMultiAccountHistoricalReturns] Todas las cuentas, usando overall`);
-      return await getHistoricalReturnsInternal(userId, {
-        currency,
-        accountId: "overall",
-        ticker,
-        assetType,
-        forceRefresh
-      });
+      return await rendimientoDeUnAlcance(context, 'overall', unAlcance);
     }
 
     // ============================================================================
@@ -1943,4 +2006,7 @@ module.exports = {
   getSnapshotMemCacheSize,
   getSnapshotWithCache,
   getSnapshotCacheTTL,
+  // HU 6.11.2: una cuenta, todas y el Copiloto desde los resúmenes
+  rendimientoDesdeResumenes,
+  rendimientoDisponibleEn,
 };

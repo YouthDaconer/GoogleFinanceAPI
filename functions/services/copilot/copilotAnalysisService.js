@@ -120,6 +120,31 @@ function resumenDePaso(investigacion) {
 }
 
 /**
+ * HU 6.11.2 — La nota con que empieza el informe cuando la moneda pedida no
+ * estaba disponible y el análisis se armó en USD (Escenario 5, acordada con el
+ * PO el 2026-11-14).
+ *
+ * Es un texto fijo, no lo redacta el modelo: así el informe **siempre** lo
+ * dice, sin depender de que el redactor lo mencione.
+ */
+const NOTA_MONEDA_NO_DISPONIBLE = {
+  es: (moneda) => `> Este análisis está en USD porque ${moneda} no está disponible por ahora.`,
+  en: (moneda) => `> This analysis is in USD because ${moneda} isn't available right now.`,
+};
+
+/**
+ * @param {string} markdown - El informe redactado
+ * @param {string|null|undefined} monedaNoDisponible - La moneda pedida que no se pudo usar
+ * @param {string} language
+ * @returns {string} El informe, con la nota delante si hace falta
+ */
+function conNotaDeMoneda(markdown, monedaNoDisponible, language) {
+  if (!monedaNoDisponible) return markdown;
+  const nota = (NOTA_MONEDA_NO_DISPONIBLE[language] || NOTA_MONEDA_NO_DISPONIBLE.es)(monedaNoDisponible);
+  return `${nota}\n\n${markdown}`;
+}
+
+/**
  * Guarda el análisis terminado.
  *
  * @param {string} userId
@@ -395,11 +420,14 @@ async function runAnalysis(run, { marketDataTokenSecret }) {
         portafolio: {
           currency: payload.userCurrency,
           totalAssets: holdings.length,
+          // HU 6.11.2: el redactor sabe que la moneda pedida no estaba disponible.
+          ...(payload.unavailableCurrency ? { unavailableCurrency: payload.unavailableCurrency } : {}),
         },
         comparacion: construirComparacionParaElInforme(comparacion),
       },
       motor,
     );
+    informe.markdown = conNotaDeMoneda(informe.markdown, payload.unavailableCurrency, language);
 
     await runRepository.finishStep(userId, runId, indice, { ok: true, summary: null });
 
@@ -465,6 +493,7 @@ module.exports = {
   buildPayloadSummary,
   construirPlan,
   resumenDePaso,
+  conNotaDeMoneda,
   persistAnalysis,
   runAnalysis,
 };
