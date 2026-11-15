@@ -22,6 +22,7 @@
  * - getConsolidatedDataStatus (COST-OPT-001: Diagnóstico de datos)
  * - getPerformanceOnDemand (OPT-DEMAND-102: Rendimiento con precios live)
  * - getHistoryCorrectionStatus (HU 6.8.1: aviso de corrección del historial)
+ * - getPreviousDayPerformance (HU 6.11.5: cabecera del día anterior en una moneda)
  *
  * @module unified/queryOperations
  * @see docs/stories/56.story.md
@@ -87,6 +88,8 @@ const ACTION_HANDLERS = {
   getOpeningCorrectionPlan: queryHandlers.getOpeningCorrectionPlan,
   // HU 6.8.1: estado de la corrección del historial para el aviso
   getHistoryCorrectionStatus: queryHandlers.getHistoryCorrectionStatus,
+  // HU 6.11.5: la cabecera del día anterior, solo en la moneda que se muestra
+  getPreviousDayPerformance: queryHandlers.getPreviousDayPerformance,
   // COST-OPT-001: Nuevas acciones para rendimientos optimizados (V2)
   getHistoricalReturnsOptimized: queryHandlers.getHistoricalReturnsOptimized,
   getConsolidatedDataStatus: queryHandlers.getConsolidatedDataStatus,
