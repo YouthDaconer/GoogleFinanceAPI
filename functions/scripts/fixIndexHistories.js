@@ -23,6 +23,7 @@
  * @see docs/architecture/firebase-cost-analysis-detailed.md
  */
 
+const { serviceTokenFromEnv } = require('./serviceTokenFromEnv');
 const admin = require('firebase-admin');
 const axios = require('axios');
 
@@ -48,7 +49,7 @@ const CONFIG = {
   HISTORICAL_API_BASE: 'https://api.portastock.net/v1',
   
   API_HEADERS: {
-    'x-service-token': '26ca00231ead1b5fbd63c6bba10a16e2f619b56809013ab3b3bcbbfb029aff10',
+    'x-service-token': serviceTokenFromEnv(),
     'origin': 'https://portastock.net',
     'referer': 'https://portastock.net'
   },

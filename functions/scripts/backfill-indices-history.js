@@ -15,6 +15,7 @@
  * NOTA: Debe ejecutarse desde el directorio functions para encontrar las dependencias
  */
 
+const { serviceTokenFromEnv } = require('./serviceTokenFromEnv');
 const admin = require('firebase-admin');
 const axios = require('axios');
 const path = require('path');
@@ -39,7 +40,7 @@ const db = admin.firestore();
 
 // Configuración del API
 const FINANCE_QUERY_API_URL = 'https://ws.portastock.net/v1';
-const SERVICE_TOKEN = '26ca00231ead1b5fbd63c6bba10a16e2f619b56809013ab3b3bcbbfb029aff10';
+const SERVICE_TOKEN = serviceTokenFromEnv();
 
 // Headers necesarios para Cloudflare WAF
 const API_HEADERS = {

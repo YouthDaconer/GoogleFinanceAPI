@@ -33,6 +33,7 @@
  * @see fixOverallComplete.js (Script alternativo para corregir OVERALL existente)
  */
 
+const { serviceTokenFromEnv } = require('../../serviceTokenFromEnv');
 const admin = require('firebase-admin');
 const fs = require('fs');
 const path = require('path');
@@ -63,7 +64,7 @@ const CONFIG = {
   
   // Headers de autenticación para API
   API_HEADERS: {
-    'x-service-token': '26ca00231ead1b5fbd63c6bba10a16e2f619b56809013ab3b3bcbbfb029aff10',
+    'x-service-token': serviceTokenFromEnv(),
     'origin': 'https://portastock.net',
     'referer': 'https://portastock.net'
   },

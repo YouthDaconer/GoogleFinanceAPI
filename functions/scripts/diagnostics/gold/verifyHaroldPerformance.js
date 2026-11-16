@@ -1,6 +1,7 @@
 /**
  * Quick diagnostic: Verify Harold Serrano's performance data
  */
+const { serviceTokenFromEnv } = require('../../serviceTokenFromEnv');
 const admin = require('firebase-admin');
 const sa = require('../../../key.json');
 if (!admin.apps.length) admin.initializeApp({ credential: admin.credential.cert(sa) });
@@ -145,7 +146,7 @@ const USER = 'GlWtKSe53tMfcqNeFHeGf9OhowN2';
   console.log('-'.repeat(40));
   try {
     const resp = await fetch('https://api.portastock.net/v1/historical?symbol=VOO&range=2y&interval=1d', {
-      headers: { 'x-service-token': '26ca00231ead1b5fbd63c6bba10a16e2f619b56809013ab3b3bcbbfb029aff10', 'origin': 'https://portastock.net', 'referer': 'https://portastock.net' }
+      headers: { 'x-service-token': serviceTokenFromEnv(), 'origin': 'https://portastock.net', 'referer': 'https://portastock.net' }
     });
     const prices = await resp.json();
     const dates = Object.keys(prices).sort();

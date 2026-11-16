@@ -1,7 +1,8 @@
 /**
  * Debug de calculateAccountPerformance para ECOPETROL
  */
-process.env.CF_SERVICE_TOKEN = '26ca00231ead1b5fbd63c6bba10a16e2f619b56809013ab3b3bcbbfb029aff10';
+const { serviceTokenFromEnv } = require('../serviceTokenFromEnv');
+process.env.CF_SERVICE_TOKEN = serviceTokenFromEnv();
 
 const admin = require('../../services/firebaseAdmin');
 const { getPricesFromApi, getCurrencyRatesFromApi } = require('../../services/marketDataHelper');

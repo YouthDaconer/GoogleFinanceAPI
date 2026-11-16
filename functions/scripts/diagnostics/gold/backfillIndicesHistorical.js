@@ -9,6 +9,7 @@
  *   node backfillIndicesHistorical.js --dry-run --dates=2026-03-05
  */
 
+const { serviceTokenFromEnv } = require('../../serviceTokenFromEnv');
 const admin = require('firebase-admin');
 const axios = require('axios');
 const serviceAccount = require('../../../key.json');
@@ -24,7 +25,7 @@ const db = admin.firestore();
 // Configuración API
 const FINANCE_QUERY_API_URL = 'https://api.portastock.net/v1';
 const API_HEADERS = {
-  'x-service-token': '26ca00231ead1b5fbd63c6bba10a16e2f619b56809013ab3b3bcbbfb029aff10',
+  'x-service-token': serviceTokenFromEnv(),
   'origin': 'https://portastock.net',
   'referer': 'https://portastock.net'
 };
