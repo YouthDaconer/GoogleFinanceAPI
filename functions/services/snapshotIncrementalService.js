@@ -21,6 +21,8 @@ const {
   processDailyDocument,
   buildReturnsResult,
 } = require('../utils/periodConsolidation');
+// HU 6.11.6: la puesta al día añade el día a los días del activo del resumen en USD.
+const { agregarDiaAlActivo, registroDelActivo } = require('../utils/assetDays');
 
 // ============================================================================
 // CONSTANTS
@@ -396,6 +398,13 @@ function aplicarDiaAResumenDeActivo(snapshot, newAssetData, date, options = {}) 
     lastDateInTimeline: date,
     schemaVersion: SCHEMA_VERSION_INCREMENTAL,
   };
+
+  // HU 6.11.6 (T2): si el resumen guarda los días del activo (solo en USD), se
+  // añade el día, o la marca de que ya no lo tenía. Así lo mantienen igual la
+  // apertura (6.4) y la noche con la 6.4 apagada (RN-6.4-K).
+  if (Array.isArray(snapshot.assetDays)) {
+    updatedSnapshot.assetDays = agregarDiaAlActivo(snapshot.assetDays, registroDelActivo(date, newAssetData));
+  }
 
   return { method: 'incremental', snapshot: updatedSnapshot };
 }

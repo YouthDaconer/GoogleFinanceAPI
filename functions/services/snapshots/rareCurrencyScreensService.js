@@ -16,8 +16,13 @@
  * - `RARE_CURRENCY_SCREENS_FROM_USD=false` devuelve el comportamiento de antes en
  *   las tres pantallas, sin apagar la 6.9.2 ni la 6.11.1 (RN-6-H, Escenario 7).
  *
+ * HU 6.11.6: el detalle de un activo toma esos días en USD de su resumen por
+ * activo en USD (una lectura), no de los documentos diarios. Su interruptor
+ * `RARE_ASSET_FROM_USD_SUMMARY=false` devuelve el cálculo de la 6.11.3.
+ *
  * @module services/snapshots/rareCurrencyScreensService
  * @see platform-docs/stories/6.11.3-activo-comparacion-riesgo-usd/refinamiento.md (T1, T2)
+ * @see platform-docs/stories/6.11.6-detalle-activo-desde-resumen-usd/refinamiento.md (T5)
  */
 
 const {
@@ -48,6 +53,17 @@ const CAMPOS_CAMBIO = ['adjustedDailyChangePercentage', 'dailyChangePercentage',
  */
 function pantallasDesdeUsd() {
   return process.env.RARE_CURRENCY_SCREENS_FROM_USD !== 'false';
+}
+
+/**
+ * HU 6.11.6 (T5) — ¿El detalle de un activo en una moneda poco usada toma sus
+ * días del resumen en USD? Se lee en cada llamada; apagarlo no apaga la 6.11.3,
+ * la 6.9.2 ni la 6.11.1 (RN-6-H, Escenario 9).
+ *
+ * @returns {boolean} `true` salvo `RARE_ASSET_FROM_USD_SUMMARY=false`
+ */
+function activoDesdeResumenUsd() {
+  return process.env.RARE_ASSET_FROM_USD_SUMMARY !== 'false';
 }
 
 /**
@@ -169,21 +185,27 @@ async function diasEnMonedaDesdeUsd(dias, currency, opciones = {}) {
  * en esa moneda en cada primera apertura tras un cierre: leer los días en USD
  * cuesta lo mismo (decisión 1 del refinamiento).
  *
+ * HU 6.11.6 (T5): con `opciones.dias` (los días reconstruidos desde el resumen en
+ * USD, `utils/assetDays`) no lee nada y corre exactamente el mismo cálculo.
+ *
  * @param {FirebaseFirestore.Firestore} db
  * @param {Object} params - `{ userId, accountId, currency, ticker, assetType }`
+ * @param {Object} [opciones]
+ * @param {Object[]|null} [opciones.dias] - Días en USD ya reconstruidos
  * @returns {Promise<{snapshot: Object|null, metodo: 'derivado'|'no-derivable'|'sin-datos', motivo?: string}>}
  */
-async function resumenDeActivoDesdeUsd(db, params) {
+async function resumenDeActivoDesdeUsd(db, params, opciones = {}) {
   const { userId, accountId, currency, ticker, assetType } = params;
   const claveActivo = `${ticker}_${assetType}`;
+  const origen = opciones.dias ? 'resumen' : 'dias';
   const inicio = Date.now();
   const terminar = (resultado, dias) => {
     const motivo = resultado.motivo ? ` (${resultado.motivo})` : '';
-    console.log(`[rareCurrencyScreens] activo ${userId}/${accountId}/${claveActivo} ${currency}: ${resultado.metodo}${motivo}, ${dias} días en USD, ${Date.now() - inicio} ms`);
+    console.log(`[rareCurrencyScreens] activo ${userId}/${accountId}/${claveActivo} ${currency}: ${resultado.metodo}${motivo}, ${dias} días en USD desde ${origen}, ${Date.now() - inicio} ms`);
     return resultado;
   };
 
-  const dias = await fetchAssetDailyDocs(db, userId, accountId, 'USD', ticker, assetType);
+  const dias = opciones.dias || await fetchAssetDailyDocs(db, userId, accountId, 'USD', ticker, assetType);
   const conversion = await diasEnMonedaDesdeUsd(dias, currency, { claveActivo });
   if (conversion.motivo) return terminar({ snapshot: null, metodo: 'no-derivable', motivo: conversion.motivo }, dias.length);
 
@@ -194,6 +216,7 @@ async function resumenDeActivoDesdeUsd(db, params) {
 
 module.exports = {
   pantallasDesdeUsd,
+  activoDesdeResumenUsd,
   calculaDesdeUsd,
   convertirDiasDesdeUsd,
   diasEnMonedaDesdeUsd,

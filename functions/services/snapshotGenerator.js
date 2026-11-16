@@ -18,6 +18,8 @@ const {
   processDailyDocument,
   buildReturnsResult,
 } = require('../utils/periodConsolidation');
+// HU 6.11.6: el resumen por activo en USD guarda sus días.
+const { extraerDiasDelActivo } = require('../utils/assetDays');
 
 const SCHEMA_VERSION = 3;
 const ASSET_SCHEMA_VERSION = 3;
@@ -621,6 +623,13 @@ async function generateAssetSnapshot(db, userId, accountId, currency, ticker, as
   const snapshot = armarResumenDeActivo(dailyDocs, { userId, accountId, currency, ticker, assetType });
   if (!snapshot) return false;
   const timeline = snapshot.timeline;
+
+  // HU 6.11.6 (T2): en USD, los días del activo, para que el detalle en una
+  // moneda poco usada salga de este resumen con una lectura (RN-6.11.6-A, B).
+  // Los demás campos no cambian: las cifras en USD son las de siempre (Escenario 8).
+  if (currency === 'USD') {
+    snapshot.assetDays = extraerDiasDelActivo(dailyDocs, currency, ticker, assetType);
+  }
 
   const docId = buildSnapshotDocId(userId, accountId, currency, ticker, assetType);
   console.log(`[snapshotGenerator] Writing asset snapshot ${docId} — timeline: ${timeline.length} points (daily)`);

@@ -1127,3 +1127,36 @@ describe('HU 6.9.2 (T1) — la noche mantiene las listas por día', () => {
     expect(escrito).not.toHaveProperty('realizedPnL');
   });
 });
+
+describe('HU 6.11.6 (T2) — la puesta al día añade el día a los días del activo', () => {
+  const { aplicarDiaAResumenDeActivo } = require('../snapshotIncrementalService');
+  const resumen = (overrides = {}) => ({
+    userId: 'user-1', currency: 'USD', accountId: 'overall', ticker: 'AAPL', assetType: 'stock', type: 'asset',
+    schemaVersion: SCHEMA_VERSION_INCREMENTAL, lastDateInTimeline: '2026-04-28',
+    timeline: [{ d: '2026-04-28', v: 5050, c: 1.0, u: 10 }],
+    returns: { ytdReturn: 1.0 }, startDate: '2026-04-28', lastUpdated: '2026-04-28T05:00:00.000Z',
+    ...overrides,
+  });
+  const dia = { totalValue: 5100, adjustedDailyChangePercentage: 0.99, units: 10, totalCashFlow: 0, doneProfitAndLoss: 12.5 };
+
+  it('con días guardados añade el registro del día (RN-6.4-K, QA-08)', () => {
+    const { snapshot } = aplicarDiaAResumenDeActivo(resumen({ assetDays: [{ d: '2026-04-28', v: 5050, u: 10 }] }), dia, '2026-04-29', { now: NOW });
+
+    expect(snapshot.assetDays).toEqual([
+      { d: '2026-04-28', v: 5050, u: 10 },
+      { d: '2026-04-29', v: 5100, a: 0.99, u: 10, p: 12.5 },
+    ]);
+  });
+
+  it('vendido (sin datos del activo) añade la marca sin el activo', () => {
+    const { snapshot } = aplicarDiaAResumenDeActivo(resumen({ assetDays: [] }), null, '2026-04-29', { now: NOW });
+
+    expect(snapshot.assetDays).toEqual([{ d: '2026-04-29', e: 'sin-activo' }]);
+  });
+
+  it('sin días guardados (otra moneda o anterior a la HU) no los añade: el resumen queda igual que antes', () => {
+    const { snapshot } = aplicarDiaAResumenDeActivo(resumen(), dia, '2026-04-29', { now: NOW });
+
+    expect(snapshot).not.toHaveProperty('assetDays');
+  });
+});

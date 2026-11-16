@@ -974,6 +974,29 @@ describe('PERF-SNAP-003: snapshotGenerator', () => {
 
       expect(result).toBeTruthy();
     });
+
+    // HU 6.11.6 (T2, RN-6.11.6-B): en USD guarda los días del activo; en otra moneda no.
+    it('HU 6.11.6: en USD guarda un día del activo por documento leído; en otra moneda no', async () => {
+      const db = createMockDb();
+
+      const usd = await generateAssetSnapshot(db, 'user1', 'overall', 'USD', 'AAPL', 'stock');
+      const otra = await generateAssetSnapshot(createMockDb(), 'user1', 'overall', 'COP', 'AAPL', 'stock', {
+        dailyDocs: mockDailyDocsList.map((d) => {
+          const data = d.data();
+          return { date: data.date, COP: data.USD };
+        }),
+      });
+
+      const aapl = mockLatestDailyDoc.USD.assetPerformance.AAPL_stock;
+      expect(usd.assetDays).toEqual([
+        { d: '2026-04-09', e: 'sin-activo' },
+        { d: '2026-04-10', e: 'sin-activo' },
+        expect.objectContaining({ d: mockLatestDailyDoc.date, v: aapl.totalValue, u: aapl.units }),
+      ]);
+      expect(db._mockSet.mock.calls[0][0].assetDays).toEqual(usd.assetDays);
+      expect(otra).toBeTruthy();
+      expect(otra.assetDays).toBeUndefined();
+    });
   });
 
   // ==========================================================================
