@@ -5,8 +5,9 @@
  *   el navegador, y solo se pide la fecha y esa moneda.
  * - QA-09: en una moneda poco usada, USD × tasa de cierre del día, sin leer lo
  *   guardado en esa moneda (RN-6.11-J), incluido el día sin cierre de divisa.
- * - QA-10: sin tasa, con tasa inválida o con el servicio caído → no disponible,
- *   nunca la cifra guardada (RN-6.11-K).
+ * - QA-10: sin tasa o con el servicio caído → no disponible, nunca la cifra
+ *   guardada (RN-6.11-K). Una tasa inválida es un día sin cierre (HU 6.14.2,
+ *   RN-6.14-D).
  * - QA-12: el límite de los 5 días naturales (RN-6.11-L).
  * - RN-6-H: con DERIVED_CURRENCY_SNAPSHOTS=false se lee lo guardado, como antes.
  *
@@ -251,12 +252,15 @@ describe('obtenerCabeceraDiaAnterior — sin con qué calcular (QA-10, QA-12, RN
     ['cero', 0],
     ['negativa', -0.8615],
     ['vacía', null],
-  ])('tasa inválida (%s): no disponible, sin una cifra calculada con ella', async (_nombre, tasa) => {
-    // Integración con la 6.11.1: la regla unificada distingue la tasa inválida
-    // del día sin cierre; la cabecera responde "no disponible" en lugar de fallar.
-    const r = await pedirEur({ '2026-11-12': tasa });
-    expect(r).toMatchObject({ disponible: false, motivo: 'tasa-invalida' });
-    expect(r.data).toBeUndefined();
+  ])('HU 6.14.2: tasa inválida (%s) es un día sin cierre: toma el cierre hábil anterior (RN-6.14-D, QA-06)', async (_nombre, tasa) => {
+    const r = await pedirEur({ '2026-11-11': 0.8611, '2026-11-12': tasa });
+    expect(r.disponible).toBe(true);
+    expect(r.data.totalValue).toBe(239480 * 0.8611);
+
+    // Sin un cierre válido en los 5 días: no disponible, como un hueco de festivos (QA-07)
+    limpiarCachesDerivados();
+    const sinValido = await pedirEur({ '2026-11-12': tasa });
+    expect(sinValido).toEqual({ disponible: false, date: '2026-11-12', currency: 'EUR', motivo: 'sin-tasa-del-dia' });
   });
 
   test('QA-12: la tasa del 5.º día natural previo vale; la del 6.º no', async () => {

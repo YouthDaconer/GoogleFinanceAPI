@@ -84,8 +84,8 @@ function esAvisoMonedaNoDisponible(error) {
 
 /**
  * La tasa de cierre de cada fecha pedida, con la regla de los resúmenes
- * derivados (`tasasDeLaSerie`): cierre hábil anterior hasta 5 días naturales;
- * una tasa inválida deja la cifra sin calcular.
+ * derivados (`tasasDeLaSerie`): cierre hábil anterior hasta 5 días naturales,
+ * también si el del día es inválido (RN-6.14-D); más allá, sin calcular.
  *
  * @param {string} currency
  * @param {Array<string|null|undefined>} fechas - `YYYY-MM-DD`
@@ -105,8 +105,7 @@ async function conversorDeCierres(currency, fechas, deps = {}) {
   const cierres = await obtener(currency, unicas[0], unicas[unicas.length - 1]);
   if (!cierres) throw monedaNoDisponible(currency, 'sin-tasas');
 
-  const { tasas, faltante, invalida } = tasasDeLaSerie(unicas.map((d) => ({ d })), cierres);
-  if (invalida) throw monedaNoDisponible(currency, `tasa-invalida-${invalida}`);
+  const { tasas, faltante } = tasasDeLaSerie(unicas.map((d) => ({ d })), cierres);
   if (faltante) throw monedaNoDisponible(currency, `sin-tasa-${faltante}`);
 
   return {

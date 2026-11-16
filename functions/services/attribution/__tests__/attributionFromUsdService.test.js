@@ -138,9 +138,10 @@ describe('HU 6.11.4 — conversorDeCierres: la tasa de cierre de cada día (RN-6
     expect(error.details).toEqual({ code: 'CURRENCY_UNAVAILABLE', currency: 'COP', motivo: 'sin-tasa-2026-09-17' });
   });
 
-  it('una tasa cero en un día del periodo da el aviso, no el cierre anterior', async () => {
-    const error = await conversorDeCierres('COP', ['2026-11-03'], tasasFijas({ ...CIERRES_COP, '2026-11-03': 0 })).catch((e) => e);
-    expect(error.details.motivo).toBe('tasa-invalida-2026-11-03');
+  it('HU 6.14.2: una tasa cero en un día del periodo es un día sin cierre: toma el cierre anterior (RN-6.14-D)', async () => {
+    const { tasaDe } = await conversorDeCierres('COP', ['2026-11-03'], tasasFijas({ ...CIERRES_COP, '2026-11-03': 0 }));
+    // No hay cierre el 2 (festivo en Colombia): el hábil anterior es el del 30 de octubre
+    expect(tasaDe('2026-11-03')).toBe(CIERRES_COP['2026-10-30']);
   });
 
   it('QA-09: el servicio de tasas sin responder da el aviso', async () => {

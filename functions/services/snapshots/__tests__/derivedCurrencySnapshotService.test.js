@@ -10,8 +10,11 @@
  * - RN-6.9.2-J: USD y la moneda principal no se derivan (QA-09).
  * - RN-6-H: con DERIVED_CURRENCY_SNAPSHOTS=false, el comportamiento de siempre (QA-13).
  *
- * HU 6.11.1: tasa inválida (QA-03), 5 frente a 6 días naturales (QA-05), resumen
- * en USD sin listas preparado de nuevo (QA-07) y el aviso con su interruptor.
+ * HU 6.11.1: 5 frente a 6 días naturales (QA-05), resumen en USD sin listas
+ * preparado de nuevo (QA-07) y el aviso con su interruptor.
+ *
+ * HU 6.14.2: una tasa inválida es un día sin cierre, como un festivo (RN-6.14-D,
+ * QA-06, QA-07); sustituye la regla de la 6.11.1 QA-03 y la 6.11.2 QA-15.
  *
  * @see platform-docs/stories/6.9.2-resumenes-poco-usados-incrementales/refinamiento.md (T6b)
  * @see platform-docs/stories/6.11.1-sin-tasa-aviso-y-usd/refinamiento.md (T8a)
@@ -229,23 +232,22 @@ describe('HU 6.9.2 — derivarResumenDeMoneda: USD × tasa del día', () => {
     ['cero', 0],
     ['negativa', -3950.5],
     ['vacía', null],
-  ])('HU 6.11.2: una tasa %s no se tapa con el cierre anterior: no hay con qué calcular (QA-15)', async (_caso, valor) => {
+  ])('HU 6.14.2 (antes 6.11.2 QA-15): una tasa %s es un día sin cierre y toma el cierre hábil anterior (RN-6.14-D)', async (_caso, valor) => {
     const tasas = { ...TASAS, '2025-12-31': valor };
 
-    const resultado = derivarResumenDeMoneda(await desdeCero(HISTORIA), tasas, 'COP', { now: AHORA });
+    const { snapshot } = derivarResumenDeMoneda(await desdeCero(HISTORIA), tasas, 'COP', { now: AHORA });
 
-    expect(resultado).toEqual({ snapshot: null, motivo: 'tasa-invalida-2025-12-31' });
+    expect(snapshot.timeline.find((p) => p.d === '2025-12-31').v).toBe(1510 * TASAS['2025-12-30']);
   });
 
-  it('HU 6.11.2: un día sin cierre cuyo cierre anterior es inválido tampoco se calcula (QA-15)', async () => {
+  it('HU 6.14.2 (antes 6.11.2 QA-15): un día sin cierre cuyo cierre anterior es inválido sigue buscando hacia atrás', async () => {
     const tasas = { ...TASAS, '2025-12-30': 0 };
     delete tasas['2025-12-31'];
 
-    const resultado = derivarResumenDeMoneda(await desdeCero(HISTORIA), tasas, 'COP', { now: AHORA });
+    const { snapshot } = derivarResumenDeMoneda(await desdeCero(HISTORIA), tasas, 'COP', { now: AHORA });
 
-    // El primer día que topa con la tasa inválida es el 30 (la suya)
-    // Con la regla unificada (6.11.1) el motivo dice que la tasa es inválida
-    expect(resultado).toEqual({ snapshot: null, motivo: 'tasa-invalida-2025-12-30' });
+    // Ni el 31 (ausente) ni el 30 (inválido) cuentan: se toma el 29
+    expect(snapshot.timeline.find((p) => p.d === '2025-12-31').v).toBe(1510 * TASAS['2025-12-29']);
   });
 
   it('un resumen en USD sin las listas por día no se deriva', async () => {
@@ -397,33 +399,37 @@ describe('HU 6.9.2 — interruptor (RN-6-H, QA-13)', () => {
 // HU 6.11.1 — Sin con qué calcular, se avisa y se ofrece USD
 // ============================================================================
 
-describe('HU 6.11.1 — una tasa inválida deja la cifra sin calcular (QA-03)', () => {
-  beforeEach(() => { delete process.env.CURRENCY_UNAVAILABLE_NOTICE; });
-  afterAll(() => { delete process.env.CURRENCY_UNAVAILABLE_NOTICE; });
+/**
+ * HU 6.14.2 (RN-6.14-D, QA-06, QA-07): una tasa inválida se trata como un festivo.
+ * Sustituye la regla de la 6.11.1 (QA-03), que la daba por "sin con qué calcular".
+ * @see platform-docs/stories/6.14.2-dias-tasa-corrida-recalculados/refinamiento.md (T3)
+ */
+describe('HU 6.14.2 — una tasa inválida es un día sin cierre, como un festivo (QA-06, QA-07)', () => {
+  afterEach(() => { delete process.env.CURRENCY_UNAVAILABLE_NOTICE; });
 
   it.each([
     ['cero', 0],
     ['negativa', -3908.4],
     ['vacía', null],
     ['no numérica', '3905,60'],
-  ])('una tasa %s en un día de la serie no se cambia por el cierre anterior: no se deriva', async (_caso, valor) => {
+  ])('una tasa %s toma el cierre hábil anterior y la cifra se calcula, sin aviso', async (_caso, valor) => {
     const tasas = { ...TASAS, '2025-12-31': valor };
 
-    const resultado = derivarResumenDeMoneda(await desdeCero(HISTORIA), tasas, 'COP', { now: AHORA });
+    const { snapshot } = derivarResumenDeMoneda(await desdeCero(HISTORIA), tasas, 'COP', { now: AHORA });
 
-    expect(resultado).toEqual({ snapshot: null, motivo: 'tasa-invalida-2025-12-31' });
+    expect(snapshot.timeline.find((p) => p.d === '2025-12-31').v).toBe(1510 * TASAS['2025-12-30']);
   });
 
-  it('una tasa inválida en el día que sustituiría a un festivo también deja la cifra sin calcular', async () => {
-    const tasas = { ...TASAS, '2025-12-30': 0 };
-    delete tasas['2025-12-31'];
+  it('inválidas o ausentes más de 5 días naturales: sin tasa, como un hueco de festivos (QA-07)', async () => {
+    const tasas = { ...TASAS, '2026-01-02': 0, '2026-01-05': -1 };
+    delete tasas['2025-12-31']; // 2026-01-05 queda a 6 días del último válido, el 2025-12-30
 
     const resultado = derivarResumenDeMoneda(await desdeCero(HISTORIA), tasas, 'COP', { now: AHORA });
 
-    expect(resultado).toEqual({ snapshot: null, motivo: 'tasa-invalida-2025-12-30' });
+    expect(resultado).toEqual({ snapshot: null, motivo: 'sin-tasa-2026-01-05' });
   });
 
-  it('con CURRENCY_UNAVAILABLE_NOTICE=false la tasa inválida vuelve a tratarse como ausente, como en la 6.9.2 (RN-6-H)', async () => {
+  it('el interruptor CURRENCY_UNAVAILABLE_NOTICE ya no cambia esta regla', async () => {
     process.env.CURRENCY_UNAVAILABLE_NOTICE = 'false';
     const tasas = { ...TASAS, '2025-12-31': 0 };
 

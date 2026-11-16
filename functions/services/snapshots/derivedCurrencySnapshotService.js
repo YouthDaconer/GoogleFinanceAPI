@@ -31,9 +31,10 @@
  * HU 6.11.1 — Sin con qué calcular, se avisa y se ofrece USD. En una moneda poco
  * usada, la lectura de rendimientos ya no vuelve a lo guardado en esa moneda
  * cuando no puede derivar: responde `monedaNoDisponible` (RN-6.11-J, RN-6.11-K).
- * Una tasa recibida inválida cuenta como "sin con qué calcular", y un resumen en
- * USD sin sus listas por día se prepara de nuevo antes de derivar. Todo detrás
- * de `CURRENCY_UNAVAILABLE_NOTICE` (RN-6-H).
+ * Un resumen en USD sin sus listas por día se prepara de nuevo antes de derivar,
+ * detrás de `CURRENCY_UNAVAILABLE_NOTICE` (RN-6-H). Una tasa recibida inválida
+ * ya no es "sin con qué calcular": desde la HU 6.14.2 es un día sin cierre
+ * (RN-6.14-D, ver `tasasDeLaSerie`).
  *
  * @module services/snapshots/derivedCurrencySnapshotService
  * @see platform-docs/stories/6.9.2-resumenes-poco-usados-incrementales/refinamiento.md (T2, T3)
@@ -142,19 +143,17 @@ const PERIODOS_CON_DATOS = ['hasYtdData', 'hasOneMonthData', 'hasThreeMonthData'
  * anterior hasta `MAX_LOOKBACK_DAYS` días, como `historicalRateService`; más
  * allá no hay tasa (RN-3-D).
  *
- * Una tasa **inválida** (regla acordada con el PO el 2026-11-14; HU 6.11.1 T2 y
- * HU 6.11.2 QA-15): un día **presente** en la respuesta del servicio de tasas
- * con un valor que no es un número finito positivo (cero, negativo, vacío) no
- * es un festivo. Deja la cifra sin calcular y no se tapa con el cierre
- * anterior. Un día **ausente** sigue siendo un día sin cierre (RN-6.11-L). Con
- * `CURRENCY_UNAVAILABLE_NOTICE=false` la tasa inválida vuelve a tratarse como
- * ausente, como en la 6.9.2.
+ * Una tasa **inválida** (cero, negativa o vacía) es un día sin cierre, como un
+ * festivo: toma el cierre hábil anterior y, más allá de los 5 días, la cifra
+ * queda sin calcular (decisión del PO del 2026-11-16, RN-6.14-D). Es lo que ya
+ * hacen finance-query (`_is_valid_rate`) y `historicalRateService`. Sustituye la
+ * regla de la 6.11.1 T2 y la 6.11.2 QA-15, que la trataba como "sin con qué
+ * calcular" aunque hubiera un cierre válido el día anterior.
  *
- * @returns {{tasas?: Object<string, number>, faltante?: string, invalida?: string}}
+ * @returns {{tasas?: Object<string, number>, faltante?: string}}
+ * @see platform-docs/stories/6.14.2-dias-tasa-corrida-recalculados/refinamiento.md (T3)
  */
 function tasasDeLaSerie(timeline, cierres) {
-  const validarInvalidas = avisoMonedaNoDisponible();
-  const presente = (dia) => Object.prototype.hasOwnProperty.call(cierres, dia);
   const valida = (dia) => typeof cierres[dia] === 'number' && Number.isFinite(cierres[dia]) && cierres[dia] > 0;
 
   const tasas = {};
@@ -163,7 +162,6 @@ function tasasDeLaSerie(timeline, cierres) {
     for (let i = 0; tasa === undefined && i <= MAX_LOOKBACK_DAYS; i++) {
       const dia = i === 0 ? d : DateTime.fromISO(d).minus({ days: i }).toISODate();
       if (valida(dia)) tasa = cierres[dia];
-      else if (validarInvalidas && presente(dia)) return { invalida: dia };
     }
     if (tasa === undefined) return { faltante: d };
     tasas[d] = tasa;
@@ -198,8 +196,7 @@ function derivarResumenDeMoneda(resumenUsd, cierres, currency, options = {}) {
     return { snapshot: null, motivo: 'usd-sin-listas' };
   }
 
-  const { tasas, faltante, invalida } = tasasDeLaSerie(timelineUsd, cierres);
-  if (invalida) return { snapshot: null, motivo: `tasa-invalida-${invalida}` };
+  const { tasas, faltante } = tasasDeLaSerie(timelineUsd, cierres);
   if (faltante) return { snapshot: null, motivo: `sin-tasa-${faltante}` };
 
   const now = options.now || DateTime.now().setZone(ZONA);

@@ -168,10 +168,13 @@ describe('HU 6.11.3: convertirDiasDesdeUsd — USD × tasa de cierre del día', 
     expect(convertirDiasDesdeUsd(dias, 'COP', { '2026-08-04': 3950 }, { claveActivo: CLAVE }).motivo).toBe('sin-tasa-2026-08-10');
   });
 
-  it.each([[0], [-3890.2], [null]])('una tasa inválida (%p) deja la cifra sin calcular (QA-09)', (tasa) => {
+  it.each([[0], [-3890.2], [null]])('HU 6.14.2: una tasa inválida (%p) es un día sin cierre: toma el del día hábil anterior (RN-6.14-D)', (tasa) => {
     const cierres = { ...CIERRES, '2026-01-06': tasa };
 
-    expect(convertirDiasDesdeUsd(DIAS, 'COP', cierres, { claveActivo: CLAVE }).motivo).toBe('tasa-invalida-2026-01-06');
+    const { dias, motivo } = convertirDiasDesdeUsd(DIAS, 'COP', cierres, { claveActivo: CLAVE });
+
+    expect(motivo).toBeUndefined();
+    expect(dias.find((d) => d.date === '2026-01-06').COP.assetPerformance[CLAVE].totalValue).toBe(1010 * 4000);
   });
 
   it('sin respuesta del servicio de tasas no hay con qué calcular (QA-09)', async () => {
@@ -216,10 +219,11 @@ describe('HU 6.11.3: resumenDeActivoDesdeUsd', () => {
   });
 
   it('sin con qué calcular responde no-derivable con el motivo (Escenario 3)', async () => {
-    mockGetExchangeRates.mockResolvedValue({ rates: { COP: { ...CIERRES, '2026-01-09': 0 } } });
+    // HU 6.14.2: un cierre inválido ya no basta (es un día sin cierre); sin ningún cierre en 5 días, sí
+    mockGetExchangeRates.mockResolvedValue({ rates: { COP: { '2026-01-02': 0 } } });
 
     await expect(resumenDeActivoDesdeUsd(crearDb(), params))
-      .resolves.toEqual({ snapshot: null, metodo: 'no-derivable', motivo: 'tasa-invalida-2026-01-09' });
+      .resolves.toEqual({ snapshot: null, metodo: 'no-derivable', motivo: 'sin-tasa-2026-01-05' });
   });
 
   it('un activo sin días en el alcance responde sin-datos', async () => {
@@ -295,11 +299,17 @@ describe('HU 6.11.6: resumenDeActivoDesdeUsd con los días del resumen en USD (T
     expect(seis).toEqual({ snapshot: null, metodo: 'no-derivable', motivo: 'sin-tasa-2026-08-10' });
   });
 
-  it('una tasa inválida da el aviso con el mismo motivo que hoy (QA-04)', async () => {
-    mockGetExchangeRates.mockResolvedValue({ rates: { COP: { ...CIERRES, '2026-01-09': 0 } } });
+  it('HU 6.14.2: una tasa inválida da lo mismo que un día sin cierre, también desde el resumen (RN-6.14-D)', async () => {
+    const { [`2026-01-09`]: _sinEl9, ...festivo } = CIERRES;
+    mockGetExchangeRates.mockResolvedValue({ rates: { COP: festivo } });
+    const comoFestivo = await resumenDeActivoDesdeUsd(crearDb(), params, { dias: delResumen() });
 
-    await expect(resumenDeActivoDesdeUsd(crearDb(), params, { dias: delResumen() }))
-      .resolves.toEqual({ snapshot: null, metodo: 'no-derivable', motivo: 'tasa-invalida-2026-01-09' });
+    limpiarCachesDerivados();
+    mockGetExchangeRates.mockResolvedValue({ rates: { COP: { ...CIERRES, '2026-01-09': 0 } } });
+    const conInvalida = await resumenDeActivoDesdeUsd(crearDb(), params, { dias: delResumen() });
+
+    expect(conInvalida.metodo).not.toBe('no-derivable');
+    expect(conInvalida.snapshot.timeline).toEqual(comoFestivo.snapshot.timeline);
   });
 
   it('el interruptor RARE_ASSET_FROM_USD_SUMMARY está encendido salvo con "false" (RN-6-H, Escenario 9)', () => {
