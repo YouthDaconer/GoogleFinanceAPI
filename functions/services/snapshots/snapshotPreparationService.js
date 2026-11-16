@@ -16,14 +16,46 @@
  * entre sí; con la concurrencia por instancia de las funciones v2, las
  * peticiones simultáneas de un inversor caen casi siempre en la misma.
  *
+ * HU 6.11.6 (T3): el mecanismo se separa en `prepararUnaVez` para que el resumen
+ * por activo en USD, del que sale el detalle en una moneda poco usada, también
+ * se prepare o se complete una sola vez (RN-6.11.6-J).
+ *
  * @module services/snapshots/snapshotPreparationService
  * @see platform-docs/stories/6.11.2-una-cuenta-y-copiloto-sin-recorrer/refinamiento.md (T2)
+ * @see platform-docs/stories/6.11.6-detalle-activo-desde-resumen-usd/refinamiento.md (T3)
  */
 
 const { buildSnapshotDocId, generatePerformanceSnapshot } = require('../snapshotGenerator');
 
 /** Preparaciones en curso, por id de resumen. */
 const enVuelo = new Map();
+
+/**
+ * Corre `preparar`, o espera a la preparación que ya está en curso con el mismo
+ * id. Al terminar (bien o mal) se olvida.
+ *
+ * @template T
+ * @param {string} id - Id del resumen (o de lo que se prepara)
+ * @param {() => Promise<T>} preparar
+ * @returns {Promise<T>}
+ */
+function prepararUnaVez(id, preparar) {
+  const enCurso = enVuelo.get(id);
+  if (enCurso) {
+    console.log(`[snapshotPreparation] ${id}: ya se está preparando, se espera esa preparación`);
+    return enCurso;
+  }
+
+  const preparacion = (async () => {
+    try {
+      return await preparar();
+    } finally {
+      enVuelo.delete(id);
+    }
+  })();
+  enVuelo.set(id, preparacion);
+  return preparacion;
+}
 
 /**
  * Prepara el resumen de un alcance, o espera a la preparación que ya está en
@@ -36,22 +68,10 @@ const enVuelo = new Map();
  * @returns {Promise<Object|null>} El resumen preparado (o `null` si no hay historia)
  */
 function prepararResumenUnaVez(db, userId, accountId, currency) {
-  const id = buildSnapshotDocId(userId, accountId, currency);
-  const enCurso = enVuelo.get(id);
-  if (enCurso) {
-    console.log(`[snapshotPreparation] ${id}: ya se está preparando, se espera esa preparación`);
-    return enCurso;
-  }
-
-  const preparacion = (async () => {
-    try {
-      return await generatePerformanceSnapshot(db, userId, accountId, currency);
-    } finally {
-      enVuelo.delete(id);
-    }
-  })();
-  enVuelo.set(id, preparacion);
-  return preparacion;
+  return prepararUnaVez(
+    buildSnapshotDocId(userId, accountId, currency),
+    () => generatePerformanceSnapshot(db, userId, accountId, currency),
+  );
 }
 
 /** Solo para tests: cuántas preparaciones siguen en curso. */
@@ -60,6 +80,7 @@ function preparacionesEnCurso() {
 }
 
 module.exports = {
+  prepararUnaVez,
   prepararResumenUnaVez,
   preparacionesEnCurso,
 };

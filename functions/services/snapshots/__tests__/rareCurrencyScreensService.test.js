@@ -259,3 +259,58 @@ describe('HU 6.11.3: calculaDesdeUsd — solo en monedas poco usadas (RN-6.11-N,
     }
   });
 });
+
+// ============================================================================
+// HU 6.11.6 — DESDE LOS DÍAS GUARDADOS EN EL RESUMEN EN USD
+// ============================================================================
+
+describe('HU 6.11.6: resumenDeActivoDesdeUsd con los días del resumen en USD (T8b)', () => {
+  const { extraerDiasDelActivo, docsDesdeDiasDelActivo } = require('../../../utils/assetDays');
+  const params = { userId: UID, accountId: 'overall', currency: 'COP', ticker: 'MSFT', assetType: 'stock' };
+  const delResumen = (dias = DIAS) => docsDesdeDiasDelActivo(extraerDiasDelActivo(dias, 'USD', 'MSFT', 'stock'), CLAVE);
+
+  it('no lee días ni escribe, y da lo mismo que desde los días (RN-6.11.6-H, QA-01)', async () => {
+    const db = crearDb();
+
+    const nuevo = await resumenDeActivoDesdeUsd(db, params, { dias: delResumen() });
+    const hoy = await resumenDeActivoDesdeUsd(crearDb(), params);
+
+    expect(db.proyecciones).toEqual([]);
+    expect(db.escrituras).toEqual([]);
+    const { lastUpdated: _a, ...a } = nuevo.snapshot;
+    const { lastUpdated: _b, ...b } = hoy.snapshot;
+    expect(a).toEqual(b);
+  });
+
+  it('5 días naturales sin cierre se cubren y 6 dan el aviso, igual que hoy (LIM-5, LIM-6, QA-04)', async () => {
+    const dias = [dia('2026-08-10', activo())];
+
+    mockGetExchangeRates.mockResolvedValue({ rates: { COP: { '2026-08-05': 3950 } } });
+    const cinco = await resumenDeActivoDesdeUsd(crearDb(), { ...params, accountId: 'acc-5' }, { dias: delResumen(dias) });
+    limpiarCachesDerivados();
+    mockGetExchangeRates.mockResolvedValue({ rates: { COP: { '2026-08-04': 3950 } } });
+    const seis = await resumenDeActivoDesdeUsd(crearDb(), { ...params, accountId: 'acc-6' }, { dias: delResumen(dias) });
+
+    expect(cinco.metodo).not.toBe('no-derivable');
+    expect(seis).toEqual({ snapshot: null, metodo: 'no-derivable', motivo: 'sin-tasa-2026-08-10' });
+  });
+
+  it('una tasa inválida da el aviso con el mismo motivo que hoy (QA-04)', async () => {
+    mockGetExchangeRates.mockResolvedValue({ rates: { COP: { ...CIERRES, '2026-01-09': 0 } } });
+
+    await expect(resumenDeActivoDesdeUsd(crearDb(), params, { dias: delResumen() }))
+      .resolves.toEqual({ snapshot: null, metodo: 'no-derivable', motivo: 'tasa-invalida-2026-01-09' });
+  });
+
+  it('el interruptor RARE_ASSET_FROM_USD_SUMMARY está encendido salvo con "false" (RN-6-H, Escenario 9)', () => {
+    const { activoDesdeResumenUsd } = require('../rareCurrencyScreensService');
+    try {
+      delete process.env.RARE_ASSET_FROM_USD_SUMMARY;
+      expect(activoDesdeResumenUsd()).toBe(true);
+      process.env.RARE_ASSET_FROM_USD_SUMMARY = 'false';
+      expect(activoDesdeResumenUsd()).toBe(false);
+    } finally {
+      delete process.env.RARE_ASSET_FROM_USD_SUMMARY;
+    }
+  });
+});

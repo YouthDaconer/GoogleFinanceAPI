@@ -28,8 +28,11 @@ const {
   resumenesPorActivoBajoDemanda,
   monedasDelCierre,
   ponerAlDiaResumenDeActivo,
+  completarDiasDelActivo,
   retirarResumenesSinTenencia,
+  retirarResumenesDeActivoPocoUsados,
 } = require('../assetSnapshotOnDemandService');
+const { extraerDiasDelActivo } = require('../../../utils/assetDays');
 
 // ============================================================================
 // Firestore en memoria
@@ -76,9 +79,9 @@ function crearFirestore(inicial = {}) {
       const d = col(p).get(id);
       return { exists: d !== undefined, id, data: () => copia(d) };
     },
-    set: async (data) => {
+    set: async (data, opciones) => {
       contador.escrituras.push(`${p}/${id}`);
-      col(p).set(id, copia(data));
+      col(p).set(id, opciones?.merge ? { ...col(p).get(id), ...copia(data) } : copia(data));
     },
     borrar: () => {
       contador.borrados.push(`${p}/${id}`);
@@ -481,5 +484,154 @@ describe('HU 6.4: retirar resúmenes de activos que el inversor ya no tiene (Esc
     const segunda = await retirarResumenesSinTenencia(db, { userId: UID, aplicar: true });
 
     expect(segunda).toEqual({ revisados: 3, sobrantes: [], retirados: 0, conservados: 3 });
+  });
+});
+
+// ============================================================================
+// HU 6.11.6 — Los días del activo en el resumen en USD
+// ============================================================================
+
+describe('HU 6.11.6: el resumen por activo en USD guarda y mantiene sus días (T2)', () => {
+  const todosLosDias = async (db) => (await db.collection(RUTA_DIAS).orderBy('date').get()).docs;
+  const params = { userId: UID, accountId: 'overall', currency: 'USD', ticker: 'MSFT', assetType: 'stock', senal: SENAL };
+  const sinDias = ({ assetDays: _, ...resto }) => resto;
+
+  it('al prepararlo en USD guarda un día por documento, con la venta marcada; en otra moneda no (RN-6.11.6-B)', async () => {
+    const db = crearInversor({ dias: 40, defaultCurrency: 'COP' });
+
+    const usd = await generateAssetSnapshot(db, UID, 'overall', 'USD', 'MSFT', 'stock');
+    const cop = await generateAssetSnapshot(db, UID, 'overall', 'COP', 'MSFT', 'stock');
+
+    expect(usd.assetDays).toHaveLength(40);
+    expect(usd.assetDays[20]).toEqual({ d: usd.assetDays[20].d, e: 'sin-activo' });
+    expect(usd.assetDays[0]).toEqual(expect.objectContaining({ v: 2000, u: 10, i: 1800 }));
+    expect(db.leer('performanceSnapshots', `${UID}_MSFT_stock_USD`).assetDays).toEqual(usd.assetDays);
+    expect(cop.assetDays).toBeUndefined();
+  });
+
+  it('la puesta al día al abrir añade los días nuevos: quedan los mismos que preparándolo desde cero (QA-08)', async () => {
+    const db = crearInversor({ dias: 40 });
+    const inicial = await resumenHasta(db, 37, ['AAPL', 'stock']);
+
+    const r = await ponerAlDiaResumenDeActivo(db, { ...params, ticker: 'AAPL', snapshot: inicial });
+
+    expect(r.metodo).toBe('incremental');
+    expect(r.diasLeidos).toBe(3);
+    expect(r.snapshot.assetDays).toEqual(extraerDiasDelActivo(await todosLosDias(db), 'USD', 'AAPL', 'stock'));
+  });
+
+  it('con completarDias, uno viejo sin días lee una vez todos, se pone al día igual y los guarda en la misma escritura (QA-06)', async () => {
+    const db = crearInversor({ dias: 40 });
+    const { assetDays: _, ...inicial } = await resumenHasta(db, 37, ['AAPL', 'stock']);
+    const sinCompletar = await ponerAlDiaResumenDeActivo(crearInversor({ dias: 40 }), { ...params, ticker: 'AAPL', snapshot: inicial });
+    db.contador.docsLeidos = 0;
+    db.contador.escrituras.length = 0;
+
+    const r = await ponerAlDiaResumenDeActivo(db, { ...params, ticker: 'AAPL', snapshot: inicial, completarDias: true });
+
+    expect(r.metodo).toBe('incremental+dias');
+    expect(db.contador.docsLeidos).toBe(41); // userData + los 40 días, una vez
+    expect(db.contador.escrituras).toEqual([`performanceSnapshots/${UID}_AAPL_stock_USD`]);
+    expect(sinHora(sinDias(r.snapshot))).toEqual(sinHora(sinDias(sinCompletar.snapshot)));
+    expect(r.snapshot.assetDays).toEqual(extraerDiasDelActivo(await todosLosDias(db), 'USD', 'AAPL', 'stock'));
+  });
+
+  it('con completarDias, si hay que rehacerlo (lo vendió) no vuelve a leer los días', async () => {
+    const db = crearInversor({ dias: 40 });
+    const { assetDays: _, ...inicial } = await resumenHasta(db, 15, ['MSFT', 'stock']);
+    db.contador.docsLeidos = 0;
+
+    const r = await ponerAlDiaResumenDeActivo(db, { ...params, snapshot: inicial, completarDias: true });
+
+    expect(r.metodo).toBe('rehecho');
+    expect(db.contador.docsLeidos).toBe(41);
+    expect(r.snapshot.assetDays).toHaveLength(40);
+  });
+
+  it('completarDias no aplica fuera de USD ni a uno que ya tiene sus días', async () => {
+    const db = crearInversor({ dias: 40, defaultCurrency: 'COP' });
+    const cop = await resumenHasta(db, 37, ['AAPL', 'stock'], 'COP');
+    const usd = await resumenHasta(db, 37, ['AAPL', 'stock']);
+
+    const enCop = await ponerAlDiaResumenDeActivo(db, { ...params, currency: 'COP', ticker: 'AAPL', snapshot: cop, completarDias: true });
+    const conDias = await ponerAlDiaResumenDeActivo(db, { ...params, ticker: 'AAPL', snapshot: usd, completarDias: true });
+
+    expect(enCop.metodo).toBe('incremental');
+    expect(enCop.snapshot.assetDays).toBeUndefined();
+    expect(conDias.metodo).toBe('incremental');
+    expect(conDias.diasLeidos).toBe(3);
+  });
+
+  it('completarDiasDelActivo escribe solo los días: el resto del resumen y su hora no cambian (Escenario 8, QA-06)', async () => {
+    const db = crearInversor({ dias: 40 });
+    const { assetDays: _, ...anterior } = await resumenHasta(db, 40, ['MSFT', 'stock']);
+    await db.collection('performanceSnapshots').doc(`${UID}_MSFT_stock_USD`).set(anterior);
+    db.contador.docsLeidos = 0;
+
+    const r = await completarDiasDelActivo(db, { userId: UID, accountId: 'overall', ticker: 'MSFT', assetType: 'stock', snapshot: anterior });
+
+    const guardado = db.leer('performanceSnapshots', `${UID}_MSFT_stock_USD`);
+    expect(db.contador.docsLeidos).toBe(40);
+    expect(sinDias(guardado)).toEqual(anterior);
+    expect(guardado.assetDays).toEqual(extraerDiasDelActivo(await todosLosDias(db), 'USD', 'MSFT', 'stock'));
+    expect(r).toEqual(guardado);
+  });
+});
+
+describe('HU 6.11.6: retirar los resúmenes por activo en monedas poco usadas (RN-6.11.6-G, QA-10)', () => {
+  const resumen = (userId, ticker, currency, extra = {}) => ({ userId, ticker, assetType: 'stock', type: 'asset', currency, ...extra });
+
+  function crearPlataforma() {
+    return crearFirestore({
+      userData: { [UID]: { defaultCurrency: 'COP' }, 'user-2': { defaultCurrency: 'EUR' } },
+      performanceSnapshots: {
+        [`${UID}_EUR`]: { userId: UID, accountId: 'overall', currency: 'EUR' },
+        [`${UID}_AAPL_stock_USD`]: resumen(UID, 'AAPL', 'USD'),
+        [`${UID}_AAPL_stock_COP`]: resumen(UID, 'AAPL', 'COP'),
+        [`${UID}_AAPL_stock_EUR`]: resumen(UID, 'AAPL', 'EUR'),
+        [`${UID}_MSFT_stock_acc-1_MXN`]: resumen(UID, 'MSFT', 'MXN', { accountId: 'acc-1' }),
+        'user-2_MSFT_stock_EUR': resumen('user-2', 'MSFT', 'EUR'),
+        'user-2_MSFT_stock_COP': resumen('user-2', 'MSFT', 'COP'),
+      },
+    });
+  }
+
+  it('sin aplicar solo cuenta los de monedas que no son USD ni la principal, con sus monedas', async () => {
+    const db = crearPlataforma();
+
+    const r = await retirarResumenesDeActivoPocoUsados(db, { userId: UID });
+
+    expect(r).toEqual({
+      revisados: 4,
+      pocoUsados: [`${UID}_AAPL_stock_EUR`, `${UID}_MSFT_stock_acc-1_MXN`],
+      retirados: 0,
+      monedas: ['EUR', 'MXN'],
+    });
+    expect(db.contador.borrados).toEqual([]);
+  });
+
+  it('al aplicar retira solo esos; conserva USD, la principal, el resumen de portafolio y los de otro inversor', async () => {
+    const db = crearPlataforma();
+
+    const r = await retirarResumenesDeActivoPocoUsados(db, { userId: UID, aplicar: true });
+
+    expect(r.retirados).toBe(2);
+    expect(db.contador.borrados.sort()).toEqual([
+      `performanceSnapshots/${UID}_AAPL_stock_EUR`,
+      `performanceSnapshots/${UID}_MSFT_stock_acc-1_MXN`,
+    ]);
+    expect(db.leer('performanceSnapshots', `${UID}_AAPL_stock_USD`)).toBeDefined();
+    expect(db.leer('performanceSnapshots', `${UID}_AAPL_stock_COP`)).toBeDefined();
+    expect(db.leer('performanceSnapshots', `${UID}_EUR`)).toBeDefined();
+    expect(db.leer('performanceSnapshots', 'user-2_MSFT_stock_EUR')).toBeDefined();
+  });
+
+  it('relanzarla no retira nada más', async () => {
+    const db = crearPlataforma();
+    await retirarResumenesDeActivoPocoUsados(db, { userId: UID, aplicar: true });
+
+    const segunda = await retirarResumenesDeActivoPocoUsados(db, { userId: UID, aplicar: true });
+
+    expect(segunda).toEqual({ revisados: 2, pocoUsados: [], retirados: 0, monedas: [] });
   });
 });

@@ -104,6 +104,9 @@ const mockDiasEnMoneda = jest.fn();
 jest.mock('../../snapshots/rareCurrencyScreensService', () => ({
   calculaDesdeUsd: async (db, userId, currency) => process.env.RARE_CURRENCY_SCREENS_FROM_USD !== 'false'
     && !['USD', 'COP'].includes(currency),
+  // HU 6.11.6: aquí se prueba el cálculo desde los días (6.11.3), el de su
+  // interruptor apagado; el camino desde el resumen en USD tiene su propio test.
+  activoDesdeResumenUsd: () => false,
   resumenDeActivoDesdeUsd: (...args) => mockResumenDeActivo(...args),
   diasEnMonedaDesdeUsd: (...args) => mockDiasEnMoneda(...args),
 }));

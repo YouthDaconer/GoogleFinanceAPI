@@ -12,7 +12,7 @@ jest.mock('../../snapshotGenerator', () => ({
   generatePerformanceSnapshot: (...args) => mockGenerate(...args),
 }));
 
-const { prepararResumenUnaVez, preparacionesEnCurso } = require('../snapshotPreparationService');
+const { prepararResumenUnaVez, prepararUnaVez, preparacionesEnCurso } = require('../snapshotPreparationService');
 
 const DB = { nombre: 'db' };
 
@@ -82,5 +82,41 @@ describe('HU 6.11.2: prepararResumenUnaVez (Escenario 3)', () => {
     const reintento = await prepararResumenUnaVez(DB, 'inv-m', 'overall', 'USD');
     expect(reintento.returns.ytdReturn).toBe(7.5);
     expect(mockGenerate).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('HU 6.11.6: prepararUnaVez, la preparación única para cualquier resumen (RN-6.11.6-J)', () => {
+  it('dos aperturas a la vez del mismo resumen por activo esperan la misma preparación', async () => {
+    let terminar;
+    const preparar = jest.fn(() => new Promise((resolve) => { terminar = resolve; }));
+
+    const a = prepararUnaVez('inv-m_MSFT_stock_USD', preparar);
+    const b = prepararUnaVez('inv-m_MSFT_stock_USD', preparar);
+    terminar({ assetDays: [] });
+
+    await expect(Promise.all([a, b])).resolves.toEqual([{ assetDays: [] }, { assetDays: [] }]);
+    expect(preparar).toHaveBeenCalledTimes(1);
+    expect(preparacionesEnCurso()).toBe(0);
+  });
+
+  it('comparte el registro con prepararResumenUnaVez: el mismo id espera la preparación en curso', async () => {
+    let terminar;
+    mockGenerate.mockImplementationOnce(() => new Promise((resolve) => { terminar = resolve; }));
+    const otra = jest.fn();
+
+    const a = prepararResumenUnaVez(DB, 'inv-m', 'overall', 'USD');
+    const b = prepararUnaVez('inv-m_USD', otra);
+    terminar({ ok: true });
+
+    await expect(Promise.all([a, b])).resolves.toEqual([{ ok: true }, { ok: true }]);
+    expect(otra).not.toHaveBeenCalled();
+  });
+
+  it('un error llega a todos los que esperaban y se puede reintentar', async () => {
+    const preparar = jest.fn().mockRejectedValueOnce(new Error('DEADLINE_EXCEEDED')).mockResolvedValueOnce('listo');
+
+    await expect(prepararUnaVez('inv-m_MSFT_stock_USD#dias', preparar)).rejects.toThrow('DEADLINE_EXCEEDED');
+    await expect(prepararUnaVez('inv-m_MSFT_stock_USD#dias', preparar)).resolves.toBe('listo');
+    expect(preparacionesEnCurso()).toBe(0);
   });
 });

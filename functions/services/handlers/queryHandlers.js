@@ -67,7 +67,7 @@ const { buildExcludeSet } = require('../../utils/carveOutReturns');
 // PERF-SNAP-024: Importar generateAssetSnapshot para on-demand per-asset
 const { buildSnapshotDocId, generatePerformanceSnapshot, generateAssetSnapshot } = require('../snapshotGenerator');
 // HU 6.4: los resúmenes por activo se ponen al día al abrirlos, no cada noche.
-const { resumenesPorActivoBajoDemanda, ponerAlDiaResumenDeActivo } = require('../snapshots/assetSnapshotOnDemandService');
+const { resumenesPorActivoBajoDemanda, ponerAlDiaResumenDeActivo, completarDiasDelActivo } = require('../snapshots/assetSnapshotOnDemandService');
 const {
   resumenesDerivadosDelUsd,
   obtenerResumenDerivado,
@@ -81,11 +81,15 @@ const {
 const { fetchAssetDailyDocs } = require('../snapshotGenerator');
 const {
   calculaDesdeUsd,
+  activoDesdeResumenUsd,
   resumenDeActivoDesdeUsd,
   diasEnMonedaDesdeUsd,
 } = require('../snapshots/rareCurrencyScreensService');
+// HU 6.11.6: el detalle en una moneda poco usada sale de los días guardados en el resumen en USD.
+const { docsDesdeDiasDelActivo } = require('../../utils/assetDays');
 // HU 6.11.2: un resumen viejo se prepara una sola vez aunque lo pidan varios a la vez.
-const { prepararResumenUnaVez } = require('../snapshots/snapshotPreparationService');
+// HU 6.11.6: también el resumen por activo en USD (`prepararUnaVez`).
+const { prepararResumenUnaVez, prepararUnaVez } = require('../snapshots/snapshotPreparationService');
 // HU 6.11.5: la cabecera del día anterior, solo en la moneda que se muestra
 const { obtenerCabeceraDiaAnterior } = require('../snapshots/previousDayPerformanceService');
 
@@ -234,6 +238,115 @@ async function resumenDerivadoConCache(userId, accountId, currency, signal) {
 }
 
 /**
+ * HU 6.11.6 (T4) — El resumen por activo de un alcance, al día: el de la memoria
+ * o el guardado si siguen vigentes según la señal; si está viejo se pone al día
+ * (HU 6.4) y si falta se prepara entero.
+ *
+ * Es el bloque por activo que tenía `getHistoricalReturns`, extraído sin cambiar
+ * lo que hace en USD para que el detalle en una moneda poco usada use el mismo.
+ * La preparación corre dentro de `prepararUnaVez`: dos aperturas a la vez del
+ * mismo activo preparan una sola vez (RN-6.11.6-J, decisión 4 del refinamiento).
+ *
+ * Con `completarDias` (solo la ruta de la 6.11.6, en USD) un resumen sin sus
+ * días (`assetDays`, anterior a la HU) se completa una vez sin tocar sus cifras
+ * (RN-6.11.6-A, decisión 2).
+ *
+ * @param {string} userId
+ * @param {Object} params - `{ accountId, currency, ticker, assetType }`
+ * @param {string|null|undefined} signal - `lastSnapshotUpdate` ya leído
+ * @param {Object} [opciones]
+ * @param {boolean} [opciones.completarDias=false]
+ * @returns {Promise<{snapshot: Object|null, lastSnapshotUpdate: string|null, preparado: boolean, error?: Error}>}
+ *   Si la preparación falla, `snapshot: null` con el `error` (como antes, se avisa
+ *   en el log y quien llama sigue su camino); un fallo al leer se propaga
+ * @see platform-docs/stories/6.11.6-detalle-activo-desde-resumen-usd/refinamiento.md (T4)
+ */
+async function resumenDeActivoAlDia(userId, params, signal, opciones = {}) {
+  const { accountId, currency, ticker, assetType } = params;
+  const { completarDias = false } = opciones;
+  const id = buildSnapshotDocId(userId, accountId, currency, ticker, assetType);
+  const leido = await getSnapshotWithCache(id, userId, signal);
+  const lastSnapshotUpdate = leido.lastSnapshotUpdate || null;
+  let snapshot = leido.data;
+  let preparado = false;
+
+  try {
+    if (!snapshot) {
+      // HU 6.4: si el resumen existe pero está viejo, se pone al día con los días
+      // que le faltan (RN-6.4-K); si no existe, se prepara entero (Escenario 1).
+      const ponerAlDia = !!leido.staleData && resumenesPorActivoBajoDemanda();
+      console.log(`[PERF] Asset snapshot miss - ${id}, ${ponerAlDia ? 'catching up' : 'generating'} on-demand`);
+      snapshot = await prepararUnaVez(id, async () => (ponerAlDia
+        ? (await ponerAlDiaResumenDeActivo(db, {
+          userId,
+          accountId,
+          currency,
+          ticker,
+          assetType,
+          snapshot: leido.staleData,
+          senal: lastSnapshotUpdate,
+          ...(completarDias ? { completarDias } : {}),
+        })).snapshot
+        : await generateAssetSnapshot(db, userId, accountId, currency, ticker, assetType)));
+      snapshot = snapshot || null;
+      preparado = true;
+    }
+
+    if (snapshot && completarDias && currency === 'USD' && !Array.isArray(snapshot.assetDays)) {
+      const actual = snapshot;
+      snapshot = await prepararUnaVez(`${id}#dias`, () => completarDiasDelActivo(db, {
+        userId, accountId, ticker, assetType, snapshot: actual,
+      }));
+      preparado = true;
+    }
+  } catch (error) {
+    console.warn(`[PERF] On-demand asset snapshot generation failed for ${id}: ${error.message}`);
+    return { snapshot: null, lastSnapshotUpdate, preparado: false, error };
+  }
+
+  if (snapshot && preparado) {
+    snapshotMemCache.set(id, { data: snapshot, cachedAt: Date.now() });
+    if (snapshotMemCache.size > SNAPSHOT_MEM_CACHE_MAX_SIZE) {
+      snapshotMemCache.delete(snapshotMemCache.keys().next().value);
+    }
+  }
+  return { snapshot, lastSnapshotUpdate, preparado };
+}
+
+/**
+ * HU 6.11.6 (T5) — Los días en USD de un activo reconstruidos desde su resumen
+ * por activo en USD, preparado o completado una vez si hace falta.
+ *
+ * Si el resumen no se puede usar (falla al prepararlo o completarlo, no hay
+ * resumen o no trae días) devuelve `null` y quien llama calcula como en la
+ * 6.11.3, desde los días en USD (RN-6.11.6-D): nunca lo guardado en la moneda.
+ *
+ * @param {string} userId
+ * @param {Object} params - `{ accountId, ticker, assetType }`
+ * @param {string|null|undefined} signal
+ * @returns {Promise<Object[]|null>}
+ * @see platform-docs/stories/6.11.6-detalle-activo-desde-resumen-usd/refinamiento.md (T5)
+ */
+async function diasDelResumenUsd(userId, { accountId, ticker, assetType }, signal) {
+  const id = buildSnapshotDocId(userId, accountId, 'USD', ticker, assetType);
+  try {
+    const { snapshot, error } = await resumenDeActivoAlDia(
+      userId, { accountId, currency: 'USD', ticker, assetType }, signal, { completarDias: true });
+    if (snapshot && Array.isArray(snapshot.assetDays)) {
+      return docsDesdeDiasDelActivo(snapshot.assetDays, `${ticker}_${assetType}`);
+    }
+    if (!error) {
+      console.warn(`[rareCurrencyScreens] ${id}: ${snapshot ? 'sin días' : 'sin resumen'}, se calcula desde los días en USD`);
+    } else {
+      console.warn(`[rareCurrencyScreens] ${id}: no se pudo preparar (${error.message}), se calcula desde los días en USD`);
+    }
+  } catch (err) {
+    console.warn(`[rareCurrencyScreens] ${id}: no se pudo leer (${err.message}), se calcula desde los días en USD`);
+  }
+  return null;
+}
+
+/**
  * HU 6.11.3 (T2) — El detalle de un activo (portafolio o una cuenta) en una
  * moneda poco usada, desde sus días en USD, con la misma caché en memoria y la
  * misma regla de la señal que el derivado de la 6.9.2.
@@ -259,7 +372,15 @@ async function activoDesdeUsdConCache(userId, params, signal) {
 
   let snapshot = vigente && !forceRefresh ? cached.data : null;
   if (!snapshot) {
-    const resultado = await resumenDeActivoDesdeUsd(db, { userId, accountId, currency, ticker, assetType });
+    // HU 6.11.6 (T5): los días salen del resumen en USD (una lectura); si no se
+    // puede usar, o con `forceRefresh`, se leen como en la 6.11.3.
+    const dias = activoDesdeResumenUsd() && !forceRefresh
+      ? await diasDelResumenUsd(userId, { accountId, ticker, assetType }, signal)
+      : null;
+    const params = { userId, accountId, currency, ticker, assetType };
+    const resultado = dias
+      ? await resumenDeActivoDesdeUsd(db, params, { dias })
+      : await resumenDeActivoDesdeUsd(db, params);
     if (resultado.metodo === 'no-derivable') throw monedaNoDisponible(currency, resultado.motivo, id);
     snapshot = resultado.snapshot;
     if (snapshot) {
@@ -290,14 +411,23 @@ async function activoDesdeUsdConCache(userId, params, signal) {
  * No guarda nada en la caché de Firestore: es una moneda poco usada y casi nadie
  * la consulta.
  *
+ * HU 6.11.6 (T5): los días de cada cuenta salen de su resumen por activo en USD
+ * (una lectura por cuenta); solo la cuenta cuyo resumen no se puede usar lee sus
+ * días (RN-6.11.6-E, I).
+ *
  * @throws {HttpsError} `unavailable` con `details.code = 'CURRENCY_UNAVAILABLE'`
  * @see platform-docs/stories/6.11.3-activo-comparacion-riesgo-usd/refinamiento.md (T3)
+ * @see platform-docs/stories/6.11.6-detalle-activo-desde-resumen-usd/refinamiento.md (T5)
  */
-async function activoVariasCuentasDesdeUsd(userId, { accountIds, currency, ticker, assetType }) {
+async function activoVariasCuentasDesdeUsd(userId, { accountIds, currency, ticker, assetType, forceRefresh = false }, signal) {
   const claveActivo = `${ticker}_${assetType}`;
   const inicio = Date.now();
-  const diasPorCuenta = await Promise.all(accountIds.map(async (accountId) => {
-    const dias = await fetchAssetDailyDocs(db, userId, accountId, 'USD', ticker, assetType);
+  const desdeResumen = activoDesdeResumenUsd() && !forceRefresh;
+  const origenes = [];
+  const diasPorCuenta = await Promise.all(accountIds.map(async (accountId, i) => {
+    const delResumen = desdeResumen ? await diasDelResumenUsd(userId, { accountId, ticker, assetType }, signal) : null;
+    origenes[i] = delResumen ? 'resumen' : 'dias';
+    const dias = delResumen || await fetchAssetDailyDocs(db, userId, accountId, 'USD', ticker, assetType);
     const conversion = await diasEnMonedaDesdeUsd(dias, currency, { claveActivo });
     if (conversion.motivo) {
       throw monedaNoDisponible(currency, conversion.motivo, buildSnapshotDocId(userId, accountId, currency, ticker, assetType));
@@ -306,7 +436,8 @@ async function activoVariasCuentasDesdeUsd(userId, { accountIds, currency, ticke
   }));
 
   const result = calculateHistoricalReturns(agregarDiasDeCuentas(diasPorCuenta), currency, ticker, assetType);
-  console.log(`[rareCurrencyScreens] activo ${userId}/[${accountIds.join(',')}]/${claveActivo} ${currency}: derivado, ${Date.now() - inicio} ms`);
+  const deDonde = accountIds.map((accountId, i) => `${accountId}:${origenes[i]}`).join(',');
+  console.log(`[rareCurrencyScreens] activo ${userId}/[${deDonde}]/${claveActivo} ${currency}: derivado, ${Date.now() - inicio} ms`);
   return {
     ...result,
     cacheHit: false,
@@ -691,61 +822,26 @@ async function getHistoricalReturns(context, payload) {
     }
 
     // PERF-SNAP-024: Per-asset snapshot read path (antes del bypass legacy)
+    // HU 6.11.6 (T4): memoria + señal → puesta al día o preparación, en `resumenDeActivoAlDia`.
     if (ticker && assetType && !forceRefresh) {
       const inicioActivo = Date.now();
       const assetSnapshotId = buildSnapshotDocId(userId, accountId, currency, ticker, assetType);
-      const assetSnapshotResult = await getSnapshotWithCache(assetSnapshotId, userId, signal);
-      const assetSnapshot = assetSnapshotResult.data;
-
-      if (assetSnapshot) {
-        const result = transformSnapshotToResponse(assetSnapshot);
-        // HU 6.4 (RN-6.4-J): la duración de la segunda apertura en adelante.
-        console.log(`[PERF] Asset snapshot hit - ${assetSnapshotId} (${Date.now() - inicioActivo} ms)`);
-
-        const now = new Date();
-        return {
-          ...result,
-          cacheHit: false,
-          lastCalculated: now.toISOString(),
-          validUntil: calculateDynamicTTL().toISOString(),
-          lastSnapshotUpdate: assetSnapshotResult.lastSnapshotUpdate || null,
-        };
-      }
-
       // OPT-FIRESTORE-002 P2-A: Await snapshot generation to avoid double-read with legacy.
-      // Previously fire-and-forget + legacy read the same daily docs twice (~27K reads/mes).
-      // HU 6.4: si el resumen existe pero está viejo, se pone al día con los días
-      // que le faltan (RN-6.4-K); si no existe, se prepara entero (Escenario 1).
-      const ponerAlDia = !!assetSnapshotResult.staleData && resumenesPorActivoBajoDemanda();
-      console.log(`[PERF] Asset snapshot miss - ${assetSnapshotId}, ${ponerAlDia ? 'catching up' : 'generating'} on-demand`);
-      try {
-        const generatedSnapshot = ponerAlDia
-          ? (await ponerAlDiaResumenDeActivo(db, {
-            userId,
-            accountId,
-            currency,
-            ticker,
-            assetType,
-            snapshot: assetSnapshotResult.staleData,
-            senal: assetSnapshotResult.lastSnapshotUpdate || null,
-          })).snapshot
-          : await generateAssetSnapshot(db, userId, accountId, currency, ticker, assetType);
-        if (generatedSnapshot) {
-          snapshotMemCache.set(assetSnapshotId, { data: generatedSnapshot, cachedAt: Date.now() });
-          const result = transformSnapshotToResponse(generatedSnapshot);
-          const now = new Date();
-          // HU 6.4 (RN-6.4-J): la duración de la primera apertura del día.
-          console.log(`[PERF] Asset snapshot generated on-demand - ${assetSnapshotId} (${Date.now() - inicioActivo} ms)`);
-          return {
-            ...result,
-            cacheHit: false,
-            lastCalculated: now.toISOString(),
-            validUntil: calculateDynamicTTL().toISOString(),
-            lastSnapshotUpdate: assetSnapshotResult.lastSnapshotUpdate || null,
-          };
-        }
-      } catch (err) {
-        console.warn(`[PERF] On-demand asset snapshot generation failed for ${assetSnapshotId}: ${err.message}`);
+      // Si la preparación falla, se avisa en el log y se sigue a la ruta legacy, como antes.
+      const { snapshot: assetSnapshot, lastSnapshotUpdate, preparado } =
+        await resumenDeActivoAlDia(userId, { accountId, currency, ticker, assetType }, signal);
+      if (assetSnapshot) {
+        // HU 6.4 (RN-6.4-J): la duración de la primera apertura del día y de las siguientes.
+        console.log(preparado
+          ? `[PERF] Asset snapshot generated on-demand - ${assetSnapshotId} (${Date.now() - inicioActivo} ms)`
+          : `[PERF] Asset snapshot hit - ${assetSnapshotId} (${Date.now() - inicioActivo} ms)`);
+        return {
+          ...transformSnapshotToResponse(assetSnapshot),
+          cacheHit: false,
+          lastCalculated: new Date().toISOString(),
+          validUntil: calculateDynamicTTL().toISOString(),
+          lastSnapshotUpdate,
+        };
       }
     }
 
@@ -1182,7 +1278,9 @@ async function getMultiAccountHistoricalReturns(context, payload) {
     // HU 6.11.3 (T3): el detalle de un activo con varias cuentas en una moneda
     // poco usada no recorre lo guardado en esa moneda.
     if (ticker && assetType && await calculaDesdeUsd(db, userId, currency)) {
-      return await activoVariasCuentasDesdeUsd(userId, { accountIds, currency, ticker, assetType });
+      // HU 6.11.6: la señal decide si el resumen en USD de cada cuenta sigue vigente.
+      const senal = await readSnapshotSignal(userId);
+      return await activoVariasCuentasDesdeUsd(userId, { accountIds, currency, ticker, assetType, forceRefresh }, senal);
     }
 
     // Fallback a ruta legacy (full collection scan + cache)
@@ -2213,4 +2311,6 @@ module.exports = {
   // HU 6.11.2: una cuenta, todas y el Copiloto desde los resúmenes
   rendimientoDesdeResumenes,
   rendimientoDisponibleEn,
+  // HU 6.11.6: la misma agregación de varias cuentas para `scripts/activo-desde-resumen-usd.js`
+  agregarDiasDeCuentas,
 };
