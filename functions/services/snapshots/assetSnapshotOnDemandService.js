@@ -20,9 +20,11 @@
  * cifras, y `retirarResumenesDeActivoPocoUsados()` retira los que se guardaron
  * en esas monedas (RN-6.11.6-A, G).
  *
- * Las correcciones del historial (RN-6.4-L) no pasan por aquí: la corrección
- * nocturna y el reintento del cierre borran todos los resúmenes del inversor,
- * y el primero que se abre después se rehace con los datos corregidos.
+ * Las correcciones del historial (RN-6.4-L) no pasan por aquí. El reintento del
+ * cierre borra todos los resúmenes del inversor, y el primero que se abre
+ * después se rehace con los datos corregidos. La corrección nocturna, desde la
+ * HU 6.12, los rehace desde la fecha afectada (`snapshotRebuildService.js`);
+ * solo borra los que no puede rehacer.
  *
  * @module services/snapshots/assetSnapshotOnDemandService
  * @see platform-docs/stories/6.4-resumenes-activo-bajo-demanda/refinamiento.md (T2, T3, T6)

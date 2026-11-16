@@ -159,6 +159,8 @@ function memQuery(path, filters = [], order = null, max = null) {
 
 const memDb = {
   collection: (name) => memQuery(name),
+  // HU 6.12: el incremental del cierre lee y escribe con `db.doc(ruta)`
+  doc: (path) => memDocRef(path),
   batch: () => {
     const ops = [];
     const batch = {

@@ -87,6 +87,28 @@ async function isRetroactiveTransaction(transactionDate, userId) {
 }
 
 /**
+ * HU 6.12 (RN-6.12-C): la fecha más antigua de **toda** la corrección, desde la
+ * que se rehacen los resúmenes al terminarla. `since` no sirve para eso: la
+ * corrección por tramos lo avanza noche a noche (6.8.1).
+ *
+ * - Sin marca previa: la fecha de la operación.
+ * - Con una marca que ya la tiene: la más antigua de las dos.
+ * - Con una marca anterior a esta HU (sin `desdeInicial`): ninguna. No se sabe
+ *   desde qué fecha empezó si ya avanzó algún tramo, así que esa corrección
+ *   termina por el camino de siempre (decisión 7 del refinamiento).
+ *
+ * @param {Object|null|undefined} currentStale - La marca actual
+ * @param {string} txDate - YYYY-MM-DD
+ * @returns {string|null}
+ * @see platform-docs/stories/6.12-correccion-desde-fecha-afectada/refinamiento.md (T3)
+ */
+function fechaMasAntiguaDeLaCorreccion(currentStale, txDate) {
+  if (!currentStale) return txDate;
+  if (!currentStale.desdeInicial) return null;
+  return currentStale.desdeInicial < txDate ? currentStale.desdeInicial : txDate;
+}
+
+/**
  * Marca el documento de performance como stale
  * 
  * Si ya existe un campo _stale, solo actualiza 'since' si la nueva fecha es más antigua.
@@ -153,6 +175,8 @@ async function markPerformanceAsStale(userId, transactionDate, metadata = {}) {
       // Un tramo en curso en este momento lo verá como marca movida y deshará
       // su intento (reconcileStalePerformance.corregirTramo)
       if (currentStale?.enCurso) staleData.enCurso = currentStale.enCurso;
+      const desdeInicial = fechaMasAntiguaDeLaCorreccion(currentStale, txDate);
+      if (desdeInicial) staleData.desdeInicial = desdeInicial;
       
       transaction.update(perfRef, { _stale: staleData });
     });
@@ -216,4 +240,5 @@ module.exports = {
   markPerformanceAsStale,
   checkAndMarkStaleIfRetroactive,
   clearStaleMarker,
+  fechaMasAntiguaDeLaCorreccion,
 };

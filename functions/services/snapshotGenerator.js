@@ -50,12 +50,30 @@ function transformToCompactTimeline(totalValueData) {
   }));
 }
 
-async function fetchAllDailyDocs(db, userId, accountId) {
+/**
+ * Los documentos diarios de un alcance, en orden de fecha.
+ *
+ * HU 6.12 (T1): con `desde`, solo los días desde esa fecha (incluida). La
+ * corrección nocturna rehace los resúmenes sin releer lo anterior a la fecha
+ * afectada (RN-6.12-B).
+ *
+ * @param {FirebaseFirestore.Firestore} db
+ * @param {string} userId
+ * @param {string} accountId - `'overall'` o el id de la cuenta
+ * @param {Object} [options]
+ * @param {string} [options.desde] - YYYY-MM-DD
+ * @returns {Promise<FirebaseFirestore.QueryDocumentSnapshot[]>}
+ */
+async function fetchAllDailyDocs(db, userId, accountId, options = {}) {
   const basePath = accountId === 'overall'
     ? `portfolioPerformance/${userId}/dates`
     : `portfolioPerformance/${userId}/accounts/${accountId}/dates`;
 
-  const snapshot = await db.collection(basePath)
+  let query = db.collection(basePath);
+  if (options.desde) {
+    query = query.where('date', '>=', options.desde);
+  }
+  const snapshot = await query
     .orderBy('date', 'asc')
     .get();
 
@@ -147,7 +165,7 @@ function extraerListasDiarias(docs, currency) {
 function buildDailyTimeline(docs, currency) {
   const timeline = [];
   for (const doc of docs) {
-    const data = doc.data();
+    const data = doc.data ? doc.data() : doc; // HU 6.12: también documentos reconstruidos
     const currencyData = data[currency];
     if (!currencyData) continue;
     timeline.push({
@@ -162,7 +180,7 @@ function buildDailyTimeline(docs, currency) {
 function extractLatestAssetPerformanceFromDocs(docs, currency) {
   if (!docs || docs.length === 0) return {};
   const lastDoc = docs[docs.length - 1];
-  const data = lastDoc.data();
+  const data = lastDoc.data ? lastDoc.data() : lastDoc;
   const currencyData = data[currency] || {};
   const assetPerf = currencyData.assetPerformance || {};
   return extractAssetPerformanceFields(assetPerf);
@@ -306,16 +324,29 @@ async function fetchLatestAssetPerformance(db, userId, accountId, currency) {
   return extractAssetPerformanceFields(assetPerf);
 }
 
-async function generatePerformanceSnapshot(db, userId, accountId, currency, options = {}) {
-  // PERF-SNAP-030: Usar daily docs directamente (como PERF-SNAP-025 para assets)
-  const dailyDocs = options.dailyDocs || await fetchAllDailyDocs(db, userId, accountId);
-
-  const now = DateTime.now().setZone('America/New_York');
+/**
+ * El resumen de portafolio o de cuenta a partir de sus documentos diarios, sin
+ * escribir nada.
+ *
+ * HU 6.12 (T1): es el cálculo de `generatePerformanceSnapshot`, separado (como
+ * `armarResumenDeActivo` en la 6.11.3) para que la corrección nocturna rehaga un
+ * resumen desde la fecha afectada con **la misma** función que el desde cero
+ * (RN-6-A).
+ *
+ * @param {Array} dailyDocs - Documentos diarios (snapshots o planos) en orden de fecha
+ * @param {Object} alcance - `{ userId, accountId, currency }`
+ * @param {Object} [options]
+ * @param {DateTime} [options.now] - "Ahora" de los periodos
+ * @returns {Object|null} El resumen, o `null` si no hay datos
+ * @see platform-docs/stories/6.12-correccion-desde-fecha-afectada/refinamiento.md (T1)
+ */
+function armarResumenDePortafolio(dailyDocs, { userId, accountId, currency }, options = {}) {
+  const now = options.now || DateTime.now().setZone('America/New_York');
   const computedResult = computePortfolioReturnsFromDailyDocs(dailyDocs, currency, now);
 
   if (!computedResult || !computedResult.returns) {
     console.log(`[snapshotGenerator] No data for userId=${userId}, accountId=${accountId}, currency=${currency} — skipping`);
-    return false;
+    return null;
   }
 
   const hasAnyData = computedResult.returns.hasYtdData ||
@@ -324,7 +355,7 @@ async function generatePerformanceSnapshot(db, userId, accountId, currency, opti
 
   if (!hasAnyData) {
     console.log(`[snapshotGenerator] Empty result for userId=${userId}, accountId=${accountId}, currency=${currency} — skipping`);
-    return false;
+    return null;
   }
 
   const timeline = buildDailyTimeline(dailyDocs, currency);
@@ -358,6 +389,16 @@ async function generatePerformanceSnapshot(db, userId, accountId, currency, opti
     cashFlows,
     realizedPnL,
   };
+  return snapshot;
+}
+
+async function generatePerformanceSnapshot(db, userId, accountId, currency, options = {}) {
+  // PERF-SNAP-030: Usar daily docs directamente (como PERF-SNAP-025 para assets)
+  const dailyDocs = options.dailyDocs || await fetchAllDailyDocs(db, userId, accountId);
+
+  const snapshot = armarResumenDePortafolio(dailyDocs, { userId, accountId, currency });
+  if (!snapshot) return false;
+  const timeline = snapshot.timeline;
 
   const docId = buildSnapshotDocId(userId, accountId, currency);
   console.log(`[snapshotGenerator] Writing snapshot ${docId} — timeline: ${timeline.length} points`);
@@ -697,6 +738,8 @@ async function generateAllSnapshots(db, userId, currencies, accountIds) {
 
 module.exports = {
   generatePerformanceSnapshot,
+  // HU 6.12: el mismo cálculo, sin escribir
+  armarResumenDePortafolio,
   generateAllSnapshots,
   generateAssetSnapshot,
   // HU 6.11.3: el mismo cálculo, sin escribir

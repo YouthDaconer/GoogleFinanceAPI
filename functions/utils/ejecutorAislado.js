@@ -71,11 +71,15 @@ function crearEjecutorAislado({ script, maxMemoriaMb, tiempoMaxMs, etiqueta = 'e
 
   /**
    * @param {*} payload - Debe poder clonarse (structured clone)
+   * @param {Object} [opcionesTarea]
+   * @param {number} [opcionesTarea.tiempoMaxMs] - HU 6.12: tope de esta tarea, si
+   *   no es el del ejecutor (la reconstrucción usa lo que queda de la noche)
    * @returns {Promise<SalidaTarea>}
    */
-  const ejecutar = (payload) => new Promise((resolve) => {
+  const ejecutar = (payload, opcionesTarea = {}) => new Promise((resolve) => {
     const w = worker || arrancar();
     const id = ++secuencia;
+    const tope = opcionesTarea.tiempoMaxMs || tiempoMaxMs;
     let terminada = false;
 
     const terminar = (salida, { descartarWorker = false } = {}) => {
@@ -108,10 +112,10 @@ function crearEjecutorAislado({ script, maxMemoriaMb, tiempoMaxMs, etiqueta = 'e
     };
 
     const reloj = setTimeout(() => {
-      terminar({ ok: false, motivo: 'tiempo', detalle: `superó el tope de ${tiempoMaxMs / 1000} s` },
+      terminar({ ok: false, motivo: 'tiempo', detalle: `superó el tope de ${tope / 1000} s` },
         { descartarWorker: true });
       w.terminate().catch((error) => console.error(`[${etiqueta}] no se pudo terminar el worker: ${error.message}`));
-    }, tiempoMaxMs);
+    }, tope);
 
     w.on('message', alMensaje);
     w.on('error', alError);

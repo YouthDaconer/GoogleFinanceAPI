@@ -135,6 +135,7 @@ const mockLatestDailyDoc = {
 
 const {
   generatePerformanceSnapshot,
+  armarResumenDePortafolio,
   generateAllSnapshots,
   generateAssetSnapshot,
   generateAllAssetSnapshots,
@@ -1077,5 +1078,55 @@ describe('HU 6.9.2 (T1) — el resumen guarda flujos y P&G realizado por día', 
     const escrito = db._mockSet.mock.calls[0][0];
     expect(escrito.cashFlows).toEqual([]);
     expect(escrito.realizedPnL).toEqual([]);
+  });
+});
+
+describe('HU 6.12 (T1) — el cálculo desde cero, reutilizable', () => {
+  const dia = (date, usd) => ({ data: () => ({ date, USD: { totalValue: 1000, adjustedDailyChangePercentage: 0.2, ...usd } }) });
+  const DIAS = [
+    dia('2026-11-10', { totalCashFlow: -500.25, totalInvestment: 900 }),
+    dia('2026-11-11', { totalValue: 1010 }),
+    dia('2026-11-12', { totalValue: 1020, doneProfitAndLoss: 41.7 }),
+  ];
+  const sinFecha = ({ lastUpdated, ...resto }) => resto;
+
+  it('generatePerformanceSnapshot escribe exactamente lo que arma armarResumenDePortafolio', async () => {
+    const db = createMockDb(DIAS);
+
+    await generatePerformanceSnapshot(db, 'user1', 'overall', 'USD');
+
+    const escrito = db._mockSet.mock.calls[0][0];
+    const armado = armarResumenDePortafolio(DIAS, { userId: 'user1', accountId: 'overall', currency: 'USD' });
+    expect(sinFecha(escrito)).toEqual(sinFecha(armado));
+    expect(escrito.timeline).toEqual([
+      { d: '2026-11-10', v: 1000, c: 0.2 }, { d: '2026-11-11', v: 1010, c: 0.2 }, { d: '2026-11-12', v: 1020, c: 0.2 },
+    ]);
+  });
+
+  it('acepta documentos planos (reconstruidos) igual que los de Firestore', () => {
+    const planos = DIAS.map((d) => d.data());
+    const alcance = { userId: 'user1', accountId: 'overall', currency: 'USD' };
+    expect(sinFecha(armarResumenDePortafolio(planos, alcance))).toEqual(sinFecha(armarResumenDePortafolio(DIAS, alcance)));
+  });
+
+  it('sin datos devuelve null y generatePerformanceSnapshot no escribe', async () => {
+    const db = createMockDb(null);
+    expect(armarResumenDePortafolio([], { userId: 'user1', accountId: 'overall', currency: 'USD' })).toBeNull();
+    expect(await generatePerformanceSnapshot(db, 'user1', 'overall', 'USD')).toBe(false);
+    expect(db._mockSet).not.toHaveBeenCalled();
+  });
+
+  it('fetchAllDailyDocs con desde filtra date >= desde antes de ordenar (RN-6.12-B)', async () => {
+    const get = jest.fn().mockResolvedValue({ docs: ['d'] });
+    const orderBy = jest.fn(() => ({ get }));
+    const where = jest.fn(() => ({ orderBy }));
+    const collection = jest.fn(() => ({ where, orderBy }));
+
+    const docs = await fetchAllDailyDocs({ collection }, 'user1', 'acc123', { desde: '2026-10-26' });
+
+    expect(collection).toHaveBeenCalledWith('portfolioPerformance/user1/accounts/acc123/dates');
+    expect(where).toHaveBeenCalledWith('date', '>=', '2026-10-26');
+    expect(orderBy).toHaveBeenCalledWith('date', 'asc');
+    expect(docs).toEqual(['d']);
   });
 });

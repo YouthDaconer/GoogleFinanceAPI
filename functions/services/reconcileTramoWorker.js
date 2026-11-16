@@ -17,6 +17,7 @@
 
 require('./firebaseAdmin');
 const { atenderTareas } = require('../utils/ejecutorAislado');
-const { ejecutarTramo } = require('./reconcileStalePerformance');
+// HU 6.12: además de los tramos, la reconstrucción de los resúmenes al terminar
+const { ejecutarTarea } = require('./reconcileStalePerformance');
 
-atenderTareas(ejecutarTramo);
+atenderTareas(ejecutarTarea);
