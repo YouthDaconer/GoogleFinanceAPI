@@ -21,9 +21,17 @@
  * - Al terminar queda el estado de la noche y, si hay atraso, el aviso a
  *   operación (Escenarios 4 y 5, `reconcileNightReportService.js`).
  *
+ * HU 6.12: los resúmenes ya no se borran en cada tramo. Al terminar toda la
+ * corrección se rehacen una vez, desde la fecha más antigua de la corrección
+ * (`_stale.desdeInicial`), solo los que ya existían y sin releer lo anterior a
+ * esa fecha (`snapshots/snapshotRebuildService.js`). Mientras tanto el
+ * inversor ve las cifras anteriores con el aviso. `REBUILD_SNAPSHOTS_FROM_DATE=false`
+ * devuelve el borrado de siempre.
+ *
  * @see LATE-REG-003
  * @see platform-docs/stories/6.8.1-historial-corregido-por-tramos/historia.md
  * @see platform-docs/stories/6.8.2-nadie-bloquea-correccion-nocturna/refinamiento.md
+ * @see platform-docs/stories/6.12-correccion-desde-fecha-afectada/refinamiento.md (T4)
  */
 
 const path = require('path');
@@ -40,6 +48,11 @@ const { consolidateMonth, consolidateYear } = require('./periodConsolidationSche
 const { invalidatePerformanceCache } = require('./cacheInvalidationService');
 const { deleteInSmallBatches } = require('../utils/firestoreDeletes');
 const { crearEjecutorAislado, crearEjecutorEnProceso } = require('../utils/ejecutorAislado');
+const {
+  rehacerResumenesDelInversor,
+  resumenesRehechosDesdeLaFecha,
+  listarResumenes,
+} = require('./snapshots/snapshotRebuildService');
 const {
   esperaDe,
   porEspera,
@@ -89,6 +102,19 @@ const LIMITS = {
    * margen, y un tramo que se pase muere solo.
    */
   MEMORIA_MAX_TRAMO_MB: 512,
+
+  /**
+   * HU 6.12: la reconstrucción de los resúmenes al terminar una corrección
+   * tiene que acabar antes de este instante de la noche. Con
+   * `timeoutSeconds: 540` deja 10 s para cerrar.
+   */
+  TIEMPO_LIMITE_NOCHE_MS: 530 * 1000,
+
+  /** HU 6.12: con menos tiempo que esto no se intenta rehacer: se trata como hoy. */
+  TIEMPO_MIN_REHACER_MS: 15 * 1000,
+
+  /** HU 6.12: sellos de `lastUpdated` por batch (escrituras de un campo). */
+  SELLOS_POR_LOTE: 400,
 };
 
 /** Motivo provisional del intento: si nadie lo cambia, el proceso murió con él en curso. */
@@ -138,6 +164,34 @@ function nocheDeIso(iso) {
 // ============================================================================
 
 /**
+ * Rehace los consolidados de meses y años cerrados que tocan `[firstDay, lastDay]`.
+ *
+ * HU 6.12: separado de `propagateReconciledRange` porque los tramos que no
+ * terminan la corrección solo hacen esto. Los consolidados siguen rehaciéndose
+ * en cada tramo (propuesta P1, fuera de alcance).
+ *
+ * @returns {Promise<{months: string[], closedYears: string[]}>}
+ */
+async function consolidarRango(userId, firstDay, accountIds, lastDay, now) {
+  const scopes = [null, ...accountIds];
+  const lastMonth = lastDay ? lastDay.slice(0, 7) : null;
+  const months = closedMonthsSince(firstDay, now).filter((m) => !lastMonth || m <= lastMonth);
+  const closedYears = [...new Set(months.map((m) => m.slice(0, 4)))].filter((y) => Number(y) < now.year);
+
+  for (const periodKey of months) {
+    for (const accountId of scopes) {
+      await consolidateMonth(userId, accountId, periodKey);
+    }
+  }
+  for (const yearKey of closedYears) {
+    for (const accountId of scopes) {
+      await consolidateYear(userId, accountId, yearKey);
+    }
+  }
+  return { months, closedYears };
+}
+
+/**
  * Hace llegar el recálculo a todo lo que se deriva de los docs diarios:
  * consolidados de meses y años cerrados, snapshots, caché de rendimientos y la
  * señal que invalida las cachés del cliente. Sin esto los docs quedaban bien
@@ -160,21 +214,7 @@ async function propagateReconciledRange(
   lastDay = null,
   now = DateTime.now().setZone('America/New_York'),
 ) {
-  const scopes = [null, ...accountIds];
-  const lastMonth = lastDay ? lastDay.slice(0, 7) : null;
-  const months = closedMonthsSince(firstDay, now).filter((m) => !lastMonth || m <= lastMonth);
-  const closedYears = [...new Set(months.map((m) => m.slice(0, 4)))].filter((y) => Number(y) < now.year);
-
-  for (const periodKey of months) {
-    for (const accountId of scopes) {
-      await consolidateMonth(userId, accountId, periodKey);
-    }
-  }
-  for (const yearKey of closedYears) {
-    for (const accountId of scopes) {
-      await consolidateYear(userId, accountId, yearKey);
-    }
-  }
+  const { months, closedYears } = await consolidarRango(userId, firstDay, accountIds, lastDay, now);
 
   // Snapshots del usuario (portafolio, cuentas y activos): se regeneran al
   // leerlos o en el próximo EOD. Actualizarlos en sitio no sirve, el
@@ -216,11 +256,17 @@ async function propagateReconciledRange(
  * @param {Object} params
  * @param {string} params.userId
  * @param {string[]} params.tramo - Días hábiles del tramo (YYYY-MM-DD)
+ * HU 6.12: con `conservarResumenes` solo rehace los consolidados. Los
+ * resúmenes, la caché y la señal se tocan una sola vez, al terminar toda la
+ * corrección (`rehacerAlTerminar`): mientras tanto el inversor ve las cifras
+ * anteriores con el aviso (RN-6.12-E). Sin él, propaga como siempre.
+ *
  * @param {string} params.rangeStart - Inicio de calendario (`_stale.since`)
  * @param {number} params.nowMs - Reloj de la corrida
+ * @param {boolean} [params.conservarResumenes=false]
  * @returns {Promise<{success: boolean, daysProcessed: number, docsBorrados: number, errors: string[]}>}
  */
-async function ejecutarTramo({ userId, tramo, rangeStart, nowMs }) {
+async function ejecutarTramo({ userId, tramo, rangeStart, nowMs, conservarResumenes = false }) {
   const result = await backfillUserPerformance(userId, tramo, { rangeStart });
   if (!result.success) {
     return { success: false, daysProcessed: 0, docsBorrados: 0, errors: result.errors || [] };
@@ -230,10 +276,152 @@ async function ejecutarTramo({ userId, tramo, rangeStart, nowMs }) {
   if (result.daysProcessed + docsBorrados > 0) {
     const accountIds = (await db.collection('portfolioAccounts').where('userId', '==', userId).get())
       .docs.map((d) => d.id);
-    await propagateReconciledRange(userId, tramo[0], accountIds, tramo[tramo.length - 1],
-      DateTime.fromMillis(nowMs, { zone: 'America/New_York' }));
+    const now = DateTime.fromMillis(nowMs, { zone: 'America/New_York' });
+    if (conservarResumenes) {
+      await consolidarRango(userId, tramo[0], accountIds, tramo[tramo.length - 1], now);
+    } else {
+      await propagateReconciledRange(userId, tramo[0], accountIds, tramo[tramo.length - 1], now);
+    }
   }
   return { success: true, daysProcessed: result.daysProcessed, docsBorrados, errors: [] };
+}
+
+/**
+ * HU 6.12: la tarea que rehace los resúmenes del inversor desde la fecha más
+ * antigua de la corrección. Corre en el worker aislado, como un tramo, con su
+ * propio tope de tiempo y de memoria.
+ *
+ * @param {{userId: string, desde: string}} params
+ * @returns {Promise<Object>} Ver `rehacerResumenesDelInversor`
+ */
+async function ejecutarRehacer({ userId, desde }) {
+  return rehacerResumenesDelInversor(db, { userId, desde });
+}
+
+/**
+ * Lo que ejecuta el worker: un tramo o, al terminar la corrección, la
+ * reconstrucción de los resúmenes (HU 6.12).
+ *
+ * @param {Object} payload - `tipo: 'rehacer'` o los parámetros de un tramo
+ * @returns {Promise<Object>}
+ */
+async function ejecutarTarea(payload) {
+  if (payload && payload.tipo === 'rehacer') return ejecutarRehacer(payload);
+  return ejecutarTramo(payload);
+}
+
+// ============================================================================
+// HU 6.12: AL TERMINAR LA CORRECCIÓN, LOS RESÚMENES DESDE LA FECHA
+// ============================================================================
+
+/**
+ * Cierra los resúmenes del inversor tras rehacerlos, en el orden que no deja
+ * cifras viejas en ningún sitio (RN-6.12-E, QA-07).
+ *
+ * 1. Si la reconstrucción falló, borra los resúmenes que no alcanzó a reescribir
+ *    (`lastUpdated` anterior a su inicio): se tratan como hoy, sin reintento
+ *    (RN-6.12-F, QA-14).
+ * 2. Vacía la caché de rendimientos del inversor.
+ * 3. Escribe la señal con la hora **de este momento**, ya con todo escrito. Toda
+ *    memoria guardada durante la reconstrucción es anterior a la señal y se
+ *    descarta.
+ * 4. Sella con esa misma hora el `lastUpdated` de los rehechos. Si no, la señal
+ *    los daría por viejos y el lector los volvería a preparar enteros.
+ *
+ * @param {string} userId
+ * @param {Object} params
+ * @param {string} params.inicioIso - Inicio de la reconstrucción
+ * @param {Object|null} params.resultado - Lo que devolvió la tarea, o `null` si falló
+ * @param {Function} params.now
+ * @returns {Promise<{rehechos: string[], borrados: string[], senal: string}>}
+ */
+async function cerrarResumenes(userId, { inicioIso, resultado, now }) {
+  let rehechos = resultado ? resultado.rehechos : [];
+  let borrados = [];
+
+  if (!resultado) {
+    const resumenes = await listarResumenes(db, userId, ['lastUpdated']);
+    const sinRehacer = resumenes.filter((r) => !(r.lastUpdated >= inicioIso));
+    rehechos = resumenes.filter((r) => r.lastUpdated >= inicioIso).map((r) => r.id);
+    await deleteInSmallBatches(db, sinRehacer.map((r) => r.ref));
+    borrados = sinRehacer.map((r) => r.id);
+  }
+
+  await invalidatePerformanceCache(userId);
+
+  const senal = new Date(now()).toISOString();
+  const signal = { lastSnapshotUpdate: senal };
+  await db.collection('portfolioPerformance').doc(userId).set(signal, { merge: true });
+  await db.collection('userData').doc(userId).set(signal, { merge: true });
+
+  for (let i = 0; i < rehechos.length; i += LIMITS.SELLOS_POR_LOTE) {
+    const lote = rehechos.slice(i, i + LIMITS.SELLOS_POR_LOTE);
+    try {
+      const batch = db.batch();
+      lote.forEach((id) => batch.update(db.collection('performanceSnapshots').doc(id), { lastUpdated: senal }));
+      await batch.commit();
+    } catch (error) {
+      // Uno borrado mientras tanto hace fallar el lote: los demás se sellan uno a uno
+      for (const id of lote) {
+        await db.collection('performanceSnapshots').doc(id).update({ lastUpdated: senal })
+          .catch((e) => console.warn(`[reconcile] No se pudo sellar ${id}: ${e.message}`));
+      }
+    }
+  }
+  return { rehechos, borrados, senal };
+}
+
+/**
+ * HU 6.12: al terminar toda la corrección, rehace **una vez** los resúmenes que
+ * el inversor ya tenía, desde la fecha más antigua de la corrección
+ * (RN-6.12-A, C, D), y los cierra (`cerrarResumenes`).
+ *
+ * - Si la marca cambió durante el tramo, no hace nada: llegó una operación
+ *   nueva y la corrección sigue otra noche.
+ * - Corre aislada con el tiempo que queda de la noche, hasta
+ *   `TIEMPO_MAX_TRAMO_MS`. Con menos de `TIEMPO_MIN_REHACER_MS`, o si falla,
+ *   los resúmenes que no se rehicieron se tratan como hoy (RN-6.12-F).
+ * - Deja una línea `RESUMENES` en los registros (RN-6-I, Escenario 3).
+ *
+ * @param {FirebaseFirestore.DocumentReference} ref - portfolioPerformance/{uid}
+ * @param {Object} stale - La marca con la que empezó el tramo
+ * @param {Object} params
+ * @param {string} params.desde - `_stale.desdeInicial`
+ * @param {Object} params.ejecutor
+ * @param {number} params.finNocheMs - Instante en que la reconstrucción tiene que haber terminado
+ * @param {Function} params.now
+ * @returns {Promise<Object>} Resumen de lo hecho, o `{ omitido }`
+ */
+async function rehacerAlTerminar(ref, stale, { desde, ejecutor, finNocheMs, now }) {
+  const userId = ref.id;
+  const fresh = await ref.get();
+  const actual = fresh.exists ? fresh.data()._stale : null;
+  if (!actual || actual.registeredAt !== stale.registeredAt || actual.since !== stale.since) {
+    return { omitido: 'marca-movida' };
+  }
+
+  const inicio = now();
+  const inicioIso = new Date(inicio).toISOString();
+  const tope = Math.min(LIMITS.TIEMPO_MAX_TRAMO_MS, finNocheMs - inicio);
+  const salida = tope < LIMITS.TIEMPO_MIN_REHACER_MS
+    ? { ok: false, motivo: 'tiempo', detalle: `quedaban ${Math.max(0, Math.round(tope / 1000))} s de la noche` }
+    : await ejecutor.ejecutar({ tipo: 'rehacer', userId, desde }, { tiempoMaxMs: tope });
+
+  const resultado = salida.ok ? salida.resultado : null;
+  const cierre = await cerrarResumenes(userId, { inicioIso, resultado, now });
+
+  const ms = now() - inicio;
+  if (resultado) {
+    const motivos = resultado.comoHoy.map((x) => `${x.id} (${x.motivo})`).join(', ');
+    console.log(`[reconcile] RESUMENES ${userId} desde ${desde}: ${resultado.rehechos.length} rehechos, ` +
+      `${resultado.sinCambios.length} sin cambios, ${resultado.comoHoy.length} como hoy` +
+      `${motivos ? ` [${motivos}]` : ''}; ${resultado.diasLeidos} días leídos, ${ms} ms`);
+  } else {
+    console.error(`[reconcile] RESUMENES ${userId} desde ${desde}: la reconstrucción falló ` +
+      `(${salida.motivo}: ${salida.detalle}); ${cierre.rehechos.length} rehechos, ` +
+      `${cierre.borrados.length} como hoy, sin reintento [${cierre.borrados.join(', ')}]; ${ms} ms`);
+  }
+  return { desde, ok: salida.ok, motivo: salida.ok ? null : salida.motivo, ...cierre, resultado };
 }
 
 // ============================================================================
@@ -353,16 +541,25 @@ async function registrarFallo(ref, fallo, { contado, noche, now }) {
  * @param {string} [options.lastClosedDate] - Último día cerrado (YYYY-MM-DD)
  * @param {Function} [options.now=Date.now] - Reloj en ms
  * @param {string} [options.noche] - Noche de la corrida (YYYY-MM-DD)
- * @param {Object} [options.ejecutor] - Ejecuta `ejecutarTramo`
+ * HU 6.12: con el interruptor y una marca con `desdeInicial`, los tramos solo
+ * corrigen días y consolidados. Tras el último, antes de retirar la marca (el
+ * aviso sigue mientras tanto), se rehacen una vez los resúmenes desde
+ * `desdeInicial` (`rehacerAlTerminar`). Sin interruptor o con una marca
+ * anterior a la HU, cada tramo propaga y borra todo, como siempre.
+ *
+ * @param {Object} [options.ejecutor] - Ejecuta `ejecutarTarea`
+ * @param {number} [options.finNocheMs=Infinity] - HU 6.12: la reconstrucción tiene que acabar antes
  * @returns {Promise<{status: 'reconciled'|'advanced'|'moved'|'failed'|'gone', days: number,
- *   desde?: string, hasta?: string, motivo?: string, retryCount?: number, sinceInicial?: string}>}
+ *   desde?: string, hasta?: string, motivo?: string, retryCount?: number, sinceInicial?: string,
+ *   resumenes?: Object}>}
  */
 async function corregirTramo(doc, {
   yaAvanzo = false,
   lastClosedDate = getLastClosedDate(),
   now = Date.now,
   noche = nocheDe(now()),
-  ejecutor = crearEjecutorEnProceso(ejecutarTramo),
+  ejecutor = crearEjecutorEnProceso(ejecutarTarea),
+  finNocheMs = Infinity,
 } = {}) {
   const userId = doc.id;
   const startedAt = now();
@@ -376,6 +573,8 @@ async function corregirTramo(doc, {
     ({ stale, previo } = abierto);
   }
   const sinceInicial = stale.since;
+  // HU 6.12: desde dónde se rehacen los resúmenes al terminar; `null` = como siempre
+  const rehacerDesde = resumenesRehechosDesdeLaFecha() && stale.desdeInicial ? stale.desdeInicial : null;
 
   let desde;
   let hasta;
@@ -390,8 +589,11 @@ async function corregirTramo(doc, {
 
     let fallo = null;
     let daysProcessed = 0;
+    let corrigio = false;
     if (tramo.length > 0) {
-      const salida = await ejecutor.ejecutar({ userId, tramo, rangeStart: stale.since, nowMs: now() });
+      const salida = await ejecutor.ejecutar({
+        tipo: 'tramo', userId, tramo, rangeStart: stale.since, nowMs: now(), conservarResumenes: !!rehacerDesde,
+      });
       if (!salida.ok) {
         fallo = { motivo: salida.motivo, detalle: salida.detalle };
       } else if (!salida.resultado.success) {
@@ -401,6 +603,7 @@ async function corregirTramo(doc, {
         fallo = { motivo: 'sin_avance', detalle: 'terminó sin error pero sin corregir ningún día' };
       }
       daysProcessed = salida.ok ? salida.resultado.daysProcessed : 0;
+      corrigio = !fallo;
     }
 
     if (fallo) {
@@ -411,6 +614,13 @@ async function corregirTramo(doc, {
           `${contado ? ` (intento ${retryCount} de ${LIMITS.MAX_RETRY_COUNT})` : ' (ya avanzó esta noche: no suma intento)'}`,
       });
       return { status: 'failed', days: 0, desde, hasta, motivo: fallo.motivo, retryCount, sinceInicial, contado };
+    }
+
+    // HU 6.12: una sola vez, al terminar, y solo si algún tramo corrigió días
+    // (este o los de noches anteriores, que dejaron `since` por delante).
+    let resumenes;
+    if (esUltimo && rehacerDesde && (corrigio || rehacerDesde < stale.since)) {
+      resumenes = await rehacerAlTerminar(doc.ref, stale, { desde: rehacerDesde, ejecutor, finNocheMs, now });
     }
 
     const siguiente = esUltimo ? null : nextCalendarDay(hasta);
@@ -453,7 +663,7 @@ async function corregirTramo(doc, {
       moved: `la marca cambió durante el tramo; sigue desde ${currentSince || 'sin marca'}`,
     }[status];
     logTramo(userId, { desde, hasta, days: dias, ms: now() - startedAt, status, detail, since: stale.since });
-    return { status, days: status === 'moved' ? 0 : daysProcessed, desde, hasta, sinceInicial };
+    return { status, days: status === 'moved' ? 0 : daysProcessed, desde, hasta, sinceInicial, resumenes };
   } catch (error) {
     // Un fallo de la propia corrida (Firestore, calendario) también es un intento sin avance
     const fallo = { motivo: 'error', detalle: error.message };
@@ -552,6 +762,12 @@ async function liberarRevision(userId, { aplicar = true, now = Date.now } = {}) 
       .filter(Boolean).sort()[0];
     const pendienteDesde = [datos.pendienteDesde, esperaDe(previa), actual && esperaDe(actual)]
       .filter(Boolean).sort()[0] || at;
+    // HU 6.12 (RN-6.12-C, QA-12): lo corregido antes de la revisión todavía no
+    // rehízo los resúmenes; se rehacen desde la fecha más antigua de toda la
+    // corrección. Una revisión anterior a la HU, sin ella, sigue el camino de hoy.
+    const desdeInicial = previa.desdeInicial
+      ? [previa.desdeInicial, actual && actual.desdeInicial, since].filter(Boolean).sort()[0]
+      : null;
 
     if (aplicar) {
       tx.update(perfRef, {
@@ -564,6 +780,7 @@ async function liberarRevision(userId, { aplicar = true, now = Date.now } = {}) 
           pendienteDesde,
           retryCount: 0,
           intentos: [],
+          ...(desdeInicial ? { desdeInicial } : {}),
         },
       });
       tx.update(failRef, { resolvedAt: at, liberadoAt: at });
@@ -618,16 +835,18 @@ async function contarEnRevision() {
  * @param {Object} [options]
  * @param {number} [options.timeBudgetMs] - No se empieza un tramo pasado este tiempo
  * @param {Function} [options.now=Date.now] - Reloj en ms; también fija la fecha de la noche
- * @param {Object} [options.ejecutor] - Ejecuta cada tramo; por omisión, en este proceso
+ * @param {Object} [options.ejecutor] - Ejecuta cada tarea (tramo o reconstrucción); por omisión, en este proceso
  * @returns {Promise<Object>} Recuentos de la noche y su `estado`
  */
 async function runReconciliation({
   timeBudgetMs = LIMITS.TIME_BUDGET_MS,
   now = Date.now,
-  ejecutor = crearEjecutorEnProceso(ejecutarTramo),
+  ejecutor = crearEjecutorEnProceso(ejecutarTarea),
 } = {}) {
   const startTime = now();
   const hayTiempo = () => now() - startTime < timeBudgetMs;
+  // HU 6.12: la reconstrucción de resúmenes tiene que acabar antes que la función
+  const finNocheMs = startTime + LIMITS.TIEMPO_LIMITE_NOCHE_MS;
   const noche = nocheDe(startTime);
   const lastClosedDate = getLastClosedDate(DateTime.fromMillis(startTime, { zone: 'America/New_York' }));
   const avanzaron = new Set();
@@ -649,7 +868,7 @@ async function runReconciliation({
     const stale = doc.data()._stale;
     const yaAvanzo = avanzaron.has(doc.id) || nocheDeIso(stale.lastAdvance) === noche;
     totals.tramos++;
-    const r = await corregirTramo(doc, { yaAvanzo, lastClosedDate, now, noche, ejecutor });
+    const r = await corregirTramo(doc, { yaAvanzo, lastClosedDate, now, noche, ejecutor, finNocheMs });
     if (r.status === 'gone') {
       totals.tramos--;
       return false;
@@ -785,6 +1004,9 @@ module.exports = {
   runReconciliation,
   corregirTramo,
   ejecutarTramo,
+  ejecutarTarea,
+  rehacerAlTerminar,
+  cerrarResumenes,
   abrirIntento,
   abandonUser,
   liberarRevision,

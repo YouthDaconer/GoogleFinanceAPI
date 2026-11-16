@@ -712,7 +712,8 @@ describe('HU 6.8.1 — operaciones nuevas a mitad de un rango (Escenario 8, RN-6
 });
 
 describe('HU 6.8.1 — lo que se propaga y lo que se registra por tramo', () => {
-  test('solo se rehacen los meses cerrados del tramo y se borran los snapshots del inversor, no los de otros', async () => {
+  /** Un tramo intermedio de inv-a con dos snapshots suyos y uno de otro inversor. */
+  async function tramoIntermedioConSnapshots() {
     restore(BASES['inv-a']);
     moveHistoricalPrices();
     mockStore.docs.set('performanceSnapshots/inv-a_overall_USD', { timeline: { a: 1 } });
@@ -720,13 +721,27 @@ describe('HU 6.8.1 — lo que se propaga y lo que se registra por tramo', () => 
     mockStore.docs.set('performanceSnapshots/otro_overall_USD', { timeline: { a: 1 } });
     const since = tradingOffset(FROM['inv-a'], 0);
     await markPerformanceAsStale('inv-a', since, { reason: 'asset_edit' });
-
     const { tramos } = await run({ n: 1, timeBudgetMs: ONE_TRAMO });
-
     const months = [...new Set(consolidateMonth.mock.calls.map((c) => c[2]))];
     expect(months).toEqual(calendar(since, tramos[0].hasta).map((d) => d.slice(0, 7)).filter((m, i, all) => all.indexOf(m) === i));
+  }
+
+  test('con REBUILD_SNAPSHOTS_FROM_DATE=false (como antes de la HU 6.12): solo los meses del tramo y se borran los snapshots del inversor, no los de otros', async () => {
+    process.env.REBUILD_SNAPSHOTS_FROM_DATE = 'false';
+    try {
+      await tramoIntermedioConSnapshots();
+    } finally {
+      delete process.env.REBUILD_SNAPSHOTS_FROM_DATE;
+    }
     expect(mockStore.docs.has('performanceSnapshots/inv-a_overall_USD')).toBe(false);
     expect(mockStore.docs.has('performanceSnapshots/inv-a_inv-a-usd_USD')).toBe(false);
+    expect(mockStore.docs.has('performanceSnapshots/otro_overall_USD')).toBe(true);
+  });
+
+  test('HU 6.12 (RN-6.12-E): un tramo intermedio rehace los meses del tramo pero no toca los snapshots', async () => {
+    await tramoIntermedioConSnapshots();
+    expect(mockStore.docs.has('performanceSnapshots/inv-a_overall_USD')).toBe(true);
+    expect(mockStore.docs.has('performanceSnapshots/inv-a_inv-a-usd_USD')).toBe(true);
     expect(mockStore.docs.has('performanceSnapshots/otro_overall_USD')).toBe(true);
   });
 
