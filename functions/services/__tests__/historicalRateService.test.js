@@ -264,3 +264,56 @@ describe('historicalRateService (HU #3)', () => {
     });
   });
 });
+
+/**
+ * HU 6.14.2 (RN-6.14-D, RN-6.11-L): un cierre inválido (cero, negativo o vacío)
+ * se trata como un festivo: se usa el cierre hábil anterior, hasta 5 días
+ * naturales, sin aviso; más allá no hay tasa y quien llama muestra el aviso de
+ * no disponible. finance-query ya los descarta (`_is_valid_rate`); esto fija que
+ * este servicio tampoco los use si llegaran.
+ *
+ * @see platform-docs/stories/6.14.2-dias-tasa-corrida-recalculados/qa.md (QA-06, QA-07)
+ */
+describe('HU 6.14.2 — un cierre inválido es un día sin cierre, como un festivo', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    _resetMemory();
+  });
+
+  it.each([
+    ['0', 0],
+    ['vacío', null],
+    ['negativo', -4049.45],
+  ])('el 2025-08-15 llega %s y el 2025-08-14 es 4.021,75: se usa 4.021,75 (QA-06)', async (_caso, invalido) => {
+    mockGetExchangeRates.mockResolvedValue(channel({ COP: { '2025-08-14': 4021.75, '2025-08-15': invalido } }));
+
+    const result = await getRateForDate('COP', '2025-08-15');
+
+    expect(result).toEqual({ rate: 4021.75, rateDate: '2025-08-14', source: RATE_SOURCES.PREVIOUS_CLOSE });
+  });
+
+  it('inválidos o ausentes del 2025-08-10 al 2025-08-15 (6 días naturales): no hay tasa (QA-07)', async () => {
+    mockGetExchangeRates.mockResolvedValue(channel({
+      COP: { '2025-08-09': 4100, '2025-08-11': 0, '2025-08-12': null, '2025-08-13': -1, '2025-08-14': 0, '2025-08-15': 0 },
+    }));
+
+    await expect(getRateForDate('COP', '2025-08-15')).resolves.toBeNull();
+  });
+
+  it('inválidos del 2025-08-11 al 2025-08-15 y válido el 2025-08-10 (5 días atrás): se usa el del 2025-08-10 (QA-07)', async () => {
+    mockGetExchangeRates.mockResolvedValue(channel({
+      COP: { '2025-08-10': 4043.14, '2025-08-11': 0, '2025-08-12': 0, '2025-08-13': 0, '2025-08-14': 0, '2025-08-15': 0 },
+    }));
+
+    await expect(getRateForDate('COP', '2025-08-15'))
+      .resolves.toEqual({ rate: 4043.14, rateDate: '2025-08-10', source: RATE_SOURCES.PREVIOUS_CLOSE });
+  });
+
+  it('en un rango, el día con cierre inválido queda sin cierre propio y la reconstrucción arrastra el anterior', async () => {
+    mockGetExchangeRates.mockResolvedValue(channel({ COP: { '2025-08-14': 4021.75, '2025-08-15': 0 } }));
+
+    const result = await getRatesForRange(['COP'], '2025-08-14', '2025-08-15');
+
+    expect(result).toEqual({ '2025-08-14': { USD: 1, COP: 4021.75 } });
+  });
+});

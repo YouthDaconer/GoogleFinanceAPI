@@ -8,9 +8,10 @@
  * resultado por **las mismas funciones** que hoy calculan esas cifras. Calcular
  * desde USD y calcular desde cero son así la misma cuenta (RN-6-A).
  *
- * - Un día sin cierre toma el cierre hábil anterior hasta 5 días naturales; una
- *   tasa inválida o un hueco mayor dejan la cifra sin calcular (`tasasDeLaSerie`,
- *   RN-6.11-L). Quien llama responde entonces el aviso de la 6.11.1 (RN-6.11-K).
+ * - Un día sin cierre, o con un cierre inválido, toma el cierre hábil anterior
+ *   hasta 5 días naturales; un hueco mayor deja la cifra sin calcular
+ *   (`tasasDeLaSerie`, RN-6.11-L, RN-6.14-D). Quien llama responde entonces el
+ *   aviso de la 6.11.1 (RN-6.11-K).
  * - La tasa solo se exige en los días que la cifra usa: el detalle de un activo
  *   no se queda sin calcular por un día sin tasa anterior a su compra (QA-08).
  * - `RARE_CURRENCY_SCREENS_FROM_USD=false` devuelve el comportamiento de antes en
@@ -124,15 +125,14 @@ function convertirBloque(bloque, tasa, valorPrevioUsd, tasaPrevia) {
  * @param {Object<string, number>} cierres - `{ 'YYYY-MM-DD': unidades por 1 USD }`
  * @param {Object} [opciones]
  * @param {string} [opciones.claveActivo] - `${ticker}_${assetType}`
- * @returns {{dias?: Object[], motivo?: string}} `motivo` si falta o es inválida una tasa
+ * @returns {{dias?: Object[], motivo?: string}} `motivo` si falta una tasa (sin cierre válido en 5 días)
  */
 function convertirDiasDesdeUsd(dias, currency, cierres, opciones = {}) {
   const { claveActivo } = opciones;
   const planos = dias.map(datosDe);
   const usaTasa = (d) => !!d?.USD && (!claveActivo || !!d.USD.assetPerformance?.[claveActivo]);
 
-  const { tasas, faltante, invalida } = tasasDeLaSerie(planos.filter(usaTasa).map((d) => ({ d: d.date })), cierres);
-  if (invalida) return { motivo: `tasa-invalida-${invalida}` };
+  const { tasas, faltante } = tasasDeLaSerie(planos.filter(usaTasa).map((d) => ({ d: d.date })), cierres);
   if (faltante) return { motivo: `sin-tasa-${faltante}` };
 
   const convertidos = planos.map((d, i) => {
