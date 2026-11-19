@@ -17,10 +17,22 @@ const { StructuredLogger } = require('../utils/logger');
 // node-fetch no está en package.json como dependencia directa
 // const fetch = require('node-fetch');
 
-// SEC-CF-001: Configuración centralizada de URLs y headers
-const { FINANCE_QUERY_API_URL, getServiceHeaders } = require('./config');
 // OPT-DEMAND-SECTOR: Importar servicio de financeQuery para precios on-demand
 const { getQuotes } = require('./financeQuery');
+// HU 6.16: el desglose de los ETF se guarda una vez y lo usan todas las consultas.
+// El cliente de la fuente (fetchETFDataFromAPI*) vive ahora en ese módulo.
+const {
+  desgloseCompartidoActivo,
+  hasUsableETFData,
+  fetchWithConcurrencyLimit,
+  fetchETFDataFromAPIWithRetry,
+  normalizarSimbolo,
+  leerDesgloses,
+  guardarDesglose,
+  estaVencido,
+  hoyEnNuevaYork,
+  programarRefresco,
+} = require('./etfBreakdown/etfBreakdownService');
 
 const logger = new StructuredLogger('PortfolioDistributionService');
 
@@ -28,9 +40,16 @@ const logger = new StructuredLogger('PortfolioDistributionService');
 const distributionCache = new Map();
 const CACHE_TTL = 5 * 60 * 1000;
 
-// Cache para datos de ETFs (más largo TTL ya que cambian poco)
+// Cache para datos de ETFs (más largo TTL ya que cambian poco).
+// HU 6.16 (D7): es la del camino de hoy, el que corre con ETF_BREAKDOWN_STORE=false.
 const etfDataCache = new Map();
 const ETF_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 horas
+
+// HU 6.16 (D3): con el desglose compartido, la memoria de la instancia guarda
+// lo leído 1 hora. Un refresco hecho por otra instancia se ve en menos de una
+// hora; cuesta como mucho una lectura por ETF y hora por instancia.
+const desgloseEnMemoria = new Map();
+const DESGLOSE_EN_MEMORIA_TTL = 60 * 60 * 1000;
 
 // FIX-ETF-EU-001: Cobertura mínima de holdings para considerar un ETF
 // completamente desagregado.
@@ -41,12 +60,11 @@ const ETF_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 horas
 // Por debajo del umbral se conserva el remanente como posición del propio ETF.
 const ETF_HOLDINGS_COVERAGE_THRESHOLD = 0.97;
 
-// FIX-ETF-EU-001: Timeout de cada llamada a /v1/etf/{symbol}/unified.
-// La cadena de fuentes del API tarda ~18s en frío para un UCITS europeo.
-// Cota superior: los símbolos se piden en lotes de CONCURRENT_LIMIT en paralelo,
-// así que el coste es (nº de lotes × el símbolo más lento del lote), no la suma.
-// Con 2 lotes son 50s como máximo, dentro de los 60s de timeout de queryOperations.
-const ETF_API_TIMEOUT_MS = 25000;
+// FIX-ETF-EU-001: el timeout de cada llamada a /v1/etf/{symbol}/unified
+// (ETF_API_TIMEOUT_MS, 25 s) vive con el cliente de la fuente en
+// etfBreakdown/etfBreakdownService.js (HU 6.16). Los símbolos se piden en lotes
+// de 3 en paralelo: con 2 lotes son 50 s como máximo, dentro de los 60 s de
+// timeout de queryOperations.
 
 // Cache para sectores (raramente cambian)
 let sectorsCache = null;
@@ -306,6 +324,9 @@ async function getPortfolioDistribution(userId, options = {}) {
   if (options.forceRefresh) {
     distributionCache.delete(cacheKey);
     etfDataCache.clear(); // También limpiar cache de ETFs
+    // HU 6.16 (D4): vacía también la memoria del desglose compartido. No fuerza
+    // la fuente: el siguiente cálculo relee el desglose guardado.
+    desgloseEnMemoria.clear();
     logger.info('Force refresh requested, cache cleared', { userId, cacheKey });
   }
   
@@ -344,104 +365,15 @@ async function getPortfolioDistribution(userId, options = {}) {
   }
 
   try {
-    // 1. Obtener assets del usuario
-    const assets = await getActiveAssets(userId, options);
-    
-    if (!assets.length) {
+    // HU 6.16 (T5): reunir las entradas y calcular con ellas son dos pasos,
+    // para que la comparación previa calcule dos versiones con las mismas.
+    const entradas = await reunirEntradas(userId, options);
+    const result = entradas.assets.length ? calcularDesdeEntradas(userId, entradas, options) : null;
+
+    if (!result) {
       return recortarPosiciones(buildEmptyResponse(options.currency), options);
     }
-
-    // 2. Obtener precios actuales
-    const symbols = [...new Set(assets.map(a => a.name))];
-    const prices = await batchGetPrices(symbols);
-
-    // 3. Obtener cuentas del portafolio
-    const portfolioAccounts = await getPortfolioAccounts(userId);
-
-    // 4. Obtener datos de ETFs
-    const etfSymbols = assets
-      .filter(a => a.assetType === 'etf' || prices[a.name]?.type === 'etf')
-      .map(a => a.name);
-    const etfData = await batchGetETFData(etfSymbols);
-
-    // 5. Obtener tasas de cambio de monedas (FIX-CURRENCY-001)
-    const currencyRates = await getCurrencyRates();
-
-    // 6. Obtener mapeo de sectores
-    const sectorMappings = await getSectorMappings();
-
-    // 7. Obtener mapeo de países
-    const countryMappings = await getCountryMappings();
-
-    // 8. Calcular valor total del portafolio (FIX-CURRENCY-001: convertir a USD)
-    const totalPortfolioValue = calculateTotalValue(assets, prices, currencyRates);
-    
-    if (totalPortfolioValue === 0) {
-      return recortarPosiciones(buildEmptyResponse(options.currency), options);
-    }
-
-    // 9. Calcular distribuciones (FIX-CURRENCY-001: pasar currencyRates)
-    const { holdings, sectors, etfStats } = calculateSectorDistribution(
-      assets, prices, etfData, sectorMappings, portfolioAccounts, userId, totalPortfolioValue, currencyRates
-    );
-
-    const countries = calculateCountryDistribution(
-      assets, prices, etfData, countryMappings, portfolioAccounts, userId, totalPortfolioValue, currencyRates
-    );
-
-    // SCALE-OPT-001: Calcular activos sin ubicación geográfica
-    const nonGeographicData = calculateNonGeographicAssets(
-      assets, prices, etfData, countryMappings, portfolioAccounts, userId, totalPortfolioValue, currencyRates
-    );
-
-    // SCALE-OPT-001: Filtrar países con porcentaje muy pequeño (< 0.0001%)
-    // Estos países no se pueden representar significativamente en el mapa
-    const MIN_PERCENTAGE_THRESHOLD = 0.0001;
-    const filteredCountries = countries.filter(c => c.percentage >= MIN_PERCENTAGE_THRESHOLD);
-
-    // 9. Construir respuesta
-    const result = {
-      sectors: sectors.map(s => ({
-        sector: s.sector,
-        weight: s.weight,
-        percentage: s.weight * 100
-      })),
-      countries: filteredCountries.map(c => ({
-        id: c.id,
-        name: c.name,
-        value: c.value,
-        percentage: c.percentage,
-        assets: c.assets || []
-      })),
-      // SCALE-OPT-001: Incluir activos sin ubicación geográfica
-      nonGeographicData: {
-        totalPercentage: nonGeographicData.totalPercentage,
-        assets: nonGeographicData.assets,
-        assetTypeDistribution: nonGeographicData.assetTypeDistribution
-      },
-      // HU 6.15 (D2): la caché guarda SIEMPRE la lista completa. Su clave no
-      // distingue `includeHoldings` ni `holdingsLimit`, así que recortar aquí
-      // haría que la carga completa (Inteligencia, Copilot) recibiera el recorte.
-      // `recortarPosiciones` aplica lo pedido sobre una copia de la respuesta.
-      holdings,
-      totals: {
-        portfolioValue: totalPortfolioValue,
-        currency: options.currency || 'USD'
-      },
-      metadata: {
-        calculatedAt: new Date().toISOString(),
-        assetCount: assets.length,
-        accountCount: new Set(assets.map(a => a.portfolioAccount).filter(Boolean)).size,
-        etfCount: etfSymbols.length,
-        etfDataLoaded: etfData.size,
-        etfDecomposed: etfStats.decomposed,
-        etfNotDecomposed: etfStats.notDecomposed,
-        // FIX-ETF-EU-001: ETFs cuya fuente sólo publica el top-10 de la cartera.
-        // El resto se conserva como posición del propio ETF en `holdings`.
-        etfPartiallyDecomposed: Array.from(etfStats.partiallyDecomposed),
-        etfHoldingsCoverage: etfStats.coverage
-      }
-    };
+    const { assets, etfSymbols, etfData } = entradas;
 
     // FIX-DIST-002: Solo cachear si cargamos ETF data correctamente
     // Si hay ETFs pero no se cargaron datos, no cachear el resultado degradado
@@ -468,8 +400,8 @@ async function getPortfolioDistribution(userId, options = {}) {
       userId,
       duration: Date.now() - startTime,
       assetCount: assets.length,
-      sectorsCount: sectors.length,
-      countriesCount: countries.length
+      sectorsCount: result.sectors.length,
+      countriesCount: result.countries.length
     });
 
     // Sanitizar resultado para evitar NaN/Infinity que rompen JSON serialization.
@@ -479,6 +411,136 @@ async function getPortfolioDistribution(userId, options = {}) {
     logger.error('Error calculating distribution', { userId, error: error.message });
     throw error;
   }
+}
+
+/**
+ * HU 6.16 (T5) — Reúne todo lo que necesita el cálculo, en el orden de siempre:
+ * activos, cotizaciones, cuentas, desglose de los ETF, tasas, sectores y países.
+ *
+ * Separado de `calcularDesdeEntradas` para que la comparación previa (D6)
+ * calcule la versión «como hoy» y la nueva con **las mismas** cotizaciones y
+ * tasas, cambiando solo el desglose y el mapeo de países.
+ *
+ * @param {string} userId
+ * @param {Object} options - Las de `getPortfolioDistribution`
+ * @returns {Promise<{assets: Object[], prices?: Object, portfolioAccounts?: Object[], etfSymbols?: string[],
+ *   etfData?: Map<string, Object>, currencyRates?: Object, sectorMappings?: Object, countryMappings?: Map<string, Object>}>}
+ *   Sin activos, solo `{ assets: [] }`.
+ */
+async function reunirEntradas(userId, options = {}) {
+  // 1. Obtener assets del usuario
+  const assets = await getActiveAssets(userId, options);
+  if (!assets.length) return { assets };
+
+  // 2. Obtener precios actuales
+  const symbols = [...new Set(assets.map(a => a.name))];
+  const prices = await batchGetPrices(symbols);
+
+  // 3. Obtener cuentas del portafolio
+  const portfolioAccounts = await getPortfolioAccounts(userId);
+
+  // 4. Obtener datos de ETFs
+  const etfSymbols = assets
+    .filter(a => a.assetType === 'etf' || prices[a.name]?.type === 'etf')
+    .map(a => a.name);
+  const etfData = await batchGetETFData(etfSymbols);
+
+  // 5. Obtener tasas de cambio de monedas (FIX-CURRENCY-001)
+  const currencyRates = await getCurrencyRates();
+
+  // 6. Obtener mapeo de sectores
+  const sectorMappings = await getSectorMappings();
+
+  // 7. Obtener mapeo de países
+  const countryMappings = await getCountryMappings();
+
+  return { assets, prices, portfolioAccounts, etfSymbols, etfData, currencyRates, sectorMappings, countryMappings };
+}
+
+/**
+ * HU 6.16 (T5) — Calcula la distribución con unas entradas ya reunidas. No lee
+ * ni escribe nada.
+ *
+ * @param {string} userId
+ * @param {Object} entradas - Las de `reunirEntradas` (con activos)
+ * @param {Object} options - Las de `getPortfolioDistribution` (moneda)
+ * @returns {Object|null} La distribución con la lista completa de posiciones,
+ *   sin sanear ni recortar; `null` si el portafolio vale 0
+ */
+function calcularDesdeEntradas(userId, entradas, options = {}) {
+  const { assets, prices, portfolioAccounts, etfSymbols, etfData, currencyRates, sectorMappings, countryMappings } = entradas;
+
+  // 8. Calcular valor total del portafolio (FIX-CURRENCY-001: convertir a USD)
+  const totalPortfolioValue = calculateTotalValue(assets, prices, currencyRates);
+  
+  if (totalPortfolioValue === 0) {
+    return null;
+  }
+
+  // 9. Calcular distribuciones (FIX-CURRENCY-001: pasar currencyRates)
+  const { holdings, sectors, etfStats } = calculateSectorDistribution(
+    assets, prices, etfData, sectorMappings, portfolioAccounts, userId, totalPortfolioValue, currencyRates
+  );
+
+  const countries = calculateCountryDistribution(
+    assets, prices, etfData, countryMappings, portfolioAccounts, userId, totalPortfolioValue, currencyRates
+  );
+
+  // SCALE-OPT-001: Calcular activos sin ubicación geográfica
+  const nonGeographicData = calculateNonGeographicAssets(
+    assets, prices, etfData, countryMappings, portfolioAccounts, userId, totalPortfolioValue, currencyRates
+  );
+
+  // SCALE-OPT-001: Filtrar países con porcentaje muy pequeño (< 0.0001%)
+  // Estos países no se pueden representar significativamente en el mapa
+  const MIN_PERCENTAGE_THRESHOLD = 0.0001;
+  const filteredCountries = countries.filter(c => c.percentage >= MIN_PERCENTAGE_THRESHOLD);
+
+  // 9. Construir respuesta
+  const result = {
+    sectors: sectors.map(s => ({
+      sector: s.sector,
+      weight: s.weight,
+      percentage: s.weight * 100
+    })),
+    countries: filteredCountries.map(c => ({
+      id: c.id,
+      name: c.name,
+      value: c.value,
+      percentage: c.percentage,
+      assets: c.assets || []
+    })),
+    // SCALE-OPT-001: Incluir activos sin ubicación geográfica
+    nonGeographicData: {
+      totalPercentage: nonGeographicData.totalPercentage,
+      assets: nonGeographicData.assets,
+      assetTypeDistribution: nonGeographicData.assetTypeDistribution
+    },
+    // HU 6.15 (D2): la caché guarda SIEMPRE la lista completa. Su clave no
+    // distingue `includeHoldings` ni `holdingsLimit`, así que recortar aquí
+    // haría que la carga completa (Inteligencia, Copilot) recibiera el recorte.
+    // `recortarPosiciones` aplica lo pedido sobre una copia de la respuesta.
+    holdings,
+    totals: {
+      portfolioValue: totalPortfolioValue,
+      currency: options.currency || 'USD'
+    },
+    metadata: {
+      calculatedAt: new Date().toISOString(),
+      assetCount: assets.length,
+      accountCount: new Set(assets.map(a => a.portfolioAccount).filter(Boolean)).size,
+      etfCount: etfSymbols.length,
+      etfDataLoaded: etfData.size,
+      etfDecomposed: etfStats.decomposed,
+      etfNotDecomposed: etfStats.notDecomposed,
+      // FIX-ETF-EU-001: ETFs cuya fuente sólo publica el top-10 de la cartera.
+      // El resto se conserva como posición del propio ETF en `holdings`.
+      etfPartiallyDecomposed: Array.from(etfStats.partiallyDecomposed),
+      etfHoldingsCoverage: etfStats.coverage
+    }
+  };
+
+  return result;
 }
 
 // ============================================================================
@@ -881,29 +943,144 @@ async function getPortfolioAccounts(userId) {
 }
 
 /**
- * FIX-ETF-EU-001: Determina si la respuesta del API de ETFs es aprovechable.
+ * Obtiene datos de ETFs en batch.
  *
- * Antes se exigían holdings; eso descartaba respuestas que sí traen sectores
- * y/o países (p.ej. justETF sin top-10), perdiendo la geografía del ETF y
- * dejándolo en `nonGeographicData`.
+ * HU 6.16: con el desglose compartido encendido (por defecto) sale de
+ * `etfBreakdowns`; con `ETF_BREAKDOWN_STORE=false`, del camino de hoy.
  *
- * @param {Object|null} data - Respuesta de /v1/etf/{symbol}/unified
- * @returns {boolean} true si aporta holdings, sectores o países
+ * @param {string[]} symbols
+ * @returns {Promise<Map<string, Object>>} Desglose por símbolo normalizado
  */
-function hasUsableETFData(data) {
-  if (!data) return false;
-  return Boolean(
-    (data.holdings && data.holdings.length > 0) ||
-    (data.sectors && data.sectors.length > 0) ||
-    (data.countries && data.countries.length > 0)
-  );
+async function batchGetETFData(symbols) {
+  if (!desgloseCompartidoActivo()) return batchGetETFDataComoHoy(symbols);
+  return batchGetETFDataCompartido(symbols);
+}
+
+/**
+ * HU 6.16 (T2, RN-6.16-A, RN-6.16-B, RN-6.16-E) — El desglose, desde el guardado.
+ *
+ * 1. Memoria de la instancia (1 h, D3).
+ * 2. `etfBreakdowns`, en una sola ida: vigente **o vencido**, se usa al instante.
+ *    El vencido además programa su refresco aparte (como mucho un intento al
+ *    día por ETF; ajuste 1 del PO). Nadie espera a la fuente por él.
+ * 3. Solo un ETF que **nunca** se guardó (o cuyo guardado se descartó) espera
+ *    a la fuente, como hoy, y se guarda para todas las instancias.
+ *
+ * Si leer o escribir `etfBreakdowns` falla, la distribución sigue: lo no leído
+ * se pide a la fuente, como hoy.
+ *
+ * Deja una línea `[etfBreakdown] Paso del desglose` por cálculo con lo que
+ * mide la HU (RN-6-I): duración, de dónde salió cada ETF, lecturas, escrituras
+ * y refrescos encolados.
+ *
+ * @param {string[]} symbols
+ * @returns {Promise<Map<string, Object>>}
+ */
+async function batchGetETFDataCompartido(symbols) {
+  const inicio = Date.now();
+  const ahora = new Date();
+  const etfData = new Map();
+  const unicos = [...new Set(symbols.map(normalizarSimbolo))];
+  const origen = { memoria: [], guardado: [], fuente: [], sinDesglose: [] };
+  const vencidos = [];
+  let lecturas = 0;
+  let escrituras = 0;
+
+  // 1. Memoria de la instancia
+  const pendientes = [];
+  for (const symbol of unicos) {
+    const enMemoria = desgloseEnMemoria.get(symbol);
+    if (enMemoria && Date.now() - enMemoria.timestamp < DESGLOSE_EN_MEMORIA_TTL) {
+      etfData.set(symbol, enMemoria.data);
+      origen.memoria.push(symbol);
+      if (estaVencido(enMemoria.meta, ahora)) vencidos.push({ symbol, meta: enMemoria.meta });
+    } else {
+      pendientes.push(symbol);
+    }
+  }
+
+  // 2. Desglose guardado, vigente o vencido
+  let guardados = new Map();
+  let descartados = [];
+  let lecturaFallida = false;
+  if (pendientes.length > 0) {
+    try {
+      const leido = await leerDesgloses(db, pendientes);
+      guardados = leido.guardados;
+      descartados = leido.descartados;
+      lecturas += leido.lecturas;
+    } catch (error) {
+      lecturaFallida = true;
+      console.warn(`[etfBreakdown] No se pudo leer el desglose guardado (${error.message}); se pide a la fuente, como antes`);
+    }
+  }
+
+  const aLaFuente = [];
+  for (const symbol of pendientes) {
+    const guardado = guardados.get(symbol);
+    if (guardado && hasUsableETFData(guardado.data)) {
+      etfData.set(symbol, guardado.data);
+      desgloseEnMemoria.set(symbol, { data: guardado.data, meta: guardado.meta, timestamp: Date.now() });
+      origen.guardado.push(symbol);
+      if (estaVencido(guardado.meta, ahora)) vencidos.push({ symbol, meta: guardado.meta });
+    } else {
+      aLaFuente.push(symbol);
+    }
+  }
+
+  // 3. Nunca guardados: se espera a la fuente, como hoy, y se guarda
+  if (aLaFuente.length > 0) {
+    const resultados = await fetchWithConcurrencyLimit(aLaFuente, fetchETFDataFromAPIWithRetry, 3);
+    await Promise.all(resultados.map(async ({ symbol, data }) => {
+      if (!hasUsableETFData(data)) {
+        origen.sinDesglose.push(symbol);
+        return;
+      }
+      etfData.set(symbol, data);
+      origen.fuente.push(symbol);
+      const meta = { obtenidoEn: new Date().toISOString(), ultimoIntentoEn: hoyEnNuevaYork(new Date()) };
+      try {
+        // Si hubo un guardado que no se pudo leer (descartado, o la lectura falló),
+        // se lee su raíz para que el lote borre sus partes sobrantes (ajuste 2 del PO)
+        const anterior = lecturaFallida || descartados.includes(symbol) ? undefined : null;
+        const r = await guardarDesglose(db, symbol, data, { anterior });
+        escrituras += r.escrituras;
+        Object.assign(meta, { version: r.version, posiciones: r.posiciones, partes: r.partes });
+      } catch (error) {
+        console.warn(`[etfBreakdown] No se pudo guardar el desglose de ${symbol}: ${error.message}`);
+      }
+      desgloseEnMemoria.set(symbol, { data, meta, timestamp: Date.now() });
+    }));
+  }
+
+  // RN-6.16-B: los vencidos se refrescan aparte; aquí solo se programa
+  const encolados = [];
+  await Promise.all(vencidos.map(async ({ symbol, meta }) => {
+    const r = await programarRefresco(db, symbol, meta, { ahora });
+    lecturas += r.lecturas;
+    escrituras += r.escrituras;
+    if (r.estado === 'encolado') encolados.push(symbol);
+  }));
+
+  const ms = Date.now() - inicio;
+  console.log(`[etfBreakdown] Paso del desglose: ms=${ms} etfs=${unicos.length} memoria=${origen.memoria.length} ` +
+    `guardado=${origen.guardado.length} vencidos=${vencidos.length} fuente=${aLaFuente.length} ` +
+    `sinDesglose=${origen.sinDesglose.length} lecturas=${lecturas} escrituras=${escrituras} encolados=${encolados.length}` +
+    (aLaFuente.length > 0 ? ` esperaronFuente=${aLaFuente.join(',')}` : '') +
+    (encolados.length > 0 ? ` refrescos=${encolados.join(',')}` : ''));
+
+  return etfData;
 }
 
 /**
  * Obtiene datos de ETFs en batch (con cache)
  * Optimizado para evitar rate limiting (429) y llamadas duplicadas
+ *
+ * HU 6.16 (D7, RN-6-H): el camino de hoy, intacto. Es el que corre con
+ * `ETF_BREAKDOWN_STORE=false`: 24 h en memoria, sin leer ni escribir
+ * `etfBreakdowns` y sin encolar refrescos.
  */
-async function batchGetETFData(symbols) {
+async function batchGetETFDataComoHoy(symbols) {
   const etfData = new Map();
   const symbolsToFetch = new Set(); // Usar Set para deduplicar
   const cacheHits = [];
@@ -958,128 +1135,6 @@ async function batchGetETFData(symbols) {
 }
 
 /**
- * Ejecuta fetches con límite de concurrencia
- */
-async function fetchWithConcurrencyLimit(symbols, fetchFn, limit) {
-  const results = [];
-  
-  for (let i = 0; i < symbols.length; i += limit) {
-    const batch = symbols.slice(i, i + limit);
-    const batchResults = await Promise.all(
-      batch.map(async (symbol) => ({
-        symbol,
-        data: await fetchFn(symbol)
-      }))
-    );
-    results.push(...batchResults);
-    
-    // Pequeña pausa entre batches para evitar rate limiting
-    if (i + limit < symbols.length) {
-      await new Promise(resolve => setTimeout(resolve, 100));
-    }
-  }
-  
-  return results;
-}
-
-/**
- * Obtiene datos de un ETF con retry automático para errores 429
- */
-async function fetchETFDataFromAPIWithRetry(symbol, maxRetries = 3) {
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    const result = await fetchETFDataFromAPI(symbol);
-    
-    // Si obtuvimos datos o es un error definitivo (no 429), retornar
-    if (result !== 'RATE_LIMITED') {
-      return result;
-    }
-    
-    // Esperar antes de reintentar (backoff exponencial)
-    const delay = Math.min(1000 * Math.pow(2, attempt - 1), 5000);
-    logger.debug('ETF retry', { symbol, attempt, delay });
-    await new Promise(resolve => setTimeout(resolve, delay));
-  }
-  
-  logger.warn('ETF max retries exceeded', { symbol, maxRetries });
-  return null;
-}
-
-/**
- * Obtiene datos de un ETF desde la API externa
- * SEC-CF-001: Usa Cloudflare Tunnel y token de servicio
- * Retorna 'RATE_LIMITED' si hay error 429 para permitir retry
- * FIX-FETCH-001: Usa fetch nativo con AbortController para timeout
- */
-async function fetchETFDataFromAPI(symbol) {
-  // SEC-CF-001: Usar URL centralizada (sin /v1 duplicado)
-  const baseUrl = FINANCE_QUERY_API_URL.replace('/v1', '');
-  const url = `${baseUrl}/v1/etf/${symbol}/unified`;
-  
-  // FIX-ETF-DEBUG-001: Log headers para diagnóstico
-  const headers = getServiceHeaders({ 'Accept': 'application/json' });
-  const hasToken = Boolean(headers['x-service-token']);
-  logger.debug('ETF API request', { symbol, url, hasToken });
-  
-  // FIX-FETCH-001: Usar AbortController para timeout (fetch nativo no soporta timeout param)
-  // FIX-ETF-EU-001: Subido de 15s a 25s. Medido en producción, la cadena del API
-  // para un UCITS europeo tarda ~18s en frío (etf.com 0.3s + TrackInsight
-  // rate-limited 4.4s + justETF/Yahoo 13s) y ~7s en caliente. Con 15s se abortaba
-  // justo el primer fetch, el que puebla la caché, y el ETF quedaba sin desagregar.
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), ETF_API_TIMEOUT_MS);
-  
-  try {
-    const response = await fetch(url, { 
-      headers,
-      signal: controller.signal
-    });
-    clearTimeout(timeoutId);
-    
-    if (response.status === 429) {
-      logger.debug('ETF API rate limited', { symbol });
-      return 'RATE_LIMITED';
-    }
-    
-    if (response.status === 204) {
-      logger.debug('ETF API 204 No Content', { symbol });
-      return null;
-    }
-    
-    if (!response.ok) {
-      logger.warn('ETF API error status', { symbol, status: response.status });
-      return null;
-    }
-    
-    const text = await response.text();
-    if (!text || text.trim() === '') {
-      logger.debug('ETF API empty response', { symbol });
-      return null;
-    }
-    
-    const data = JSON.parse(text);
-    logger.debug('ETF API success', { 
-      symbol, 
-      holdingsCount: data.holdings?.length,
-      sectorsCount: data.sectors?.length 
-    });
-    
-    return data;
-  } catch (error) {
-    clearTimeout(timeoutId); // FIX-FETCH-001: Limpiar timeout en caso de error
-    // FIX-ETF-DEBUG-001: Logging detallado para diagnóstico
-    logger.warn('ETF API fetch error', { 
-      symbol, 
-      error: error.message,
-      errorName: error.name,
-      errorCode: error.code,
-      url,
-      stack: error.stack?.split('\n').slice(0, 3).join(' | ')
-    });
-    return null;
-  }
-}
-
-/**
  * Obtiene mapeo de sectores desde Firestore (con cache)
  */
 async function getSectorMappings() {
@@ -1106,50 +1161,117 @@ async function getSectorMappings() {
 }
 
 /**
- * Obtiene mapeo de países desde Firestore (con cache)
+ * Alias de países tal como estaban en `master` antes de la HU 6.16. Se
+ * conservan aparte porque la comparación previa calcula el lado «como hoy»
+ * con ellos (ajuste 3 del PO).
+ *
+ * Ojo: se buscan por el nombre **canónico** del documento de `countries`
+ * (`country` en minúsculas). Por eso `'czech republic': ['czechia']` nunca
+ * hizo nada: el documento se llama `Czechia`.
  */
-async function getCountryMappings() {
-  if (countriesCache && Date.now() - countriesCacheTimestamp < COUNTRIES_CACHE_TTL) {
-    return countriesCache;
-  }
+const ALIAS_PAISES_COMO_HOY = {
+  'united states': ['usa', 'us', 'u.s.', 'u.s.a.', 'america'],
+  'united kingdom': ['uk', 'u.k.', 'great britain', 'britain', 'england'],
+  'south korea': ['korea', 'republic of korea'],
+  'taiwan': ['taiwan, province of china', 'chinese taipei'],
+  'russia': ['russian federation'],
+  'czech republic': ['czechia'],
+  'hong kong': ['hong kong sar'],
+  'macau': ['macao'],
+};
 
-  const snapshot = await db.collection('countries').get();
+/**
+ * HU 6.16 (Escenario 5, QA-09) — Alias vigentes.
+ *
+ * - `czechia` ← «Czech Republic»: el documento de `countries` se llama
+ *   `Czechia` (`CZ`, `codeNo` 203; ajuste 5 del PO).
+ * - `cayman islands` ← «Caymen Islands», la errata de la fuente.
+ */
+const ALIAS_PAISES = {
+  ...ALIAS_PAISES_COMO_HOY,
+  'czechia': ['czech republic'],
+  'cayman islands': ['caymen islands'],
+};
+
+/**
+ * HU 6.16 (D5, Escenario 5) — Países que la fuente usa y que `countries` no
+ * tiene. Se añaden en código, sin escribir en esa colección, y **solo si** la
+ * colección no los trae: si algún día se añade el documento, manda él.
+ * `codeNo` es el ISO 3166-1 numérico que usa el mapa (TopoJSON).
+ */
+const PAISES_FUERA_DEL_CATALOGO = [
+  {
+    id: 'CY', code2: 'CY', code3: 'CYP', codeNo: '196', country: 'Cyprus', name2: 'Cyprus',
+    currencyCode: 'EUR', region: 'Europe', subRegion: 'Western Asia',
+  },
+];
+
+/**
+ * Mapa nombre/alias/código (en minúsculas) → documento de país.
+ *
+ * @param {Array<Object>} paises - Documentos de `countries` ya con `id`
+ * @param {boolean} comoHoy - true: los alias de `master` y sin complemento
+ * @returns {Map<string, Object>}
+ */
+function construirMapeoDePaises(paises, comoHoy) {
   const mappings = new Map();
-  
-  // Aliases comunes
-  const countryAliases = {
-    'united states': ['usa', 'us', 'u.s.', 'u.s.a.', 'america'],
-    'united kingdom': ['uk', 'u.k.', 'great britain', 'britain', 'england'],
-    'south korea': ['korea', 'republic of korea'],
-    'taiwan': ['taiwan, province of china', 'chinese taipei'],
-    'russia': ['russian federation'],
-    'czech republic': ['czechia'],
-    'hong kong': ['hong kong sar'],
-    'macau': ['macao'],
-  };
+  const countryAliases = comoHoy ? ALIAS_PAISES_COMO_HOY : ALIAS_PAISES;
 
-  snapshot.docs.forEach(doc => {
-    const country = { id: doc.id, ...doc.data() };
+  const registrar = (country) => {
     const countryLower = (country.country || '').toLowerCase();
-    
+
     mappings.set(countryLower, country);
-    
+
     if (country.name2) {
       mappings.set(country.name2.toLowerCase(), country);
     }
-    
+
     const aliases = countryAliases[countryLower];
     if (aliases) {
       aliases.forEach(alias => mappings.set(alias.toLowerCase(), country));
     }
-    
+
     if (country.code3) {
       mappings.set(country.code3.toLowerCase(), country);
     }
     if (country.code2) {
       mappings.set(country.code2.toLowerCase(), country);
     }
-  });
+  };
+
+  paises.forEach(registrar);
+
+  if (!comoHoy) {
+    const codigos = new Set(paises.map(p => (p.code3 || '').toLowerCase()).filter(Boolean));
+    PAISES_FUERA_DEL_CATALOGO
+      .filter(p => !codigos.has(p.code3.toLowerCase()) && !mappings.has(p.country.toLowerCase()))
+      .forEach(registrar);
+  }
+
+  return mappings;
+}
+
+/**
+ * Obtiene mapeo de países desde Firestore (con cache)
+ *
+ * HU 6.16: con `{ comoHoy: true }` devuelve el mapeo de `master` (alias de
+ * antes, sin complemento) y sin caché; solo lo usa la comparación previa.
+ *
+ * @param {{comoHoy?: boolean}} [opciones]
+ * @returns {Promise<Map<string, Object>>}
+ */
+async function getCountryMappings(opciones = {}) {
+  if (opciones.comoHoy) {
+    const snapshot = await db.collection('countries').get();
+    return construirMapeoDePaises(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })), true);
+  }
+
+  if (countriesCache && Date.now() - countriesCacheTimestamp < COUNTRIES_CACHE_TTL) {
+    return countriesCache;
+  }
+
+  const snapshot = await db.collection('countries').get();
+  const mappings = construirMapeoDePaises(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })), false);
 
   countriesCache = mappings;
   countriesCacheTimestamp = Date.now();
@@ -1798,11 +1920,16 @@ module.exports = {
   diferenciasDeDistribucion,
   invalidateDistributionCache,
   getAvailableSectors,
+  // HU 6.16 (T5, D6): la comparación previa calcula dos versiones con las mismas entradas
+  reunirEntradas,
+  calcularDesdeEntradas,
+  getCountryMappings,
   // FIX-ETF-EU-001: expuestos para pruebas unitarias del desglose de ETFs
   // (no forman parte del contrato público del servicio).
   __testing: {
     calculateSectorDistribution,
     calculateCountryDistribution,
+    // HU 6.16: vive en etfBreakdown/etfBreakdownService.js; se re-exporta para los tests existentes
     hasUsableETFData,
     normalizeSectorName,
     ETF_HOLDINGS_COVERAGE_THRESHOLD
