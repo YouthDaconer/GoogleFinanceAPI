@@ -1700,7 +1700,16 @@ async function getIndexHistory(context, payload) {
 async function getPortfolioDistribution(context, payload) {
   const { auth } = context;
   const userId = auth.uid;
-  const { accountIds, accountId, currency, includeHoldings, forceRefresh } = payload || {};
+  const { accountIds, accountId, currency, includeHoldings, forceRefresh, holdingsLimit } = payload || {};
+
+  // HU 6.15 (RN-6.15-A): la carga ligera pide las N posiciones de mayor peso.
+  // Sin `holdingsLimit` la respuesta es la de siempre (lista completa).
+  if (holdingsLimit !== undefined && holdingsLimit !== null && !esLimiteDePosicionesValido(holdingsLimit)) {
+    throw new HttpsError(
+      'invalid-argument',
+      `holdingsLimit debe ser un entero entre ${HOLDINGS_LIMIT_MIN} y ${HOLDINGS_LIMIT_MAX}`
+    );
+  }
 
   console.log(`[queryHandlers][getPortfolioDistribution] userId: ${userId}, forceRefresh: ${forceRefresh}`);
 
@@ -1712,7 +1721,8 @@ async function getPortfolioDistribution(context, payload) {
         accountId, 
         currency: currency || 'USD', 
         includeHoldings: includeHoldings ?? true,
-        forceRefresh: forceRefresh ?? false
+        forceRefresh: forceRefresh ?? false,
+        holdingsLimit: holdingsLimit ?? undefined
       }
     );
 
@@ -1722,6 +1732,60 @@ async function getPortfolioDistribution(context, payload) {
   } catch (error) {
     console.error(`[queryHandlers][getPortfolioDistribution] Error:`, error);
     throw new HttpsError('internal', 'Error calculando distribución del portafolio');
+  }
+}
+
+/** HU 6.15: la carga ligera cubre al menos la primera página de la tabla (10 filas). */
+const HOLDINGS_LIMIT_MIN = 10;
+/** HU 6.15: tope para que nadie pida "ligera" una lista que ya no lo es. */
+const HOLDINGS_LIMIT_MAX = 1000;
+
+function esLimiteDePosicionesValido(valor) {
+  return Number.isInteger(valor) && valor >= HOLDINGS_LIMIT_MIN && valor <= HOLDINGS_LIMIT_MAX;
+}
+
+/**
+ * HU 6.15 (T3, RN-6.15-C, RN-6.15-D) — El resto de la lista de posiciones de
+ * la distribución, solo del usuario de la sesión.
+ *
+ * El navegador lo pide una vez, cuando el inversor usa la tabla, con las mismas
+ * cuentas y moneda de la carga ligera, la instantánea que recibió
+ * (`metadata.calculatedAt`) y desde qué posición (`offset`). Sale de la caché
+ * del servidor sin lecturas; si no puede, se recalcula y vuelve completa con
+ * `offset: 0` (D4). El log dice de dónde salió y por qué (RN-6-I).
+ *
+ * @param {Object} context - Contexto con `auth`
+ * @param {{accountIds?: string[], accountId?: string, currency?: string,
+ *   offset: number, snapshot: string}} payload
+ * @returns {Promise<Object>} `{ holdings, offset, holdingsTotal, snapshot, origen, motivo? }`
+ * @see platform-docs/stories/6.15-distribucion-portafolio-carga-ligera/refinamiento.md (T3, D4)
+ */
+async function getPortfolioDistributionHoldings(context, payload) {
+  const userId = context.auth.uid;
+  const { accountIds, accountId, currency, offset, snapshot } = payload || {};
+
+  if (!Number.isInteger(offset) || offset < 0) {
+    throw new HttpsError('invalid-argument', 'offset debe ser un entero mayor o igual que 0');
+  }
+  if (typeof snapshot !== 'string' || snapshot.trim() === '') {
+    throw new HttpsError('invalid-argument', 'Se requiere la instantánea de la distribución (snapshot)');
+  }
+
+  try {
+    const resto = await portfolioDistributionService.obtenerRestoDePosiciones(
+      userId,
+      { accountIds, accountId, currency: currency || 'USD' },
+      { offset, snapshot }
+    );
+    console.log(
+      `[getPortfolioDistributionHoldings] ${userId}: ${resto.origen}` +
+      `${resto.motivo ? ` (${resto.motivo})` : ''}, ${resto.holdings.length} posiciones` +
+      ` desde ${resto.offset} de ${resto.holdingsTotal}`
+    );
+    return resto;
+  } catch (error) {
+    console.error('[getPortfolioDistributionHoldings] Error:', error);
+    throw new HttpsError('internal', 'Error obteniendo la lista completa de posiciones');
   }
 }
 
@@ -2194,6 +2258,8 @@ module.exports = {
   getMultiAccountHistoricalReturns,
   getIndexHistory,
   getPortfolioDistribution,
+  // HU 6.15: el resto de la lista de posiciones de la distribución
+  getPortfolioDistributionHoldings,
   getAvailableSectors,
   // HU 2.1: Tipo de cambio de una fecha concreta
   getHistoricalExchangeRate,

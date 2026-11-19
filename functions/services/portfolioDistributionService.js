@@ -328,7 +328,11 @@ async function getPortfolioDistribution(userId, options = {}) {
         });
         // Sanitizar datos del cache para evitar NaN/Infinity
         const sanitizedData = sanitizeForJSON(cached.data);
-        return { ...sanitizedData, metadata: { ...sanitizedData.metadata, fromCache: true } };
+        // HU 6.15: la caché guarda la lista completa; se recorta solo la respuesta
+        return recortarPosiciones(
+          { ...sanitizedData, metadata: { ...sanitizedData.metadata, fromCache: true } },
+          options
+        );
       } else {
         logger.info('Cache invalidated by portfolioLastModified', { 
           userId, 
@@ -344,7 +348,7 @@ async function getPortfolioDistribution(userId, options = {}) {
     const assets = await getActiveAssets(userId, options);
     
     if (!assets.length) {
-      return buildEmptyResponse(options.currency);
+      return recortarPosiciones(buildEmptyResponse(options.currency), options);
     }
 
     // 2. Obtener precios actuales
@@ -373,7 +377,7 @@ async function getPortfolioDistribution(userId, options = {}) {
     const totalPortfolioValue = calculateTotalValue(assets, prices, currencyRates);
     
     if (totalPortfolioValue === 0) {
-      return buildEmptyResponse(options.currency);
+      return recortarPosiciones(buildEmptyResponse(options.currency), options);
     }
 
     // 9. Calcular distribuciones (FIX-CURRENCY-001: pasar currencyRates)
@@ -415,7 +419,11 @@ async function getPortfolioDistribution(userId, options = {}) {
         assets: nonGeographicData.assets,
         assetTypeDistribution: nonGeographicData.assetTypeDistribution
       },
-      holdings: options.includeHoldings ? holdings : undefined,
+      // HU 6.15 (D2): la caché guarda SIEMPRE la lista completa. Su clave no
+      // distingue `includeHoldings` ni `holdingsLimit`, así que recortar aquí
+      // haría que la carga completa (Inteligencia, Copilot) recibiera el recorte.
+      // `recortarPosiciones` aplica lo pedido sobre una copia de la respuesta.
+      holdings,
       totals: {
         portfolioValue: totalPortfolioValue,
         currency: options.currency || 'USD'
@@ -464,12 +472,169 @@ async function getPortfolioDistribution(userId, options = {}) {
       countriesCount: countries.length
     });
 
-    // Sanitizar resultado para evitar NaN/Infinity que rompen JSON serialization
-    return sanitizeForJSON(result);
+    // Sanitizar resultado para evitar NaN/Infinity que rompen JSON serialization.
+    // `sanitizeForJSON` devuelve una copia: recortarla no toca la entrada de la caché.
+    return recortarPosiciones(sanitizeForJSON(result), options);
   } catch (error) {
     logger.error('Error calculating distribution', { userId, error: error.message });
     throw error;
   }
+}
+
+// ============================================================================
+// HU 6.15 — La distribución llega ligera: las principales primero, el resto al
+// usar la tabla de posiciones.
+// @see platform-docs/stories/6.15-distribucion-portafolio-carga-ligera/refinamiento.md
+// ============================================================================
+
+/**
+ * HU 6.15 (T1, RN-6.15-A) — Da a la respuesta la forma que pidió el llamador.
+ *
+ * - Sin `includeHoldings`: sin lista de posiciones (lo de siempre).
+ * - Con `includeHoldings` y sin `holdingsLimit`: la lista completa (lo de
+ *   siempre; Inteligencia, Copilot, simulador).
+ * - Con `holdingsLimit` N: las N primeras posiciones, que ya vienen ordenadas
+ *   por peso descendente (el orden por defecto de la tabla), más
+ *   `holdingsTotal` (el total real, para el contador y el paginador) y
+ *   `holdingsComplete` (si con las N ya están todas).
+ *
+ * No muta `resultado`: devuelve una copia superficial.
+ *
+ * @param {Object} resultado - Distribución con la lista completa en `holdings`
+ * @param {{includeHoldings?: boolean, holdingsLimit?: number}} [opciones]
+ * @returns {Object} La respuesta para ese pedido
+ */
+function recortarPosiciones(resultado, opciones = {}) {
+  if (!resultado || typeof resultado !== 'object') return resultado;
+  const { holdings, ...resto } = resultado;
+  const lista = Array.isArray(holdings) ? holdings : [];
+  if (!opciones.includeHoldings) {
+    // Lo de siempre: sin lista; la respuesta vacía siempre la trajo vacía
+    return { ...resto, holdings: lista.length === 0 ? [] : undefined };
+  }
+  const limite = opciones.holdingsLimit;
+  if (!Number.isInteger(limite) || limite <= 0) {
+    return { ...resto, holdings: lista };
+  }
+  return {
+    ...resto,
+    holdings: lista.slice(0, limite),
+    holdingsTotal: lista.length,
+    holdingsComplete: lista.length <= limite,
+  };
+}
+
+/**
+ * HU 6.15 (T2, RN-6.15-C, D3, D4) — El resto de la lista de posiciones.
+ *
+ * Sale de la **misma entrada de caché** de la que salieron las principales,
+ * identificada por su instantánea (`metadata.calculatedAt`): sin lecturas de
+ * datos y con las mismas cifras que el inversor ya está viendo. No se consulta
+ * `portfolioLastModified`, a propósito: se sirve la instantánea que ya se
+ * muestra, no una más nueva.
+ *
+ * Si la entrada no sirve, se recalcula (respaldo, la única excepción a
+ * RN-6.15-C) y se devuelve la lista **completa** con `offset: 0`, para que el
+ * navegador reemplace la lista entera y nunca mezcle dos cálculos. El motivo
+ * queda en la respuesta para el log (RN-6-I):
+ * - `otra-instancia`: esta instancia no tiene entrada para esa clave;
+ * - `instantanea-reemplazada`: la entrada es de otro cálculo;
+ * - `cache-vencida`: la entrada es de esa instantánea, pero pasaron los 5 min
+ *   del TTL de la caché (ajuste del PO a D4).
+ *
+ * @param {string} userId - ID del usuario de la sesión
+ * @param {Object} opciones - Las mismas cuentas y moneda de la carga ligera
+ * @param {{offset: number, snapshot: string}} pedido - Desde qué posición y de qué instantánea
+ * @returns {Promise<{holdings: Object[], offset: number, holdingsTotal: number,
+ *   snapshot: string|null, origen: 'cache'|'recalculado', motivo?: string}>}
+ */
+async function obtenerRestoDePosiciones(userId, opciones = {}, { offset, snapshot }) {
+  const entrada = distributionCache.get(buildCacheKey(userId, opciones));
+  const enCache = entrada?.data?.holdings;
+
+  let motivo = null;
+  if (!entrada) {
+    motivo = 'otra-instancia';
+  } else if (!Array.isArray(enCache) || entrada.data.metadata?.calculatedAt !== snapshot) {
+    motivo = 'instantanea-reemplazada';
+  } else if (Date.now() - entrada.timestamp >= CACHE_TTL) {
+    motivo = 'cache-vencida';
+  }
+
+  if (!motivo) {
+    return {
+      holdings: sanitizeForJSON(enCache.slice(offset)),
+      offset,
+      holdingsTotal: enCache.length,
+      snapshot,
+      origen: 'cache',
+    };
+  }
+
+  const completa = await getPortfolioDistribution(userId, {
+    accountIds: opciones.accountIds,
+    accountId: opciones.accountId,
+    currency: opciones.currency,
+    includeHoldings: true,
+  });
+  const holdings = Array.isArray(completa?.holdings) ? completa.holdings : [];
+  return {
+    holdings,
+    offset: 0,
+    holdingsTotal: holdings.length,
+    snapshot: completa?.metadata?.calculatedAt || null,
+    origen: 'recalculado',
+    motivo,
+  };
+}
+
+/** Campos de la distribución que la comparación previa exige idénticos (RN-6-A). */
+const CAMPOS_COMPARADOS = ['sectors', 'countries', 'nonGeographicData', 'totals', 'holdings'];
+
+/**
+ * HU 6.15 (T2, RN-6-A, RN-6-B, D8) — Diferencias exactas entre dos distribuciones.
+ *
+ * Compara, en todos los decimales (`Object.is`), sectores, países con sus
+ * activos, activos sin ubicación, totales y, por posición, símbolo, peso y
+ * aporte por origen. Los metadatos (`calculatedAt`, `fromCache`) no cuentan.
+ * Las posiciones y los orígenes se nombran por su símbolo para que la línea
+ * diga qué difiere.
+ *
+ * @param {Object} referencia - La distribución de hoy (lista completa)
+ * @param {Object} candidata - La de la carga ligera, principales + resto
+ * @param {number} [maximo=50] - Cuántas líneas devolver como mucho
+ * @returns {string[]} Una línea por diferencia; vacío si son idénticas
+ */
+function diferenciasDeDistribucion(referencia, candidata, maximo = 50) {
+  const lineas = [];
+  const etiqueta = (valor) => (valor && typeof valor === 'object' && typeof valor.symbol === 'string'
+    ? `(${valor.symbol})` : '');
+
+  const comparar = (a, b, ruta) => {
+    if (lineas.length >= maximo) return;
+    if (Array.isArray(a) || Array.isArray(b)) {
+      if (!Array.isArray(a) || !Array.isArray(b)) {
+        lineas.push(`${ruta}: ${Array.isArray(a) ? 'lista' : typeof a} ≠ ${Array.isArray(b) ? 'lista' : typeof b}`);
+        return;
+      }
+      if (a.length !== b.length) lineas.push(`${ruta}: ${a.length} elementos ≠ ${b.length}`);
+      for (let i = 0; i < Math.min(a.length, b.length); i++) {
+        comparar(a[i], b[i], `${ruta}[${i}]${etiqueta(a[i])}`);
+      }
+      return;
+    }
+    if (a && b && typeof a === 'object' && typeof b === 'object') {
+      const claves = [...new Set([...Object.keys(a), ...Object.keys(b)])].sort();
+      for (const clave of claves) comparar(a[clave], b[clave], `${ruta}.${clave}`);
+      return;
+    }
+    if (!Object.is(a, b)) lineas.push(`${ruta}: ${JSON.stringify(a)} ≠ ${JSON.stringify(b)}`);
+  };
+
+  for (const campo of CAMPOS_COMPARADOS) {
+    comparar(referencia?.[campo], candidata?.[campo], campo);
+  }
+  return lineas.slice(0, maximo);
 }
 
 /**
@@ -1627,6 +1792,10 @@ async function getAvailableSectors() {
 
 module.exports = {
   getPortfolioDistribution,
+  // HU 6.15: carga ligera de la distribución
+  recortarPosiciones,
+  obtenerRestoDePosiciones,
+  diferenciasDeDistribucion,
   invalidateDistributionCache,
   getAvailableSectors,
   // FIX-ETF-EU-001: expuestos para pruebas unitarias del desglose de ETFs

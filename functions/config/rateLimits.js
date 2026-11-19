@@ -61,6 +61,9 @@ const RATE_LIMITS = {
   // HU 6.11.5: la cabecera del día anterior se pide al abrir /portfolio o
   // cambiar de moneda, y solo si el navegador no la tiene guardada
   getPreviousDayPerformance: { limit: 30, windowMs: 60000 },
+  // HU 6.15: el resto de la lista de posiciones se pide una vez por selección
+  // de cuentas, al usar la tabla (y al pulsar Reintentar)
+  getPortfolioDistributionHoldings: { limit: 30, windowMs: 60000 },
 
   // ═══════════════════════════════════════════════════════════════
   // 🟡 Operaciones de Escritura Normales
