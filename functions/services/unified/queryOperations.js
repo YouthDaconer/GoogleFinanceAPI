@@ -4,8 +4,9 @@
  * SCALE-CF-001: Consolida 6 Cloud Functions HTTP de consulta en un solo endpoint
  * con action router para reducir cold starts y costos.
  * 
- * COST-OPT-001: Agregadas acciones getHistoricalReturnsOptimized y 
- * getConsolidatedDataStatus para rendimientos con períodos consolidados.
+ * HU 6.13: se retiraron las acciones getHistoricalReturnsOptimized y
+ * getConsolidatedDataStatus (COST-OPT-001), que leían los consolidados de
+ * meses y años y no las llamaba nadie. Pedirlas responde "acción inválida".
  * 
  * NOTA: Esta función usa 512MiB de memoria porque getHistoricalReturns y 
  * getMultiAccountHistoricalReturns lo requieren. Las otras funciones están
@@ -14,12 +15,10 @@
  * Acciones disponibles:
  * - getCurrentPricesForUser
  * - getHistoricalReturns
- * - getHistoricalReturnsOptimized (COST-OPT-001: V2 con períodos consolidados)
  * - getMultiAccountHistoricalReturns
  * - getIndexHistory
  * - getPortfolioDistribution
  * - getAvailableSectors
- * - getConsolidatedDataStatus (COST-OPT-001: Diagnóstico de datos)
  * - getPerformanceOnDemand (OPT-DEMAND-102: Rendimiento con precios live)
  * - getHistoryCorrectionStatus (HU 6.8.1: aviso de corrección del historial)
  * - getPreviousDayPerformance (HU 6.11.5: cabecera del día anterior en una moneda)
@@ -90,9 +89,7 @@ const ACTION_HANDLERS = {
   getHistoryCorrectionStatus: queryHandlers.getHistoryCorrectionStatus,
   // HU 6.11.5: la cabecera del día anterior, solo en la moneda que se muestra
   getPreviousDayPerformance: queryHandlers.getPreviousDayPerformance,
-  // COST-OPT-001: Nuevas acciones para rendimientos optimizados (V2)
-  getHistoricalReturnsOptimized: queryHandlers.getHistoricalReturnsOptimized,
-  getConsolidatedDataStatus: queryHandlers.getConsolidatedDataStatus,
+  // HU 6.13: getHistoricalReturnsOptimized y getConsolidatedDataStatus retiradas
   // OPT-DEMAND-102: Rendimiento on-demand con precios en vivo del API Lambda
   getPerformanceOnDemand: getPerformanceOnDemand,
 };

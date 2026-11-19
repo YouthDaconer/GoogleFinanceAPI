@@ -36,10 +36,12 @@ const { calculateIndexData } = require('../indexHistoryService');
 const { DateTime } = require('luxon');
 
 // COST-OPT-001: Importar servicio de rendimientos consolidados (V2)
-const { 
-  getHistoricalReturnsV2,
-  checkConsolidatedDataStatus 
-} = require('../consolidatedReturnsService');
+// HU 6.13: solo lo usa la ruta antigua con el interruptor apagado.
+const { getHistoricalReturnsV2 } = require('../consolidatedReturnsService');
+const {
+  consolidadosRetirados,
+  rendimientosNoDisponibles,
+} = require('../consolidation/consolidatedPeriodsRetirementService');
 
 // Importar utilidades MWR para cálculos de multi-account
 const {
@@ -784,7 +786,12 @@ function transformSnapshotToResponse(snapshot) {
  * 
  * PERF-SNAP-007: Intenta leer snapshot pre-computado (1 read).
  * Si no existe o es request por ticker/assetType, cae a ruta legacy (V2/V1).
- * 
+ *
+ * HU 6.13: con `RETIRE_CONSOLIDATED_PERIODS` encendido (por defecto) ya no hay
+ * ruta legacy: si el resumen no se puede preparar responde el aviso
+ * `RETURNS_UNAVAILABLE` (RN-6.13-A) y `forceRefresh` no se salta los resúmenes.
+ * @see platform-docs/stories/6.13-retirar-ruta-antigua-consolidados/refinamiento.md (T2)
+ *
  * @param {Object} context - Contexto de ejecución
  * @param {Object} payload - Opciones de consulta
  * @returns {Promise<Object>} Rendimientos calculados
@@ -814,6 +821,12 @@ async function getHistoricalReturns(context, payload) {
     // R-03: Read signal once, reuse across all snapshot lookups in this CF invocation.
     const signal = await readSnapshotSignal(userId);
 
+    // HU 6.13: con la ruta antigua retirada, `forceRefresh` ya no se salta los
+    // resúmenes: su único efecto era ir a la ruta antigua, y nadie lo manda.
+    const retirada = consolidadosRetirados();
+    const saltarResumenes = forceRefresh && !retirada;
+    let motivoSinResumen = 'sin-resumen';
+
     // HU 6.11.3 (T2): en una moneda poco usada, el detalle del activo sale de sus
     // días en USD, antes del resumen guardado y de la ruta legacy en esa moneda.
     if (ticker && assetType) {
@@ -823,12 +836,13 @@ async function getHistoricalReturns(context, payload) {
 
     // PERF-SNAP-024: Per-asset snapshot read path (antes del bypass legacy)
     // HU 6.11.6 (T4): memoria + señal → puesta al día o preparación, en `resumenDeActivoAlDia`.
-    if (ticker && assetType && !forceRefresh) {
+    if (ticker && assetType && !saltarResumenes) {
       const inicioActivo = Date.now();
       const assetSnapshotId = buildSnapshotDocId(userId, accountId, currency, ticker, assetType);
       // OPT-FIRESTORE-002 P2-A: Await snapshot generation to avoid double-read with legacy.
-      // Si la preparación falla, se avisa en el log y se sigue a la ruta legacy, como antes.
-      const { snapshot: assetSnapshot, lastSnapshotUpdate, preparado } =
+      // Si la preparación falla, se avisa en el log y se sigue: a la ruta legacy
+      // con el interruptor apagado, al aviso de la HU 6.13 con él encendido.
+      const { snapshot: assetSnapshot, lastSnapshotUpdate, preparado, error: errorActivo } =
         await resumenDeActivoAlDia(userId, { accountId, currency, ticker, assetType }, signal);
       if (assetSnapshot) {
         // HU 6.4 (RN-6.4-J): la duración de la primera apertura del día y de las siguientes.
@@ -843,17 +857,27 @@ async function getHistoricalReturns(context, payload) {
           lastSnapshotUpdate,
         };
       }
+      motivoSinResumen = errorActivo
+        ? `preparacion-fallida: ${errorActivo.message}`
+        : 'resumen-por-activo-no-disponible';
     }
 
     // PERF-SNAP-007: Ticker/AssetType → ruta legacy
+    // HU 6.13 (RN-6.13-A): retirada, el aviso en lugar de cifras de los consolidados.
     if (ticker || assetType) {
+      if (retirada) {
+        throw rendimientosNoDisponibles({
+          userId, accountId, currency, ticker, assetType,
+          motivo: ticker ? motivoSinResumen : 'activo-sin-ticker',
+        });
+      }
       return await getHistoricalReturnsLegacy(context, payload);
     }
 
     // HU 6.9.2 (T4): en una moneda poco usada el resumen se deriva del USD.
     // HU 6.11.1: si no se puede derivar, `resumenDerivadoConCache` lanza el
     // aviso y nunca se llega al resumen guardado en esa moneda (RN-6.11-J).
-    if (!forceRefresh) {
+    if (!saltarResumenes) {
       const inicioDerivado = Date.now();
       const derivado = await resumenDerivadoConCache(userId, accountId, currency, signal);
       if (derivado) {
@@ -869,7 +893,7 @@ async function getHistoricalReturns(context, payload) {
     }
 
     // PERF-SNAP-007/021: Intentar leer snapshot (cache in-memory → Firestore)
-    if (!forceRefresh) {
+    if (!saltarResumenes) {
       const snapshotDocId = buildSnapshotDocId(userId, accountId, currency);
       const snapshotResult = await getSnapshotWithCache(snapshotDocId, userId, signal);
       const snapshot = snapshotResult.data;
@@ -913,7 +937,14 @@ async function getHistoricalReturns(context, payload) {
         }
       } catch (err) {
         console.warn(`[PERF] On-demand snapshot generation failed for ${snapshotDocId}: ${err.message}`);
+        motivoSinResumen = `preparacion-fallida: ${err.message}`;
       }
+    }
+
+    // HU 6.13 (RN-6.13-A): con la ruta antigua retirada, el aviso. Nunca la caché
+    // que guardó la ruta antigua (QA-07) ni cifras de los consolidados.
+    if (retirada) {
+      throw rendimientosNoDisponibles({ userId, accountId, currency, motivo: motivoSinResumen });
     }
 
     // Fallback a ruta legacy (V2/V1 + cache)
@@ -1051,6 +1082,9 @@ function rejectTickerWithoutAssetType(payload, endpoint) {
 /**
  * Ruta legacy de rendimientos históricos (V2 consolidados + cache Firestore).
  * Usada como fallback cuando no hay snapshot, para ticker/assetType, o forceRefresh.
+ *
+ * HU 6.13: solo con `RETIRE_CONSOLIDATED_PERIODS=false` (volver atrás, RN-6-H).
+ * Se conserva para eso; antes de apagar se rehacen los consolidados (RN-6.13-E).
  */
 async function getHistoricalReturnsLegacy(context, payload) {
   const { auth } = context;
@@ -2148,128 +2182,6 @@ async function getPreviousDayPerformance(context, payload) {
   }
 }
 
-/**
- * Obtiene rendimientos históricos usando períodos consolidados (V2)
- *
- * COST-OPT-001: Versión optimizada que reduce lecturas de Firestore
- * de ~1,825 a ~40 documentos para consultas de 5 años.
- * 
- * @param {Object} context - Contexto de ejecución
- * @param {Object} payload - Opciones de consulta
- * @returns {Promise<Object>} Rendimientos calculados
- */
-async function getHistoricalReturnsOptimized(context, payload) {
-  const { auth } = context;
-  const userId = auth.uid;
-  const { 
-    currency = "USD", 
-    accountId = "overall", 
-    ticker = null, 
-    assetType = null, 
-    forceRefresh = false,
-    fallbackToV1 = true
-  } = payload || {};
-
-  // Generar clave de cache
-  const cacheKey = `v2_${currency}_${accountId}${ticker ? `_${ticker}` : ''}${assetType ? `_${assetType}` : ''}`;
-  
-  console.log(`[queryHandlers][getHistoricalReturnsOptimized] userId: ${userId}, cacheKey: ${cacheKey}`);
-
-  rejectExcludeTickers(payload, 'getHistoricalReturnsOptimized');
-
-  try {
-    // 1. Verificar cache (si no forceRefresh)
-    if (!forceRefresh) {
-      const cacheRef = db.doc(`userData/${userId}/performanceCache/${cacheKey}`);
-      const cacheDoc = await cacheRef.get();
-
-      if (cacheDoc.exists) {
-        const cacheData = cacheDoc.data();
-        const validUntil = new Date(cacheData.validUntil);
-
-        if (validUntil > new Date()) {
-          console.log(`[queryHandlers][getHistoricalReturnsOptimized] Cache hit`);
-          return {
-            ...cacheData.data,
-            cacheHit: true,
-            lastCalculated: cacheData.lastCalculated,
-            validUntil: cacheData.validUntil
-          };
-        }
-      }
-    }
-
-    // 2. Ejecutar cálculos con V2 (períodos consolidados)
-    const result = await getHistoricalReturnsV2(userId, {
-      currency,
-      accountId,
-      ticker,
-      assetType,
-      forceRefresh,
-      fallbackToV1
-    });
-
-    // 3. Guardar en cache
-    const now = new Date();
-    const validUntil = calculateDynamicTTL();
-
-    const cacheData = {
-      data: result,
-      lastCalculated: now.toISOString(),
-      validUntil: validUntil.toISOString()
-    };
-
-    try {
-      const cacheRef = db.doc(`userData/${userId}/performanceCache/${cacheKey}`);
-      await cacheRef.set(cacheData);
-    } catch (cacheWriteError) {
-      console.error(`[queryHandlers][getHistoricalReturnsOptimized] Error guardando cache:`, cacheWriteError);
-    }
-
-    console.log(`[queryHandlers][getHistoricalReturnsOptimized] Éxito - version: ${result._metadata?.version || 'unknown'}`);
-    
-    return {
-      ...result,
-      cacheHit: false,
-      lastCalculated: now.toISOString(),
-      validUntil: validUntil.toISOString()
-    };
-
-  } catch (error) {
-    console.error(`[queryHandlers][getHistoricalReturnsOptimized] Error:`, error);
-    if (error instanceof HttpsError) throw error;
-    throw new HttpsError('internal', 'Error calculando rendimientos históricos optimizados');
-  }
-}
-
-/**
- * Verifica el estado de datos consolidados de un usuario
- * 
- * COST-OPT-001: Útil para diagnóstico y determinar si usar V2.
- * 
- * @param {Object} context - Contexto de ejecución
- * @param {Object} payload - Opciones de consulta
- * @returns {Promise<Object>} Estado de datos consolidados
- */
-async function getConsolidatedDataStatus(context, payload) {
-  const { auth } = context;
-  const userId = auth.uid;
-  const { accountId = "overall" } = payload || {};
-
-  console.log(`[queryHandlers][getConsolidatedDataStatus] userId: ${userId}, accountId: ${accountId}`);
-
-  try {
-    const status = await checkConsolidatedDataStatus(userId, accountId);
-    
-    console.log(`[queryHandlers][getConsolidatedDataStatus] Éxito - canUseV2: ${status.canUseV2}`);
-    
-    return status;
-  } catch (error) {
-    console.error(`[queryHandlers][getConsolidatedDataStatus] Error:`, error);
-    throw new HttpsError('internal', 'Error verificando estado de datos consolidados');
-  }
-}
-
 // ============================================================================
 // EXPORTS
 // ============================================================================
@@ -2292,9 +2204,6 @@ module.exports = {
   getOpeningCorrectionPlan,
   // HU 6.8.1: estado de la corrección del historial para el aviso
   getHistoryCorrectionStatus,
-  // COST-OPT-001: Nuevos handlers para rendimientos optimizados
-  getHistoricalReturnsOptimized,
-  getConsolidatedDataStatus,
   // PERF-SNAP-007: Funciones expuestas para testing
   transformSnapshotToResponse,
   getHistoricalReturnsLegacy,

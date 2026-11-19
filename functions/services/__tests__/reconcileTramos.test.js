@@ -65,7 +65,7 @@ const {
   CONFIG,
 } = require('../backfillCoreModule');
 const { markPerformanceAsStale } = require('../../utils/performanceStaleMarker');
-const { consolidateMonth } = require('../periodConsolidationScheduled');
+const { consolidateMonth, consolidateYear } = require('../periodConsolidationScheduled');
 
 CONFIG.API_DELAY_MS = 0;
 
@@ -313,6 +313,7 @@ beforeEach(() => {
   logs = [];
   mockClock.commitMs = 1000;
   consolidateMonth.mockClear();
+  consolidateYear.mockClear();
   const capture = (...args) => logs.push(args.map(String).join(' '));
   jest.spyOn(console, 'log').mockImplementation(capture);
   jest.spyOn(console, 'error').mockImplementation(capture);
@@ -712,6 +713,12 @@ describe('HU 6.8.1 — operaciones nuevas a mitad de un rango (Escenario 8, RN-6
 });
 
 describe('HU 6.8.1 — lo que se propaga y lo que se registra por tramo', () => {
+  // HU 6.13: estos tests defienden la consolidación por tramo, que solo ocurre
+  // con el interruptor apagado (volver atrás, RN-6-H). Con él encendido, ver el
+  // describe de la HU 6.13 más abajo.
+  beforeEach(() => { process.env.RETIRE_CONSOLIDATED_PERIODS = 'false'; });
+  afterEach(() => { delete process.env.RETIRE_CONSOLIDATED_PERIODS; });
+
   /** Un tramo intermedio de inv-a con dos snapshots suyos y uno de otro inversor. */
   async function tramoIntermedioConSnapshots() {
     restore(BASES['inv-a']);
@@ -756,5 +763,42 @@ describe('HU 6.8.1 — lo que se propaga y lo que se registra por tramo', () => 
     expect(line).toMatch(new RegExp(`advanced — queda desde ${staleOf('inv-a').since}$`));
     expect(tramos[0].days).toBe(LIMITS.DIAS_POR_TRAMO);
     expect(logs.find((l) => l.includes('[reconcile] DONE'))).toMatch(/1 vuelta\(s\), 1 tramo\(s\) — 0 completados, 1 avanzaron/);
+  });
+});
+
+/**
+ * HU 6.13 (RN-6.13-B, Escenario 1, QA-02) — Con `RETIRE_CONSOLIDATED_PERIODS`
+ * encendido (por defecto) la corrección nocturna corrige los días y avanza como
+ * siempre, pero no rehace ningún consolidado de meses o años, y lo deja en el
+ * registro para medirlo (RN-6-I).
+ * @see platform-docs/stories/6.13-retirar-ruta-antigua-consolidados/refinamiento.md (T3, T7a)
+ */
+describe('HU 6.13 — la corrección nocturna ya no rehace consolidados', () => {
+  test('QA-02: un tramo corrige y avanza sin llamar a consolidateMonth ni consolidateYear', async () => {
+    restore(BASES['inv-a']);
+    moveHistoricalPrices();
+    await markPerformanceAsStale('inv-a', tradingOffset(FROM['inv-a'], 0), { reason: 'asset_edit' });
+
+    const { tramos } = await run({ n: 1, timeBudgetMs: ONE_TRAMO });
+
+    expect(tramos[0]).toMatchObject({ status: 'advanced' });
+    expect(tramos[0].days).toBe(LIMITS.DIAS_POR_TRAMO);
+    expect(consolidateMonth).not.toHaveBeenCalled();
+    expect(consolidateYear).not.toHaveBeenCalled();
+    expect(logs.find((l) => l.includes('[reconcile] CONSOLIDADOS inv-a'))).toMatch(/retirado \(HU 6\.13\), escrituras=0$/);
+  });
+
+  test('RN-6-H: con RETIRE_CONSOLIDATED_PERIODS=false el tramo vuelve a consolidar y lo registra', async () => {
+    process.env.RETIRE_CONSOLIDATED_PERIODS = 'false';
+    try {
+      restore(BASES['inv-a']);
+      moveHistoricalPrices();
+      await markPerformanceAsStale('inv-a', tradingOffset(FROM['inv-a'], 0), { reason: 'asset_edit' });
+      await run({ n: 1, timeBudgetMs: ONE_TRAMO });
+    } finally {
+      delete process.env.RETIRE_CONSOLIDATED_PERIODS;
+    }
+    expect(consolidateMonth).toHaveBeenCalled();
+    expect(logs.find((l) => l.includes('[reconcile] CONSOLIDADOS inv-a'))).toMatch(/meses=\d+ años=\d+ alcances=\d+ escrituras=\d+$/);
   });
 });

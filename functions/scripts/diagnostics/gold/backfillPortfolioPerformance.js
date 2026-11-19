@@ -53,6 +53,8 @@ const db = admin.firestore();
 
 // Utilidades de consolidación de períodos (COST-OPT-001)
 const { consolidatePeriod, CONSOLIDATED_SCHEMA_VERSION, NON_CURRENCY_FIELDS } = require('../../../utils/periodConsolidation');
+// HU 6.13: interruptor de los consolidados retirados (RN-6.13-B)
+const { consolidadosRetirados } = require('../../../services/consolidation/consolidatedPeriodsRetirementService');
 
 // ============================================================================
 // CONFIGURACIÓN
@@ -1695,7 +1697,11 @@ async function main() {
   }
   
   // 9. Re-consolidar períodos afectados (mensual y anual)
-  if (options.mode === 'fix' && !options.noConsolidate) {
+  // HU 6.13 (RN-6.13-B): con la ruta antigua retirada nadie lee los consolidados;
+  // el paso se salta salvo con RETIRE_CONSOLIDATED_PERIODS=false.
+  if (options.mode === 'fix' && !options.noConsolidate && consolidadosRetirados()) {
+    log('INFO', '  [HU 6.13] Consolidados retirados: se omite la re-consolidación de períodos');
+  } else if (options.mode === 'fix' && !options.noConsolidate) {
     console.log('');
     log('PROGRESS', '═══ Re-consolidando períodos afectados ═══');
     

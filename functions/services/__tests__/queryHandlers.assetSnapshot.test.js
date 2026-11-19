@@ -111,6 +111,12 @@ const {
   clearSnapshotMemCache,
 } = require('../handlers/queryHandlers');
 
+// HU 6.13: estos tests defienden la ruta antigua, que solo responde con
+// RETIRE_CONSOLIDATED_PERIODS=false (volver atrás, RN-6-H). Con el interruptor
+// encendido: services/handlers/__tests__/queryHandlers.returnsUnavailable.test.js.
+beforeAll(() => { process.env.RETIRE_CONSOLIDATED_PERIODS = 'false'; });
+afterAll(() => { delete process.env.RETIRE_CONSOLIDATED_PERIODS; });
+
 // ============================================================================
 // Test Data
 // ============================================================================
