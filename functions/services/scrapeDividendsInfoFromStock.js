@@ -16,7 +16,8 @@
 const axios = require("axios");
 const { DateTime } = require("luxon");
 const admin = require("firebase-admin");
-const { FINANCE_QUERY_API_URL } = require('./config');
+// FIX-DIV-401 (2026-11-19): la Lambda exige x-service-token (RN-7-I); sin él respondía 401 desde el 2026-11-03
+const { FINANCE_QUERY_API_URL, getServiceHeaders } = require('./config');
 
 // SEC-CF-001: API URL via Cloudflare Tunnel
 const LAMBDA_API_BASE_URL = FINANCE_QUERY_API_URL;
@@ -35,7 +36,7 @@ async function getDividendInfoFromStockEvents(symbol) {
     const url = `${FASTAPI_BASE_URL}/dividends?symbols=${encodeURIComponent(symbol)}`;
     console.log(`[StockEvents] Consultando dividendos para ${symbol}`);
     
-    const { data } = await axios.get(url, { timeout: 15000 });
+    const { data } = await axios.get(url, { timeout: 15000, headers: getServiceHeaders() });
     
     if (!data || !data.dividendDate) {
       console.log(`[StockEvents] No hay datos de dividendos para ${symbol}`);
@@ -74,7 +75,7 @@ async function getDividendInfoFromLambda(symbol) {
     const url = `${LAMBDA_API_BASE_URL}/quotes?symbols=${encodeURIComponent(symbol)}`;
     console.log(`[Lambda API] Consultando dividendos para ${symbol}`);
     
-    const { data: responseData } = await axios.get(url, { timeout: 10000 });
+    const { data: responseData } = await axios.get(url, { timeout: 10000, headers: getServiceHeaders() });
     
     // La API siempre devuelve un array, incluso para un solo símbolo
     const data = Array.isArray(responseData) ? responseData[0] : responseData;
@@ -190,7 +191,7 @@ async function scrapeDividendsInfoFromStockEvents(options = {}) {
       const url = `${FASTAPI_BASE_URL}/dividends/batch?symbols=${encodeURIComponent(symbolsParam)}`;
       console.log(`[StockEvents] Intentando batch request para ${symbols.length} símbolos`);
       
-      const { data: batchResponse } = await axios.get(url, { timeout: 60000 });
+      const { data: batchResponse } = await axios.get(url, { timeout: 60000, headers: getServiceHeaders() });
       
       if (batchResponse && batchResponse.success) {
         stockEventsResults = batchResponse.success;
@@ -237,7 +238,7 @@ async function scrapeDividendsInfoFromStockEvents(options = {}) {
         
         try {
           const url = `${LAMBDA_API_BASE_URL}/quotes?symbols=${encodeURIComponent(symbolsParam)}`;
-          const { data: apiResponse } = await axios.get(url, { timeout: 30000 });
+          const { data: apiResponse } = await axios.get(url, { timeout: 30000, headers: getServiceHeaders() });
           
           const quotes = Array.isArray(apiResponse) ? apiResponse : [apiResponse];
           
