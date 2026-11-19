@@ -22,6 +22,7 @@
  * - getPerformanceOnDemand (OPT-DEMAND-102: Rendimiento con precios live)
  * - getHistoryCorrectionStatus (HU 6.8.1: aviso de corrección del historial)
  * - getPreviousDayPerformance (HU 6.11.5: cabecera del día anterior en una moneda)
+ * - getPortfolioDistributionHoldings (HU 6.15: el resto de la lista de posiciones)
  *
  * @module unified/queryOperations
  * @see docs/stories/56.story.md
@@ -89,6 +90,8 @@ const ACTION_HANDLERS = {
   getHistoryCorrectionStatus: queryHandlers.getHistoryCorrectionStatus,
   // HU 6.11.5: la cabecera del día anterior, solo en la moneda que se muestra
   getPreviousDayPerformance: queryHandlers.getPreviousDayPerformance,
+  // HU 6.15: el resto de la lista de posiciones, al usar la tabla
+  getPortfolioDistributionHoldings: queryHandlers.getPortfolioDistributionHoldings,
   // HU 6.13: getHistoricalReturnsOptimized y getConsolidatedDataStatus retiradas
   // OPT-DEMAND-102: Rendimiento on-demand con precios en vivo del API Lambda
   getPerformanceOnDemand: getPerformanceOnDemand,

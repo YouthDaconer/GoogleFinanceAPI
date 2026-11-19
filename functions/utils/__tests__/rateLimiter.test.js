@@ -246,6 +246,8 @@ describe('getRateLimitConfig', () => {
       'getHistoryCorrectionStatus',
       // HU 6.11.5: la cabecera del día anterior en una moneda
       'getPreviousDayPerformance',
+      // HU 6.15: el resto de la lista de posiciones de la distribución
+      'getPortfolioDistributionHoldings',
     ];
 
     expectedFunctions.forEach(fn => {
@@ -254,6 +256,6 @@ describe('getRateLimitConfig', () => {
       expect(RATE_LIMITS[fn].windowMs).toBe(60000);
     });
 
-    expect(Object.keys(RATE_LIMITS).length).toBe(39);
+    expect(Object.keys(RATE_LIMITS).length).toBe(40);
   });
 });
