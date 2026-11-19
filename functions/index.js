@@ -202,6 +202,20 @@ exports.eodUserPerformanceTask = eodUserPerformanceTask;
 exports.scheduledEodFinalization = scheduledEodFinalization;
 
 // ============================================================================
+// HU 6.16: El desglose de los ETF se guarda una vez y lo usan todas las consultas
+// ============================================================================
+/**
+ * `etfBreakdownRefreshTask`: refresca aparte el desglose guardado de un ETF
+ * vencido (más de 7 días). Lo encola el cálculo de la distribución, como mucho
+ * una vez al día por ETF; el inversor no lo espera (RN-6.16-B).
+ *
+ * @see platform-docs/stories/6.16-desglose-etf-compartido/refinamiento.md (T3)
+ */
+const { etfBreakdownRefreshTask } = require('./services/etfBreakdown/etfBreakdownRefreshTask');
+
+exports.etfBreakdownRefreshTask = etfBreakdownRefreshTask;
+
+// ============================================================================
 // HU 6.7: Un aviso de consumo el mismo día, antes de que llegue a la factura
 // ============================================================================
 /**
