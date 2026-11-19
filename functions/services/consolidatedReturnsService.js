@@ -201,57 +201,8 @@ async function getHistoricalReturnsV2(userId, params = {}) {
   }
 }
 
-/**
- * Verifica si existen documentos consolidados para un usuario
- * 
- * Útil para determinar si el usuario puede usar V2 o necesita migración.
- * 
- * @param {string} userId - ID del usuario
- * @param {string} accountId - ID de cuenta o "overall"
- * @returns {Promise<Object>} Estado de los documentos consolidados
- */
-async function checkConsolidatedDataStatus(userId, accountId = 'overall') {
-  const basePath = buildBasePath(userId, accountId);
-  
-  const [yearlySnapshot, monthlySnapshot] = await Promise.all([
-    db.collection(`${basePath}/${PATHS.CONSOLIDATED}/${PATHS.YEARLY}`).limit(1).get(),
-    db.collection(`${basePath}/${PATHS.CONSOLIDATED}/${PATHS.MONTHLY}`).limit(1).get()
-  ]);
-  
-  const hasYearly = !yearlySnapshot.empty;
-  const hasMonthly = !monthlySnapshot.empty;
-  
-  return {
-    hasConsolidatedData: hasYearly || hasMonthly,
-    hasYearlyDocs: hasYearly,
-    hasMonthlyDocs: hasMonthly,
-    canUseV2: hasYearly || hasMonthly
-  };
-}
-
-/**
- * Obtiene el conteo de documentos consolidados para un usuario
- * 
- * @param {string} userId - ID del usuario
- * @param {string} accountId - ID de cuenta o "overall"
- * @returns {Promise<Object>} Conteos de documentos
- */
-async function getConsolidatedDataCounts(userId, accountId = 'overall') {
-  const basePath = buildBasePath(userId, accountId);
-  
-  const [yearlySnapshot, monthlySnapshot, dailySnapshot] = await Promise.all([
-    db.collection(`${basePath}/${PATHS.CONSOLIDATED}/${PATHS.YEARLY}`).get(),
-    db.collection(`${basePath}/${PATHS.CONSOLIDATED}/${PATHS.MONTHLY}`).get(),
-    db.collection(`${basePath}/${PATHS.DATES}`).get()
-  ]);
-  
-  return {
-    yearlyDocs: yearlySnapshot.size,
-    monthlyDocs: monthlySnapshot.size,
-    dailyDocs: dailySnapshot.size,
-    totalDocs: yearlySnapshot.size + monthlySnapshot.size + dailySnapshot.size
-  };
-}
+// HU 6.13: `checkConsolidatedDataStatus` y `getConsolidatedDataCounts` se
+// retiraron con la acción `getConsolidatedDataStatus`, su único uso.
 
 // ============================================================================
 // FUNCIONES AUXILIARES
@@ -405,10 +356,6 @@ function calculateDynamicTTL() {
 module.exports = {
   // Función principal V2
   getHistoricalReturnsV2,
-  
-  // Funciones de verificación
-  checkConsolidatedDataStatus,
-  getConsolidatedDataCounts,
   
   // Utilidades
   buildBasePath,

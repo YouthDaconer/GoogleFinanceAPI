@@ -69,7 +69,6 @@ jest.mock('../../firebaseAdmin', () => {
 
 const {
   getHistoricalReturns,
-  getHistoricalReturnsOptimized,
   getMultiAccountHistoricalReturns,
 } = require('../queryHandlers');
 
@@ -152,8 +151,8 @@ describe('FEAT-EXCLUDE-001: getHistoricalReturns con excludeTickers', () => {
     expect(mockGetCarveOut).not.toHaveBeenCalled();
   });
 
+  // HU 6.13: getHistoricalReturnsOptimized se retiró (leía los consolidados).
   it.each([
-    ['getHistoricalReturnsOptimized', () => getHistoricalReturnsOptimized(context, { excludeTickers: ['VUAA.L'] })],
     ['getMultiAccountHistoricalReturns', () => getMultiAccountHistoricalReturns(context, { accountIds: ['a'], excludeTickers: ['VUAA.L'] })],
   ])('%s rechaza excludeTickers en lugar de ignorarlo', async (name, call) => {
     await expect(call()).rejects.toMatchObject({ code: 'invalid-argument', message: expect.stringMatching(name) });

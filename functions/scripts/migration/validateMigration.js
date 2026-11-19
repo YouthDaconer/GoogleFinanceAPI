@@ -1,5 +1,11 @@
 #!/usr/bin/env node
 /**
+ * OBSOLETO (HU 6.13): los consolidados de meses y años (`consolidatedPeriods`)
+ * dejaron de escribirse y de leerse con `RETIRE_CONSOLIDATED_PERIODS` encendido.
+ * Este script solo existe para ellos y no se debe usar. Para volver atrás se usa
+ * `node scripts/ruta-antigua-consolidados.js rehacer` (raíz del repositorio).
+ * @see platform-docs/stories/6.13-retirar-ruta-antigua-consolidados/refinamiento.md (T4)
+ *
  * Script de Validación: Comparación Exhaustiva V1 vs V2 de Historical Returns
  * 
  * COST-OPT-003: Valida que getHistoricalReturnsV2 retorna los mismos resultados

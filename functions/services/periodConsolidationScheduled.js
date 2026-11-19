@@ -12,15 +12,24 @@
  * - SRP: Cada función tiene una responsabilidad clara
  * - DRY: Reutiliza consolidatePeriod de periodConsolidation.js
  * - KISS: Procesamiento secuencial simple con batching
- * 
+ *
+ * HU 6.13: con `RETIRE_CONSOLIDATED_PERIODS` encendido (por defecto) los dos
+ * trabajos terminan sin hacer nada (RN-6.13-B). Siguen exportados en `index.js`:
+ * quitarlos borraría las funciones y sus jobs al desplegar, y volver atrás dejaría
+ * de ser cambiar una variable. `consolidateMonth`/`consolidateYear` se conservan
+ * para volver atrás (`scripts/ruta-antigua-consolidados.js rehacer`).
+ *
  * @module periodConsolidationScheduled
  * @see docs/stories/63.story.md (COST-OPT-002)
+ * @see platform-docs/stories/6.13-retirar-ruta-antigua-consolidados/refinamiento.md (T3)
  */
 
 const { onSchedule } = require("firebase-functions/v2/scheduler");
 const admin = require('./firebaseAdmin');
 const { DateTime } = require('luxon');
 const { consolidatePeriod, CONSOLIDATED_SCHEMA_VERSION } = require('../utils/periodConsolidation');
+// HU 6.13: los consolidados ya no se escriben; los trabajos siguen exportados sin efecto.
+const { consolidadosRetirados } = require('./consolidation/consolidatedPeriodsRetirementService');
 
 const db = admin.firestore();
 
@@ -64,8 +73,15 @@ const consolidateMonthlyPerformance = onSchedule(
     ...SCHEDULED_CONFIG
   },
   async (event) => {
+    // HU 6.13 (RN-6.13-B): retirado. Sigue desplegado para poder volver atrás
+    // sin perder el job de Cloud Scheduler, pero no lee ni escribe nada.
+    if (consolidadosRetirados()) {
+      console.log('[consolidateMonthlyPerformance] Retirado (HU 6.13): no se consolida');
+      return;
+    }
+
     const startTime = Date.now();
-    
+
     const now = DateTime.now().setZone('America/New_York');
     const previousMonth = now.minus({ months: 1 });
     const periodKey = previousMonth.toFormat('yyyy-MM');
@@ -176,8 +192,14 @@ const consolidateYearlyPerformance = onSchedule(
     ...SCHEDULED_CONFIG
   },
   async (event) => {
+    // HU 6.13 (RN-6.13-B): retirado, igual que el mensual.
+    if (consolidadosRetirados()) {
+      console.log('[consolidateYearlyPerformance] Retirado (HU 6.13): no se consolida');
+      return;
+    }
+
     const startTime = Date.now();
-    
+
     const now = DateTime.now().setZone('America/New_York');
     const previousYear = now.minus({ years: 1 });
     const yearKey = previousYear.year.toString();

@@ -45,6 +45,8 @@ const {
   clearHistoricalPriceCache,
 } = require('./backfillCoreModule');
 const { consolidateMonth, consolidateYear } = require('./periodConsolidationScheduled');
+// HU 6.13: la corrección deja de rehacer consolidados de meses y años.
+const { consolidadosRetirados } = require('./consolidation/consolidatedPeriodsRetirementService');
 const { invalidatePerformanceCache } = require('./cacheInvalidationService');
 const { deleteInSmallBatches } = require('../utils/firestoreDeletes');
 const { crearEjecutorAislado, crearEjecutorEnProceso } = require('../utils/ejecutorAislado');
@@ -167,16 +169,26 @@ function nocheDeIso(iso) {
  * Rehace los consolidados de meses y años cerrados que tocan `[firstDay, lastDay]`.
  *
  * HU 6.12: separado de `propagateReconciledRange` porque los tramos que no
- * terminan la corrección solo hacen esto. Los consolidados siguen rehaciéndose
- * en cada tramo (propuesta P1, fuera de alcance).
+ * terminan la corrección solo hacen esto.
  *
- * @returns {Promise<{months: string[], closedYears: string[]}>}
+ * HU 6.13 (RN-6.13-B): con `RETIRE_CONSOLIDATED_PERIODS` encendido ya no rehace
+ * nada: los consolidados solo los leía la ruta antigua, que se retiró. Lo deja
+ * en el registro (`[reconcile] CONSOLIDADOS`) para medir antes y después (RN-6-I).
+ *
+ * @returns {Promise<{months: string[], closedYears: string[], retirado?: boolean}>}
  */
 async function consolidarRango(userId, firstDay, accountIds, lastDay, now) {
+  const rango = `${firstDay}..${lastDay || 'último mes cerrado'}`;
+  if (consolidadosRetirados()) {
+    console.log(`[reconcile] CONSOLIDADOS ${userId} ${rango}: retirado (HU 6.13), escrituras=0`);
+    return { months: [], closedYears: [], retirado: true };
+  }
+
   const scopes = [null, ...accountIds];
   const lastMonth = lastDay ? lastDay.slice(0, 7) : null;
   const months = closedMonthsSince(firstDay, now).filter((m) => !lastMonth || m <= lastMonth);
   const closedYears = [...new Set(months.map((m) => m.slice(0, 4)))].filter((y) => Number(y) < now.year);
+  console.log(`[reconcile] CONSOLIDADOS ${userId} ${rango}: meses=${months.length} años=${closedYears.length} alcances=${scopes.length} escrituras=${(months.length + closedYears.length) * scopes.length}`);
 
   for (const periodKey of months) {
     for (const accountId of scopes) {
