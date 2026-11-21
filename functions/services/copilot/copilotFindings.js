@@ -19,6 +19,9 @@
  * @see platform-docs/stories/5.3-analista-investiga-recomienda/refinamiento.md (T9)
  */
 
+const { DateTime } = require('luxon');
+const { VENTANA_NOTICIAS_DIAS } = require('./copilotConstants');
+
 /** Qué le pasó a la investigación de un activo (RN-5.3-R). */
 const RESEARCH_OUTCOME = {
   /** Se investigó y hay hallazgos. */
@@ -161,6 +164,43 @@ function esRancia(publishedAt, now = new Date()) {
 }
 
 /**
+ * HU 5.7.1 — ¿Este hecho es anterior a la ventana de noticias? (RN-5.7-J)
+ *
+ * Gemela de `esRancia`, pero por días y en el huso del mercado: la ventana es
+ * "los últimos 30 días" y la frontera se decide por fecha, no por hora. Con
+ * hoy = 2026-11-19, el 2026-10-20 (día −30) está dentro y el 2026-10-19
+ * (día −31) fuera (QA-17).
+ *
+ * Lo que no trae fecha, o la trae ilegible, **no** se juzga: decidir que es
+ * viejo sería inventar el dato que falta.
+ *
+ * @param {string|null} publishedAt - `YYYY-MM-DD` o ISO 8601.
+ * @param {Date} [now]
+ * @param {number} [dias]
+ * @returns {boolean}
+ * @see platform-docs/stories/5.7.1-recomendaciones-sin-panico/refinamiento.md (T4)
+ */
+function fueraDeVentana(publishedAt, now = new Date(), dias = VENTANA_NOTICIAS_DIAS) {
+  if (!publishedAt) return false;
+
+  const fecha = DateTime.fromISO(String(publishedAt), { zone: 'America/New_York' });
+  if (!fecha.isValid) return false;
+
+  const corte = DateTime.fromJSDate(now, { zone: 'America/New_York' })
+    .minus({ days: dias })
+    .toISODate();
+
+  return fecha.toISODate() < corte;
+}
+
+/**
+ * HU 5.7.1 — Lo que el hallazgo dice de la tesis (RN-5.7-I): `tesis` si afecta
+ * a la tesis de largo plazo, `ruido` si es de corto plazo. Cualquier otro valor
+ * queda `null`: no se deduce.
+ */
+const IMPACTOS = ['tesis', 'ruido'];
+
+/**
  * Deja sólo los hallazgos que cumplen las reglas, y dice cuáles se cayeron.
  *
  * @param {Array<object>} findings
@@ -205,6 +245,8 @@ function filtrarHallazgos(findings) {
       publishedAt: finding.publishedAt || null,
       sourceUrl: finding.sourceUrl,
       sourceTitle: finding.sourceTitle || null,
+      // HU 5.7.1 (RN-5.7-I): el efecto en la tesis llega como dato al redactor.
+      impact: IMPACTOS.includes(finding.impact) ? finding.impact : null,
     });
   }
 
@@ -359,6 +401,8 @@ function recolectarFuentes(investigaciones) {
 module.exports = {
   MESES_PARA_CIFRA_RANCIA,
   esRancia,
+  fueraDeVentana,
+  IMPACTOS,
   RESEARCH_OUTCOME,
   esCifraFundamental,
   parsearRespuesta,

@@ -327,3 +327,152 @@ describe('HU 5.6 — la marca de procedencia viaja del hallazgo a la fuente', ()
     expect(crudas[0].verified).toBe(false);
   });
 });
+
+// ============================================================================
+// HU 5.7.1 — La ficha llega al redactor y las recomendaciones vuelven con su criterio
+// ============================================================================
+
+describe('HU 5.7.1 — la ficha llega con la fuente de la plataforma (QA-01, QA-03)', () => {
+  const PLATAFORMA = 'https://api.portastock.net';
+  const FICHA = {
+    kind: 'crypto',
+    asOf: '2026-11-19',
+    items: [{ label: 'Precio (último cierre)', value: '61914.00', period: '2026-11-19' }],
+    missing: [],
+    signals: { weightPct: 11.5, overweight: true, roomToThresholdPct: 0 },
+  };
+  const entrada = (overrides = {}) => ({
+    investigaciones: [crearInvestigacion({ ticker: 'BTC-USD', findings: [], card: FICHA, ...overrides })],
+    macro: null,
+    resto: null,
+    excluidos: [],
+    portafolio: { currency: 'USD', totalAssets: 1 },
+    now: new Date('2026-11-20T03:00:00Z'),
+  });
+
+  beforeEach(() => {
+    sources.dominiosRespaldados.mockResolvedValue(new Set());
+    sources.construirListaDeFuentes.mockImplementation(async (crudas) =>
+      crudas.map((f, i) => ({ n: i + 1, title: f.title, url: f.url, date: f.date, verificada: f.verified === true })));
+    sources.construirIndice.mockResolvedValue(new Map([[PLATAFORMA, 1]]));
+  });
+
+  it('una cripto sin hallazgos de la plataforma estrena su fuente, verificada', async () => {
+    await composer.construirContexto({ ...entrada(), language: 'en' });
+
+    const [crudas] = sources.construirListaDeFuentes.mock.calls[0];
+    expect(crudas).toEqual([{
+      title: 'Portastock — platform data (finance-query)',
+      url: PLATAFORMA,
+      date: '2026-11-19',
+      verified: true,
+    }]);
+  });
+
+  it('la ficha viaja entera, con el número de su fuente', async () => {
+    const { context } = await composer.construirContexto(entrada());
+
+    expect(context.assets[0].card).toEqual({ ...FICHA, source: 1 });
+  });
+
+  it('sin ficha, el activo lleva card: null y no añade fuente', async () => {
+    const { context } = await composer.construirContexto(entrada({ card: undefined }));
+
+    expect(context.assets[0].card).toBeNull();
+    expect(sources.construirListaDeFuentes.mock.calls[0][0]).toEqual([]);
+  });
+
+  it('el redactor sabe qué día es hoy en Nueva York, para la ventana de 30 días', async () => {
+    // 03:00 UTC del 20 son las 22:00 del 19 en Nueva York.
+    const { context } = await composer.construirContexto(entrada());
+
+    expect(context.today).toBe('2026-11-19');
+  });
+
+  it('el efecto en la tesis de cada hallazgo llega al redactor (QA-02)', async () => {
+    const { context } = await composer.construirContexto(entrada({
+      findings: [{ ...crearInvestigacion().findings[0], impact: 'ruido' }],
+    }));
+
+    expect(context.assets[0].findings[0].impact).toBe('ruido');
+  });
+});
+
+describe('HU 5.7.1 — normalizarRecomendaciones: acción, pilar, nivel y tramos (QA-22)', () => {
+  const base = { statement: 'Reducir BTC-USD hacia el 10 %', asset: 'BTC-USD' };
+  const normalizar = (extra) => composer.normalizarRecomendaciones([{ ...base, ...extra }])[0];
+
+  it('conserva lo que el informe declara', () => {
+    expect(normalizar({ action: 'reducir', pillar: 'valoracion', level: 3 })).toMatchObject({
+      action: 'reducir', pillar: 'valoracion', level: 3, tranches: [],
+    });
+  });
+
+  it.each([0, 4, '3', 2.5, null])('un nivel %p queda null', (level) => {
+    expect(normalizar({ action: 'vender', level }).level).toBeNull();
+  });
+
+  it.each(['mantener', 'aumentar', 'comprar'])('una recomendación de %s no lleva nivel aunque lo escriba', (action) => {
+    expect(normalizar({ action, level: 2 }).level).toBeNull();
+  });
+
+  it('sin acción legible el nivel válido se conserva: no se puede decir que sobre', () => {
+    expect(normalizar({ action: 'liquidar', level: 1 })).toMatchObject({ action: null, level: 1 });
+  });
+
+  it('un pilar fuera de la lista queda null', () => {
+    expect(normalizar({ pillar: 'intuición' }).pillar).toBeNull();
+  });
+
+  it('dos o tres tramos válidos se conservan', () => {
+    const tranches = [{ zone: '145-150 (mínimo de 52 semanas)', pct: 0.5 }, { zone: '200-205 (SMA200)', pct: 1 }];
+
+    expect(normalizar({ action: 'aumentar', tranches }).tranches).toEqual(tranches);
+  });
+
+  it.each([
+    ['un solo tramo', [{ zone: '145', pct: 1 }]],
+    ['cuatro tramos', [1, 2, 3, 4].map((n) => ({ zone: `z${n}`, pct: 0.2 }))],
+    ['un tramo sin zona', [{ zone: '', pct: 1 }, { zone: '150', pct: 1 }]],
+    ['un tramo sin porcentaje', [{ zone: '140', pct: '1 %' }, { zone: '150', pct: 1 }]],
+    ['algo que no es una lista', 'dos tramos'],
+  ])('%s: no hay tramos', (_caso, tranches) => {
+    expect(normalizar({ action: 'aumentar', tranches }).tranches).toEqual([]);
+  });
+
+  it('una recomendación de antes de la HU (sin estos campos) sale con todo a null', () => {
+    expect(composer.normalizarRecomendaciones([base])[0]).toMatchObject({
+      action: null, pillar: null, level: null, tranches: [],
+    });
+  });
+});
+
+describe('limpiarMarcasDelCuerpo — la marca de procedencia va solo en Fuentes (regla 13)', () => {
+  it('la quita de las citas del cuerpo y la conserva en Fuentes', () => {
+    const informe = [
+      '## Hallazgos fundamentales',
+      'Un dato [4 — procedencia no verificada]. Otro [33 — procedencia no verificada, 34].',
+      '## Fuentes',
+      '4. https://a.test — procedencia no verificada',
+    ].join('\n');
+
+    expect(composer.limpiarMarcasDelCuerpo(informe)).toBe([
+      '## Hallazgos fundamentales',
+      'Un dato [4]. Otro [33, 34].',
+      '## Fuentes',
+      '4. https://a.test — procedencia no verificada',
+    ].join('\n'));
+  });
+
+  it('en inglés, igual', () => {
+    const informe = 'A fact [2 — unverified provenance].\n## Sources\n2. https://b.test — unverified provenance';
+
+    expect(composer.limpiarMarcasDelCuerpo(informe))
+      .toBe('A fact [2].\n## Sources\n2. https://b.test — unverified provenance');
+  });
+
+  it('sin sección de fuentes, limpia todo el texto; sin texto, no rompe', () => {
+    expect(composer.limpiarMarcasDelCuerpo('Algo [1 — procedencia no verificada]')).toBe('Algo [1]');
+    expect(composer.limpiarMarcasDelCuerpo(undefined)).toBeUndefined();
+  });
+});

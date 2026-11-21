@@ -154,6 +154,77 @@ const FAILURE_CODE = {
   UNEXPECTED: 'UNEXPECTED',
 };
 
+/**
+ * HU 5.7.1 — RN-5.7-E: por encima de este peso (en % del portafolio) una acción
+ * o una cripto está sobreponderada. Es el único sitio que se edita para
+ * cambiarlo. `peso > 10` es sobrepeso: 10,0 % no lo es y 10,1 % sí (QA-12).
+ * Nunca aplica a un ETF, que ya es una canasta diversificada.
+ *
+ * @see platform-docs/stories/5.7.1-recomendaciones-sin-panico/refinamiento.md (T1)
+ */
+const UMBRAL_SOBREPESO_PCT = 10;
+
+/**
+ * HU 5.7.1 — RN-5.7-D, Nivel 2: cuántos puntos porcentuales tiene que caer el
+ * margen operativo anual para contar como deterioro (decisión del PO,
+ * 2026-11-20). Con cualquier caída, el primer análisis real dio Nivel 2 en casi
+ * todas las acciones: NVDA bajó de 62,4 % a 60,4 % con ingresos +65 % y el
+ * margen trimestral subiendo. Además de esta caída, la señal exige que el
+ * margen no suba en los dos últimos trimestres publicados.
+ */
+const CAIDA_MATERIAL_MARGEN_PP = 3;
+
+/**
+ * HU 5.7.1 — RN-5.7-E, excepción de oportunidad (decisión del PO, 2026-11-20).
+ *
+ * Una acción de excelente calidad en una oportunidad real puede superar el
+ * umbral de sobrepeso, pero solo si cumple TODAS las condiciones (evaluadas en
+ * código con la ficha, nunca por el modelo) y solo hasta un techo. El techo
+ * sube del 15 % al 20 % cuando las compras recientes del usuario en esa acción
+ * son escalonadas (DCA): la excepción se justifica con los datos de la acción y
+ * con la estrategia del propio usuario. Todos los valores los edita el PO.
+ */
+const EXCEPCION_OPORTUNIDAD = {
+  /** Techo con la excepción. */
+  TECHO_PCT: 15,
+  /** Techo con la excepción y compras escalonadas recientes. */
+  TECHO_CON_DCA_PCT: 20,
+  /** Crecimiento anual de ingresos mínimo. */
+  CRECIMIENTO_INGRESOS_MIN_PCT: 15,
+  /** Consensos de analistas que la permiten. */
+  CONSENSOS: ['buy', 'strongBuy'],
+  /** Potencial mínimo hasta el objetivo medio. */
+  POTENCIAL_MIN_PCT: 30,
+  /** P/E frente al crecimiento anual de ingresos, máximo. */
+  PE_FRENTE_A_CRECIMIENTO_MAX: 1,
+  /** Distancia mínima por debajo del máximo de 52 semanas (en negativo). */
+  DISTANCIA_MAXIMO_52_MAX_PCT: -20,
+};
+
+/**
+ * HU 5.7.1 — Qué cuenta como compra escalonada (DCA) en una acción: compras en
+ * al menos `MIN_SEMANAS` semanas distintas dentro de los últimos `VENTANA_DIAS`
+ * días. Las compras del mismo día o de la misma semana cuentan como una.
+ */
+const DCA = {
+  VENTANA_DIAS: 90,
+  MIN_SEMANAS: 3,
+};
+
+/**
+ * HU 5.7.1 — Versión del criterio de decisión con el que se redactó un
+ * análisis. Se guarda en `copilotAnalyses.decisionCriteria`; la HU 5.7.3 la lee
+ * para saber qué recomendaciones anteriores se emitieron sin el criterio.
+ */
+const CRITERIO_DE_DECISION = '5.7.1';
+
+/**
+ * HU 5.7.1 — RN-5.7-J: a la web solo se le preguntan los hechos de los últimos
+ * 30 días de un activo cuyas cifras pone la plataforma. Un hallazgo más viejo
+ * no llega al redactor (QA-17).
+ */
+const VENTANA_NOTICIAS_DIAS = 30;
+
 module.exports = {
   STEP_KIND,
   STEP_STATUS,
@@ -169,4 +240,10 @@ module.exports = {
   COPILOT_ANALYSES_SUBCOLLECTION,
   NOTIFICATION_TYPE,
   FAILURE_CODE,
+  UMBRAL_SOBREPESO_PCT,
+  CAIDA_MATERIAL_MARGEN_PP,
+  EXCEPCION_OPORTUNIDAD,
+  DCA,
+  CRITERIO_DE_DECISION,
+  VENTANA_NOTICIAS_DIAS,
 };

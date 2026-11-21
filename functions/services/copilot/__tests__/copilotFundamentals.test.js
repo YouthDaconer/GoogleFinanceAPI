@@ -368,7 +368,14 @@ describe('la plataforma caída degrada, no cancela (Escenario 5, RN-5.6-D)', () 
       [crearHolding()], { language: 'es' }, fetchers, HOY,
     );
 
-    expect(datos.get('MSFT')).toEqual({ findings: [], cubierto: false });
+    expect(datos.get('MSFT')).toMatchObject({ findings: [], cubierto: false });
+    // HU 5.7.1: la ficha sale igual, declarando lo que falta (Escenario 12).
+    expect(datos.get('MSFT').card.items).toEqual([]);
+    expect(datos.get('MSFT').card.missing.map((m) => m.label)).toEqual([
+      'Datos técnicos', 'P/E (TTM)', 'Consenso de analistas',
+      'Objetivos de analistas (bajo / medio / alto)', 'Potencial hasta el objetivo medio',
+      'Crecimiento esperado del BPA', 'Estados de resultados', 'Crecimiento anual de ingresos',
+    ]);
   });
 
   it('un origen caído no se lleva por delante a los demás', async () => {
@@ -442,5 +449,176 @@ describe('no se satura a finance-query (medido el 14/10/2026)', () => {
 
     expect([...datos.keys()]).toEqual(['A', 'B', 'C', 'D', 'E', 'F', 'G']);
     expect(fetchers.fetchAnalysis).toHaveBeenCalledTimes(7);
+  });
+});
+
+// ============================================================================
+// HU 5.7.1 — La ficha de cuatro pilares
+// ============================================================================
+
+/** Una serie diaria de 1 año que termina poco antes de HOY, con cierre fijo. */
+const crearSerie = (cierre = 400) => {
+  const serie = {};
+  const fin = new Date('2026-10-09T12:00:00Z');
+  for (let d = new Date('2025-10-09T12:00:00Z'); d <= fin; d = new Date(d.getTime() + 86400000)) {
+    const dia = d.getUTCDay();
+    if (dia !== 0 && dia !== 6) {
+      serie[d.toISOString().slice(0, 10)] = { close: cierre, high: cierre, low: cierre };
+    }
+  }
+  return serie;
+};
+
+const conHistorial = (overrides = {}) => fetchersQueResponden({
+  fetchHistorical: jest.fn().mockResolvedValue(crearSerie()),
+  ...overrides,
+});
+
+const SIETE = ['A', 'B', 'C', 'D', 'E', 'F', 'G'];
+
+describe('HU 5.7.1 — cada activo trae su ficha según su tipo (QA-01, RN-5.7-A)', () => {
+  it('una acción: técnico, valoración y fundamentales, atribuidos a la plataforma', async () => {
+    const { card } = (await fundamentals.obtenerDatosDePlataforma(
+      [crearHolding({ weight: 0.085 })], { language: 'es' }, conHistorial(), HOY,
+    )).get('MSFT');
+
+    const etiquetas = card.items.map((i) => i.label);
+    expect(card.kind).toBe('stock');
+    expect(etiquetas).toEqual(expect.arrayContaining([
+      'Precio (último cierre)', 'RSI (14)', 'P/E (TTM)', 'Potencial hasta el objetivo medio',
+      'Ingresos de los últimos trimestres', 'Crecimiento anual de ingresos',
+    ]));
+    expect(card.signals.weightPct).toBe(8.5);
+  });
+
+  it('un ETF: técnico, sin estado de resultados ni objetivos', async () => {
+    const fetchers = conHistorial({
+      fetchQuotes: jest.fn().mockResolvedValue([crearQuote({ symbol: 'VUAA.L', pe: null })]),
+    });
+
+    const { card } = (await fundamentals.obtenerDatosDePlataforma(
+      [crearHolding({ symbol: 'VUAA.L', asset_type: 'etf', weight: 0.282 })],
+      { language: 'es' }, fetchers, HOY,
+    )).get('VUAA.L');
+
+    const etiquetas = card.items.map((i) => i.label);
+    expect(card.kind).toBe('etf');
+    expect(etiquetas).toContain('Precio (último cierre)');
+    expect(etiquetas).not.toContain('Objetivos de analistas (bajo / medio / alto)');
+    expect(etiquetas).not.toContain('Ingresos de los últimos trimestres');
+    expect(card.signals.overweight).toBe(false);
+  });
+
+  it('una cripto: solo técnico', async () => {
+    const { card } = (await fundamentals.obtenerDatosDePlataforma(
+      [crearHolding({ symbol: 'BTC-USD', asset_type: 'crypto', weight: 0.115 })],
+      { language: 'es' }, conHistorial(), HOY,
+    )).get('BTC-USD');
+
+    expect(card.kind).toBe('crypto');
+    expect(card.items.map((i) => i.label)).not.toContain('P/E (TTM)');
+    expect(card.signals.overweight).toBe(true);
+  });
+
+  it('el historial que se pide es el del activo', async () => {
+    const fetchers = conHistorial();
+
+    await fundamentals.obtenerDatosDePlataforma([crearHolding()], { language: 'es' }, fetchers, HOY);
+
+    expect(fetchers.fetchHistorical).toHaveBeenCalledWith('MSFT');
+  });
+
+  it('el fetcher real pide range=1y a getHistoricalPrices', async () => {
+    const { getHistoricalPrices } = require('../../financeQuery');
+    getHistoricalPrices.mockResolvedValue({});
+
+    await fundamentals.createFundamentalsFetchers().fetchHistorical('NVDA');
+
+    expect(getHistoricalPrices).toHaveBeenCalledWith('NVDA', '1y');
+  });
+});
+
+describe('HU 5.7.1 — el historial que falla no tumba el análisis (QA-19)', () => {
+  it('si no responde, la ficha declara el técnico como no disponible y no se lanza', async () => {
+    const fetchers = conHistorial({
+      fetchHistorical: jest.fn().mockRejectedValue(new Error('API call failed after 3 attempts')),
+    });
+
+    const { card, cubierto } = (await fundamentals.obtenerDatosDePlataforma(
+      [crearHolding()], { language: 'es' }, fetchers, HOY,
+    )).get('MSFT');
+
+    expect(cubierto).toBe(true);
+    expect(card.missing).toEqual(expect.arrayContaining([
+      { label: 'Datos técnicos', reason: 'la plataforma no devolvió el historial de precios' },
+    ]));
+    expect(card.items.map((i) => i.label)).not.toContain('Potencial hasta el objetivo medio');
+  });
+
+  it('una respuesta sin cierres válidos: ni variaciones ni potencial', async () => {
+    const fetchers = conHistorial({
+      fetchHistorical: jest.fn().mockResolvedValue({ '2026-10-09': { close: 'N/A' } }),
+    });
+
+    const { card } = (await fundamentals.obtenerDatosDePlataforma(
+      [crearHolding()], { language: 'es' }, fetchers, HOY,
+    )).get('MSFT');
+    const etiquetas = card.items.map((i) => i.label);
+
+    expect(etiquetas).not.toContain('Variación a 1 mes');
+    expect(etiquetas).not.toContain('Potencial hasta el objetivo medio');
+  });
+});
+
+describe('HU 5.7.1 — el historial no sube la concurrencia (medida el 14/10/2026)', () => {
+  it('se pide después de las cuatro llamadas del activo, nunca a la vez que ellas', async () => {
+    const orden = [];
+    const registrar = (nombre, valor) => async (simbolo) => {
+      orden.push(`${nombre}:${simbolo}`);
+      await new Promise((r) => setTimeout(r, 2));
+      orden.push(`fin-${nombre}:${simbolo}`);
+      return valor;
+    };
+    const fetchers = {
+      fetchIncome: jest.fn().mockImplementation(async (s, f) =>
+        registrar('income', f === 'annual' ? crearAnual() : crearIncome())(s)),
+      fetchQuotes: jest.fn().mockResolvedValue([crearQuote()]),
+      fetchAnalysis: jest.fn().mockImplementation(registrar('analysis', crearAnalisis())),
+      fetchNews: jest.fn().mockImplementation(registrar('news', crearNoticias())),
+      fetchHistorical: jest.fn().mockImplementation(registrar('historical', crearSerie())),
+    };
+
+    await fundamentals.obtenerDatosDePlataforma([crearHolding()], { language: 'es' }, fetchers, HOY);
+
+    const inicioHistorial = orden.indexOf('historical:MSFT');
+    for (const fin of ['fin-income:MSFT', 'fin-analysis:MSFT', 'fin-news:MSFT']) {
+      expect(orden.indexOf(fin)).toBeLessThan(inicioHistorial);
+    }
+  });
+
+  it('con el historial, nunca hay más de ACTIVOS_EN_PARALELO × 4 conexiones en vuelo', async () => {
+    let enVuelo = 0;
+    let maximo = 0;
+    const vigilado = async (valor) => {
+      enVuelo += 1;
+      maximo = Math.max(maximo, enVuelo);
+      await new Promise((r) => setTimeout(r, 3));
+      enVuelo -= 1;
+      return valor;
+    };
+    const fetchers = {
+      fetchIncome: jest.fn().mockImplementation(async (_s, f) =>
+        vigilado(f === 'annual' ? crearAnual() : crearIncome())),
+      fetchQuotes: jest.fn().mockResolvedValue([crearQuote()]),
+      fetchAnalysis: jest.fn().mockImplementation(async () => vigilado(crearAnalisis())),
+      fetchNews: jest.fn().mockImplementation(async () => vigilado(crearNoticias())),
+      fetchHistorical: jest.fn().mockImplementation(async () => vigilado(crearSerie())),
+    };
+
+    const siete = SIETE.map((s) => crearHolding({ symbol: s }));
+    await fundamentals.obtenerDatosDePlataforma(siete, { language: 'es' }, fetchers, HOY);
+
+    expect(maximo).toBeLessThanOrEqual(fundamentals.ACTIVOS_EN_PARALELO * 4);
+    expect(fetchers.fetchHistorical).toHaveBeenCalledTimes(7);
   });
 });

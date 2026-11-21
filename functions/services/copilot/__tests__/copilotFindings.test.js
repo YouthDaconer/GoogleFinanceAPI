@@ -19,6 +19,7 @@ const {
   normalizarInvestigacion,
   normalizarInvestigacionLote,
   esRancia,
+  fueraDeVentana,
 } = require('../copilotFindings');
 
 const crearHallazgo = (overrides = {}) => ({
@@ -306,5 +307,47 @@ describe('HU 5.6 — un salto de línea crudo no tira la tanda entera', () => {
   it('sigue tolerando el bloque de código y la prosa alrededor', () => {
     expect(parsearRespuesta('```json\n{"a": 1}\n```')).toEqual({ a: 1 });
     expect(parsearRespuesta('Aquí tienes:\n{"a": 1}\nespero que sirva')).toEqual({ a: 1 });
+  });
+});
+
+// ============================================================================
+// HU 5.7.1 — La ventana de noticias y el efecto en la tesis
+// ============================================================================
+
+describe('fueraDeVentana — la ventana de 30 días (QA-17, RN-5.7-J)', () => {
+  // El análisis de referencia: 2026-11-19 por la tarde en Nueva York.
+  const HOY = new Date('2026-11-19T20:00:00Z');
+
+  it.each([
+    ['2026-10-20', 'el día −30 está dentro', false],
+    ['2026-10-19', 'el día −31 está fuera', true],
+    ['2026-03-05', 'un hecho de marzo está fuera', true],
+    ['2026-11-19', 'hoy está dentro', false],
+  ])('%s: %s', (fecha, _caso, fuera) => {
+    expect(fueraDeVentana(fecha, HOY)).toBe(fuera);
+  });
+
+  it('una fecha con hora se juzga por su día en Nueva York', () => {
+    // 2026-10-20T02:00Z es aún el 19 de octubre en Nueva York.
+    expect(fueraDeVentana('2026-10-20T02:00:00Z', HOY)).toBe(true);
+    expect(fueraDeVentana('2026-10-20T15:00:00Z', HOY)).toBe(false);
+  });
+
+  it('sin fecha, o con una ilegible, no se juzga', () => {
+    expect(fueraDeVentana(null, HOY)).toBe(false);
+    expect(fueraDeVentana('hace unas semanas', HOY)).toBe(false);
+  });
+});
+
+describe('filtrarHallazgos — el efecto en la tesis llega al redactor (QA-02, RN-5.7-I)', () => {
+  it.each([
+    ['tesis', 'tesis'],
+    ['ruido', 'ruido'],
+    ['muy grave', null],
+    [undefined, null],
+  ])('impact %p queda %p', (impact, esperado) => {
+    const { validos } = filtrarHallazgos([crearHallazgo({ impact })]);
+
+    expect(validos[0].impact).toBe(esperado);
   });
 });

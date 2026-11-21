@@ -38,6 +38,7 @@ const {
   STEP_KIND,
   FAILURE_CODE,
   COPILOT_ANALYSES_SUBCOLLECTION,
+  CRITERIO_DE_DECISION,
 } = require('./copilotConstants');
 
 // HU 5.6: `CONCURRENCIA_ACTIVOS` desapareció. Existía porque diez activos en
@@ -201,8 +202,12 @@ async function persistAnalysis(userId, analysisId, createdAt, informe, payload, 
       tokensUsed: meta.tokensUsed,
       modelId: informe.modelId,
       feedback: null,
+      // HU 5.7.1: el criterio de decisión con que se redactó. La 5.7.3 lo lee
+      // para saber qué recomendaciones anteriores se emitieron sin él; un
+      // análisis anterior a esta historia no lo tiene (QA-23).
+      decisionCriteria: CRITERIO_DE_DECISION,
       _meta: {
-        promptVersion: 'v3',
+        promptVersion: 'v4',
         researchedAssets: meta.investigados,
         failedAssets: meta.fallidos,
         excludedPositions: meta.excluidos,
@@ -357,6 +362,8 @@ async function runAnalysis(run, { marketDataTokenSecret }) {
       weight: holding.weight,
       motivo: holding.motivo,
       variacionSemanal: holding.variacionSemanal,
+      // HU 5.7.1: la ficha de cuatro pilares, si la plataforma pudo armarla.
+      card: (datosDePlataforma.get(holding.symbol) || {}).card || null,
     }));
 
     await Promise.all(investigaciones.map((investigacion, i) => runRepository.finishStep(

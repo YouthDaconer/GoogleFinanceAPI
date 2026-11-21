@@ -20,6 +20,9 @@ const { CLAVE_MACRO, construirExposicion, investigarTanda } = require('../copilo
 
 const ENTORNO = { userId: 'u-pro', secret: 'secreto', language: 'es' };
 
+/** HU 5.7.1: "hoy" fijo, para que la ventana de 30 días no dependa del reloj. */
+const HOY = new Date('2026-10-20T15:00:00Z');
+
 const crearHolding = (overrides = {}) => ({
   symbol: 'MSFT',
   name: 'Microsoft',
@@ -220,7 +223,7 @@ describe('los datos de la plataforma se añaden encima de lo investigado', () =>
   it('van delante de lo que encontró el modelo', async () => {
     const { investigaciones } = await investigarTanda(HOLDINGS, ENTORNO, datosDePlataforma([
       ['MSFT', { findings: [DE_PLATAFORMA], cubierto: true }],
-    ]));
+    ]), HOY);
 
     expect(investigaciones[0].findings[0].label).toBe('Ingresos');
     expect(investigaciones[0].findings[1].label).toBe('Qué está pasando');
@@ -278,5 +281,82 @@ describe('el macro mira este portafolio, no el mercado en general', () => {
 
     const [, , peticion] = engineClient.investigar.mock.calls[0];
     expect(peticion.exposure.divisas[0].peso).toBe(100);
+  });
+});
+
+// ============================================================================
+// HU 5.7.1 — La ventana de 30 días (QA-17, RN-5.7-J)
+// ============================================================================
+
+describe('HU 5.7.1 — un hecho fuera de la ventana no se cuela como reciente (QA-17)', () => {
+  // 2026-11-19: el día −30 es el 2026-10-20 y el −31 el 2026-10-19.
+  const NOV_19 = new Date('2026-11-19T20:00:00Z');
+  const MELI = crearHolding({ symbol: 'MELI', name: 'MercadoLibre' });
+
+  const hecho = (publishedAt) => ({ ...hallazgo(`Hecho del ${publishedAt}`), publishedAt });
+  const tandaCon = (fechas) => ({
+    text: JSON.stringify({
+      MELI: { findings: fechas.map(hecho), notes: [], conflicts: [] },
+      macro: { findings: [hallazgo()], notes: [], conflicts: [] },
+    }),
+    tokensUsed: 100,
+    sources: [],
+  });
+  const cubierto = datosDePlataforma([['MELI', { findings: [], cubierto: true }]]);
+  const etiquetas = (inv) => inv.findings.map((f) => f.label);
+
+  it('el día −30 se queda; el −31 y uno de marzo se descartan; sin fecha se conserva', async () => {
+    engineClient.investigar.mockResolvedValue(tandaCon(['2026-10-20', '2026-10-19', '2026-03-05', null]));
+
+    const { investigaciones } = await investigarTanda([MELI], ENTORNO, cubierto, NOV_19);
+
+    expect(etiquetas(investigaciones[0])).toEqual(['Hecho del 2026-10-20', 'Hecho del null']);
+  });
+
+  it('a un activo no cubierto no se le aplica: la web le trae cifras de trimestres anteriores', async () => {
+    engineClient.investigar.mockResolvedValue(tandaCon(['2026-10-19', '2026-03-05']));
+
+    const { investigaciones } = await investigarTanda(
+      [MELI], ENTORNO, datosDePlataforma([['MELI', { findings: [], cubierto: false }]]), NOV_19,
+    );
+
+    expect(investigaciones[0].findings).toHaveLength(2);
+  });
+
+  it('lo que viene del caché también se filtra: pudo guardarse hace días', async () => {
+    cache.leer.mockImplementation(async (symbol) => (symbol === 'MELI' ? {
+      ticker: 'MELI', outcome: 'ok', findings: [hecho('2026-10-01'), hecho('2026-11-10')],
+      notes: [], conflicts: [], descartados: [],
+    } : null));
+
+    const { investigaciones } = await investigarTanda([MELI], ENTORNO, cubierto, NOV_19);
+
+    expect(etiquetas(investigaciones[0])).toEqual(['Hecho del 2026-11-10']);
+  });
+
+  it('los datos de la plataforma no pasan por la ventana: no son noticias', async () => {
+    engineClient.investigar.mockResolvedValue(tandaCon([]));
+    const ingresos = { ...hallazgo('Ingresos'), publishedAt: '2026-06-30', verified: true };
+
+    const { investigaciones } = await investigarTanda(
+      [MELI], ENTORNO, datosDePlataforma([['MELI', { findings: [ingresos], cubierto: true }]]), NOV_19,
+    );
+
+    expect(etiquetas(investigaciones[0])).toEqual(['Ingresos']);
+  });
+
+  it('el efecto en la tesis llega con el hallazgo (QA-02)', async () => {
+    engineClient.investigar.mockResolvedValue({
+      text: JSON.stringify({
+        MELI: { findings: [{ ...hecho('2026-11-10'), impact: 'tesis' }], notes: [], conflicts: [] },
+        macro: { findings: [], notes: [], conflicts: [] },
+      }),
+      tokensUsed: 1,
+      sources: [],
+    });
+
+    const { investigaciones } = await investigarTanda([MELI], ENTORNO, cubierto, NOV_19);
+
+    expect(investigaciones[0].findings[0].impact).toBe('tesis');
   });
 });

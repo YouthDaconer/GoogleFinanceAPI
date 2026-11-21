@@ -36,6 +36,16 @@ const { DateTime } = require('luxon');
 const enricher = require('./copilotEnricher');
 const { claseDeActivo } = require('./copilotRelevance');
 const { esRancia } = require('./copilotFindings');
+const { getHistoricalPrices } = require('../financeQuery');
+// HU 5.7.1: los ayudantes de series y formato viven en `copilotAssetCardService`, que
+// los usa para la ficha; este módulo construye la ficha, así que importa de él.
+const {
+  idioma,
+  formatearImporte,
+  periodosOrdenados,
+  crecimientoAnualPct,
+  construirFicha,
+} = require('./copilotAssetCardService');
 
 /**
  * La fuente que se le atribuye a un dato de la plataforma (RN-5.6-C).
@@ -148,16 +158,6 @@ async function enTandas(items, fn, limite = ACTIVOS_EN_PARALELO) {
 const TOLERANCIA_INTERANUAL_DIAS = 45;
 
 /**
- * El idioma, normalizado a los dos que existen.
- *
- * @param {string} language
- * @returns {'es'|'en'}
- */
-function idioma(language) {
-  return language === 'en' ? 'en' : 'es';
-}
-
-/**
  * Un hallazgo con la forma que espera el informe, atribuido a la plataforma.
  *
  * @param {string} label
@@ -178,42 +178,6 @@ function hallazgo(label, value, extra = {}, lang = 'es') {
     // (RN-5.6-C). Lo lee `copilotComposer` al armar las fuentes crudas.
     verified: true,
   };
-}
-
-/**
- * Un importe grande, legible, sin perder la escala.
- *
- * El redondeo es **de presentación** y se aplica al final: el margen y el
- * crecimiento se calculan antes con los enteros crudos, como exige el estándar
- * de montos.
- *
- * @param {number} valor
- * @param {string} moneda
- * @returns {string}
- */
-function formatearImporte(valor, moneda) {
-  const abs = Math.abs(valor);
-  const sufijo = moneda ? ` ${moneda}` : '';
-
-  if (abs >= 1e9) return `${(valor / 1e9).toFixed(2)} B${sufijo}`;
-  if (abs >= 1e6) return `${(valor / 1e6).toFixed(1)} M${sufijo}`;
-  return `${Math.round(valor)}${sufijo}`;
-}
-
-/**
- * Los estados de resultados de una serie, del más reciente al más antiguo.
- *
- * Sirve igual para la serie trimestral y para la anual: lo que ordena son
- * cierres, y cuál es cada uno lo decide quién la pidió.
- *
- * @param {object|null} income - La respuesta de `/financials/{s}/income`.
- * @returns {object[]}
- */
-function periodosOrdenados(income) {
-  const statements = (income && income.statements) || [];
-  return [...statements]
-    .filter((s) => s && s.endDate)
-    .sort((a, b) => String(b.endDate).localeCompare(String(a.endDate)));
 }
 
 /**
@@ -336,16 +300,15 @@ function hallazgoDeCrecimiento(trimestres, ultimo, anual, periodo, publicado, la
     );
   }
 
-  const anos = periodosOrdenados(anual);
-  if (anos.length < 2) return null;
+  // HU 5.7.1: el mismo cálculo que la ficha compara con el P/E.
+  const anualComparable = crecimientoAnualPct(anual);
+  if (!anualComparable) return null;
 
-  const [esteAno, anoPasado] = anos;
-  if (!anoPasado.totalRevenue || typeof esteAno.totalRevenue !== 'number') return null;
-
+  const { esteAno, anoPasado } = anualComparable;
   const ano = (s) => String(s.endDate).slice(0, 4);
   return hallazgo(
     t.crecimientoAnual,
-    conSigno(variacion(esteAno.totalRevenue, anoPasado.totalRevenue)),
+    conSigno(anualComparable.pct),
     {
       period: `FY ${ano(esteAno)} vs FY ${ano(anoPasado)}`,
       publishedAt: String(esteAno.endDate).slice(0, 10),
@@ -459,7 +422,12 @@ function hallazgosDeTitulares(news, language) {
 /**
  * Los fetchers reales, sobre el canal de servicio que ya usa el enriquecedor.
  *
- * @returns {{fetchIncome: Function, fetchQuotes: Function, fetchAnalysis: Function, fetchNews: Function}}
+ * HU 5.7.1: `fetchHistorical` trae la serie diaria de 1 año de la que sale el
+ * pilar técnico de la ficha. Es el mismo `getHistoricalPrices` que usa
+ * `copilotRelevance`, ya autenticado y con su circuito.
+ *
+ * @returns {{fetchIncome: Function, fetchQuotes: Function, fetchAnalysis: Function,
+ *   fetchNews: Function, fetchHistorical: Function}}
  */
 function createFundamentalsFetchers() {
   const pedir = (endpoint) => enricher.pedirAFinanceQuery(endpoint, 'copilotFundamentals');
@@ -470,6 +438,7 @@ function createFundamentalsFetchers() {
     fetchQuotes: (symbols) => pedir(`/quotes?symbols=${encodeURIComponent(symbols.join(','))}`),
     fetchAnalysis: (symbol) => pedir(`/analysis/${encodeURIComponent(symbol)}`),
     fetchNews: (symbol) => pedir(`/news?symbol=${encodeURIComponent(symbol)}`),
+    fetchHistorical: (symbol) => getHistoricalPrices(symbol, '1y'),
   };
 }
 
@@ -493,17 +462,42 @@ async function quotesPorSimbolo(symbols, fetchers) {
 }
 
 /**
+ * HU 5.7.1 — La serie diaria de 1 año, sin que un fallo tumbe nada.
+ *
+ * `getHistoricalPrices` **lanza** cuando agota sus reintentos (los demás
+ * orígenes devuelven `null`); aquí se convierte en `null` para que la ficha
+ * declare el técnico como no disponible (QA-19).
+ *
+ * @param {string} symbol
+ * @param {object} fetchers
+ * @returns {Promise<object|null>}
+ */
+async function serieDeUnAno(symbol, fetchers) {
+  if (typeof fetchers.fetchHistorical !== 'function') return null;
+
+  try {
+    return await enricher.withTimeout(fetchers.fetchHistorical(symbol), enricher.FETCH_TIMEOUT_MS);
+  } catch (error) {
+    console.warn(`[copilotFundamentals] ${symbol}: sin historial de precios (${error.message})`);
+    return null;
+  }
+}
+
+/**
  * Todo lo que la plataforma sabe de los activos de una tanda.
  *
  * Nunca lanza y nunca deja a un activo fuera: lo que no se consiguió sale con
  * `findings: []` y `cubierto: false`, que es la señal de que ese activo tiene
  * que buscarse en la web como hasta ahora (Escenarios 4 y 5).
  *
- * @param {object[]} holdings - Posiciones con `symbol` y `asset_type`.
+ * HU 5.7.1: cada activo trae además su `card`, la ficha de cuatro pilares con
+ * las señales del criterio de decisión (`copilotAssetCardService.construirFicha`).
+ *
+ * @param {object[]} holdings - Posiciones con `symbol`, `asset_type` y `weight`.
  * @param {{language: string}} opciones
  * @param {object} [fetchers]
  * @param {Date} [now]
- * @returns {Promise<Map<string, {findings: object[], cubierto: boolean}>>}
+ * @returns {Promise<Map<string, {findings: object[], cubierto: boolean, card: object}>>}
  */
 async function obtenerDatosDePlataforma(
   holdings,
@@ -532,10 +526,17 @@ async function obtenerDatosDePlataforma(
       enricher.withTimeout(fetchers.fetchNews(symbol), enricher.FETCH_TIMEOUT_MS),
     ]);
 
+    // HU 5.7.1: el historial va DESPUÉS de las cuatro llamadas del activo, no
+    // con ellas. Así nunca hay más de cuatro conexiones por activo en vuelo y
+    // la concurrencia sigue siendo la medida el 14/10/2026 (ver
+    // `ACTIVOS_EN_PARALELO`).
+    const serie = await serieDeUnAno(symbol, fetchers);
+    const quote = quotes.get(String(symbol).toUpperCase());
+
     const deIngresos = hallazgosDeIngresos(income, language, now, anual);
     const findings = [
       ...deIngresos,
-      ...hallazgosDeValoracion(quotes.get(String(symbol).toUpperCase()), language),
+      ...hallazgosDeValoracion(quote, language),
       ...hallazgosDeAnalistas(analysis, language),
       ...hallazgosDeTitulares(news, language),
     ];
@@ -553,7 +554,11 @@ async function obtenerDatosDePlataforma(
       );
     }
 
-    return [symbol, { findings, cubierto }];
+    const card = construirFicha({
+      holding, quote, analysis, income, anual, serie, language, now,
+    });
+
+    return [symbol, { findings, cubierto, card }];
   });
 
   return new Map(resultados);
@@ -566,6 +571,7 @@ module.exports = {
   ACTIVOS_EN_PARALELO,
   enTandas,
   TOLERANCIA_INTERANUAL_DIAS,
+  idioma,
   formatearImporte,
   periodosOrdenados,
   mismoTrimestreDelAnoPasado,

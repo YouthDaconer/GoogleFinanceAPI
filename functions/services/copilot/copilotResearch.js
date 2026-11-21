@@ -28,6 +28,7 @@ const engineClient = require('./copilotEngineClient');
 const findings = require('./copilotFindings');
 const cache = require('./copilotResearchCache');
 const { claseDeActivo } = require('./copilotRelevance');
+const { VENTANA_NOTICIAS_DIAS } = require('./copilotConstants');
 
 /**
  * Una consulta que falla y se recupera dentro del mismo análisis **no es un
@@ -114,6 +115,33 @@ function conDatosDePlataforma(investigacion, deLaPlataforma) {
 }
 
 /**
+ * HU 5.7.1 — Quita de una investigación los hechos anteriores a la ventana de
+ * noticias (RN-5.7-J, QA-17).
+ *
+ * Sólo se aplica a un activo cuyas cifras puso la plataforma: a la web se le
+ * preguntó por lo que pasó en los últimos 30 días, así que un hecho más viejo
+ * es justo el que se coló como reciente el 2026-11-19 ("−30,78 % hasta el 5 de
+ * octubre"). A un activo **no** cubierto la web le trae las cifras de los
+ * trimestres anteriores, que son legítimas y tienen su propio filtro
+ * (`esRancia`).
+ *
+ * @param {object} investigacion
+ * @param {Date} now
+ * @returns {object} La misma investigación si no había nada que quitar.
+ */
+function sinHechosFueraDeVentana(investigacion, now) {
+  const dentro = investigacion.findings.filter((f) => !findings.fueraDeVentana(f.publishedAt, now));
+  const quitados = investigacion.findings.length - dentro.length;
+  if (quitados === 0) return investigacion;
+
+  console.log(
+    `[copilotResearch] ${investigacion.ticker}: ${quitados} hecho(s) fuera de la ventana de `
+    + `${VENTANA_NOTICIAS_DIAS} días descartado(s)`,
+  );
+  return { ...investigacion, findings: dentro };
+}
+
+/**
  * Investiga todos los activos relevantes y el macro, en **una** llamada.
  *
  * Nunca lanza: lo que no se pudo investigar vuelve con `outcome: 'fallo'`, que
@@ -124,10 +152,16 @@ function conDatosDePlataforma(investigacion, deLaPlataforma) {
  * @param {object} entorno - `{ userId, secret, language }`.
  * @param {Map<string, {findings: object[], cubierto: boolean}>} [datosDePlataforma] -
  *   Lo que `copilotFundamentals` consiguió para cada ticker.
+ * @param {Date} [now] - HU 5.7.1: el "hoy" de la ventana de noticias.
  * @returns {Promise<{investigaciones: object[], macro: object, tokensUsed: number}>}
  *   Las investigaciones van en el **mismo orden** que `holdings`.
  */
-async function investigarTanda(holdings, { userId, secret, language }, datosDePlataforma = new Map()) {
+async function investigarTanda(
+  holdings,
+  { userId, secret, language },
+  datosDePlataforma = new Map(),
+  now = new Date(),
+) {
   const plataformaDe = (symbol) => (datosDePlataforma.get(symbol) || { findings: [], cubierto: false });
 
   // Lo que ya se investigó hace poco no se vuelve a pagar. Son hechos públicos
@@ -160,10 +194,15 @@ async function investigarTanda(holdings, { userId, secret, language }, datosDePl
   );
 
   const investigaciones = holdings.map((holding) => {
-    const base = cacheadas.get(holding.symbol)
+    const deLaPlataforma = plataformaDe(holding.symbol);
+    const encontrada = cacheadas.get(holding.symbol)
       || porClave.get(holding.symbol)
       || fallida(holding.symbol);
-    return conDatosDePlataforma(base, plataformaDe(holding.symbol).findings);
+    // HU 5.7.1: la ventana se aplica antes de unir los datos de la plataforma,
+    // que llevan la fecha del cierre del trimestre y no son noticias. También
+    // a lo que vino del caché: pudo guardarse hace días.
+    const base = deLaPlataforma.cubierto ? sinHechosFueraDeVentana(encontrada, now) : encontrada;
+    return conDatosDePlataforma(base, deLaPlataforma.findings);
   });
 
   return {
@@ -271,5 +310,6 @@ module.exports = {
   CLAVE_MACRO,
   construirExposicion,
   conDatosDePlataforma,
+  sinHechosFueraDeVentana,
   investigarTanda,
 };

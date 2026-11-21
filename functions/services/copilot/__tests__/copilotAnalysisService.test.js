@@ -249,7 +249,8 @@ describe('runAnalysis — el camino feliz', () => {
     expect(resultado.desenlace).toBe('completed');
     expect(documentosEscritos).toHaveLength(1);
     expect(documentosEscritos[0].datos.executiveSummary).toBe('- Todo en orden.');
-    expect(documentosEscritos[0].datos._meta.promptVersion).toBe('v3');
+    // HU 5.7.1: el criterio de decisión entra en los prompts de redacción.
+    expect(documentosEscritos[0].datos._meta.promptVersion).toBe('v4');
   });
 
   it('la fecha del análisis es la del lanzamiento (RN-5.2-R)', async () => {
@@ -681,5 +682,40 @@ describe('HU 6.11.2 — la moneda pedida no estaba disponible (Escenario 5)', ()
     expect(servicio.conNotaDeMoneda('# Informe', null, 'es')).toBe('# Informe');
     expect(servicio.conNotaDeMoneda('# Informe', 'COP', 'fr'))
       .toBe('> Este análisis está en USD porque COP no está disponible por ahora.\n\n# Informe');
+  });
+});
+
+// ============================================================================
+// HU 5.7.1 — El análisis guarda su criterio y la ficha llega al redactor
+// ============================================================================
+
+describe('HU 5.7.1 — el criterio de decisión con que se generó (QA-23)', () => {
+  beforeEach(() => montarCaminoFeliz());
+
+  it('el análisis guardado lleva decisionCriteria: 5.7.1', async () => {
+    await servicio.runAnalysis(crearRun(), ENTORNO);
+
+    expect(documentosEscritos[0].datos.decisionCriteria).toBe('5.7.1');
+  });
+
+  it('la ficha de cada activo viaja al redactor junto a su investigación', async () => {
+    const ficha = { kind: 'stock', asOf: '2026-10-08', items: [], missing: [], signals: {} };
+    fundamentals.obtenerDatosDePlataforma.mockResolvedValue(new Map([
+      ['MSFT', { findings: [], cubierto: true, card: ficha }],
+    ]));
+
+    await servicio.runAnalysis(crearRun(), ENTORNO);
+
+    const entrada = composer.redactarInforme.mock.calls[0][0];
+    expect(entrada.investigaciones[0].card).toBe(ficha);
+  });
+
+  it('sin datos de la plataforma, el activo va sin ficha y el análisis sigue', async () => {
+    fundamentals.obtenerDatosDePlataforma.mockRejectedValue(new Error('finance-query caído'));
+
+    const resultado = await servicio.runAnalysis(crearRun(), ENTORNO);
+
+    expect(resultado.desenlace).toBe('completed');
+    expect(composer.redactarInforme.mock.calls[0][0].investigaciones[0].card).toBeNull();
   });
 });

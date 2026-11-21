@@ -14,9 +14,12 @@
  * @see platform-docs/stories/5.3-analista-investiga-recomienda/refinamiento.md (T12)
  */
 
+const { DateTime } = require('luxon');
 const engineClient = require('./copilotEngineClient');
 const sources = require('./copilotSources');
 const { RESEARCH_OUTCOME, parsearRespuesta } = require('./copilotFindings');
+const { FUENTE_PLATAFORMA } = require('./copilotFundamentals');
+const { idioma } = require('./copilotAssetCardService');
 
 /**
  * Encabezados con los que arranca el resumen ejecutivo, en los dos idiomas. Se
@@ -32,6 +35,47 @@ const ESTADOS_DE_TESIS = ['confirmada', 'invalidada', 'sin_cambio'];
 
 /** Lo que se devuelve cuando no hay seccion 2 que leer. */
 const SEGUIMIENTO_VACIO = { recommendations: [], theses: [] };
+
+/** HU 5.7.1 (RN-5.7-K) — El pilar que decide una recomendación. */
+const PILARES = ['fundamentales', 'valoracion', 'tecnico', 'noticias'];
+
+/** HU 5.7.1 (RN-5.7-K) — Las acciones posibles de una recomendación. */
+const ACCIONES = ['vender', 'reducir', 'mantener', 'aumentar', 'comprar'];
+
+/** Las únicas acciones que llevan nivel de la jerarquía (RN-5.7-D). */
+const ACCIONES_CON_NIVEL = ['vender', 'reducir'];
+
+/** Los niveles de la jerarquía de RN-5.7-D. */
+const NIVELES = [1, 2, 3];
+
+/** RN-5.7-G — Una compra por tramos se reparte en 2 o 3. */
+const TRAMOS_MIN = 2;
+const TRAMOS_MAX = 3;
+
+/** Encabezados de la sección de fuentes, la única que lleva la marca de procedencia. */
+const ENCABEZADOS_FUENTES = ['\n## Fuentes', '\n## Sources'];
+
+/** La marca que el prompt pone a una fuente `verified: false`, en los dos idiomas. */
+const MARCA_NO_VERIFICADA = /\s*—\s*(?:procedencia no verificada|unverified provenance)/g;
+
+/**
+ * Quita la marca de procedencia del cuerpo del informe y la deja en Fuentes.
+ *
+ * La regla 13 del prompt lo pide y el modelo no lo cumple: el 2026-11-20 un
+ * informe la escribió 33 veces en el cuerpo ("[4 — procedencia no
+ * verificada]"). Lo que se puede hacer en código no se le pide al modelo.
+ *
+ * @param {string} markdown
+ * @returns {string}
+ */
+function limpiarMarcasDelCuerpo(markdown) {
+  if (typeof markdown !== 'string') return markdown;
+  const corte = ENCABEZADOS_FUENTES
+    .map((e) => markdown.indexOf(e))
+    .filter((i) => i !== -1)
+    .reduce((min, i) => Math.min(min, i), markdown.length);
+  return markdown.slice(0, corte).replace(MARCA_NO_VERIFICADA, '') + markdown.slice(corte);
+}
 
 /**
  * El resumen ejecutivo, recortado del informe.
@@ -69,10 +113,14 @@ function extraerResumenEjecutivo(markdown) {
  * @param {object} entrada.portafolio
  * @param {object|null} [entrada.comparacion] - HU 5.4: el análisis anterior, su
  *   estado y sus recomendaciones ya cerradas de entrada
+ * @param {string} [entrada.language] - HU 5.7.1: el idioma del título de la
+ *   fuente de la plataforma que respalda la ficha.
+ * @param {Date} [entrada.now] - HU 5.7.1: el "hoy" que se le dice al redactor.
  * @returns {Promise<{context: object, fuentes: object[]}>}
  */
 async function construirContexto({
   investigaciones, macro, resto, excluidos, portafolio, comparacion = null,
+  language = 'es', now = new Date(),
 }) {
   const todas = [...investigaciones, ...(macro ? [macro] : [])];
 
@@ -92,6 +140,17 @@ async function construirContexto({
     }
     for (const c of inv.conflicts) {
       for (const v of c.versions) crudas.push({ title: '', url: v.sourceUrl, date: null });
+    }
+    // HU 5.7.1: la ficha es un dato de la plataforma (RN-5.6-C): cita la misma
+    // fuente, verificada por construcción. Un ETF o una cripto sin hallazgos de
+    // la plataforma la estrenan aquí.
+    if (inv.card) {
+      crudas.push({
+        title: FUENTE_PLATAFORMA.titulo[idioma(language)],
+        url: FUENTE_PLATAFORMA.url,
+        date: inv.card.asOf,
+        verified: true,
+      });
     }
   }
 
@@ -128,7 +187,11 @@ async function construirContexto({
       period: f.period,
       publishedAt: f.publishedAt,
       source: indice.get(f.sourceUrl) || null,
+      // HU 5.7.1 (RN-5.7-I): si el hecho toca la tesis o es ruido.
+      impact: f.impact || null,
     })),
+    // HU 5.7.1: la ficha de cuatro pilares, con las señales ya evaluadas.
+    card: inv.card ? { ...inv.card, source: indice.get(FUENTE_PLATAFORMA.url) || null } : null,
     notes: inv.notes,
     conflicts: inv.conflicts.map((c) => ({
       about: c.about,
@@ -138,6 +201,8 @@ async function construirContexto({
 
   return {
     context: {
+      // HU 5.7.1 (RN-5.7-J): la ventana de 30 días se mide desde aquí.
+      today: DateTime.fromJSDate(now, { zone: 'America/New_York' }).toISODate(),
       portfolio: portafolio,
       excluded: excluidos,
       assets: investigaciones.map(conCita),
@@ -210,10 +275,60 @@ async function extraerEstructura(markdown, { userId, secret, language }) {
 }
 
 /**
+ * HU 5.7.1 — Los tramos de una compra por tramos (RN-5.7-G).
+ *
+ * Valen de 2 a 3, cada uno con su zona de precio y un porcentaje positivo. Si
+ * alguno no cuadra, o son uno o más de tres, no hay tramos: `[]`. No se arreglan
+ * a medias, porque un reparto incompleto se leería como el reparto completo.
+ *
+ * @param {*} crudos
+ * @returns {Array<{zone: string, pct: number}>}
+ */
+function normalizarTramos(crudos) {
+  if (!Array.isArray(crudos) || crudos.length < TRAMOS_MIN || crudos.length > TRAMOS_MAX) return [];
+
+  const tramos = [];
+  for (const tramo of crudos) {
+    if (!tramo || typeof tramo !== 'object') return [];
+    const zone = String(tramo.zone || '').trim();
+    const { pct } = tramo;
+    if (!zone || typeof pct !== 'number' || !Number.isFinite(pct) || pct <= 0) return [];
+    tramos.push({ zone, pct });
+  }
+
+  return tramos;
+}
+
+/**
+ * HU 5.7.1 — Lo que el criterio de decisión añade a una recomendación.
+ *
+ * @param {object} rec - La recomendación tal como la extrajo el modelo.
+ * @returns {{action: string|null, pillar: string|null, level: number|null,
+ *   tranches: Array<{zone: string, pct: number}>}}
+ */
+function camposDelCriterio(rec) {
+  const action = ACCIONES.includes(rec.action) ? rec.action : null;
+  // Sin acción legible no se puede decir que el nivel sobre: se conserva si es
+  // válido. Con una acción que no reduce ni vende, el nivel no existe.
+  const admiteNivel = action === null || ACCIONES_CON_NIVEL.includes(action);
+
+  return {
+    action,
+    pillar: PILARES.includes(rec.pillar) ? rec.pillar : null,
+    level: admiteNivel && NIVELES.includes(rec.level) ? rec.level : null,
+    tranches: normalizarTramos(rec.tranches),
+  };
+}
+
+/**
  * Deja cada recomendación con la forma que la HU 5.4 va a comparar.
  *
  * Lo que el modelo no entregue queda a `null`, nunca deducido: una zona de
  * precio inventada convertiría un "sigue vigente" en una afirmación falsa.
+ *
+ * HU 5.7.1 (RN-5.7-K, QA-22): `action`, `pillar`, `level` y `tranches`. El
+ * nivel sólo existe en lo que reduce o vende: en mantener, aumentar o comprar
+ * queda `null` aunque el modelo lo escriba.
  *
  * @param {Array<object>} crudas
  * @returns {object[]}
@@ -236,6 +351,7 @@ function normalizarRecomendaciones(crudas) {
       priceZone: rec.priceZone || null,
       horizon: rec.horizon || null,
       isNewAsset: rec.isNewAsset === true,
+      ...camposDelCriterio(rec),
     });
   }
 
@@ -305,17 +421,18 @@ function normalizarTesis(crudas) {
  *   análisis, y eso sí es un fallo (RN-5-C).
  */
 async function redactarInforme(entrada, { userId, secret, language }) {
-  const { context, fuentes } = await construirContexto(entrada);
+  const { context, fuentes } = await construirContexto({ language, ...entrada });
 
   const salida = await engineClient.redactar(userId, secret, { language, context });
+  const markdown = limpiarMarcasDelCuerpo(salida.text);
 
   // HU 5.4: con el informe escrito, se extrae su estructura para que el
   // análisis siguiente pueda compararse contra él.
-  const estructura = await extraerEstructura(salida.text, { userId, secret, language });
+  const estructura = await extraerEstructura(markdown, { userId, secret, language });
 
   return {
-    markdown: salida.text,
-    executiveSummary: extraerResumenEjecutivo(salida.text),
+    markdown,
+    executiveSummary: extraerResumenEjecutivo(markdown),
     tokensUsed: salida.tokensUsed + estructura.tokensUsed,
     modelId: salida.modelId,
     sources: fuentes,
@@ -332,9 +449,14 @@ module.exports = {
   ESTADOS_DE_RECOMENDACION,
   ESTADOS_DE_TESIS,
   SEGUIMIENTO_VACIO,
+  PILARES,
+  ACCIONES,
+  NIVELES,
   extraerResumenEjecutivo,
+  limpiarMarcasDelCuerpo,
   extraerEstructura,
   normalizarRecomendaciones,
+  normalizarTramos,
   normalizarTesis,
   normalizarSeguimiento,
   construirContexto,

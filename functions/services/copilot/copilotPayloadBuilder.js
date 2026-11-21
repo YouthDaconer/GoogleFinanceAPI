@@ -61,6 +61,21 @@ function buildCurrencyRateMap(currencies) {
 }
 
 /**
+ * La fecha de compra de un lote, como `YYYY-MM-DD`, o `null` si no la tiene.
+ *
+ * `acquisitionDate` es un ISO 8601; los documentos antiguos pueden traer un
+ * Timestamp de Firestore.
+ *
+ * @param {string|{toDate: Function}|undefined} valor
+ * @returns {string|null}
+ */
+function fechaDeCompra(valor) {
+  if (!valor) return null;
+  const fecha = typeof valor.toDate === 'function' ? valor.toDate() : new Date(valor);
+  return Number.isNaN(fecha.getTime()) ? null : fecha.toISOString().slice(0, 10);
+}
+
+/**
  * Posiciones del usuario agregadas por ticker, con su peso.
  *
  * Son las posiciones reales, no los constituyentes en que la API de
@@ -70,7 +85,8 @@ function buildCurrencyRateMap(currencies) {
  * @param {object[]} assets
  * @param {Map<string, object>} priceMap
  * @param {Map<string, number>} rates
- * @returns {Array<{symbol: string, weight: number, sector: string, asset_type: string}>}
+ * @returns {Array<{symbol: string, weight: number, sector: string, asset_type: string,
+ *   purchaseDates: string[]}>}
  */
 function buildUserHoldings(assets, priceMap, rates) {
   const byTicker = new Map();
@@ -87,10 +103,17 @@ function buildUserHoldings(assets, priceMap, rates) {
     const precio = priceInfo && priceInfo.price !== undefined ? priceInfo.price : a.unitValue;
     const priceUSD = rate > 0 ? (precio || 0) / rate : 0;
 
+    // HU 5.7.1: cada lote abierto es una compra. Su fecha dice si el usuario
+    // compra de forma escalonada (DCA), lo que sube el techo de la excepción de
+    // oportunidad. Las posiciones no viajan enteras al motor: esto no llega a
+    // ningún prompt.
+    const fechaCompra = fechaDeCompra(a.acquisitionDate);
+
     const existing = byTicker.get(ticker);
     if (existing) {
       existing.totalCostUSD += costUSD;
       existing.totalUnits += a.units;
+      if (fechaCompra) existing.compras.add(fechaCompra);
     } else {
       byTicker.set(ticker, {
         totalCostUSD: costUSD,
@@ -102,6 +125,7 @@ function buildUserHoldings(assets, priceMap, rates) {
         // HU 5.3: el prompt de investigación necesita el nombre para
         // desambiguar — "MELI" a secas se confunde con otras cosas.
         name: (priceInfo && priceInfo.name) || a.company || ticker,
+        compras: new Set(fechaCompra ? [fechaCompra] : []),
       });
     }
   }
@@ -120,6 +144,7 @@ function buildUserHoldings(assets, priceMap, rates) {
       // HU 5.3: el resto del portafolio se agrupa también por divisa
       currency: data.currency,
       name: data.name,
+      purchaseDates: [...data.compras].sort(),
     });
   }
 

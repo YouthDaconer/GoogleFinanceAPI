@@ -42,7 +42,7 @@ jest.mock('../../firebaseAdmin', () => {
   return { firestore: () => db };
 });
 
-const { buildBasePayload, monedaDelAnalisis } = require('../copilotPayloadBuilder');
+const { buildBasePayload, monedaDelAnalisis, buildUserHoldings } = require('../copilotPayloadBuilder');
 
 const UID = 'inv-m';
 
@@ -89,5 +89,22 @@ describe('HU 6.11.2: la moneda del análisis del Copiloto', () => {
 
     expect(await monedaDelAnalisis(UID, 'USD')).toEqual({ currency: 'USD', unavailableCurrency: null });
     expect(await monedaDelAnalisis('inv-p', 'COP')).toEqual({ currency: 'COP', unavailableCurrency: null });
+  });
+});
+
+describe('HU 5.7.1: cada posición lleva las fechas de sus compras (DCA)', () => {
+  it('una fecha por día, ordenada y sin repetir, de los lotes abiertos; un lote sin fecha no rompe nada', () => {
+    const lotes = [
+      { name: 'NVDA', units: 0.9, unitValue: 140.38, currency: 'USD', assetType: 'stock', acquisitionDate: '2026-11-20T14:56:46.107Z' },
+      { name: 'NVDA', units: 1, unitValue: 189.13, currency: 'USD', assetType: 'stock', acquisitionDate: '2026-11-05T15:45:07.522Z' },
+      { name: 'NVDA', units: 0.45, unitValue: 128.04, currency: 'USD', assetType: 'stock', acquisitionDate: '2026-11-20T20:14:50.929Z' },
+      { name: 'NVDA', units: 0.5, unitValue: 200, currency: 'USD', assetType: 'stock', acquisitionDate: { toDate: () => new Date('2026-05-01T13:49:10Z') } },
+      { name: 'NVDA', units: 0.1, unitValue: 150, currency: 'USD', assetType: 'stock' },
+    ];
+    const precios = new Map([['NVDA', { price: 125, currency: 'USD' }]]);
+
+    const [nvda] = buildUserHoldings(lotes, precios, new Map([['USD', 1]]));
+
+    expect(nvda.purchaseDates).toEqual(['2026-05-01', '2026-11-05', '2026-11-20']);
   });
 });
