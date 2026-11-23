@@ -541,25 +541,6 @@
   ],
   "fieldOverrides": [
     {
-      "collectionGroup": "_backfillSnapshots",
-      "fieldPath": "ttlExpiry",
-      "ttl": true,
-      "indexes": [
-        {
-          "order": "ASCENDING",
-          "queryScope": "COLLECTION"
-        },
-        {
-          "order": "DESCENDING",
-          "queryScope": "COLLECTION"
-        },
-        {
-          "arrayConfig": "CONTAINS",
-          "queryScope": "COLLECTION"
-        }
-      ]
-    },
-    {
       "collectionGroup": "dates",
       "fieldPath": "*",
       "indexes": []

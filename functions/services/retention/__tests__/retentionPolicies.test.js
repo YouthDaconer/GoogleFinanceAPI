@@ -174,7 +174,7 @@ describe('el catálogo — RN-6.10-J, RN-6.10-K, RN-6.10-L', () => {
 describe('QA-06 — los plazos que ya existían no cambian', () => {
   it('el catálogo no incluye ninguna colección que ya tenía plazo', () => {
     const rutas = TIPOS.map((t) => t.ruta);
-    for (const existente of ['userNotifications', 'alertHistory', '_backfillSnapshots', 'performanceSnapshots']) {
+    for (const existente of ['userNotifications', 'alertHistory', 'performanceSnapshots']) {
       expect(rutas).not.toContain(existente);
     }
   });

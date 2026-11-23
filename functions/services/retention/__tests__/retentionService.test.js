@@ -262,7 +262,6 @@ function ds03() {
     'userNotifications/n-60d': { createdAt: '2026-09-13T12:00:00.000Z' },
     'userNotifications/n-91d': { createdAt: '2026-08-13T12:00:00.000Z' },
     'alertHistory/a-200d': { triggeredAt: '2026-04-26T12:00:00.000Z' },
-    '_backfillSnapshots/b-20d': { ttlExpiry: '2026-11-22T12:00:00.000Z' },
     'performanceSnapshots/uid-inversor-H_NFLX_USD': { type: 'asset', ticker: 'NFLX' },
   };
 }
@@ -294,7 +293,7 @@ async function ensayarYActivarTodo(db, ahora) {
 /** Lo que nunca debe cambiar: DS-02 y DS-03, tal como estaban. */
 function inventarioIntocable(fs) {
   const prefijos = ['subscriptionEvents/', 'userData/', 'indexHistories/', 'currentPrices/', 'sectorsHistory/',
-    'portfolioPerformance/', 'userNotifications/', 'alertHistory/', '_backfillSnapshots/', 'performanceSnapshots/'];
+    'portfolioPerformance/', 'userNotifications/', 'alertHistory/', 'performanceSnapshots/'];
   return Object.fromEntries(prefijos.flatMap((p) => fs.bajo(p)).map((r) => [r, fs.docs.get(r)]));
 }
 
@@ -489,12 +488,11 @@ describe('Escenarios 1 y 2 — los vencidos se retiran y cada dato respeta su pl
     expect(Object.keys(constancia.tipos)).not.toEqual(expect.arrayContaining(['subscriptionEvents']));
   });
 
-  it('QA-06: notificaciones, alertas, respaldos y resúmenes de activos vendidos no los toca esta limpieza', () => {
+  it('QA-06: notificaciones, alertas y resúmenes de activos vendidos no los toca esta limpieza', () => {
     expect(fs.docs.has('userNotifications/n-60d')).toBe(true);
     // La de 91 días la retira alertRetention.js con su plazo de siempre, no esta limpieza
     expect(fs.docs.has('userNotifications/n-91d')).toBe(true);
     expect(fs.docs.has('alertHistory/a-200d')).toBe(true);
-    expect(fs.docs.has('_backfillSnapshots/b-20d')).toBe(true);
     expect(fs.docs.has('performanceSnapshots/uid-inversor-H_NFLX_USD')).toBe(true);
   });
 

@@ -17,8 +17,8 @@
  * **Qué escribe con --apply.** Los docs diarios del rango (cuentas activas y
  * portafolio, merge), borra los del rango que el recálculo no produce, rehace
  * los consolidados de meses y años cerrados, borra los snapshots del usuario
- * (se regeneran al leerse) e invalida su caché. Antes de escribir guarda el
- * respaldo `_backfillSnapshots/{uid}_{desde}` (recortado si es grande).
+ * (se regeneran al leerse) e invalida su caché. No guarda respaldo: si un
+ * recálculo sale mal, se corrige el código y se vuelve a recalcular.
  *
  * Requisitos: credenciales de Firestore (key.json o ADC) y el token del API de
  * mercado en `CF_SERVICE_TOKEN` (sin él no hay precios y no se escribe nada).

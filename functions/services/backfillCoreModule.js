@@ -1176,21 +1176,16 @@ function aggregateOverallPerformance(accountsPerformance, date, previousOverall 
 }
 
 /**
- * SCALE-003: Capture existing performance documents before overwriting
- */
-async function capturePreBackfillSnapshot(userId, accounts, tradingDays) {
-  const existing = await readExistingDocs(userId, accounts, tradingDays);
-  return buildRollbackSnapshot(userId, accounts, tradingDays, existing);
-}
-
-/**
  * Docs ya guardados en el rango, completos: cuentas y portafolio. Sirven para
- * borrar las llaves de activo que ya no existen y como respaldo.
+ * borrar las llaves de activo que ya no existen, para borrar los días que el
+ * recálculo no produce y para deshacer la segunda pasada si una escritura
+ * falla (`restoreAsBefore`).
  *
- * Antes sólo vivían dentro del respaldo, y el respaldo se recorta al
- * portafolio cuando pasa de ~800 KB: con un usuario grande las cuentas se
- * quedaban sin borrar sus llaves viejas y el merge las dejaba vivas con
- * unidades de otro día (MC.PA en XTB, sin lote desde enero).
+ * No hay respaldo persistente (2026-11-23): el de SCALE-003 en
+ * `_backfillSnapshots` no cabía en un documento (1,4–11,7 MB) y nunca se
+ * guardó. Un recálculo cortado a medias se repara solo, porque `_stale.since`
+ * no avanza hasta que el tramo termina; un recálculo equivocado se repara
+ * recalculando con el código corregido.
  *
  * @returns {Promise<{accounts: Object, overall: Object, totalDocs: number}>}
  */
@@ -1235,39 +1230,6 @@ async function readExistingDocs(userId, accounts, tradingDays) {
   }
 
   return { accounts: accountsData, overall: overallData, totalDocs };
-}
-
-/** El respaldo `_backfillSnapshots` de `existing`, recortado si es grande; null si no hay nada. */
-function buildRollbackSnapshot(userId, accounts, tradingDays, existing) {
-  const { accounts: accountsData, overall: overallData, totalDocs } = existing;
-  if (totalDocs === 0) return null;
-
-  const AVG_DOC_SIZE_BYTES = 12 * 1024;
-  const estimatedSize = totalDocs * AVG_DOC_SIZE_BYTES;
-  if (estimatedSize > 800 * 1024) {
-    console.warn(`[backfillCore] Snapshot too large (~${(estimatedSize / 1024).toFixed(0)} KB for ${totalDocs} docs), saving OVERALL only`);
-    return {
-      userId,
-      tradingDays,
-      snapshotAt: new Date().toISOString(),
-      source: 'reconcileStalePerformance',
-      totalDocs: Object.keys(overallData).length,
-      truncated: true,
-      affectedAccounts: accounts.map(a => a.id),
-      accounts: {},
-      overall: overallData
-    };
-  }
-
-  return {
-    userId,
-    tradingDays,
-    snapshotAt: new Date().toISOString(),
-    source: 'reconcileStalePerformance',
-    totalDocs,
-    accounts: accountsData,
-    overall: overallData
-  };
 }
 
 // ============================================================================
@@ -1704,19 +1666,6 @@ async function backfillUserPerformance(userId, tradingDays, options = {}) {
       return done({ daysProcessed: validDays, plan, existing: existingDocs });
     }
 
-    // SCALE-003: respaldo antes de sobrescribir (recortado si es grande)
-    try {
-      const rollback = buildRollbackSnapshot(userId, accounts, tradingDays, existingDocs);
-      if (rollback) {
-        const snapshotId = `${userId}_${tradingDays[0]}`;
-        const ttlExpiry = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
-        await db.collection('_backfillSnapshots').doc(snapshotId).set({ ...rollback, ttlExpiry });
-        console.log(`[backfillCore] Snapshot saved: _backfillSnapshots/${snapshotId} (${rollback.totalDocs} docs)`);
-      }
-    } catch (snapshotError) {
-      console.warn(`[backfillCore] Could not save pre-backfill snapshot: ${snapshotError.message}`);
-    }
-
     // Pasada 2: escribir, un batch por día (cuentas + overall). Al primer
     // error se deja de escribir (RN-6-H).
     const userRef = db.collection('portfolioPerformance').doc(userId);
@@ -1826,10 +1775,8 @@ module.exports = {
   aggregateOverallPerformance,
   staleAssetKeyDeletes,
   
-  // Snapshot (SCALE-003)
-  capturePreBackfillSnapshot,
+  // Docs ya guardados en el rango
   readExistingDocs,
-  buildRollbackSnapshot,
   
   // Exchange rates (HU #3: por rango, sin archivo)
   getExchangeRatesForDates,

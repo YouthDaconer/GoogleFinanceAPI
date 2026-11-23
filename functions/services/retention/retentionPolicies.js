@@ -8,9 +8,9 @@
  *
  * **Lo que NO está aquí, a propósito:**
  * - Los plazos que ya existían (RN de la HU: «se mantienen como están»):
- *   `userNotifications` y `alertHistory` (`alertRetention.js`), los resúmenes
- *   de activos vendidos (`snapshotCleanup.js`) y `_backfillSnapshots` (TTL de
- *   Firestore sobre `ttlExpiry`).
+ *   `userNotifications` y `alertHistory` (`alertRetention.js`) y los resúmenes
+ *   de activos vendidos (`snapshotCleanup.js`). `_backfillSnapshots` (TTL de
+ *   30 días) se retiró el 2026-11-23: el respaldo nunca llegó a guardarse.
  * - Lo que nunca se retira (RN-6.10-K, RN-6.10-L): pagos y eventos de
  *   suscripción, historiales de mercado y los datos de origen de la historia
  *   del inversor. Están listados en `COLECCIONES_PROTEGIDAS`, y un test
