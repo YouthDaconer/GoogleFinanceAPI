@@ -13,6 +13,8 @@ const { getPricesFromApi, getCurrencyRatesFromApi } = require('./marketDataHelpe
 // (`cost / balance`) quedaba mintiendo a la baja con cada dividendo cobrado.
 const { buildBalanceUpdate, getUserReferenceCurrency } = require('./helpers/balanceCostBasis');
 const { resolveRealizationRate } = require('./helpers/realizedFxDecomposition');
+// HU 2.8: la base de un saldo sobrevive al cambio de moneda de referencia
+const { resolveBasisValuation } = require('./helpers/basisValuation');
 
 /**
  * SEC-TOKEN-001: Secret para autenticación server-to-server con API finance-query
@@ -190,6 +192,27 @@ exports.processDividendPayments = onSchedule({
       return realizationRateByPair.get(key);
     };
 
+    // HU 2.8: si la base del saldo se lleva en otra moneda —el usuario cambió de
+    // referencia—, el dividendo se valora a la tasa del día en esa moneda
+    // (RN-2.8-D). Una sola valoración por cuenta y divisa: todos los dividendos
+    // de la corrida comparten fecha y parten del mismo saldo.
+    const basisValuationByAccountCurrency = new Map();
+
+    const resolveDividendBasisValuation = async ({ accountId, account, currency, amount, cost, referenceCurrency }) => {
+      const key = `${accountId}_${currency}`;
+      if (!basisValuationByAccountCurrency.has(key)) {
+        basisValuationByAccountCurrency.set(key, await resolveBasisValuation({
+          account,
+          currency,
+          amountDelta: amount,
+          costDelta: cost,
+          referenceCurrency,
+          date: formattedDate,
+        }));
+      }
+      return basisValuationByAccountCurrency.get(key);
+    };
+
     // Crear transacciones por cuenta y símbolo
     for (const key of Object.keys(portfolioSymbolAssets)) {
       const portfolioSymbolData = portfolioSymbolAssets[key];
@@ -238,6 +261,15 @@ exports.processDividendPayments = onSchedule({
         ? null
         : Number((netAmount * realizationRate).toFixed(2));
 
+      const basisValuation = await resolveDividendBasisValuation({
+        accountId: portfolioSymbolData.portfolioAccountId,
+        account: portfolioAccountData,
+        currency: dividendCurrency,
+        amount: netAmount,
+        cost: dividendCost,
+        referenceCurrency,
+      });
+
       // Crear una única transacción de dividendo para esta cuenta y símbolo
       const transactionRef = db.collection('transactions').doc();
       const transaction = {
@@ -265,7 +297,9 @@ exports.processDividendPayments = onSchedule({
         referenceCurrency: referenceCurrency,
         realizationRate: realizationRate,
         realizationRateSource: realizationRateSource,
-        acquisitionCost: dividendCost
+        acquisitionCost: dividendCost,
+        // HU 2.8: la tasa que usó la base, para que el historial la reproduzca
+        ...(basisValuation ? { basisValuation } : {})
       };
 
       batch.set(transactionRef, transaction);
@@ -315,6 +349,7 @@ exports.processDividendPayments = onSchedule({
           amountDelta: accumulated.amount,
           costDelta: accumulated.costKnown ? Number(accumulated.cost.toFixed(2)) : null,
           referenceCurrency,
+          basisValuation: basisValuationByAccountCurrency.get(`${accountId}_${currency}`) || null,
         }));
 
         console.log(`Acumulado dividendo neto de ${accumulated.amount.toFixed(4)} ${currency} para la cuenta ${accountId}. Nuevo balance: ${accountUpdate[`balances.${currency}`]}`);

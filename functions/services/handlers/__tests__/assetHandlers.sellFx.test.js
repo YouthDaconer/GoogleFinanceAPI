@@ -446,3 +446,48 @@ describe('sellPartialAssetsFIFO — una operación, varios lotes (AC-6, RN-2.4-A
     expect(result.assetMeritAmount).toBeNull();
   });
 });
+
+// ============================================================================
+// HU 2.8 — la base sobrevive al cambio de moneda de referencia
+// ============================================================================
+
+describe('venta con la base del saldo mantenida en pesos (HU 2.8, QA-02)', () => {
+  beforeEach(() => {
+    // 100 USD que costaron 330.000 COP; el usuario cambió su referencia a USD.
+    givenUser('USD');
+    givenAccount({ USD: 100 }, { USD: { cost: 330000, referenceCurrency: 'COP', status: 'known' } });
+    givenSellRate(4300);
+  });
+
+  it('sellAsset valora el producto al cierre del día en pesos y lo deja en el movimiento', async () => {
+    await assetHandlers.sellAsset(context, sellPayload());
+
+    expect(historicalRateService.getCrossRate).toHaveBeenCalledWith('USD', 'COP', '2026-08-28');
+    expect(writtenSale().basisValuation).toMatchObject({ referenceCurrency: 'COP', rate: 4300 });
+    // 330.000 + 1.200 × 4.300; la base sigue en pesos.
+    expect(accountUpdate()['balanceCostBasis.USD']).toMatchObject({
+      cost: 5490000, referenceCurrency: 'COP', status: 'known',
+    });
+  });
+
+  it('sellPartialAssetsFIFO deja la misma valoración en cada lote', async () => {
+    fifoLots = [
+      { ...metaLot(), id: 'lot-1', units: 2 },
+      { ...metaLot(), id: 'lot-2', units: 1 },
+    ];
+    store.assets = Object.fromEntries(fifoLots.map((lot) => [lot.id, lot]));
+
+    await assetHandlers.sellPartialAssetsFIFO(context, {
+      ticker: 'META', portfolioAccountId: 'account-123', unitsToSell: 3,
+      pricePerUnit: 600, totalCommission: 0, sellDate: '2026-08-28',
+    });
+
+    const lotes = mockBatch.set.mock.calls.map(([, doc]) => doc).filter((doc) => doc.type === 'sell');
+    expect(lotes).toHaveLength(2);
+    for (const lote of lotes) {
+      expect(lote.basisValuation).toMatchObject({ referenceCurrency: 'COP', rate: 4300 });
+    }
+    // 330.000 + 1.800 × 4.300
+    expect(accountUpdate()['balanceCostBasis.USD'].cost).toBe(8070000);
+  });
+});

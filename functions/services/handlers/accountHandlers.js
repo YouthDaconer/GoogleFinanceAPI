@@ -29,6 +29,8 @@ const {
   MIN_ADJUSTMENT_DELTA,
   ADJUSTMENT_REASONS,
 } = require('../helpers/balanceAdjustment');
+// HU 2.8: la base de un saldo sobrevive al cambio de moneda de referencia
+const { resolveBasisValuation } = require('../helpers/basisValuation');
 
 const db = getFirestore();
 
@@ -719,6 +721,19 @@ async function updatePortfolioAccountBalance(context, payload) {
       declaredRate: payload.exchangeRate,
     });
 
+    // HU 2.8: lo declarado entra tal cual; sólo se pide tasa si la base se lleva
+    // en otra moneda o hay que reubicarla (RN-2.8-C/D/E).
+    const basisValuation = await resolveBasisValuation({
+      account: accountData,
+      currency,
+      amountDelta: delta,
+      costDelta: delta > 0 && resolved.acquisitionRate !== null
+        ? Math.abs(delta) * resolved.acquisitionRate
+        : null,
+      referenceCurrency,
+      date: adjustmentDate,
+    });
+
     const { transactionData, balanceUpdate } = buildAdjustment({
       account: accountData,
       accountId,
@@ -732,6 +747,7 @@ async function updatePortfolioAccountBalance(context, payload) {
       acquisitionRate: resolved.acquisitionRate,
       acquisitionRateSource: resolved.acquisitionRateSource,
       dollarPriceToDate: resolved.dollarPriceToDate,
+      basisValuation,
     });
 
     const batch = db.batch();

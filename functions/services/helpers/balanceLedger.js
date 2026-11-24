@@ -383,6 +383,33 @@ function resolveCashImpact(transaction, currency) {
 }
 
 /**
+ * Tasa aplicada a un movimiento, expresada en la moneda que se proyecta.
+ *
+ * HU 2.8: un movimiento registrado con otra moneda de referencia trae su tasa en
+ * esa moneda (con dólares de referencia, un 1). Mostrarla junto a costos en pesos
+ * mezclaría monedas. Se enseña la tasa que la base usó en la moneda proyectada
+ * y, si no la hay, nada (RN-13).
+ *
+ * @param {Object} impact - Resultado de `resolveCashImpact`
+ * @param {string} movementReference - Referencia con la que se registró
+ * @param {Object|null} basisValuation - Valoración guardada en el movimiento
+ * @param {string} referenceCurrency - Moneda que se proyecta
+ * @returns {number|null}
+ */
+function appliedRateIn(impact, movementReference, basisValuation, referenceCurrency) {
+  if (movementReference === referenceCurrency) return impact.appliedRate;
+
+  if (basisValuation
+    && basisValuation.referenceCurrency === referenceCurrency
+    && typeof basisValuation.rate === 'number'
+    && basisValuation.rate > 0) {
+    return basisValuation.rate;
+  }
+
+  return null;
+}
+
+/**
  * Reconstruye el libro mayor de un saldo y lo compara con el saldo guardado.
  *
  * El recorrido va hacia adelante —de la apertura a hoy— porque el promedio
@@ -392,14 +419,34 @@ function resolveCashImpact(transaction, currency) {
  * Sin exposición cambiaria (la divisa del saldo es la de referencia) las tasas
  * salen en `null` y la interfaz no pinta esas dos columnas (RN-14, D15).
  *
+ * HU 2.8: cada movimiento se reproduce con la moneda de referencia que el
+ * usuario tenía **cuando lo registró** (`transaction.referenceCurrency`) y con la
+ * tasa que la base usó entonces (`transaction.basisValuation`). Es lo que hace que
+ * el historial llegue a la misma base que la escritura aunque el usuario haya
+ * cambiado de referencia por el camino, sin volver a pedir ninguna tasa (RN-3-B).
+ * Los movimientos anteriores a la HU 2.1 no traen la referencia: se toman en
+ * `legacyReferenceCurrency` o, a falta de ella, en la de la proyección, como
+ * siempre.
+ *
  * @param {Object} params
  * @param {Array<Object>} params.transactions - Transacciones de la cuenta, con `id`
  * @param {string} params.currency - Divisa del saldo a proyectar
  * @param {string} params.referenceCurrency - Moneda de referencia del usuario
  * @param {number} [params.balance=0] - Saldo guardado hoy, para el veredicto
+ * @param {string|null} [params.legacyReferenceCurrency=null] - Referencia de los
+ *   movimientos que no la registran
+ * @param {Function} [params.orderBy] - Clave de orden alternativa (el script de
+ *   corrección reproduce en orden de registro)
  * @returns {{rows: Array<Object>, reconciliation: Object, hasFxExposure: boolean}}
  */
-function projectBalanceLedger({ transactions, currency, referenceCurrency, balance = 0 }) {
+function projectBalanceLedger({
+  transactions,
+  currency,
+  referenceCurrency,
+  balance = 0,
+  legacyReferenceCurrency = null,
+  orderBy = sortKey,
+}) {
   const hasFxExposure = currency !== referenceCurrency;
 
   const movements = (transactions || [])
@@ -408,18 +455,24 @@ function projectBalanceLedger({ transactions, currency, referenceCurrency, balan
       return impact ? { transaction, impact } : null;
     })
     .filter(Boolean)
-    .sort((a, b) => (sortKey(a.transaction) < sortKey(b.transaction) ? -1 : 1));
+    .sort((a, b) => (orderBy(a.transaction) < orderBy(b.transaction) ? -1 : 1));
 
   let state = { balances: { [currency]: 0 }, balanceCostBasis: {} };
   const rows = [];
 
   for (const { transaction, impact } of movements) {
+    const movementReference = transaction.referenceCurrency
+      || legacyReferenceCurrency
+      || referenceCurrency;
+    const basisValuation = transaction.basisValuation || null;
+
     const update = buildBalanceUpdate({
       account: state,
       currency,
       amountDelta: impact.amount,
       costDelta: impact.amount > 0 ? impact.costDelta : null,
-      referenceCurrency,
+      referenceCurrency: movementReference,
+      basisValuation,
       // El replay tiene que reconstruir también qué parte del saldo se compró
       // de verdad, o la migración devolvería una base sin esa distinción y el
       // primer retiro volvería a realizar lo que no debe. Sólo la entrada de
@@ -441,7 +494,9 @@ function projectBalanceLedger({ transactions, currency, referenceCurrency, balan
       type: transaction.type,
       kind: impact.kind,
       amount: cleanDecimal(impact.amount),
-      appliedRate: hasFxExposure ? impact.appliedRate : null,
+      appliedRate: hasFxExposure
+        ? appliedRateIn(impact, movementReference, basisValuation, referenceCurrency)
+        : null,
       balanceAfter: cleanDecimal(balanceAfter),
       averageRateAfter: hasFxExposure
         ? deriveAverageRate(basis, balanceAfter, referenceCurrency)

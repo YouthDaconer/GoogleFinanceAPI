@@ -188,6 +188,8 @@ async function resolveDollarPriceToDate({ currency, referenceCurrency, date, acq
  * @param {string} [params.acquisitionRateSource] - Origen de esa tasa
  * @param {number} [params.dollarPriceToDate=1] - Referencia por 1 USD en la fecha
  * @param {boolean} [params.estimated=false] - La tasa la estimó la migración
+ * @param {Object|null} [params.basisValuation=null] - HU 2.8: tasa del día que pide
+ *   la base cuando se lleva en otra moneda (`resolveBasisValuation`)
  * @returns {{transactionData: Object, balanceUpdate: Object, newBalance: number,
  *   cost: number|null}}
  */
@@ -205,6 +207,7 @@ function buildAdjustment({
   acquisitionRateSource = ADJUSTMENT_RATE_SOURCES.UNAVAILABLE,
   dollarPriceToDate = 1,
   estimated = false,
+  basisValuation = null,
 }) {
   const signedDelta = cleanDecimal(delta);
   const isInflow = signedDelta > 0;
@@ -244,6 +247,9 @@ function buildAdjustment({
     // Marca la base que salió de una estimación de la migración, para que la
     // interfaz la rotule como tal allí donde se muestre (RN-12, AC-7).
     costBasisEstimated: estimated,
+    // HU 2.8: la tasa que se usó para la base, para que el historial la
+    // reproduzca sin volver a pedirla (RN-3-B). Ausente si no hizo falta.
+    ...(basisValuation ? { basisValuation } : {}),
     description: description || '',
     userId,
     createdAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -264,6 +270,7 @@ function buildAdjustment({
     amountDelta: signedDelta,
     costDelta: isInflow ? cost : null,
     referenceCurrency,
+    basisValuation,
   });
 
   return {

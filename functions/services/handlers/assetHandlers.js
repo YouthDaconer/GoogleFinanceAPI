@@ -44,7 +44,12 @@ const {
   deriveAverageRate,
   getUserReferenceCurrency,
 } = require('../helpers/balanceCostBasis');
+const { DateTime } = require('luxon');
 const historicalRateService = require('../historicalRateService');
+
+// HU 2.8: la base de un saldo sobrevive al cambio de moneda de referencia; lo que
+// nadie declaró en la moneda de la base se valora a la tasa de su día
+const { resolveBasisValuation, basisValuationFields } = require('../helpers/basisValuation');
 
 // HU 2.4: el dinero que nace dentro de la cuenta entra con la tasa de su propio
 // día, y el resultado realizado se descompone en mérito del activo y efecto divisa
@@ -887,8 +892,18 @@ async function updateAsset(context, payload) {
     /** Fragmentos de actualización acumulados por cuenta */
     const balanceUpdates = {};
 
-    const applyBalanceDelta = (accountId, balanceCurrency, amountDelta) => {
+    const applyBalanceDelta = async (accountId, balanceCurrency, amountDelta) => {
       if (!amountDelta) return;
+
+      // HU 2.8: el efectivo que vuelve a un saldo cuya base se lleva en otra
+      // moneda se valora a la tasa del día de la compra (RN-2.8-D).
+      const basisValuation = await resolveBasisValuation({
+        account: accountsById[accountId],
+        currency: balanceCurrency,
+        amountDelta,
+        referenceCurrency,
+        date: purchase?.date || DateTime.now().setZone('America/New_York').toISODate(),
+      });
 
       balanceUpdates[accountId] = {
         ...(balanceUpdates[accountId] || {}),
@@ -897,6 +912,7 @@ async function updateAsset(context, payload) {
           currency: balanceCurrency,
           amountDelta,
           referenceCurrency,
+          basisValuation,
         }),
       };
     };
@@ -909,12 +925,12 @@ async function updateAsset(context, payload) {
       // nuevo. El costo del efectivo que vuelve no se conoce (venía de un
       // activo, no de un ingreso), así que ese saldo pasa a indeterminado en
       // lugar de heredar un costo inventado.
-      applyBalanceDelta(cashBefore.accountId, cashBefore.currency, -cashBefore.amount);
+      await applyBalanceDelta(cashBefore.accountId, cashBefore.currency, -cashBefore.amount);
 
       const targetAccount = accountsById[cashAfter.accountId];
       validateSufficientFunds(targetAccount, cashAfter.currency, -cashAfter.amount);
 
-      applyBalanceDelta(cashAfter.accountId, cashAfter.currency, cashAfter.amount);
+      await applyBalanceDelta(cashAfter.accountId, cashAfter.currency, cashAfter.amount);
 
       console.log(`[assetHandlers][updateAsset] Saldo ajustado: ${cashBefore.accountId}/${cashBefore.currency} ${-cashBefore.amount}, ${cashAfter.accountId}/${cashAfter.currency} ${cashAfter.amount}`);
     } else {
@@ -935,7 +951,7 @@ async function updateAsset(context, payload) {
           }
         }
 
-        applyBalanceDelta(cashAfter.accountId, cashAfter.currency, cashDelta);
+        await applyBalanceDelta(cashAfter.accountId, cashAfter.currency, cashDelta);
       }
     }
 
@@ -1101,6 +1117,17 @@ async function sellAsset(context, payload) {
       ? null
       : cleanDecimal(totalRevenue * realizationRate, 2);
 
+    // HU 2.8: si la base del saldo se lleva en otra moneda, o hay que reubicarla,
+    // la tasa que nadie declaró sale del cierre del día (RN-2.8-D, RN-2.8-E).
+    const basisValuation = await resolveBasisValuation({
+      account,
+      currency: asset.currency,
+      amountDelta: totalRevenue,
+      costDelta: revenueCost,
+      referenceCurrency,
+      date: rateDate,
+    });
+
     const transactionRef = db.collection('transactions').doc();
     const transactionData = {
       assetId: data.assetId,
@@ -1136,6 +1163,7 @@ async function sellAsset(context, payload) {
         decomposition,
         acquisitionCost: revenueCost,
       }),
+      ...basisValuationFields(basisValuation),
     };
     batch.set(transactionRef, transactionData);
 
@@ -1161,6 +1189,7 @@ async function sellAsset(context, payload) {
       amountDelta: totalRevenue,
       costDelta: revenueCost,
       referenceCurrency,
+      basisValuation,
     }));
 
     await batch.commit();
@@ -1289,6 +1318,19 @@ async function sellPartialAssetsFIFO(context, payload) {
     const { realizationRate, realizationRateSource } =
       await resolveRealizationRate(currency, referenceCurrency, rateDate);
 
+    // HU 2.8: la valoración que pida la base también es una para toda la
+    // operación —mismo día, mismo par— y cada lote la lleva consigo, porque el
+    // libro mayor reproduce cada documento por separado (RN-2.8-D, RN-3-B).
+    const expectedRevenue = cleanDecimal(unitsToSell * pricePerUnit - totalCommission);
+    const basisValuation = await resolveBasisValuation({
+      account,
+      currency,
+      amountDelta: expectedRevenue,
+      costDelta: realizationRate === null ? null : expectedRevenue * realizationRate,
+      referenceCurrency,
+      date: rateDate,
+    });
+
     /** Suma de los méritos de cada lote — la única cifra de mérito de la operación */
     let totalAssetMerit = 0;
     // Basta un lote pagado con divisa que no se compró para que el componente
@@ -1388,6 +1430,7 @@ async function sellPartialAssetsFIFO(context, payload) {
           decomposition: lotDecomposition,
           acquisitionCost: lotRevenueCost,
         }),
+        ...basisValuationFields(basisValuation),
       });
 
       if (isFullSale) {
@@ -1433,6 +1476,7 @@ async function sellPartialAssetsFIFO(context, payload) {
       amountDelta: totalRevenue,
       costDelta: totalRevenueCost,
       referenceCurrency,
+      basisValuation,
     }));
 
     await batch.commit();
@@ -1638,6 +1682,23 @@ async function addCashTransaction(context, payload) {
       })
       : {};
 
+    const amountDelta = data.type === 'cash_income' ? amount : -amount;
+    const costDelta = (data.type === 'cash_income' && acquisitionRate !== null)
+      ? amount * acquisitionRate
+      : null;
+
+    // HU 2.8: lo declarado entra tal cual (RN-2.8-C). Sólo se pide tasa para lo
+    // que nadie declaró en la moneda de la base: un ingreso mientras la base se
+    // lleva en otra moneda, o el dinero que ya estaba al reubicarla (RN-2.8-D/E).
+    const basisValuation = await resolveBasisValuation({
+      account,
+      currency: data.currency,
+      amountDelta,
+      costDelta,
+      referenceCurrency,
+      date: rateDate,
+    });
+
     // 7. Ejecutar transacción atómica
     const batch = db.batch();
 
@@ -1664,6 +1725,7 @@ async function addCashTransaction(context, payload) {
       // HU 2.5: la diferencia en cambio que esta salida realiza. Vacío en un
       // ingreso y en cualquier movimiento sin exposición cambiaria (D11).
       ...outflowFxFields,
+      ...basisValuationFields(basisValuation),
       description: data.description || '',
       userId: auth.uid,
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -1671,10 +1733,6 @@ async function addCashTransaction(context, payload) {
     batch.set(transactionRef, transactionData);
 
     const accountRef = db.collection('portfolioAccounts').doc(data.portfolioAccountId);
-    const amountDelta = data.type === 'cash_income' ? amount : -amount;
-    const costDelta = (data.type === 'cash_income' && acquisitionRate !== null)
-      ? amount * acquisitionRate
-      : null;
 
     batch.update(accountRef, buildBalanceUpdate({
       account,
@@ -1682,6 +1740,7 @@ async function addCashTransaction(context, payload) {
       amountDelta,
       costDelta,
       referenceCurrency,
+      basisValuation,
     }));
 
     await batch.commit();
@@ -1898,6 +1957,18 @@ async function convertAccountCurrency(context, payload) {
       }
     }
 
+    // HU 2.8: sólo el lado que entra puede necesitar tasa —una salida reduce la
+    // base en proporción, sin tasa (RN-2.8-B)—, así que el documento lleva a lo
+    // sumo una valoración y es la de `toCurrency`.
+    const basisValuation = await resolveBasisValuation({
+      account,
+      currency: data.toCurrency,
+      amountDelta: toAmount,
+      costDelta: destinationCost,
+      referenceCurrency,
+      date: rateDate,
+    });
+
     // 6. Escritura atómica: un documento y un solo update de la cuenta
     const batch = db.batch();
 
@@ -1935,6 +2006,7 @@ async function convertAccountCurrency(context, payload) {
       realizedFxAvailability,
       realizedFxUnavailableReason,
       referenceCurrency,
+      ...basisValuationFields(basisValuation),
       description: data.description || '',
       userId: auth.uid,
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -1966,6 +2038,7 @@ async function convertAccountCurrency(context, payload) {
       convertedDelta: destinationCost !== null && Number.isFinite(destinationCost)
         ? { amount: toAmount, cost: destinationCost }
         : null,
+      basisValuation,
     });
 
     batch.update(accountRef, { ...outflowUpdate, ...inflowUpdate });
@@ -2066,7 +2139,7 @@ async function deleteAsset(context, payload) {
     // saldo. Sin esto el saldo se queda sin la compra y sin el dinero, y deja de
     // cuadrar con su historial para siempre (AC-2).
     const referenceCurrency = await getUserReferenceCurrency(auth.uid);
-    const reversal = buildCashReversalUpdate({
+    const reversal = await buildCashReversalUpdate({
       account,
       transactions: deletedTransactions,
       referenceCurrency,
@@ -2129,13 +2202,26 @@ async function deleteAsset(context, payload) {
  * base de costo del saldo queda como estaba antes de comprar en lugar de pasar
  * a indeterminada.
  *
+ * HU 2.8: ese `releasedCost` está en la moneda de referencia que el usuario
+ * tenía al comprar. Sólo se devuelve tal cual si sigue siendo la vigente; si no,
+ * mezclaría monedas (D3), y lo que vuelve se valora como cualquier entrada que
+ * nadie declaró en la moneda de la base: a la tasa del día de la compra que se
+ * deshace (RN-2.8-D).
+ *
  * @param {Object} params
  * @param {Object} params.account - Documento actual de la cuenta
  * @param {Array<Object>} params.transactions - Transacciones que se van a borrar
  * @param {string} params.referenceCurrency - Moneda de referencia del usuario
- * @returns {Object} Fragmento de update, vacio si ninguna movia caja
+ * @param {Function} [params.resolveValuation] - Resuelve la tasa que pida la base
+ *   (inyectable para test)
+ * @returns {Promise<Object>} Fragmento de update, vacio si ninguna movia caja
  */
-function buildCashReversalUpdate({ account, transactions, referenceCurrency }) {
+async function buildCashReversalUpdate({
+  account,
+  transactions,
+  referenceCurrency,
+  resolveValuation = resolveBasisValuation,
+}) {
   const state = {
     balances: { ...(account?.balances || {}) },
     balanceCostBasis: { ...(account?.balanceCostBasis || {}) },
@@ -2152,7 +2238,20 @@ function buildCashReversalUpdate({ account, transactions, referenceCurrency }) {
     // Al reves: lo que salio vuelve y lo que entro se va.
     const reversedDelta = -impact.amount;
     const releasedCost = Number(transaction.releasedCost);
-    const costDelta = reversedDelta > 0 && Number.isFinite(releasedCost) ? releasedCost : null;
+    const sameReference = !transaction.referenceCurrency
+      || transaction.referenceCurrency === referenceCurrency;
+    const costDelta = reversedDelta > 0 && Number.isFinite(releasedCost) && sameReference
+      ? releasedCost
+      : null;
+
+    const basisValuation = await resolveValuation({
+      account: state,
+      currency,
+      amountDelta: reversedDelta,
+      costDelta,
+      referenceCurrency,
+      date: transaction.date,
+    });
 
     const fragment = buildBalanceUpdate({
       account: state,
@@ -2160,6 +2259,7 @@ function buildCashReversalUpdate({ account, transactions, referenceCurrency }) {
       amountDelta: reversedDelta,
       costDelta,
       referenceCurrency,
+      basisValuation,
     });
 
     Object.assign(update, fragment);
@@ -2232,7 +2332,7 @@ async function deleteAssets(context, payload) {
     // HU 2.6 (D12): el efectivo de las transacciones borradas vuelve al saldo,
     // igual que en el borrado de un activo suelto (AC-2).
     const referenceCurrency = await getUserReferenceCurrency(auth.uid);
-    const reversal = buildCashReversalUpdate({
+    const reversal = await buildCashReversalUpdate({
       account,
       transactions: deletedTransactions,
       referenceCurrency,
@@ -2553,13 +2653,28 @@ async function registerBalanceAdjustment(context, payload) {
         );
       }
 
+      // El asiento describe lo que le falta al HISTORIAL, así que el saldo sobre
+      // el que se construye es el del historial: el fragmento que sale de aquí
+      // deja `balances` exactamente en la cifra que escribió el usuario, cerrando
+      // la deriva en la misma operación (igual que hace la migración al escribir
+      // una apertura).
+      const ledgerAccount = { ...account, balances: { ...account.balances, [data.currency]: ledgerBalance } };
+
+      // HU 2.8: lo declarado entra tal cual; sólo se pide tasa si la base se
+      // lleva en otra moneda o hay que reubicarla (RN-2.8-C/D/E).
+      const basisValuation = await resolveBasisValuation({
+        account: ledgerAccount,
+        currency: data.currency,
+        amountDelta: delta,
+        costDelta: delta > 0 && resolved.acquisitionRate !== null
+          ? Math.abs(delta) * resolved.acquisitionRate
+          : null,
+        referenceCurrency,
+        date: rateDate,
+      });
+
       const adjustment = buildAdjustment({
-        // El asiento describe lo que le falta al HISTORIAL, así que el saldo
-        // sobre el que se construye es el del historial: el fragmento que sale
-        // de aquí deja `balances` exactamente en la cifra que escribió el
-        // usuario, cerrando la deriva en la misma operación (igual que hace la
-        // migración al escribir una apertura).
-        account: { ...account, balances: { ...account.balances, [data.currency]: ledgerBalance } },
+        account: ledgerAccount,
         accountId: data.portfolioAccountId,
         userId: auth.uid,
         currency: data.currency,
@@ -2571,6 +2686,7 @@ async function registerBalanceAdjustment(context, payload) {
         acquisitionRate: resolved.acquisitionRate,
         acquisitionRateSource: resolved.acquisitionRateSource,
         dollarPriceToDate: resolved.dollarPriceToDate,
+        basisValuation,
       });
 
       const transactionRef = db.collection('transactions').doc();

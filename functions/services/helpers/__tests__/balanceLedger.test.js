@@ -381,3 +381,66 @@ describe('movesCash', () => {
     expect(movesCash(null)).toBe(false);
   });
 });
+
+// ============================================================================
+// HU 2.8 — el historial reproduce la base aunque se cambie de referencia
+// ============================================================================
+
+describe('projectBalanceLedger — cambios de moneda de referencia (HU 2.8, QA-11)', () => {
+  /**
+   * Un usuario con referencia COP ingresa 200 USD a 3.300, cambia a USD, compra
+   * por 100 USD, vende y le entran 100 USD (el 17-nov, cierre 3.500), y vuelve
+   * a COP. La escritura llegó a 680.000 COP sobre 200 USD (3.400).
+   */
+  const historia = [
+    {
+      id: 'tx-ingreso', type: 'cash_income', amount: 200, price: 1, currency: 'USD',
+      date: '2026-11-10T15:00:00.000Z', acquisitionRate: 3300, acquisitionCost: 660000,
+      referenceCurrency: 'COP',
+    },
+    {
+      id: 'tx-compra', type: 'buy', amount: 1, price: 100, commission: 0, currency: 'USD',
+      date: '2026-11-12T15:00:00.000Z', acquisitionRate: 1, referenceCurrency: 'USD',
+    },
+    {
+      id: 'tx-venta', type: 'sell', amount: 1, price: 100, commission: 0, currency: 'USD',
+      date: '2026-11-17T15:00:00.000Z', realizationRate: 1, acquisitionCost: 100,
+      referenceCurrency: 'USD',
+      basisValuation: { referenceCurrency: 'COP', rate: 3500, rateDate: '2026-11-17', source: 'market-date' },
+    },
+  ];
+
+  it('la última fila tiene la misma tasa promedio que la tarjeta (3.400)', () => {
+    const { rows, replayedCostBasis } = projectBalanceLedger({
+      transactions: historia, currency: 'USD', referenceCurrency: 'COP', balance: 200,
+    });
+
+    expect(replayedCostBasis).toMatchObject({ cost: 680000, referenceCurrency: 'COP', status: 'known' });
+    expect(rows[0].averageRateAfter).toBe(3400);
+  });
+
+  it('ninguna fila mezcla un TC de 1 en dólares con costos en pesos', () => {
+    const { rows } = projectBalanceLedger({
+      transactions: historia, currency: 'USD', referenceCurrency: 'COP', balance: 200,
+    });
+    const byId = Object.fromEntries(rows.map((r) => [r.id, r]));
+
+    expect(byId['tx-ingreso'].appliedRate).toBe(3300);
+    // La compra se registró con referencia USD y no necesitó tasa en pesos.
+    expect(byId['tx-compra'].appliedRate).toBeNull();
+    // La venta muestra la tasa con la que la base la valoró.
+    expect(byId['tx-venta'].appliedRate).toBe(3500);
+    // Y mientras tanto la base en pesos siguió viva: tras la compra, 3.300.
+    expect(byId['tx-compra'].averageRateAfter).toBe(3300);
+  });
+
+  it('un movimiento sin referencia registrada se toma en la declarada como legado', () => {
+    const legado = { ...historia[1], referenceCurrency: undefined };
+    const { replayedCostBasis } = projectBalanceLedger({
+      transactions: [historia[0], legado], currency: 'USD', referenceCurrency: 'COP', balance: 100,
+      legacyReferenceCurrency: 'USD',
+    });
+
+    expect(replayedCostBasis).toMatchObject({ cost: 330000, referenceCurrency: 'COP' });
+  });
+});

@@ -345,3 +345,70 @@ describe('addCashTransaction — base de costo y tipo de cambio (HU 2.1)', () =>
     });
   });
 });
+
+// ============================================================================
+// HU 2.8 — la base sobrevive al cambio de moneda de referencia
+// ============================================================================
+
+describe('addCashTransaction — base mantenida en otra moneda de referencia (HU 2.8)', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockBatch.commit.mockResolvedValue(undefined);
+
+    // 100 USD que costaron 330.000 COP; el usuario cambió su referencia a USD.
+    store.portfolioAccounts = {
+      'account-123': {
+        userId: 'user-123',
+        balances: { USD: 100 },
+        balanceCostBasis: { USD: { cost: 330000, referenceCurrency: 'COP', status: 'known' } },
+      },
+    };
+    store.userData = { 'user-123': { defaultCurrency: 'USD' } };
+  });
+
+  it('un ingreso en USD se valora al cierre del día en pesos y queda en el movimiento (QA-02, RN-2.8-D)', async () => {
+    historicalRateService.getCrossRate.mockImplementation(async (from, to) => (
+      from === 'USD' && to === 'COP' ? { rate: 3500, rateDate: '2026-11-17', source: 'yahoo' } : null
+    ));
+
+    await assetHandlers.addCashTransaction(context, { ...basePayload, amount: 100, date: '2026-11-17' });
+
+    expect(writtenTransaction().basisValuation).toEqual({
+      referenceCurrency: 'COP', rate: 3500, rateDate: '2026-11-17', source: 'market-date',
+    });
+    expect(lastAccountUpdate()['balanceCostBasis.USD']).toMatchObject({
+      cost: 680000, referenceCurrency: 'COP', status: 'known',
+    });
+    expect(lastAccountUpdate()['balances.USD']).toBe(200);
+  });
+
+  it('sin tasa del día el ingreso se registra y la base se declara desconocida (QA-05, RN-2.8-F)', async () => {
+    historicalRateService.getCrossRate.mockResolvedValue(null);
+
+    await assetHandlers.addCashTransaction(context, { ...basePayload, amount: 50, date: '2026-11-19' });
+
+    expect(mockBatch.commit).toHaveBeenCalled();
+    expect(lastAccountUpdate()['balances.USD']).toBe(150);
+    expect(lastAccountUpdate()['balanceCostBasis.USD']).toMatchObject({ cost: null, status: 'unknown' });
+  });
+
+  it('un retiro baja la base en pesos en proporción, sin pedir tasa (QA-01, RN-2.8-B)', async () => {
+    await assetHandlers.addCashTransaction(context, {
+      ...basePayload, type: 'cash_expense', amount: 50, date: '2026-11-17',
+    });
+
+    expect(writtenTransaction().basisValuation).toBeUndefined();
+    expect(lastAccountUpdate()['balanceCostBasis.USD']).toMatchObject({ cost: 165000, referenceCurrency: 'COP' });
+  });
+
+  it('quien nunca cambió de referencia escribe el mismo documento de siempre (QA-09, RN-2.8-G)', async () => {
+    store.portfolioAccounts['account-123'] = { userId: 'user-123', balances: { USD: 0 } };
+    store.userData = { 'user-123': { defaultCurrency: 'COP' } };
+    historicalRateService.getCrossRate.mockResolvedValue({ rate: 4000, rateDate: '2026-03-12', source: 'cache' });
+
+    await assetHandlers.addCashTransaction(context, basePayload);
+
+    expect(writtenTransaction()).not.toHaveProperty('basisValuation');
+    expect(lastAccountUpdate()['balanceCostBasis.USD'].cost).toBe(4000000);
+  });
+});
