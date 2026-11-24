@@ -493,11 +493,16 @@ async function serieDeUnAno(symbol, fetchers) {
  * HU 5.7.1: cada activo trae además su `card`, la ficha de cuatro pilares con
  * las señales del criterio de decisión (`copilotAssetCardService.construirFicha`).
  *
+ * HU 5.7.3: y su `serie` de 1 año, de la que sale el cierre del día en que se
+ * emitió una recomendación anterior sin precio guardado (RN-5.7-L). No viaja
+ * al prompt: la lee el seguimiento.
+ *
  * @param {object[]} holdings - Posiciones con `symbol`, `asset_type` y `weight`.
  * @param {{language: string}} opciones
  * @param {object} [fetchers]
  * @param {Date} [now]
- * @returns {Promise<Map<string, {findings: object[], cubierto: boolean, card: object}>>}
+ * @returns {Promise<Map<string, {findings: object[], cubierto: boolean, card: object,
+ *   serie: object|null}>>}
  */
 async function obtenerDatosDePlataforma(
   holdings,
@@ -558,8 +563,37 @@ async function obtenerDatosDePlataforma(
       holding, quote, analysis, income, anual, serie, language, now,
     });
 
-    return [symbol, { findings, cubierto, card }];
+    return [symbol, {
+      findings, cubierto, card, serie,
+    }];
   });
+
+  return new Map(resultados);
+}
+
+/**
+ * HU 5.7.3 — La serie de 1 año de los activos que no tienen ficha.
+ *
+ * Son los de una recomendación anterior que hoy no se investiga: un activo que
+ * el usuario ya vendió o uno nuevo que nunca compró. Sin su serie no hay
+ * precio de emisión ni precio de hoy que mostrar (RN-5.7-L). Va en la misma
+ * tanda que la ficha, así que no sube la concurrencia.
+ *
+ * Nunca lanza: un historial caído deja ese activo sin serie, y el seguimiento
+ * dice "precio de emisión no disponible" (RN-5-H).
+ *
+ * @param {string[]} simbolos
+ * @param {object} [fetchers]
+ * @returns {Promise<Map<string, object|null>>}
+ */
+async function seriesDeActivos(simbolos, fetchers = createFundamentalsFetchers()) {
+  const unicos = [...new Set((simbolos || []).filter(Boolean))];
+  if (unicos.length === 0) return new Map();
+
+  const resultados = await enTandas(
+    unicos.map((symbol) => ({ symbol })),
+    async ({ symbol }) => [symbol, await serieDeUnAno(symbol, fetchers)],
+  );
 
   return new Map(resultados);
 }
@@ -582,4 +616,5 @@ module.exports = {
   hallazgosDeTitulares,
   createFundamentalsFetchers,
   obtenerDatosDePlataforma,
+  seriesDeActivos,
 };

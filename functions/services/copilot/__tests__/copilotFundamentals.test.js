@@ -622,3 +622,50 @@ describe('HU 5.7.1 — el historial no sube la concurrencia (medida el 14/10/202
     expect(fetchers.fetchHistorical).toHaveBeenCalledTimes(7);
   });
 });
+
+// ============================================================================
+// HU 5.7.3 — La serie queda para el seguimiento (RN-5.7-L)
+// ============================================================================
+
+describe('HU 5.7.3 — la serie de 1 año queda disponible para el seguimiento', () => {
+  it('cada activo trae su serie, la misma con que se armó la ficha', async () => {
+    const serie = crearSerie(145.98);
+    const fetchers = conHistorial({ fetchHistorical: jest.fn().mockResolvedValue(serie) });
+
+    const datos = (await fundamentals.obtenerDatosDePlataforma(
+      [crearHolding()], { language: 'es' }, fetchers, HOY,
+    )).get('MSFT');
+
+    expect(datos.serie).toBe(serie);
+    expect(datos.card.price).toBe(145.98);
+  });
+
+  it('seriesDeActivos pide una sola vez cada símbolo sin ficha', async () => {
+    const fetchers = { fetchHistorical: jest.fn().mockResolvedValue(crearSerie()) };
+
+    const series = await fundamentals.seriesDeActivos(['INTC', 'TLT', 'INTC', null], fetchers);
+
+    expect(fetchers.fetchHistorical).toHaveBeenCalledTimes(2);
+    expect([...series.keys()]).toEqual(['INTC', 'TLT']);
+  });
+
+  it('un historial caído deja ese activo sin serie, sin lanzar (RN-5-H)', async () => {
+    const fetchers = {
+      fetchHistorical: jest.fn()
+        .mockRejectedValueOnce(new Error('API call failed after 3 attempts'))
+        .mockResolvedValueOnce(crearSerie()),
+    };
+
+    const series = await fundamentals.seriesDeActivos(['INTC', 'TLT'], fetchers);
+
+    expect(series.get('INTC')).toBeNull();
+    expect(series.get('TLT')).toEqual(crearSerie());
+  });
+
+  it('sin símbolos no pide nada', async () => {
+    const fetchers = { fetchHistorical: jest.fn() };
+
+    expect((await fundamentals.seriesDeActivos([], fetchers)).size).toBe(0);
+    expect(fetchers.fetchHistorical).not.toHaveBeenCalled();
+  });
+});

@@ -177,7 +177,9 @@ describe('normalizarSeguimiento — HU 5.4, los estados de la sección 2', () =>
     });
 
     expect(salida.recommendations).toEqual([
-      { statement: 'Reducir NVDA al 8 %', asset: 'NVDA', state: 'ajustada' },
+      {
+        id: null, statement: 'Reducir NVDA al 8 %', asset: 'NVDA', state: 'ajustada',
+      },
     ]);
     expect(salida.theses[0].state).toBe('invalidada');
   });
@@ -372,7 +374,17 @@ describe('HU 5.7.1 — la ficha llega con la fuente de la plataforma (QA-01, QA-
   it('la ficha viaja entera, con el número de su fuente', async () => {
     const { context } = await composer.construirContexto(entrada());
 
-    expect(context.assets[0].card).toEqual({ ...FICHA, source: 1 });
+    // HU 5.7.3: las señales llegan con las acciones que permiten.
+    expect(context.assets[0].card).toEqual({
+      ...FICHA,
+      source: 1,
+      signals: {
+        ...FICHA.signals,
+        level1Eligible: false,
+        allowedActions: ['mantener', 'reducir'],
+        holdMaxConviction: null,
+      },
+    });
   });
 
   it('sin ficha, el activo lleva card: null y no añade fuente', async () => {
@@ -474,5 +486,186 @@ describe('limpiarMarcasDelCuerpo — la marca de procedencia va solo en Fuentes 
   it('sin sección de fuentes, limpia todo el texto; sin texto, no rompe', () => {
     expect(composer.limpiarMarcasDelCuerpo('Algo [1 — procedencia no verificada]')).toBe('Algo [1]');
     expect(composer.limpiarMarcasDelCuerpo(undefined)).toBeUndefined();
+  });
+});
+
+// ============================================================================
+// HU 5.7.3 — Decidir → corregir → redactar
+// ============================================================================
+
+describe('HU 5.7.3 — decidir: el modelo decide en JSON antes de redactar', () => {
+  const DECISION = {
+    recommendations: [{
+      statement: 'Vender ECOPETROL.CL', asset: 'ECOPETROL.CL', type: 'accion_concreta', conviction: 'alta',
+      targetPct: null, priceZone: null, horizon: null, isNewAsset: false,
+      action: 'vender', pillar: 'noticias', level: 1, tranches: [],
+    }],
+    theses: [{ statement: 'Ecopetrol depende del precio del crudo', asset: 'ECOPETROL.CL' }],
+    followUp: { recommendations: [{ id: 'R1', state: 'vigente' }], theses: [{ id: 'T1', state: 'sin_cambio' }] },
+  };
+
+  it('normaliza la decisión con la misma forma que la extracción, y conserva los ids', async () => {
+    engineClient.redactar.mockResolvedValueOnce({ text: JSON.stringify(DECISION), tokensUsed: 900 });
+
+    const decision = await composer.decidir({ assets: [] }, ENTORNO);
+
+    expect(engineClient.redactar.mock.calls[0][2]).toEqual({ task: 'decide', language: 'es', context: { assets: [] } });
+    expect(decision.recommendations[0]).toMatchObject({ asset: 'ECOPETROL.CL', action: 'vender', level: 1 });
+    expect(decision.followUp.recommendations).toEqual([{
+      id: 'R1', statement: '', asset: null, state: 'vigente',
+    }]);
+    expect(decision.tokensUsed).toBe(900);
+  });
+
+  it('sin JSON con recomendaciones devuelve null, y si el motor falla también', async () => {
+    engineClient.redactar.mockResolvedValueOnce({ text: 'no es json', tokensUsed: 10 });
+    expect(await composer.decidir({}, ENTORNO)).toBeNull();
+
+    engineClient.redactar.mockResolvedValueOnce({ text: '{"theses": []}', tokensUsed: 10 });
+    expect(await composer.decidir({}, ENTORNO)).toBeNull();
+
+    engineClient.redactar.mockRejectedValueOnce(new Error('502'));
+    expect(await composer.decidir({}, ENTORNO)).toBeNull();
+  });
+
+  describe('redactarInforme con decisión', () => {
+    const entrada = () => ({
+      investigaciones: [crearInvestigacion()],
+      macro: null,
+      resto: null,
+      excluidos: [],
+      portafolio: { currency: 'USD', totalAssets: 7 },
+      comparacion: { state: 'compared', recommendations: [{ id: 'R1', asset: 'MSFT' }], theses: [] },
+    });
+
+    const MARKDOWN = '## Resumen ejecutivo\n\n- Una.\n\n## Recomendaciones\n\nTexto.';
+
+    beforeEach(() => {
+      engineClient.redactar.mockImplementation(async (_u, _s, peticion) => (peticion.task === 'decide'
+        ? { text: JSON.stringify(DECISION), tokensUsed: 900 }
+        : { text: MARKDOWN, tokensUsed: 2000, modelId: 'gemini' }));
+    });
+
+    it('decide, deja corregir al llamador y redacta con lo corregido; no extrae', async () => {
+      const corregidas = [{ statement: 'Reducir ECOPETROL.CL del 2,1 % al 1,1 % del portafolio', action: 'reducir' }];
+      const alDecidir = jest.fn(() => ({
+        recommendations: corregidas,
+        theses: DECISION.theses,
+        comparison: { state: 'compared', recommendations: [{ id: 'R1', state: 'no_vigente' }] },
+        followUp: { recommendations: [{ id: 'R1', state: 'no_vigente' }], theses: [] },
+        corrections: [{ rule: 'RN-5.7-T' }],
+      }));
+
+      const informe = await composer.redactarInforme(entrada(), ENTORNO, { alDecidir });
+
+      const tareas = engineClient.redactar.mock.calls.map((c) => c[2].task || 'compose');
+      expect(tareas).toEqual(['decide', 'compose']);
+
+      const contextoDeRedaccion = engineClient.redactar.mock.calls[1][2].context;
+      expect(contextoDeRedaccion.decisions).toEqual({ recommendations: corregidas, theses: DECISION.theses });
+      expect(contextoDeRedaccion.comparison.recommendations[0].state).toBe('no_vigente');
+
+      expect(alDecidir.mock.calls[0][0].recommendations[0].action).toBe('vender');
+      expect(informe).toMatchObject({
+        recommendations: corregidas,
+        theses: DECISION.theses,
+        corrections: [{ rule: 'RN-5.7-T' }],
+        decisionPath: composer.RUTA_DE_DECISION.DECIDIDA,
+        tokensUsed: 2900,
+      });
+    });
+
+    it('QA-14: las tesis guardadas salen de la decisión, no de la prosa', async () => {
+      const informe = await composer.redactarInforme(entrada(), ENTORNO);
+
+      expect(informe.theses).toEqual(DECISION.theses);
+    });
+
+    it('lo que se cierra antes de decidir llega cerrado a la decisión (RN-5.7-P)', async () => {
+      const antesDeDecidir = (context) => ({
+        ...context,
+        comparison: {
+          ...context.comparison,
+          recommendations: [{ id: 'R1', asset: 'MSFT', closedState: 'no_vigente', closedReason: 'criterio' }],
+        },
+      });
+
+      await composer.redactarInforme(entrada(), ENTORNO, { antesDeDecidir });
+
+      expect(engineClient.redactar.mock.calls[0][2].context.comparison.recommendations[0].closedReason)
+        .toBe('criterio');
+    });
+
+    it('sin decisión legible: redacta como antes, extrae y deja corregir lo extraído (ruta degradada)', async () => {
+      engineClient.redactar.mockImplementation(async (_u, _s, peticion) => {
+        if (peticion.task === 'decide') return { text: 'no es json', tokensUsed: 50 };
+        if (peticion.task === 'extract') return { text: JSON.stringify(DECISION), tokensUsed: 300 };
+        return { text: MARKDOWN, tokensUsed: 2000, modelId: 'gemini' };
+      });
+      const alDecidir = jest.fn((decision) => ({
+        recommendations: decision.recommendations,
+        theses: decision.theses,
+        comparison: null,
+        followUp: { recommendations: [], theses: [] },
+        corrections: [],
+      }));
+
+      const informe = await composer.redactarInforme(entrada(), ENTORNO, { alDecidir });
+
+      const tareas = engineClient.redactar.mock.calls.map((c) => c[2].task || 'compose');
+      expect(tareas).toEqual(['decide', 'compose', 'extract']);
+      expect(engineClient.redactar.mock.calls[1][2].context.decisions).toBeUndefined();
+      expect(alDecidir).toHaveBeenCalledTimes(1);
+      expect(informe.decisionPath).toBe(composer.RUTA_DE_DECISION.DEGRADADA);
+      expect(informe.recommendations[0].asset).toBe('ECOPETROL.CL');
+    });
+  });
+});
+
+describe('HU 5.7.3 — el Nivel 1 solo con un hecho de tesis verificado (RN-5.7-T)', () => {
+  const FICHA = {
+    kind: 'stock',
+    asOf: '2026-11-19',
+    items: [],
+    missing: [],
+    signals: {
+      weightPct: 4, overweight: false, roomToThresholdPct: 6, maxTranchePct: 2, deterioration: [], extremeValuation: null,
+    },
+  };
+
+  const conHecho = (impact) => ({
+    investigaciones: [crearInvestigacion({
+      ticker: 'CRM',
+      card: FICHA,
+      findings: [{ ...crearInvestigacion().findings[0], impact }],
+    })],
+    macro: null,
+    resto: null,
+    excluidos: [],
+    portafolio: {},
+  });
+
+  it('un hecho que toca la tesis con fuente verificada permite vender', async () => {
+    const { context } = await composer.construirContexto(conHecho('tesis'));
+
+    expect(context.assets[0].card.signals.level1Eligible).toBe(true);
+    expect(context.assets[0].card.signals.allowedActions).toEqual(expect.arrayContaining(['reducir', 'vender']));
+  });
+
+  it('el mismo hecho con fuente no verificada no lo permite', async () => {
+    sources.construirListaDeFuentes.mockResolvedValue([
+      { n: 1, title: 'Reuters', url: 'https://reuters.com/x', date: '2026-10-01', verificada: false },
+    ]);
+
+    const { context } = await composer.construirContexto(conHecho('tesis'));
+
+    expect(context.assets[0].card.signals.level1Eligible).toBe(false);
+    expect(context.assets[0].card.signals.allowedActions).not.toContain('vender');
+  });
+
+  it('un hecho que es ruido tampoco', async () => {
+    const { context } = await composer.construirContexto(conHecho('ruido'));
+
+    expect(context.assets[0].card.signals.level1Eligible).toBe(false);
   });
 });

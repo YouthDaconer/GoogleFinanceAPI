@@ -10,8 +10,15 @@
  * historial tiene que mostrarlo (Escenario 14) y hoy recorta los primeros 150
  * caracteres del markdown.
  *
+ * HU 5.7.3: antes de redactar, el modelo **decide** (una llamada que devuelve
+ * JSON), el código corrige esa decisión y calcula los estados del seguimiento,
+ * y solo entonces se redacta, con todo ya decidido. Así el informe y lo que se
+ * guarda coinciden por construcción, y lo que se puede comprobar con datos no
+ * depende de que el modelo lo obedezca (RN-5.7-P a RN-5.7-T).
+ *
  * @module services/copilot/copilotComposer
  * @see platform-docs/stories/5.3-analista-investiga-recomienda/refinamiento.md (T12)
+ * @see platform-docs/stories/5.7.3-seguimiento-con-precio-y-criterio/refinamiento.md (T6)
  */
 
 const { DateTime } = require('luxon');
@@ -20,6 +27,7 @@ const sources = require('./copilotSources');
 const { RESEARCH_OUTCOME, parsearRespuesta } = require('./copilotFindings');
 const { FUENTE_PLATAFORMA } = require('./copilotFundamentals');
 const { idioma } = require('./copilotAssetCardService');
+const { accionesPermitidas } = require('./copilotDecisionGuard');
 
 /**
  * Encabezados con los que arranca el resumen ejecutivo, en los dos idiomas. Se
@@ -35,6 +43,17 @@ const ESTADOS_DE_TESIS = ['confirmada', 'invalidada', 'sin_cambio'];
 
 /** Lo que se devuelve cuando no hay seccion 2 que leer. */
 const SEGUIMIENTO_VACIO = { recommendations: [], theses: [] };
+
+/** HU 5.7.3 — Por qué camino se llegó a las recomendaciones guardadas. */
+const RUTA_DE_DECISION = {
+  /** El modelo decidió, el código corrigió y el informe se redactó con eso. */
+  DECIDIDA: 'decidida',
+  /**
+   * La decisión no llegó legible: se redactó como antes de la 5.7.3 y se
+   * corrigió lo extraído. El informe puede no reflejar las correcciones.
+   */
+  DEGRADADA: 'degradada',
+};
 
 /** HU 5.7.1 (RN-5.7-K) — El pilar que decide una recomendación. */
 const PILARES = ['fundamentales', 'valoracion', 'tecnico', 'noticias'];
@@ -167,6 +186,24 @@ async function construirContexto({
 
   const fuentes = await sources.construirListaDeFuentes(crudas, respaldados);
   const indice = await sources.construirIndice(crudas, fuentes);
+  const verificadaPorNumero = new Map(fuentes.map((f) => [f.n, f.verificada === true]));
+
+  // HU 5.7.3 (RN-5.7-T): el Nivel 1 es un hecho que toca la tesis con una
+  // fuente que el sistema pudo comprobar. No está en la ficha porque depende de
+  // lo investigado; se decide aquí, con la lista de fuentes ya verificada.
+  const nivelUnoPosible = (inv) => inv.findings.some((f) => f.impact === 'tesis'
+    && verificadaPorNumero.get(indice.get(f.sourceUrl)) === true);
+
+  const conAcciones = (card, level1Eligible) => {
+    if (!card.signals) return card.signals;
+    const permitidas = accionesPermitidas(card.signals, { clase: card.kind, level1Eligible });
+    return {
+      ...card.signals,
+      level1Eligible,
+      allowedActions: permitidas.allowed,
+      holdMaxConviction: permitidas.holdMaxConviction,
+    };
+  };
 
   const conCita = (inv) => ({
     ticker: inv.ticker,
@@ -191,7 +228,14 @@ async function construirContexto({
       impact: f.impact || null,
     })),
     // HU 5.7.1: la ficha de cuatro pilares, con las señales ya evaluadas.
-    card: inv.card ? { ...inv.card, source: indice.get(FUENTE_PLATAFORMA.url) || null } : null,
+    // HU 5.7.3: y las acciones que permite, ya con el Nivel 1.
+    card: inv.card
+      ? {
+        ...inv.card,
+        source: indice.get(FUENTE_PLATAFORMA.url) || null,
+        signals: conAcciones(inv.card, nivelUnoPosible(inv)),
+      }
+      : null,
     notes: inv.notes,
     conflicts: inv.conflicts.map((c) => ({
       about: c.about,
@@ -272,6 +316,55 @@ async function extraerEstructura(markdown, { userId, secret, language }) {
     console.error('[copilotComposer] No se pudo extraer la estructura:', error.message);
     return vacio;
   }
+}
+
+/**
+ * HU 5.7.3 — Las decisiones de hoy, antes de redactar.
+ *
+ * Recibe el mismo contexto que la redacción y devuelve JSON: las
+ * recomendaciones de hoy con sus parámetros, sus tesis y el estado que el
+ * modelo da a las anteriores (por `id`). Sustituye a la extracción: lo que se
+ * guarda ya no se lee de la prosa.
+ *
+ * **Nunca lanza.** Si el motor falla o no devuelve un JSON con recomendaciones,
+ * devuelve `null` y el informe sigue por la ruta degradada. Si el motor está
+ * caído de verdad, la redacción lo dirá al fallar, como hasta ahora (RN-5-C).
+ *
+ * @param {object} context - El de `construirContexto`.
+ * @param {object} entorno - `{ userId, secret, language }`.
+ * @returns {Promise<{recommendations: object[], theses: object[], followUp: object,
+ *   tokensUsed: number}|null>}
+ */
+async function decidir(context, { userId, secret, language }) {
+  try {
+    const salida = await engineClient.redactar(userId, secret, { task: 'decide', language, context });
+    const decision = normalizarDecision(parsearRespuesta(salida.text));
+    if (!decision) {
+      console.error('[copilotComposer] Decisión no legible: ruta degradada');
+      return null;
+    }
+    return { ...decision, tokensUsed: salida.tokensUsed };
+  } catch (error) {
+    console.error('[copilotComposer] No se pudo decidir, ruta degradada:', error.message);
+    return null;
+  }
+}
+
+/**
+ * La decisión del modelo con la forma que se compara y se guarda.
+ *
+ * @param {*} datos - El JSON tal como llegó.
+ * @returns {{recommendations: object[], theses: object[], followUp: object}|null}
+ *   `null` si no trae una lista de recomendaciones: sin ella no hay decisión.
+ */
+function normalizarDecision(datos) {
+  if (!datos || typeof datos !== 'object' || !Array.isArray(datos.recommendations)) return null;
+
+  return {
+    recommendations: normalizarRecomendaciones(datos.recommendations),
+    theses: normalizarTesis(datos.theses),
+    followUp: normalizarSeguimiento(datos.followUp),
+  };
 }
 
 /**
@@ -366,9 +459,13 @@ function normalizarRecomendaciones(crudas) {
  * como vigente: un recuento inventado es peor que uno corto, porque la tarjeta
  * lo presenta como un hecho.
  *
+ * HU 5.7.3: cada estado puede venir con el `id` del elemento anterior (la
+ * decisión los devuelve así); entonces el enunciado sobra, porque se empareja
+ * por `id` (RN-5.7-S).
+ *
  * @param {object} crudo - El `followUp` tal como lo devolvió el modelo.
- * @returns {{recommendations: Array<{statement: string, asset: string|null, state: string}>,
- *   theses: Array<{statement: string, asset: string|null, state: string}>}}
+ * @returns {{recommendations: Array<{id: string|null, statement: string, asset: string|null, state: string}>,
+ *   theses: Array<{id: string|null, statement: string, asset: string|null, state: string}>}}
  */
 function normalizarSeguimiento(crudo) {
   const limpiar = (lista, permitidos) => {
@@ -377,8 +474,13 @@ function normalizarSeguimiento(crudo) {
     for (const item of Array.isArray(lista) ? lista : []) {
       if (!item || typeof item !== 'object') continue;
       const statement = String(item.statement || '').trim();
-      if (!statement || !permitidos.includes(item.state)) continue;
-      salida.push({ statement, asset: item.asset || null, state: item.state });
+      const id = item.id !== undefined && item.id !== null && String(item.id).trim()
+        ? String(item.id).trim()
+        : null;
+      if ((!statement && !id) || !permitidos.includes(item.state)) continue;
+      salida.push({
+        id, statement, asset: item.asset || null, state: item.state,
+      });
     }
 
     return salida;
@@ -412,35 +514,100 @@ function normalizarTesis(crudas) {
 }
 
 /**
+ * Lo que hace el seguimiento cuando no se le pasa nada: deja la decisión tal
+ * cual. Lo usan los llamadores que no comparan (y los tests del composer).
+ */
+const SEGUIMIENTO_SIN_CAMBIOS = {
+  antesDeDecidir: (context) => context,
+  alDecidir: (decision, context) => ({
+    recommendations: decision.recommendations,
+    theses: decision.theses,
+    comparison: context.comparison || null,
+    followUp: decision.followUp,
+    corrections: [],
+  }),
+};
+
+/**
  * Escribe el informe.
+ *
+ * HU 5.7.3 — Decidir → corregir → redactar:
+ * 1. `seguimiento.antesDeDecidir(context)`: el llamador cierra lo que ya se
+ *    sabe sin el modelo (las reducciones que la ficha no permite, RN-5.7-P).
+ * 2. `decidir`: el modelo decide en JSON.
+ * 3. `seguimiento.alDecidir(decision, context)`: el llamador corrige las
+ *    recomendaciones y calcula los estados de las anteriores.
+ * 4. Se redacta con `context.decisions` y la comparación ya resuelta.
+ *
+ * Si la decisión no llega legible (ruta degradada), se redacta como antes, se
+ * extrae la estructura del informe y `alDecidir` corrige lo extraído: lo
+ * guardado cumple las reglas aunque el informe no las refleje.
  *
  * @param {object} entrada - Lo mismo que `construirContexto`.
  * @param {object} entorno - `{ userId, secret, language }`.
- * @returns {Promise<{markdown: string, executiveSummary: string, tokensUsed: number, modelId: string, sources: object[]}>}
- * @throws {CopilotEngineError} Si el motor no responde: sin informe no hay
- *   análisis, y eso sí es un fallo (RN-5-C).
+ * @param {object} [seguimiento] - `{ antesDeDecidir, alDecidir }`.
+ * @returns {Promise<{markdown: string, executiveSummary: string, tokensUsed: number, modelId: string,
+ *   sources: object[], recommendations: object[], theses: object[], followUp: object,
+ *   corrections: object[], decisionPath: string}>}
+ * @throws {CopilotEngineError} Si el motor no responde al redactar: sin informe
+ *   no hay análisis, y eso sí es un fallo (RN-5-C).
  */
-async function redactarInforme(entrada, { userId, secret, language }) {
-  const { context, fuentes } = await construirContexto({ language, ...entrada });
+async function redactarInforme(entrada, { userId, secret, language }, seguimiento = {}) {
+  const { antesDeDecidir, alDecidir } = { ...SEGUIMIENTO_SIN_CAMBIOS, ...seguimiento };
+  const entorno = { userId, secret, language };
+
+  const construido = await construirContexto({ language, ...entrada });
+  const context = antesDeDecidir(construido.context);
+
+  const decision = await decidir(context, entorno);
+
+  if (decision) {
+    const resuelto = alDecidir(decision, context);
+    const salida = await engineClient.redactar(userId, secret, {
+      language,
+      context: {
+        ...context,
+        comparison: resuelto.comparison,
+        decisions: { recommendations: resuelto.recommendations, theses: resuelto.theses },
+      },
+    });
+    const markdown = limpiarMarcasDelCuerpo(salida.text);
+
+    return {
+      markdown,
+      executiveSummary: extraerResumenEjecutivo(markdown),
+      tokensUsed: decision.tokensUsed + salida.tokensUsed,
+      modelId: salida.modelId,
+      sources: construido.fuentes,
+      recommendations: resuelto.recommendations,
+      theses: resuelto.theses,
+      // Los estados de las anteriores, ya calculados: de aquí sale el recuento
+      // de la tarjeta del historial.
+      followUp: resuelto.followUp,
+      corrections: resuelto.corrections,
+      decisionPath: RUTA_DE_DECISION.DECIDIDA,
+    };
+  }
 
   const salida = await engineClient.redactar(userId, secret, { language, context });
   const markdown = limpiarMarcasDelCuerpo(salida.text);
 
   // HU 5.4: con el informe escrito, se extrae su estructura para que el
   // análisis siguiente pueda compararse contra él.
-  const estructura = await extraerEstructura(markdown, { userId, secret, language });
+  const estructura = await extraerEstructura(markdown, entorno);
+  const resuelto = alDecidir(estructura, context);
 
   return {
     markdown,
     executiveSummary: extraerResumenEjecutivo(markdown),
     tokensUsed: salida.tokensUsed + estructura.tokensUsed,
     modelId: salida.modelId,
-    sources: fuentes,
-    recommendations: estructura.recommendations,
-    theses: estructura.theses,
-    // Los estados que la sección 2 le dio al análisis anterior: de aquí sale
-    // el recuento de la tarjeta del historial.
-    followUp: estructura.followUp,
+    sources: construido.fuentes,
+    recommendations: resuelto.recommendations,
+    theses: resuelto.theses,
+    followUp: resuelto.followUp,
+    corrections: resuelto.corrections,
+    decisionPath: RUTA_DE_DECISION.DEGRADADA,
   };
 }
 
@@ -449,12 +616,15 @@ module.exports = {
   ESTADOS_DE_RECOMENDACION,
   ESTADOS_DE_TESIS,
   SEGUIMIENTO_VACIO,
+  RUTA_DE_DECISION,
   PILARES,
   ACCIONES,
   NIVELES,
   extraerResumenEjecutivo,
   limpiarMarcasDelCuerpo,
   extraerEstructura,
+  decidir,
+  normalizarDecision,
   normalizarRecomendaciones,
   normalizarTramos,
   normalizarTesis,

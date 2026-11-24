@@ -74,6 +74,7 @@ class CopilotEngineError extends Error {
  *   Investigar el macro: `{task:'macro', language, exposure}`.
  *   Redactar: `{language, context}`.
  *   Extraer la estructura (HU 5.4): `{task:'extract', language, markdown}`.
+ *   Decidir antes de redactar (HU 5.7.3): `{task:'decide', language, context}`.
  * @returns {Promise<{text: string, tokensUsed: number, sources: object[], modelId: string}>}
  * @throws {CopilotEngineError} Si el motor no responde, devuelve error o agotó
  *   su cuota gratuita.
@@ -153,8 +154,9 @@ function investigar(userId, secret, peticion) {
  *
  * @param {string} userId
  * @param {string} secret
- * @param {object} peticion - `{language, context}` para el informe, o
- *   `{task:'extract', language, markdown}` para extraer su estructura.
+ * @param {object} peticion - `{language, context}` para el informe,
+ *   `{task:'extract', language, markdown}` para extraer su estructura, o
+ *   `{task:'decide', language, context}` para decidir antes de redactar (HU 5.7.3).
  * @returns {Promise<{text: string, tokensUsed: number, modelId: string}>}
  */
 function redactar(userId, secret, peticion) {

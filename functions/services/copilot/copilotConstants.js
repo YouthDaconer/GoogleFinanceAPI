@@ -215,8 +215,29 @@ const DCA = {
  * HU 5.7.1 — Versión del criterio de decisión con el que se redactó un
  * análisis. Se guarda en `copilotAnalyses.decisionCriteria`; la HU 5.7.3 la lee
  * para saber qué recomendaciones anteriores se emitieron sin el criterio.
+ *
+ * HU 5.7.3: pasa a '5.7.3' porque desde ahí las acciones las limita el código
+ * (RN-5.7-P a RN-5.7-T). Solo deja trazado con qué reglas se decidió cada
+ * análisis: la línea del criterio nuevo sale cuando la referencia **no tiene**
+ * este campo, no cuando tiene otra versión (QA-07).
+ *
+ * @see platform-docs/stories/5.7.3-seguimiento-con-precio-y-criterio/refinamiento.md (T1)
  */
-const CRITERIO_DE_DECISION = '5.7.1';
+const CRITERIO_DE_DECISION = '5.7.3';
+
+/**
+ * HU 5.7.3 — RN-5.7-T: un «vender» que la ficha no permite pasa a «reducir», y
+ * el modelo no decidió cuánto. Se reduce a esta fracción del peso actual
+ * (decisión del PO, 2026-11-23). Es el único sitio que se edita para cambiarlo.
+ */
+const FRACCION_REDUCCION_SIN_VENTA = 0.5;
+
+/**
+ * HU 5.7.3 — RN-5.7-Q: holgura, en puntos porcentuales, para dar por buena la
+ * suma de los tramos frente a la distancia al objetivo. Los tramos van en
+ * décimas y 3 × 0,8 no siempre suma exactamente 2,4 en coma flotante.
+ */
+const TOLERANCIA_TRAMOS_PP = 0.05;
 
 /**
  * HU 5.7.1 — RN-5.7-J: a la web solo se le preguntan los hechos de los últimos
@@ -246,4 +267,6 @@ module.exports = {
   DCA,
   CRITERIO_DE_DECISION,
   VENTANA_NOTICIAS_DIAS,
+  FRACCION_REDUCCION_SIN_VENTA,
+  TOLERANCIA_TRAMOS_PP,
 };

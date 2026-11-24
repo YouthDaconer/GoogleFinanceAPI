@@ -11,13 +11,22 @@
  * regla. "Ya no tienes INTC" es una comprobación contra el portafolio, y "su
  * horizonte terminó" es una fecha.
  *
+ * HU 5.7.3: el estado de las recomendaciones anteriores también lo decide el
+ * código. Se compara cada una con la de hoy del mismo activo (RN-5.7-P), se
+ * cierran de entrada las reducciones o ventas que la ficha de hoy ya no
+ * permite, y cada una lleva el precio de cuando se emitió y el de hoy
+ * (RN-5.7-L). Al modelo solo le queda justificar.
+ *
  * @module services/copilot/copilotFollowUp
  * @see platform-docs/stories/5.4-que-cambio-ultimo-analisis/refinamiento.md (T3)
+ * @see platform-docs/stories/5.7.3-seguimiento-con-precio-y-criterio/refinamiento.md (T4)
  */
 
 const { DateTime } = require('luxon');
 const admin = require('../firebaseAdmin');
 const { COPILOT_ANALYSES_SUBCOLLECTION } = require('./copilotConstants');
+const guard = require('./copilotDecisionGuard');
+const { cierresDeLaSerie, cierreEnOAntes } = require('./copilotAssetCardService');
 
 /**
  * En qué situación está la comparación. Son cuatro cosas distintas y ninguna
@@ -54,7 +63,40 @@ const CLOSE_REASON = {
   ASSET_GONE: 'activo_ausente',
   /** RN-5.4-U: el horizonte de la recomendación ya terminó. */
   HORIZON_OVER: 'horizonte_cumplido',
+  /** HU 5.7.3 (RN-5.7-P): reduce o vende, y la ficha de hoy ya no lo permite. */
+  CRITERIA: 'criterio',
 };
+
+/** HU 5.7.3 — De dónde salió el precio de emisión (RN-5.7-L). */
+const ORIGEN_PRECIO = {
+  /** Lo guardó la recomendación al emitirse. */
+  GUARDADO: 'guardado',
+  /** El cierre de ese día, del historial (recomendaciones de antes de la 5.7.3). */
+  CIERRE: 'cierre',
+};
+
+/** HU 5.7.3 — Los textos fijos de la línea de precio (Esc. 5 y 7). */
+const TEXTOS_PRECIO = {
+  es: {
+    cierreDel: (fecha) => `cierre del ${fecha}`,
+    emisionNoDisponible: 'precio de emisión no disponible',
+    hoyNoDisponible: 'precio de hoy no disponible',
+    hoy: 'hoy',
+    locale: 'es-ES',
+    pct: (texto) => `${texto} %`,
+  },
+  en: {
+    cierreDel: (fecha) => `close of ${fecha}`,
+    emisionNoDisponible: 'issue price not available',
+    hoyNoDisponible: 'price today not available',
+    hoy: 'today',
+    locale: 'en-US',
+    pct: (texto) => `${texto}%`,
+  },
+};
+
+/** El signo menos tipográfico, el que usa la historia: «−13,6 %». */
+const SIGNO_MENOS = '\u2212';
 
 /**
  * RN-5.4-U — a partir de aquí, la sección avisa de que el análisis es antiguo.
@@ -232,6 +274,146 @@ function cerrarDeEntrada(recomendaciones, { tickersEnCartera, emitidoEn, now = n
 }
 
 /**
+ * HU 5.7.3 (RN-5.7-P) — Cierra las reducciones o ventas anteriores que la ficha
+ * de hoy de su activo ya no permite.
+ *
+ * Se hace antes de decidir, para que el modelo las reciba ya marcadas: si no,
+ * una reducción que se apoyaba solo en noticias sin verificar seguiría viva
+ * porque "la incertidumbre persiste" (caso NVDA, 2026-11-19).
+ *
+ * Solo toca las que siguen abiertas y cuyo activo tiene ficha: sin señales no
+ * hay con qué juzgarla, y se queda para comparar con la de hoy.
+ *
+ * @param {object[]} recomendaciones - Con `closedState` ya resuelto.
+ * @param {Map<string, string[]>} permitidas - Activo → acciones que permite hoy.
+ * @returns {object[]}
+ */
+function cerrarPorCriterio(recomendaciones, permitidas) {
+  return (recomendaciones || []).map((rec) => {
+    if (rec.closedState || !rec.asset || !permitidas.has(rec.asset)) return rec;
+
+    const accion = guard.accionDe(rec);
+    const reduce = accion === guard.ACCION.VENDER || accion === guard.ACCION.REDUCIR;
+    if (!reduce || permitidas.get(rec.asset).includes(accion)) return rec;
+
+    return { ...rec, closedState: RECOMMENDATION_STATE.NO_LONGER, closedReason: CLOSE_REASON.CRITERIA };
+  });
+}
+
+/**
+ * HU 5.7.3 (RN-5.7-L) — El precio con que se emitió una recomendación.
+ *
+ * El que guardó; si no lo guardó (se emitió antes de esta historia), el cierre
+ * del día del análisis de referencia, o el de la sesión anterior si ese día no
+ * hubo mercado. Si el historial tampoco lo tiene, no hay precio: nunca se
+ * inventa uno (RN-5-H).
+ *
+ * @param {object} rec
+ * @param {object} contexto
+ * @param {string} contexto.emitidoEn - ISO 8601 del análisis de referencia.
+ * @param {object|null} [contexto.serie] - Serie diaria del activo.
+ * @returns {{value: number|null, source: string|null, date: string|null}}
+ */
+function precioDeEmision(rec, { emitidoEn, serie = null }) {
+  if (typeof rec.priceAtIssue === 'number' && Number.isFinite(rec.priceAtIssue) && rec.priceAtIssue > 0) {
+    return { value: rec.priceAtIssue, source: ORIGEN_PRECIO.GUARDADO, date: null };
+  }
+
+  const dia = DateTime.fromISO(emitidoEn, { zone: 'America/New_York' });
+  const cierre = dia.isValid ? cierreEnOAntes(cierresDeLaSerie(serie), dia.toISODate()) : null;
+  if (!cierre) return { value: null, source: null, date: null };
+
+  return { value: cierre.cierre, source: ORIGEN_PRECIO.CIERRE, date: cierre.fecha };
+}
+
+/**
+ * Un precio para leer: dos decimales, o ninguno a partir de 1.000 (61.914).
+ *
+ * @param {number} valor
+ * @param {object} t - Textos del idioma.
+ * @returns {string}
+ */
+function precioLegible(valor, t) {
+  const decimales = Math.abs(valor) >= 1000 ? 0 : 2;
+  return new Intl.NumberFormat(t.locale, {
+    minimumFractionDigits: decimales,
+    maximumFractionDigits: decimales,
+  }).format(valor);
+}
+
+/**
+ * HU 5.7.3 (Esc. 1 y 5) — La línea «precio entonces → hoy (variación)».
+ *
+ * La arma el código y el redactor la copia tal cual, igual que la línea de
+ * referencia de la 5.4: son datos, no una redacción.
+ *
+ * @param {object} precios
+ * @param {{value: number|null, source: string|null, date: string|null}} precios.emision
+ * @param {number|null} precios.hoy
+ * @param {string} language
+ * @returns {{line: string, changePct: number|null}}
+ */
+function lineaDePrecio({ emision, hoy }, language) {
+  const t = TEXTOS_PRECIO[language === 'en' ? 'en' : 'es'];
+  const hayEmision = typeof emision.value === 'number';
+  const hayHoy = typeof hoy === 'number' && Number.isFinite(hoy);
+  const sufijoCierre = emision.source === ORIGEN_PRECIO.CIERRE
+    ? ` · ${t.cierreDel(fechaLegible(emision.date, language))}`
+    : '';
+
+  if (hayEmision && hayHoy) {
+    // Sin redondear para el dato; el redondeo solo al presentarlo.
+    const changePct = ((hoy - emision.value) / emision.value) * 100;
+    const magnitud = Math.abs(changePct).toFixed(1);
+    const signo = changePct < 0 ? SIGNO_MENOS : '+';
+    const variacion = t.pct(language === 'en' ? magnitud : magnitud.replace('.', ','));
+    return {
+      line: `${precioLegible(emision.value, t)} → ${precioLegible(hoy, t)} (${signo}${variacion})${sufijoCierre}`,
+      changePct,
+    };
+  }
+
+  if (hayEmision) {
+    return { line: `${precioLegible(emision.value, t)} → ${t.hoyNoDisponible}${sufijoCierre}`, changePct: null };
+  }
+
+  if (hayHoy) {
+    return { line: `${t.emisionNoDisponible} · ${t.hoy} ${precioLegible(hoy, t)}`, changePct: null };
+  }
+
+  return { line: t.emisionNoDisponible, changePct: null };
+}
+
+/**
+ * HU 5.7.3 — El precio de una recomendación anterior, listo para el informe.
+ *
+ * @param {object} rec
+ * @param {object} contexto
+ * @param {string} contexto.emitidoEn
+ * @param {object|null} [contexto.serie]
+ * @param {number|null} [contexto.precioHoy]
+ * @param {string} contexto.language
+ * @returns {{issue: number|null, issueSource: string|null, issueDate: string|null,
+ *   today: number|null, changePct: number|null, line: string}}
+ */
+function precioDeRecomendacion(rec, {
+  emitidoEn, serie = null, precioHoy = null, language,
+}) {
+  const emision = precioDeEmision(rec, { emitidoEn, serie });
+  const hoy = typeof precioHoy === 'number' && Number.isFinite(precioHoy) ? precioHoy : null;
+  const { line, changePct } = lineaDePrecio({ emision, hoy }, language);
+
+  return {
+    issue: emision.value,
+    issueSource: emision.source,
+    issueDate: emision.date,
+    today: hoy,
+    changePct,
+    line,
+  };
+}
+
+/**
  * Los activos que hay que volver a investigar por su recomendación anterior
  * (RN-5.4-X, Escenario 18).
  *
@@ -322,33 +504,105 @@ function emparejarEstados(anteriores, declarados) {
 }
 
 /**
- * El estado final de cada recomendación anterior (RN-5.4-O).
+ * HU 5.7.3 (RN-5.7-S) — Empareja por `id` y, lo que quede, por enunciado.
  *
- * Dos orígenes, y el orden importa: lo que el backend cerró de entrada manda
- * —no es juicio, es una comprobación contra el portafolio o una fecha—, y el
- * resto lo decidió el analista dentro del informe y vuelve por la extracción.
+ * Desde esta historia cada elemento anterior viaja con su `id`, y el modelo
+ * devuelve el estado por `id`: el idioma del enunciado ya no importa. El
+ * emparejamiento por enunciado y luego por activo (`emparejarEstados`) queda
+ * para lo que llegue sin `id`, como la ruta degradada, que lee la prosa.
  *
- * @param {object[]} recomendacionesCerradas - La salida de `cerrarDeEntrada`.
- * @param {object[]} declarados - `followUp.recommendations` de la extracción.
- * @returns {object[]}
+ * @param {object[]} anteriores - Con `id`.
+ * @param {object[]} declarados - `{id?, statement?, asset?, state}`.
+ * @returns {object[]} Los anteriores, cada uno con su `state` o `null`.
  */
-function estadosFinales(recomendacionesCerradas, declarados) {
-  const emparejadas = emparejarEstados(recomendacionesCerradas, declarados);
+function emparejarPorId(anteriores, declarados) {
+  const lista = (declarados || []).filter((d) => d && d.state);
+  const ids = new Set((anteriores || []).map((a) => (a.id ? String(a.id) : null)).filter(Boolean));
 
-  return emparejadas.map((rec) => (rec.closedState
-    ? { ...rec, state: rec.closedState }
-    : rec));
+  const porId = new Map();
+  for (const d of lista) {
+    if (d.id && ids.has(String(d.id)) && !porId.has(String(d.id))) porId.set(String(d.id), d.state);
+  }
+
+  const conId = (anteriores || []).map((a) => ({ ...a, state: (a.id && porId.get(String(a.id))) || null }));
+  const sueltos = conId.filter((a) => !a.state);
+  if (sueltos.length === 0) return conId;
+
+  const libres = lista.filter((d) => !d.id || !ids.has(String(d.id)));
+  const emparejados = emparejarEstados(sueltos, libres);
+  let i = 0;
+  return conId.map((a) => (a.state ? a : emparejados[i++]));
 }
 
 /**
- * El estado final de cada tesis anterior.
+ * HU 5.7.3 (RN-5.7-P) — El estado de cada recomendación anterior, calculado.
+ *
+ * En este orden:
+ * 1. lo que se cerró de entrada (activo ausente, horizonte, criterio) manda;
+ * 2. si hoy hay una recomendación del mismo activo, el estado sale de
+ *    compararlas (`copilotDecisionGuard.compararConHoy`);
+ * 3. si no, el que el modelo declaró para ella; pero un "vigente" o un
+ *    "ajustada" cuya acción la ficha de hoy ya no permite es "ya no vigente";
+ * 4. si tampoco hay eso, queda sin estado: no se cuenta (RN-5.4).
+ *
+ * @param {object[]} anteriores - Las de la referencia, con `id` y su cierre.
+ * @param {object[]} recsDeHoy - Las de hoy, ya corregidas.
+ * @param {object[]} declarados - Los estados que declaró el modelo.
+ * @param {object} [contexto]
+ * @param {Map<string, number>} [contexto.preciosHoy] - Activo → precio de hoy.
+ * @param {Map<string, string[]>} [contexto.permitidas] - Activo → acciones
+ *   que permite hoy su ficha.
+ * @returns {object[]} Cada anterior con `state`, `stateReason` y `changes`.
+ */
+function estadosCalculados(anteriores, recsDeHoy, declarados, {
+  preciosHoy = new Map(), permitidas = new Map(),
+} = {}) {
+  return emparejarPorId(anteriores, declarados).map((rec) => {
+    const declarado = rec.state;
+
+    if (rec.closedState) {
+      return {
+        ...rec, state: rec.closedState, stateReason: rec.closedReason, changes: [],
+      };
+    }
+
+    const precioHoy = rec.asset && preciosHoy.has(rec.asset) ? preciosHoy.get(rec.asset) : null;
+    const comparado = guard.compararConHoy(rec, recsDeHoy, { precioHoy });
+    if (comparado) {
+      return {
+        ...rec, state: comparado.state, stateReason: comparado.reason, changes: comparado.changes,
+      };
+    }
+
+    if (!declarado) return { ...rec, state: null, stateReason: null, changes: [] };
+
+    const accion = guard.accionDe(rec);
+    const hoyPermitidas = rec.asset ? permitidas.get(rec.asset) : null;
+    const yaNoSePermite = declarado !== RECOMMENDATION_STATE.NO_LONGER
+      && Array.isArray(hoyPermitidas) && Boolean(accion) && !hoyPermitidas.includes(accion);
+
+    return yaNoSePermite
+      ? {
+        ...rec,
+        state: RECOMMENDATION_STATE.NO_LONGER,
+        stateReason: guard.MOTIVO_DE_ESTADO.CRITERIO,
+        changes: [],
+      }
+      : {
+        ...rec, state: declarado, stateReason: guard.MOTIVO_DE_ESTADO.DECLARADO, changes: [],
+      };
+  });
+}
+
+/**
+ * El estado final de cada tesis anterior: por `id` y, si no, por enunciado.
  *
  * @param {object[]} tesisAnteriores - Las de la referencia.
- * @param {object[]} declarados - `followUp.theses` de la extracción.
+ * @param {object[]} declarados - `followUp.theses` de la decisión o de la extracción.
  * @returns {object[]}
  */
 function estadosDeTesis(tesisAnteriores, declarados) {
-  return emparejarEstados(tesisAnteriores, declarados);
+  return emparejarPorId(tesisAnteriores, declarados);
 }
 
 /**
@@ -357,7 +611,7 @@ function estadosDeTesis(tesisAnteriores, declarados) {
  * Se fija al generarse el análisis y no se recalcula nunca (RN-5.4-V): sólo sus
  * etiquetas se traducen al leerlas.
  *
- * **Espera listas que ya traigan `state`** — las de `estadosFinales` y
+ * **Espera listas que ya traigan `state`** — las de `estadosCalculados` y
  * `estadosDeTesis`, no las de `prepararComparacion`: ésas llevan `closedState`
  * y aún les falta lo que decidió el informe, y contarlas aquí daría ceros.
  *
@@ -387,7 +641,12 @@ function contarSeguimiento(estados, tesis) {
  * @param {Set<string>} opciones.tickersEnCartera
  * @param {string} opciones.language
  * @param {Date} [opciones.now]
- * @returns {Promise<{estado: string, referencia: object|null, recomendaciones: object[], tesis: object[], referenceLine: object|null, activosARevisar: string[]}>}
+ * HU 5.7.3: cada recomendación y tesis anterior lleva un `id` (`R1`, `T1`…)
+ * con el que vuelve su estado, y `criterionChanged` dice si la referencia es
+ * anterior al criterio de decisión (Esc. 6): un análisis sin
+ * `decisionCriteria` se generó antes de la 5.7.1.
+ *
+ * @returns {Promise<{estado: string, referencia: object|null, recomendaciones: object[], tesis: object[], referenceLine: object|null, activosARevisar: string[], criterionChanged: boolean}>}
  */
 async function prepararComparacion(userId, { tickersEnCartera, language, now = new Date() }) {
   const vacio = {
@@ -396,6 +655,7 @@ async function prepararComparacion(userId, { tickersEnCartera, language, now = n
     tesis: [],
     referenceLine: null,
     activosARevisar: [],
+    criterionChanged: false,
   };
 
   let referencia;
@@ -421,19 +681,19 @@ async function prepararComparacion(userId, { tickersEnCartera, language, now = n
     return { ...vacio, estado: COMPARISON_STATE.LEGACY, referencia, referenceLine };
   }
 
-  const recomendaciones = cerrarDeEntrada(referencia.recommendations, {
-    tickersEnCartera,
-    emitidoEn: referencia.createdAt,
-    now,
-  });
+  const recomendaciones = cerrarDeEntrada(
+    referencia.recommendations.map((rec, i) => ({ ...rec, id: `R${i + 1}` })),
+    { tickersEnCartera, emitidoEn: referencia.createdAt, now },
+  );
 
   return {
     estado: COMPARISON_STATE.COMPARED,
     referencia,
     recomendaciones,
-    tesis: referencia.theses || [],
+    tesis: (referencia.theses || []).map((t, i) => ({ ...t, id: `T${i + 1}` })),
     referenceLine,
     activosARevisar: activosARevisar(recomendaciones),
+    criterionChanged: !referencia.decisionCriteria,
   };
 }
 
@@ -442,6 +702,8 @@ module.exports = {
   RECOMMENDATION_STATE,
   THESIS_STATE,
   CLOSE_REASON,
+  ORIGEN_PRECIO,
+  TEXTOS_PRECIO,
   DIAS_PARA_AVISO_DE_ANTIGUEDAD,
   MAX_CANDIDATOS,
   buscarReferencia,
@@ -450,10 +712,15 @@ module.exports = {
   fechaLegible,
   horizonteCumplido,
   cerrarDeEntrada,
+  cerrarPorCriterio,
+  precioDeEmision,
+  lineaDePrecio,
+  precioDeRecomendacion,
   activosARevisar,
   claveDeEnunciado,
   emparejarEstados,
-  estadosFinales,
+  emparejarPorId,
+  estadosCalculados,
   estadosDeTesis,
   contarSeguimiento,
   prepararComparacion,

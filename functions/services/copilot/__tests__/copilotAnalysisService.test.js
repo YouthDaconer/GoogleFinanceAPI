@@ -142,6 +142,7 @@ function montarCaminoFeliz({ assets = [crearAsset()], priceMap } = {}) {
     resto: [],
   });
   fundamentals.obtenerDatosDePlataforma.mockResolvedValue(new Map());
+  fundamentals.seriesDeActivos.mockResolvedValue(new Map());
   montarTanda([crearInvestigacion()]);
   composer.redactarInforme.mockResolvedValue(crearInforme());
 }
@@ -249,8 +250,8 @@ describe('runAnalysis — el camino feliz', () => {
     expect(resultado.desenlace).toBe('completed');
     expect(documentosEscritos).toHaveLength(1);
     expect(documentosEscritos[0].datos.executiveSummary).toBe('- Todo en orden.');
-    // HU 5.7.1: el criterio de decisión entra en los prompts de redacción.
-    expect(documentosEscritos[0].datos._meta.promptVersion).toBe('v4');
+    // HU 5.7.3: decidir → corregir → redactar.
+    expect(documentosEscritos[0].datos._meta.promptVersion).toBe('v5');
   });
 
   it('la fecha del análisis es la del lanzamiento (RN-5.2-R)', async () => {
@@ -550,39 +551,37 @@ describe('HU 5.4 — la comparación contra el análisis anterior', () => {
    */
   const conElRecuentoDeVerdad = () => {
     const real = jest.requireActual('../copilotFollowUp');
-    followUp.estadosFinales.mockImplementation(real.estadosFinales);
-    followUp.estadosDeTesis.mockImplementation(real.estadosDeTesis);
     followUp.contarSeguimiento.mockImplementation(real.contarSeguimiento);
   };
 
-  it('el recuento sale de los estados que el informe declaró', async () => {
+  it('el recuento sale de los estados ya calculados que devuelve la redacción (HU 5.7.3)', async () => {
     conElRecuentoDeVerdad();
     composer.redactarInforme.mockResolvedValue(crearInforme({
       followUp: {
-        recommendations: [{ statement: 'Reducir NVDA al 8 %', asset: 'NVDA', state: 'ajustada' }],
-        theses: [{ statement: 'La nube sostiene MSFT', asset: 'MSFT', state: 'invalidada' }],
+        recommendations: [
+          { id: 'R1', asset: 'NVDA', state: 'ajustada' },
+          // La que el portafolio cerró de entrada llega ya con su estado.
+          { id: 'R2', asset: 'INTC', state: 'no_vigente' },
+        ],
+        theses: [{ id: 'T1', asset: 'MSFT', state: 'invalidada' }],
       },
     }));
 
     await servicio.runAnalysis(crearRun(), ENTORNO);
 
     expect(documentosEscritos[0].datos.comparison.followUp).toEqual({
-      vigentes: 0,
-      ajustadas: 1,
-      // La que el portafolio cerró de entrada: ésa no la declara el informe.
-      noVigentes: 1,
-      tesisInvalidadas: 1,
+      vigentes: 0, ajustadas: 1, noVigentes: 1, tesisInvalidadas: 1,
     });
   });
 
-  it('una extracción sin estados no inventa vigencias', async () => {
+  it('una redacción sin seguimiento no inventa vigencias', async () => {
     conElRecuentoDeVerdad();
     composer.redactarInforme.mockResolvedValue(crearInforme());
 
     await servicio.runAnalysis(crearRun(), ENTORNO);
 
     expect(documentosEscritos[0].datos.comparison.followUp).toEqual({
-      vigentes: 0, ajustadas: 0, noVigentes: 1, tesisInvalidadas: 0,
+      vigentes: 0, ajustadas: 0, noVigentes: 0, tesisInvalidadas: 0,
     });
   });
 
@@ -692,10 +691,10 @@ describe('HU 6.11.2 — la moneda pedida no estaba disponible (Escenario 5)', ()
 describe('HU 5.7.1 — el criterio de decisión con que se generó (QA-23)', () => {
   beforeEach(() => montarCaminoFeliz());
 
-  it('el análisis guardado lleva decisionCriteria: 5.7.1', async () => {
+  it('el análisis guardado lleva el criterio vigente (5.7.3)', async () => {
     await servicio.runAnalysis(crearRun(), ENTORNO);
 
-    expect(documentosEscritos[0].datos.decisionCriteria).toBe('5.7.1');
+    expect(documentosEscritos[0].datos.decisionCriteria).toBe('5.7.3');
   });
 
   it('la ficha de cada activo viaja al redactor junto a su investigación', async () => {
@@ -717,5 +716,188 @@ describe('HU 5.7.1 — el criterio de decisión con que se generó (QA-23)', () 
 
     expect(resultado.desenlace).toBe('completed');
     expect(composer.redactarInforme.mock.calls[0][0].investigaciones[0].card).toBeNull();
+  });
+});
+
+// ============================================================================
+// HU 5.7.3 — El seguimiento con precio y criterio
+// ============================================================================
+
+describe('HU 5.7.3 — preciosDelSeguimiento: el precio de hoy y las series (RN-5.7-L)', () => {
+  const serieCon = (cierres) => Object.fromEntries(Object.entries(cierres).map(([f, c]) => [f, { close: c }]));
+
+  it('toma el precio del portafolio; si falta, el de la ficha; y pide la serie de lo que no tiene ficha', async () => {
+    fundamentals.seriesDeActivos.mockResolvedValue(new Map([['INTC', serieCon({ '2026-11-18': 21, '2026-11-19': 22.5 })]]));
+
+    const { preciosHoy, series } = await servicio.preciosDelSeguimiento({
+      holdings: [crearHolding({ symbol: 'MSFT' }), crearHolding({ symbol: 'NVDA' })],
+      priceMap: new Map([['MSFT', { price: 400 }]]),
+      datosDePlataforma: new Map([
+        ['MSFT', { card: { price: 395 }, serie: { a: 1 } }],
+        ['NVDA', { card: { price: 145.98 }, serie: { b: 2 } }],
+      ]),
+      comparacion: { recomendaciones: [{ asset: 'NVDA' }, { asset: 'INTC' }] },
+    });
+
+    expect(preciosHoy.get('MSFT')).toBe(400);
+    expect(preciosHoy.get('NVDA')).toBe(145.98);
+    expect(preciosHoy.get('INTC')).toBe(22.5);
+    expect(fundamentals.seriesDeActivos).toHaveBeenCalledWith(['INTC']);
+    expect(series.get('NVDA')).toEqual({ b: 2 });
+  });
+
+  it('un historial caído no tumba nada: el seguimiento dirá "no disponible"', async () => {
+    fundamentals.seriesDeActivos.mockRejectedValue(new Error('finance-query caído'));
+
+    const { preciosHoy } = await servicio.preciosDelSeguimiento({
+      holdings: [],
+      priceMap: new Map(),
+      datosDePlataforma: new Map(),
+      comparacion: { recomendaciones: [{ asset: 'INTC' }] },
+    });
+
+    expect(preciosHoy.size).toBe(0);
+  });
+});
+
+describe('HU 5.7.3 — crearSeguimiento: el código corrige y calcula antes de redactar', () => {
+  const real = jest.requireActual('../copilotFollowUp');
+
+  beforeEach(() => {
+    followUp.cerrarPorCriterio.mockImplementation(real.cerrarPorCriterio);
+    followUp.estadosCalculados.mockImplementation(real.estadosCalculados);
+    followUp.estadosDeTesis.mockImplementation(real.estadosDeTesis);
+  });
+
+  const fichaNflx = {
+    kind: 'stock',
+    signals: {
+      weightPct: 0.6,
+      overweightThresholdPct: 10,
+      overweight: false,
+      roomToThresholdPct: 9.4,
+      maxTranchePct: 3.1,
+      extremeValuation: null,
+      deterioration: [],
+      opportunityException: null,
+      allowedActions: ['mantener', 'aumentar', 'comprar'],
+      level1Eligible: false,
+    },
+  };
+
+  const contexto = () => ({
+    assets: [{ ticker: 'NFLX', card: fichaNflx }],
+    comparison: {
+      state: 'compared',
+      recommendations: [{
+        id: 'R1', statement: 'Reducir NFLX del 0,6 % al 0,3 %', asset: 'NFLX', action: 'reducir', closedState: null,
+      }],
+      theses: [{ id: 'T1', statement: 'El streaming madura', asset: 'NFLX' }],
+    },
+  });
+
+  const seguimiento = () => servicio.crearSeguimiento({
+    preciosHoy: new Map([['NFLX', 98.4]]),
+    pesos: new Map([['NFLX', 0.6]]),
+    language: 'es',
+  });
+
+  it('QA-10/QA-03: una reducción que la ficha ya no permite llega cerrada por criterio a la decisión', () => {
+    const preparado = seguimiento().antesDeDecidir(contexto());
+
+    expect(preparado.comparison.recommendations[0]).toMatchObject({
+      closedState: 'no_vigente', closedReason: 'criterio',
+    });
+  });
+
+  it('QA-11 + QA-10: corrige los tramos, guarda el precio y calcula el estado de la anterior', () => {
+    const s = seguimiento();
+    const contextoPreparado = s.antesDeDecidir(contexto());
+
+    const resuelto = s.alDecidir({
+      recommendations: [{
+        statement: 'Aumentar NFLX', asset: 'NFLX', action: 'aumentar', targetPct: 3, conviction: 'media',
+        tranches: [{ zone: 'Z1', pct: 3.1 }], pillar: 'valoracion', level: null,
+      }],
+      theses: [{ statement: 'El streaming sigue creciendo', asset: 'NFLX' }],
+      // El modelo dice "vigente": el código no le hace caso.
+      followUp: { recommendations: [{ id: 'R1', state: 'vigente' }], theses: [{ id: 'T1', state: 'sin_cambio' }] },
+    }, contextoPreparado);
+
+    expect(resuelto.recommendations[0]).toMatchObject({
+      statement: 'Aumentar NFLX por tramos del 0,6 % al 3 % del portafolio',
+      priceAtIssue: 98.4,
+    });
+    expect(resuelto.recommendations[0].tranches.map((t) => t.pct)).toEqual([0.8, 0.8, 0.8]);
+    expect(resuelto.followUp.recommendations[0]).toMatchObject({ state: 'no_vigente', stateReason: 'criterio' });
+    expect(resuelto.followUp.theses[0].state).toBe('sin_cambio');
+    expect(resuelto.comparison.recommendations[0].state).toBe('no_vigente');
+    expect(resuelto.corrections.map((c) => c.rule)).toContain('RN-5.7-Q');
+  });
+
+  it('sin comparación (primer análisis) no hay estados que calcular, pero sí correcciones y precios', () => {
+    const resuelto = seguimiento().alDecidir(
+      { recommendations: [{ statement: 'Mantener NFLX', asset: 'NFLX', action: 'mantener' }], theses: [], followUp: null },
+      { assets: [{ ticker: 'NFLX', card: fichaNflx }], comparison: { state: 'first', recommendations: [], theses: [] } },
+    );
+
+    expect(resuelto.followUp).toEqual({ recommendations: [], theses: [] });
+    expect(resuelto.recommendations[0].priceAtIssue).toBe(98.4);
+  });
+});
+
+describe('HU 5.7.3 — runAnalysis guarda lo decidido y lo corregido', () => {
+  beforeEach(() => montarCaminoFeliz());
+
+  it('QA-02 (paso 1): cada recomendación guardada lleva su precio de emisión', async () => {
+    composer.redactarInforme.mockResolvedValue(crearInforme({
+      recommendations: [{ statement: 'Mantener MSFT', asset: 'MSFT', priceAtIssue: 400 }],
+      decisionPath: 'decidida',
+      corrections: [{ asset: 'MSFT', rule: 'RN-5.7-T', field: 'conviction', from: 'alta', to: 'baja' }],
+    }));
+
+    await servicio.runAnalysis(crearRun(), ENTORNO);
+
+    const guardado = documentosEscritos[0].datos;
+    expect(guardado.recommendations[0].priceAtIssue).toBe(400);
+    expect(guardado._meta.decisionPath).toBe('decidida');
+    expect(guardado._meta.guardCorrections).toEqual([
+      { asset: 'MSFT', rule: 'RN-5.7-T', field: 'conviction', from: 'alta', to: 'baja' },
+    ]);
+  });
+
+  it('le pasa al composer los ganchos del seguimiento', async () => {
+    await servicio.runAnalysis(crearRun(), ENTORNO);
+
+    const ganchos = composer.redactarInforme.mock.calls[0][2];
+    expect(typeof ganchos.antesDeDecidir).toBe('function');
+    expect(typeof ganchos.alDecidir).toBe('function');
+  });
+
+  it('la comparación que ve el redactor lleva ids, acción, precio y si el criterio es nuevo', async () => {
+    const real = jest.requireActual('../copilotFollowUp');
+    followUp.precioDeRecomendacion.mockImplementation(real.precioDeRecomendacion);
+    followUp.prepararComparacion.mockResolvedValue({
+      estado: 'compared',
+      referencia: { id: 'A-1110', createdAt: '2026-11-10T15:00:00.000Z' },
+      recomendaciones: [{
+        id: 'R1', statement: 'Reducir la posición de NVDA del 7 % al 3 %', asset: 'MSFT', closedState: null,
+      }],
+      tesis: [{ id: 'T1', statement: 'La nube sostiene MSFT', asset: 'MSFT' }],
+      referenceLine: { fecha: '10 nov 2026', transcurrido: '9 días', stale: false, dias: 9 },
+      activosARevisar: ['MSFT'],
+      criterionChanged: true,
+    });
+    fundamentals.obtenerDatosDePlataforma.mockResolvedValue(new Map([
+      ['MSFT', { card: null, serie: { '2026-11-10': { close: 380 } } }],
+    ]));
+
+    await servicio.runAnalysis(crearRun(), ENTORNO);
+
+    const { comparacion } = composer.redactarInforme.mock.calls[0][0];
+    expect(comparacion.criterionChanged).toBe(true);
+    expect(comparacion.recommendations[0]).toMatchObject({ id: 'R1', action: 'reducir' });
+    expect(comparacion.recommendations[0].price.line).toBe('380,00 → 400,00 (+5,3 %) · cierre del 10 nov 2026');
+    expect(comparacion.theses[0].id).toBe('T1');
   });
 });

@@ -283,7 +283,7 @@ describe('prepararComparacion — los cuatro estados', () => {
   });
 });
 
-describe('estadosFinales — de dónde sale el estado de cada recomendación', () => {
+describe('estadosCalculados — sin recomendación de hoy, el estado declarado (respaldo de la HU 5.4)', () => {
   /** Las recomendaciones tal como salen de `prepararComparacion`. */
   const anteriores = () => [
     { statement: 'Reducir NVDA al 8 %', asset: 'NVDA', closedState: null, closedReason: null },
@@ -297,7 +297,7 @@ describe('estadosFinales — de dónde sale el estado de cada recomendación', (
   ];
 
   it('lo toma del informe, emparejando por el enunciado', () => {
-    const estados = followUp.estadosFinales(anteriores(), [
+    const estados = followUp.estadosCalculados(anteriores(), [], [
       { statement: 'Reducir NVDA al 8 %', asset: 'NVDA', state: 'ajustada' },
       { statement: 'Mantener MSFT', asset: 'MSFT', state: 'vigente' },
     ]);
@@ -306,7 +306,7 @@ describe('estadosFinales — de dónde sale el estado de cada recomendación', (
   });
 
   it('un enunciado con cursivas o puntuación de más sigue siendo el mismo', () => {
-    const estados = followUp.estadosFinales(anteriores(), [
+    const estados = followUp.estadosCalculados(anteriores(), [], [
       { statement: '  **Reducir NVDA al 8 %.**  ', asset: 'NVDA', state: 'ajustada' },
     ]);
 
@@ -314,7 +314,7 @@ describe('estadosFinales — de dónde sale el estado de cada recomendación', (
   });
 
   it('si el modelo lo reescribió entero, lo empareja por su activo', () => {
-    const estados = followUp.estadosFinales(anteriores(), [
+    const estados = followUp.estadosCalculados(anteriores(), [], [
       { statement: 'Bajar la exposición al fabricante de GPUs', asset: 'NVDA', state: 'vigente' },
     ]);
 
@@ -323,8 +323,9 @@ describe('estadosFinales — de dónde sale el estado de cada recomendación', (
 
   it('con dos estados sueltos del mismo activo no adivina', () => {
     // Adjudicar uno de los dos sería inventarse cuál.
-    const estados = followUp.estadosFinales(
+    const estados = followUp.estadosCalculados(
       [{ statement: 'Reducir NVDA', asset: 'NVDA', closedState: null }],
+      [],
       [
         { statement: 'otra cosa', asset: 'NVDA', state: 'vigente' },
         { statement: 'y otra', asset: 'NVDA', state: 'no_vigente' },
@@ -335,11 +336,12 @@ describe('estadosFinales — de dónde sale el estado de cada recomendación', (
   });
 
   it('un estado no responde por dos recomendaciones', () => {
-    const estados = followUp.estadosFinales(
+    const estados = followUp.estadosCalculados(
       [
         { statement: 'Reducir NVDA', asset: 'NVDA', closedState: null },
         { statement: 'Reducir NVDA', asset: 'NVDA', closedState: null },
       ],
+      [],
       [{ statement: 'Reducir NVDA', asset: 'NVDA', state: 'vigente' }],
     );
 
@@ -348,7 +350,7 @@ describe('estadosFinales — de dónde sale el estado de cada recomendación', (
 
   it('lo que el backend cerró de entrada manda sobre lo que diga el informe', () => {
     // RN-5.4-T no es un juicio: el activo está o no está en el portafolio.
-    const estados = followUp.estadosFinales(anteriores(), [
+    const estados = followUp.estadosCalculados(anteriores(), [], [
       { statement: 'Aumentar INTC al 5 %', asset: 'INTC', state: 'vigente' },
     ]);
 
@@ -356,14 +358,14 @@ describe('estadosFinales — de dónde sale el estado de cada recomendación', (
   });
 
   it('lo que nadie declaró se queda sin estado, no en vigente', () => {
-    const estados = followUp.estadosFinales(anteriores(), []);
+    const estados = followUp.estadosCalculados(anteriores(), [], []);
 
     expect(estados[0].state).toBeNull();
     expect(estados[1].state).toBeNull();
   });
 
   it('sin estados declarados sólo cuentan los cierres de entrada', () => {
-    const estados = followUp.estadosFinales(anteriores(), []);
+    const estados = followUp.estadosCalculados(anteriores(), [], []);
 
     expect(followUp.contarSeguimiento(estados, [])).toEqual({
       vigentes: 0, ajustadas: 0, noVigentes: 1, tesisInvalidadas: 0,
@@ -417,7 +419,7 @@ describe('contarSeguimiento — con la forma que produce el pipeline', () => {
     };
 
     const recuento = followUp.contarSeguimiento(
-      followUp.estadosFinales(anteriores, declarados.recommendations),
+      followUp.estadosCalculados(anteriores, [], declarados.recommendations),
       followUp.estadosDeTesis(tesisAnteriores, declarados.theses),
     );
 
@@ -449,5 +451,234 @@ describe('contarSeguimiento — lo que muestra la tarjeta (Escenario 15)', () =>
     expect(followUp.contarSeguimiento([], [])).toEqual({
       vigentes: 0, ajustadas: 0, noVigentes: 0, tesisInvalidadas: 0,
     });
+  });
+});
+
+// ============================================================================
+// HU 5.7.3 — El seguimiento sabe cuánto se movió el precio y con qué criterio
+// ============================================================================
+
+/** Serie diaria con la forma de finance-query: `{ 'YYYY-MM-DD': { close } }`. */
+const crearSerie = (cierres) => Object.fromEntries(
+  Object.entries(cierres).map(([fecha, close]) => [fecha, { close, high: close, low: close }]),
+);
+
+/** A-1110: el análisis del 2026-11-10, antes de la 5.7.1 y sin precios guardados. */
+const EMITIDO_A1110 = '2026-11-10T15:00:00.000Z';
+
+describe('HU 5.7.3 — precio de emisión, de hoy y variación (RN-5.7-L)', () => {
+  it('QA-01: sin precio guardado toma el cierre de ese día y lo dice', () => {
+    const precio = followUp.precioDeRecomendacion(
+      crearRecomendacion({ statement: 'Reducir la posición de NVDA del 7 % actual al 3 %' }),
+      {
+        emitidoEn: EMITIDO_A1110,
+        serie: crearSerie({ '2026-11-07': 170.1, '2026-11-10': 168.89, '2026-11-11': 166.5 }),
+        precioHoy: 145.98,
+        language: 'es',
+      },
+    );
+
+    expect(precio.issue).toBe(168.89);
+    expect(precio.issueSource).toBe(followUp.ORIGEN_PRECIO.CIERRE);
+    expect(precio.issueDate).toBe('2026-11-10');
+    expect(precio.line).toBe('168,89 → 145,98 (−13,6 %) · cierre del 10 nov 2026');
+  });
+
+  it('QA-01: R2 (VUAA.L) sale igual, como cierre de ese día', () => {
+    const precio = followUp.precioDeRecomendacion(
+      crearRecomendacion({ asset: 'VUAA.L' }),
+      {
+        emitidoEn: EMITIDO_A1110, serie: crearSerie({ '2026-11-10': 104.2 }), precioHoy: 101.35, language: 'es',
+      },
+    );
+
+    expect(precio.line).toBe('104,20 → 101,35 (−2,7 %) · cierre del 10 nov 2026');
+  });
+
+  it('un día sin mercado toma la sesión anterior', () => {
+    const precio = followUp.precioDeEmision(crearRecomendacion(), {
+      emitidoEn: '2026-11-08T15:00:00.000Z', // sábado
+      serie: crearSerie({ '2026-11-06': 171.2, '2026-11-10': 168.89 }),
+    });
+
+    expect(precio).toEqual({ value: 171.2, source: 'cierre', date: '2026-11-06' });
+  });
+
+  it('QA-02: con precio guardado usa ese, sin la marca de cierre', () => {
+    const nvda = followUp.precioDeRecomendacion(
+      crearRecomendacion({ priceAtIssue: 145.98 }),
+      {
+        emitidoEn: '2026-11-19T15:00:00.000Z', serie: crearSerie({ '2026-11-19': 150 }), precioHoy: 160, language: 'es',
+      },
+    );
+    const btc = followUp.precioDeRecomendacion(
+      crearRecomendacion({ asset: 'BTC-USD', priceAtIssue: 61914 }),
+      { emitidoEn: '2026-11-19T15:00:00.000Z', precioHoy: 66000, language: 'es' },
+    );
+
+    expect(nvda.issueSource).toBe(followUp.ORIGEN_PRECIO.GUARDADO);
+    expect(nvda.line).toBe('145,98 → 160,00 (+9,6 %)');
+    expect(btc.line).toBe('61.914 → 66.000 (+6,6 %)');
+  });
+
+  it('QA-06: sin cierre en el historial dice que no está disponible y no inventa nada', () => {
+    const precio = followUp.precioDeRecomendacion(
+      crearRecomendacion({ asset: 'ECOPETROL.CL' }),
+      {
+        emitidoEn: EMITIDO_A1110, serie: crearSerie({ '2026-11-12': 2450 }), precioHoy: 2390, language: 'es',
+      },
+    );
+
+    expect(precio.issue).toBeNull();
+    expect(precio.changePct).toBeNull();
+    expect(precio.line).toBe('precio de emisión no disponible · hoy 2390');
+  });
+
+  it('QA-08: los textos de la línea en inglés', () => {
+    const conCierre = followUp.precioDeRecomendacion(crearRecomendacion(), {
+      emitidoEn: EMITIDO_A1110, serie: crearSerie({ '2026-11-10': 168.89 }), precioHoy: 145.98, language: 'en',
+    });
+    const sinEmision = followUp.precioDeRecomendacion(crearRecomendacion(), {
+      emitidoEn: EMITIDO_A1110, serie: null, precioHoy: 145.98, language: 'en',
+    });
+
+    expect(conCierre.line).toBe('168.89 → 145.98 (−13.6%) · close of 10 Nov 2026');
+    expect(sinEmision.line).toBe('issue price not available · today 145.98');
+  });
+
+  it('sin precio de hoy, muestra el de emisión y dice que falta el de hoy', () => {
+    const { line } = followUp.lineaDePrecio({ emision: { value: 168.89, source: 'guardado' }, hoy: null }, 'es');
+    expect(line).toBe('168,89 → precio de hoy no disponible');
+  });
+});
+
+describe('HU 5.7.3 — ids y criterio nuevo en la comparación (Esc. 6, RN-5.7-S)', () => {
+  const opciones = { tickersEnCartera: EN_CARTERA, language: 'es', now: AHORA };
+
+  it('cada recomendación y tesis anterior lleva su id', async () => {
+    montarFirestore([crearAnalisis({
+      recommendations: [crearRecomendacion(), crearRecomendacion({ statement: 'Mantener MSFT', asset: 'MSFT' })],
+    })]);
+
+    const comparacion = await followUp.prepararComparacion('u-pro', opciones);
+
+    expect(comparacion.recomendaciones.map((r) => r.id)).toEqual(['R1', 'R2']);
+    expect(comparacion.tesis.map((t) => t.id)).toEqual(['T1']);
+  });
+
+  it('QA-07: una referencia sin criterio registrado lo marca como nuevo', async () => {
+    montarFirestore([crearAnalisis()]);
+    expect((await followUp.prepararComparacion('u-pro', opciones)).criterionChanged).toBe(true);
+  });
+
+  it('QA-07: una referencia generada con el criterio no lo marca', async () => {
+    montarFirestore([crearAnalisis({ decisionCriteria: '5.7.1' })]);
+    expect((await followUp.prepararComparacion('u-pro', opciones)).criterionChanged).toBe(false);
+  });
+});
+
+describe('HU 5.7.3 — cerrarPorCriterio: la ficha de hoy no la sostiene (RN-5.7-P)', () => {
+  const permitidas = new Map([
+    ['NVDA', ['mantener', 'aumentar', 'comprar']],
+    ['BTC-USD', ['mantener', 'reducir']],
+  ]);
+
+  it('QA-03: «Reducir NVDA» anterior sin señales hoy llega ya no vigente, por criterio', () => {
+    const [nvda] = followUp.cerrarPorCriterio([
+      crearRecomendacion({ id: 'R1', closedState: null, closedReason: null }),
+    ], permitidas);
+
+    expect(nvda.closedState).toBe(followUp.RECOMMENDATION_STATE.NO_LONGER);
+    expect(nvda.closedReason).toBe(followUp.CLOSE_REASON.CRITERIA);
+  });
+
+  it('una reducción que la ficha permite sigue abierta para compararla con la de hoy', () => {
+    const [btc] = followUp.cerrarPorCriterio([
+      crearRecomendacion({ statement: 'Reducir BTC-USD hacia el 10 %', asset: 'BTC-USD', closedState: null }),
+    ], permitidas);
+
+    expect(btc.closedState).toBeNull();
+  });
+
+  it('no toca lo que no reduce, lo que ya se cerró ni lo que no tiene ficha', () => {
+    const recs = [
+      crearRecomendacion({ statement: 'Mantener NVDA', closedState: null, closedReason: null }),
+      crearRecomendacion({ closedState: 'no_vigente', closedReason: 'activo_ausente' }),
+      crearRecomendacion({
+        asset: 'TLT', statement: 'Reducir TLT', closedState: null, closedReason: null,
+      }),
+    ];
+
+    const cerradas = followUp.cerrarPorCriterio(recs, permitidas);
+
+    expect(cerradas.map((r) => r.closedReason)).toEqual([null, 'activo_ausente', null]);
+  });
+});
+
+describe('HU 5.7.3 — estadosCalculados: el estado lo calcula el código (RN-5.7-P)', () => {
+  const anterior = (overrides = {}) => ({
+    id: 'R1', closedState: null, closedReason: null, ...crearRecomendacion(overrides),
+  });
+
+  it('QA-10: reducción anterior + «aumentar» hoy = ya no vigente, aunque el modelo diga vigente', () => {
+    const [nflx] = followUp.estadosCalculados(
+      [anterior({ statement: 'Reducir NFLX del 0,6 % al 0,3 %', asset: 'NFLX', action: 'reducir' })],
+      [{ asset: 'NFLX', action: 'aumentar', targetPct: 3, conviction: 'media' }],
+      [{ id: 'R1', state: 'vigente' }],
+    );
+
+    expect(nflx.state).toBe('no_vigente');
+    expect(nflx.stateReason).toBe('otra_accion');
+  });
+
+  it('QA-09: el cierre por activo ausente manda y conserva el motivo', () => {
+    const [eco] = followUp.estadosCalculados(
+      [anterior({ asset: 'ECOPETROL.CL', closedState: 'no_vigente', closedReason: 'activo_ausente' })],
+      [{ asset: 'ECOPETROL.CL', action: 'mantener' }],
+      [],
+    );
+
+    expect(eco.state).toBe('no_vigente');
+    expect(eco.stateReason).toBe('activo_ausente');
+  });
+
+  it('sin recomendación de hoy, un «vigente» declarado que la ficha ya no permite es ya no vigente', () => {
+    const [nvda] = followUp.estadosCalculados(
+      [anterior({ action: 'reducir' })],
+      [],
+      [{ id: 'R1', state: 'vigente' }],
+      { permitidas: new Map([['NVDA', ['mantener']]]) },
+    );
+
+    expect(nvda.state).toBe('no_vigente');
+    expect(nvda.stateReason).toBe('criterio');
+  });
+
+  it('QA-13: el estado vuelve por id aunque el enunciado venga en otro idioma', () => {
+    const [msft] = followUp.estadosCalculados(
+      [anterior({ statement: 'Mantener MSFT', asset: null })],
+      [],
+      [{ id: 'R1', statement: 'Hold MSFT', state: 'vigente' }],
+    );
+
+    expect(msft.state).toBe('vigente');
+  });
+
+  it('QA-13: una tesis sin activo y sin id que no empareja queda sin estado', () => {
+    const tesis = followUp.estadosDeTesis(
+      [{ id: 'T1', statement: 'El ciclo de tipos favorece a los bonos largos', asset: null }],
+      [{ statement: 'Long bonds benefit from the rate cycle', asset: null, state: 'confirmada' }],
+    );
+
+    expect(tesis[0].state).toBeNull();
+  });
+
+  it('QA-13: las tesis por id, en cualquier idioma', () => {
+    const tesis = followUp.estadosDeTesis(
+      [{ id: 'T1', statement: 'La nube sostiene MSFT', asset: 'MSFT' }],
+      [{ id: 'T1', state: 'invalidada' }],
+    );
+
+    expect(tesis[0].state).toBe('invalidada');
   });
 });

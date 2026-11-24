@@ -32,6 +32,7 @@ const { claseDeActivo } = require('./copilotRelevance');
 const {
   UMBRAL_SOBREPESO_PCT, CAIDA_MATERIAL_MARGEN_PP, EXCEPCION_OPORTUNIDAD, DCA,
 } = require('./copilotConstants');
+const { accionesPermitidas } = require('./copilotDecisionGuard');
 
 /** El huso en que la serie diaria pone sus fechas: el del mercado. */
 const ZONA_MERCADO = 'America/New_York';
@@ -583,6 +584,10 @@ function subeDosTrimestres(recientes) {
  * - **Excepción de oportunidad** (RN-5.7-E, decisión del PO del 2026-11-20):
  *   una acción que cumple todas las condiciones puede pasar del 10 % hasta un
  *   techo, más alto si el usuario compra de forma escalonada (DCA).
+ * - **Acciones permitidas** (HU 5.7.3, RN-5.7-T y RN-5.7-R): qué se puede
+ *   recomendar con estas señales, y si mantener tiene la convicción limitada.
+ *   Sin el Nivel 1, que depende de las noticias: lo añade el composer al
+ *   armar el contexto (`level1Eligible`).
  *
  * @param {object} entrada
  * @param {'stock'|'etf'|'crypto'} entrada.clase
@@ -595,7 +600,7 @@ function subeDosTrimestres(recientes) {
  * @returns {{weightPct: number|null, overweightThresholdPct: number|null, overweight: boolean,
  *   roomToThresholdPct: number|null, maxTranchePct: number|null, extremeValuation: string|null,
  *   deterioration: Array<{signal: string, evidence: string}>,
- *   opportunityException: object|null}}
+ *   opportunityException: object|null, allowedActions: string[], holdMaxConviction: string|null}}
  */
 function senalesDeDecision({
   clase, pesoPct, tecnico, valoracion, tendencia, compras = [], now = new Date(),
@@ -611,7 +616,7 @@ function senalesDeDecision({
     ? Math.max(0, Math.round((UMBRAL_SOBREPESO_PCT - peso) * 10) / 10)
     : null;
 
-  return {
+  const senales = {
     weightPct: peso,
     overweightThresholdPct: aplicaUmbral ? UMBRAL_SOBREPESO_PCT : null,
     overweight,
@@ -624,6 +629,15 @@ function senalesDeDecision({
         peso, tecnico, valoracion, deterioration, dca: compraEscalonada(compras, now),
       })
       : null,
+  };
+
+  // HU 5.7.3: el modelo recibe la lista ya hecha y el código la vuelve a
+  // aplicar antes de guardar (copilotDecisionGuard).
+  const permitidas = accionesPermitidas(senales, { clase });
+  return {
+    ...senales,
+    allowedActions: permitidas.allowed,
+    holdMaxConviction: permitidas.holdMaxConviction,
   };
 }
 
@@ -1047,6 +1061,9 @@ function construirFicha({
   return {
     kind: clase,
     asOf: tecnico ? tecnico.fecha : hoy,
+    // HU 5.7.3: el último cierre, sin redondear. Es el precio de hoy cuando el
+    // portafolio no trae uno (RN-5.7-L).
+    price: precio,
     items,
     missing,
     signals: senalesDeDecision({
@@ -1068,6 +1085,8 @@ module.exports = {
   periodosOrdenados,
   crecimientoAnualPct,
   numero,
+  cierresDeLaSerie,
+  cierreEnOAntes,
   mediaMovil,
   rsiWilder,
   tecnicoDeLaSerie,

@@ -219,6 +219,9 @@ describe('QA-03 — la ficha de NVDA del 2026-11-19, con fecha o periodo en cada
           '-39.0% from 52-week high',
         ],
       },
+      // HU 5.7.3: sin señales, NVDA no se reduce ni se vende.
+      allowedActions: ['mantener', 'aumentar', 'comprar'],
+      holdMaxConviction: null,
     });
   });
 
@@ -723,5 +726,56 @@ describe('crecimientoAnualPct — un solo cálculo para la ficha y el hallazgo',
 
   it('con un solo año no hay crecimiento', () => {
     expect(card.crecimientoAnualPct(crearAnual([crearTrimestre('2026-01-26', 1, 1)]))).toBeNull();
+  });
+});
+
+describe('HU 5.7.3 — la ficha dice qué acciones permite (RN-5.7-T, RN-5.7-R)', () => {
+  it('QA-12: una cripto solo se mantiene, o se reduce si está en sobrepeso', () => {
+    const eth = card.construirFicha({
+      holding: crearHolding({ symbol: 'ETH-USD', asset_type: 'crypto', weight: 0.026 }),
+      serie: crearSerie({ cierre: 3000 }),
+      language: 'es',
+      now: HOY,
+    });
+    const btc = card.construirFicha({
+      holding: crearHolding({ symbol: 'BTC-USD', asset_type: 'crypto', weight: 0.109 }),
+      serie: crearSerie({ cierre: 61914 }),
+      language: 'es',
+      now: HOY,
+    });
+
+    expect(eth.signals.allowedActions).toEqual(['mantener']);
+    expect(btc.signals.allowedActions).toEqual(['mantener', 'reducir']);
+  });
+
+  it('un ETF se puede aumentar: no tiene umbral', () => {
+    const ficha = card.construirFicha({
+      holding: crearHolding({ symbol: 'VUAA.L', asset_type: 'etf', weight: 0.282 }),
+      serie: crearSerie(),
+      language: 'es',
+      now: HOY,
+    });
+
+    expect(ficha.signals.allowedActions).toEqual(['mantener', 'aumentar', 'comprar']);
+  });
+
+  it('una acción con una sola señal de deterioro permite reducir, no vender, y limita mantener', () => {
+    const ficha = fichaNvda({
+      // Ingresos anuales a la baja: una sola señal del Nivel 2.
+      anual: crearAnual([
+        crearTrimestre('2026-01-25', 100e9, 60e9),
+        crearTrimestre('2025-01-26', 110e9, 66e9),
+      ]),
+    });
+
+    expect(ficha.signals.deterioration).toHaveLength(1);
+    expect(ficha.signals.allowedActions).toContain('reducir');
+    expect(ficha.signals.allowedActions).not.toContain('vender');
+    expect(ficha.signals.holdMaxConviction).toBe('baja');
+  });
+
+  it('expone el último cierre como precio, sin redondear (RN-5.7-L)', () => {
+    expect(fichaNvda().price).toBe(145.98);
+    expect(card.construirFicha({ holding: crearHolding(), language: 'es', now: HOY }).price).toBeNull();
   });
 });

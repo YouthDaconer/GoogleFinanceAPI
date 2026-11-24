@@ -31,6 +31,8 @@ const restOfPortfolio = require('./copilotRestOfPortfolio');
 const research = require('./copilotResearch');
 const composer = require('./copilotComposer');
 const followUp = require('./copilotFollowUp');
+const guard = require('./copilotDecisionGuard');
+const { cierresDeLaSerie } = require('./copilotAssetCardService');
 const { RESEARCH_OUTCOME } = require('./copilotFindings');
 const notifications = require('./copilotNotifications');
 const quota = require('./copilotQuota');
@@ -157,7 +159,9 @@ function conNotaDeMoneda(markdown, monedaNoDisponible, language) {
  * @returns {Promise<void>}
  */
 async function persistAnalysis(userId, analysisId, createdAt, informe, payload, meta) {
-  const declarados = informe.followUp || { recommendations: [], theses: [] };
+  // HU 5.7.3: los estados ya vienen calculados por el código (RN-5.7-P), así
+  // que se cuentan tal cual.
+  const seguimiento = informe.followUp || { recommendations: [], theses: [] };
 
   await admin
     .firestore()
@@ -186,16 +190,10 @@ async function persistAnalysis(userId, analysisId, createdAt, informe, payload, 
           referenceId: meta.comparacion.referencia ? meta.comparacion.referencia.id : null,
           referenceDate: meta.comparacion.referencia
             ? meta.comparacion.referencia.createdAt : null,
-          // El estado final de cada una no está aquí: lo decidió el analista
-          // dentro del informe y vuelve por la extracción (`informe.followUp`).
-          // Contar las de `meta.comparacion` directamente daría siempre ceros,
-          // porque sólo llevan los cierres de entrada.
-          followUp: followUp.contarSeguimiento(
-            followUp.estadosFinales(
-              meta.comparacion.recomendaciones, declarados.recommendations,
-            ),
-            followUp.estadosDeTesis(meta.comparacion.tesis, declarados.theses),
-          ),
+          // El estado final de cada una no está en `meta.comparacion`, que
+          // solo lleva los cierres de entrada: lo calculó el código al decidir
+          // (HU 5.7.3) y vuelve en `informe.followUp`.
+          followUp: followUp.contarSeguimiento(seguimiento.recommendations, seguimiento.theses),
         }
         : null,
       payloadSummary: buildPayloadSummary(payload, meta.analizados),
@@ -207,11 +205,15 @@ async function persistAnalysis(userId, analysisId, createdAt, informe, payload, 
       // análisis anterior a esta historia no lo tiene (QA-23).
       decisionCriteria: CRITERIO_DE_DECISION,
       _meta: {
-        promptVersion: 'v4',
+        promptVersion: 'v5',
         researchedAssets: meta.investigados,
         failedAssets: meta.fallidos,
         excludedPositions: meta.excluidos,
         sources: informe.sources.length,
+        // HU 5.7.3: por qué camino se decidió y qué corrigió el código. Es lo
+        // que se lee en producción para verificar RN-5.7-Q, R y T.
+        decisionPath: informe.decisionPath || null,
+        guardCorrections: informe.corrections || [],
       },
     });
 }
@@ -224,28 +226,203 @@ async function persistAnalysis(userId, analysisId, createdAt, informe, payload, 
  * una redacción) y las recomendaciones con las que ya vienen cerradas marcadas
  * como tales. El resto —qué análisis era, sus metadatos— no le hace falta.
  *
+ * HU 5.7.3: cada anterior lleva su `id` (el estado vuelve por él, RN-5.7-S),
+ * su acción y sus tramos (con ellos se compara con la de hoy, RN-5.7-P) y su
+ * precio de emisión, el de hoy y la línea ya escrita (RN-5.7-L).
+ *
  * @param {object} comparacion - La salida de `prepararComparacion`.
+ * @param {object} [precios]
+ * @param {Map<string, object|null>} [precios.series] - Activo → serie de 1 año.
+ * @param {Map<string, number>} [precios.preciosHoy] - Activo → precio de hoy.
+ * @param {string} [precios.language]
  * @returns {object|null} `null` cuando no hay nada que decir.
  */
-function construirComparacionParaElInforme(comparacion) {
+function construirComparacionParaElInforme(comparacion, {
+  series = new Map(), preciosHoy = new Map(), language = 'es',
+} = {}) {
   if (!comparacion) return null;
+  const emitidoEn = comparacion.referencia ? comparacion.referencia.createdAt : null;
 
   return {
     state: comparacion.estado,
     referenceLine: comparacion.referenceLine,
+    criterionChanged: Boolean(comparacion.criterionChanged),
     recommendations: comparacion.recomendaciones.map((rec) => ({
+      id: rec.id || null,
       statement: rec.statement,
       asset: rec.asset,
+      action: guard.accionDe(rec),
       conviction: rec.conviction,
       targetPct: rec.targetPct,
       priceZone: rec.priceZone,
       horizon: rec.horizon,
+      tranches: Array.isArray(rec.tranches) ? rec.tranches : [],
       // Las que ya vienen decididas no las juzga el modelo: se respetan.
       closedState: rec.closedState,
       closedReason: rec.closedReason,
       closedAt: rec.closedAt || null,
+      price: emitidoEn
+        ? followUp.precioDeRecomendacion(rec, {
+          emitidoEn,
+          serie: rec.asset ? series.get(rec.asset) || null : null,
+          precioHoy: rec.asset && preciosHoy.has(rec.asset) ? preciosHoy.get(rec.asset) : null,
+          language,
+        })
+        : null,
     })),
-    theses: comparacion.tesis.map((t) => ({ statement: t.statement, asset: t.asset })),
+    theses: comparacion.tesis.map((t) => ({ id: t.id || null, statement: t.statement, asset: t.asset })),
+  };
+}
+
+/**
+ * HU 5.7.3 — El último cierre de una serie, o `null`.
+ *
+ * @param {object|null} serie
+ * @returns {number|null}
+ */
+function ultimoCierre(serie) {
+  const cierres = cierresDeLaSerie(serie);
+  return cierres.length > 0 ? cierres[cierres.length - 1].cierre : null;
+}
+
+/**
+ * HU 5.7.3 (RN-5.7-L) — El precio de hoy de cada activo, y la serie de 1 año
+ * de los que tienen una recomendación anterior.
+ *
+ * El precio de hoy es el del portafolio (el mismo que ve el usuario); si no lo
+ * trae, el último cierre de la serie. Los activos de una recomendación
+ * anterior que hoy no tienen ficha (vendidos, nuevos) piden su serie aparte.
+ *
+ * **Nunca lanza**: sin precios, el seguimiento dice "no disponible" (RN-5-H).
+ *
+ * @param {object} entrada
+ * @param {object[]} entrada.holdings
+ * @param {Map<string, object>} entrada.priceMap
+ * @param {Map<string, object>} entrada.datosDePlataforma
+ * @param {object} entrada.comparacion
+ * @returns {Promise<{preciosHoy: Map<string, number>, series: Map<string, object|null>}>}
+ */
+async function preciosDelSeguimiento({
+  holdings, priceMap, datosDePlataforma, comparacion,
+}) {
+  const preciosHoy = new Map();
+  const series = new Map();
+
+  try {
+    for (const h of holdings) {
+      const info = priceMap && typeof priceMap.get === 'function' ? priceMap.get(h.symbol) : null;
+      if (info && typeof info.price === 'number' && Number.isFinite(info.price) && info.price > 0) {
+        preciosHoy.set(h.symbol, info.price);
+      }
+    }
+
+    for (const [symbol, datos] of datosDePlataforma) {
+      series.set(symbol, (datos && datos.serie) || null);
+      if (!preciosHoy.has(symbol) && datos && datos.card && typeof datos.card.price === 'number') {
+        preciosHoy.set(symbol, datos.card.price);
+      }
+    }
+
+    const faltan = (comparacion.recomendaciones || [])
+      .map((r) => r.asset)
+      .filter((a) => a && !series.has(a));
+    if (faltan.length > 0) {
+      const extra = await fundamentals.seriesDeActivos(faltan);
+      for (const [symbol, serie] of extra) {
+        series.set(symbol, serie);
+        const cierre = ultimoCierre(serie);
+        if (!preciosHoy.has(symbol) && cierre !== null) preciosHoy.set(symbol, cierre);
+      }
+    }
+  } catch (error) {
+    console.error('[copilotAnalysisService] Sin precios para el seguimiento:', error.message);
+  }
+
+  return { preciosHoy, series };
+}
+
+/**
+ * HU 5.7.3 — Lo que el código hace antes y después de que el modelo decida.
+ *
+ * - `antesDeDecidir`: cierra las reducciones o ventas anteriores que la ficha
+ *   de hoy no permite (RN-5.7-P), para que el modelo las reciba ya marcadas.
+ * - `alDecidir`: corrige las recomendaciones de hoy (RN-5.7-Q, R y T), les
+ *   pone su precio de emisión (RN-5.7-L) y calcula el estado de las anteriores
+ *   comparándolas con ellas (RN-5.7-P).
+ *
+ * @param {object} entrada
+ * @param {Map<string, number>} entrada.preciosHoy
+ * @param {Map<string, number>} entrada.pesos - Activo → peso en %.
+ * @param {string} entrada.language
+ * @returns {{antesDeDecidir: Function, alDecidir: Function}}
+ */
+function crearSeguimiento({ preciosHoy, pesos, language }) {
+  const permitidasDe = (context) => {
+    const permitidas = new Map();
+    for (const activo of context.assets || []) {
+      const signals = activo.card && activo.card.signals;
+      if (signals && Array.isArray(signals.allowedActions)) {
+        permitidas.set(activo.ticker, signals.allowedActions);
+      }
+    }
+    return permitidas;
+  };
+
+  const fichasDe = (context) => new Map((context.assets || [])
+    .filter((a) => a.card)
+    .map((a) => [a.ticker, a.card]));
+
+  return {
+    antesDeDecidir(context) {
+      const comparison = context.comparison;
+      if (!comparison || !Array.isArray(comparison.recommendations)) return context;
+
+      return {
+        ...context,
+        comparison: {
+          ...comparison,
+          recommendations: followUp.cerrarPorCriterio(comparison.recommendations, permitidasDe(context)),
+        },
+      };
+    },
+
+    alDecidir(decision, context) {
+      const { recomendaciones, correcciones } = guard.aplicarGuarda(decision.recommendations, {
+        fichas: fichasDe(context), pesos, language,
+      });
+
+      // RN-5.7-L: cada recomendación guarda el precio de su activo al emitirse.
+      const recommendations = recomendaciones.map((rec) => ({
+        ...rec,
+        priceAtIssue: rec.asset && preciosHoy.has(rec.asset) ? preciosHoy.get(rec.asset) : null,
+      }));
+
+      const comparison = context.comparison || null;
+      const declarados = decision.followUp || { recommendations: [], theses: [] };
+      if (!comparison || comparison.state !== followUp.COMPARISON_STATE.COMPARED) {
+        return {
+          recommendations,
+          theses: decision.theses,
+          comparison,
+          followUp: { recommendations: [], theses: [] },
+          corrections: correcciones,
+        };
+      }
+
+      const estados = followUp.estadosCalculados(
+        comparison.recommendations, recommendations, declarados.recommendations,
+        { preciosHoy, permitidas: permitidasDe(context) },
+      );
+      const tesis = followUp.estadosDeTesis(comparison.theses, declarados.theses);
+
+      return {
+        recommendations,
+        theses: decision.theses,
+        comparison: { ...comparison, recommendations: estados, theses: tesis },
+        followUp: { recommendations: estados, theses: tesis },
+        corrections: correcciones,
+      };
+    },
   };
 }
 
@@ -341,6 +518,11 @@ async function runAnalysis(run, { marketDataTokenSecret }) {
       console.error('[copilotAnalysisService] Sin datos de la plataforma:', error.message);
     }
 
+    // HU 5.7.3 (RN-5.7-L): los precios de emisión y de hoy del seguimiento.
+    const { preciosHoy, series } = await preciosDelSeguimiento({
+      holdings, priceMap: estado.priceMap, datosDePlataforma, comparacion,
+    });
+
     // ---- Los pasos por activo, todos a la vez ------------------------------
     //
     // Una sola llamada cubre todos los activos y el macro (Escenario 7), así
@@ -430,9 +612,14 @@ async function runAnalysis(run, { marketDataTokenSecret }) {
           // HU 6.11.2: el redactor sabe que la moneda pedida no estaba disponible.
           ...(payload.unavailableCurrency ? { unavailableCurrency: payload.unavailableCurrency } : {}),
         },
-        comparacion: construirComparacionParaElInforme(comparacion),
+        comparacion: construirComparacionParaElInforme(comparacion, { series, preciosHoy, language }),
       },
       motor,
+      crearSeguimiento({
+        preciosHoy,
+        pesos: new Map(holdings.map((h) => [h.symbol, Math.round(h.weight * 1000) / 10])),
+        language,
+      }),
     );
     informe.markdown = conNotaDeMoneda(informe.markdown, payload.unavailableCurrency, language);
 
@@ -496,6 +683,8 @@ async function borrarAnalisisDescartado(userId, analysisId) {
 
 module.exports = {
   construirComparacionParaElInforme,
+  preciosDelSeguimiento,
+  crearSeguimiento,
   buildAnalysisId,
   buildPayloadSummary,
   construirPlan,
